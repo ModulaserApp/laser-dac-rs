@@ -1,0 +1,19 @@
+name: Setup Rust
+description: Setup Rust toolchain with caching and system dependencies
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install
+    default: stable
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+    - name: Install system dependencies
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev
