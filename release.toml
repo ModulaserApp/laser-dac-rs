@@ -6,6 +6,4 @@ publish = false
 push = true
 tag = true
 
-commit = true
 tag-name = "v{{version}}"
-commit-message = "release: v{{version}}"
