@@ -8,7 +8,7 @@ This crate provides a complete solution for communicating with various laser DAC
 - **Workers**: Background threads for non-blocking frame output
 - **Backends**: Unified `DacBackend` trait for all DAC types
 
-This crate does not apply any additional processing on points except to make it compatible with the target DAC. It does not apply things like blanking.
+This crate does not apply any additional processing on points (like blanking), except to make it compatible with the target DAC.
 
 ## Supported DACs
 

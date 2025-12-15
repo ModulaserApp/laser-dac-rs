@@ -11,7 +11,7 @@ readme = "README.md"
 repository = "https://github.com/SpaceK33z/laser-dac-rs"
 homepage = "https://github.com/SpaceK33z/laser-dac-rs"
 documentation = "https://docs.rs/laser-dac"
-rust-version = "1.75"
+rust-version = "1.87"
 
 [features]
 default = ["all-dacs"]

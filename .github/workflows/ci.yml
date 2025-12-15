@@ -53,13 +53,13 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    name: MSRV (1.75)
+    name: MSRV (1.87)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
-          toolchain: "1.75"
+          toolchain: "1.87"
       - run: cargo check --all-features
 
   feature-combinations:
