@@ -1,0 +1,11 @@
+# cargo-release configuration
+# https://github.com/crate-ci/cargo-release
+
+# Let GitHub Actions handle the actual publish
+publish = false
+push = true
+tag = true
+
+commit = true
+tag-name = "v{{version}}"
+commit-message = "release: v{{version}}"
