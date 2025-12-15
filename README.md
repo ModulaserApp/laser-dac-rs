@@ -129,7 +129,7 @@ fn main() -> Result<(), String> {
 | Type                 | Description                                     |
 | -------------------- | ----------------------------------------------- |
 | `LaserFrame`         | Collection of points + PPS rate                 |
-| `LaserPoint`         | Single point with position (f32) and color (u8) |
+| `LaserPoint`         | Single point with position (f32) and color (u16) |
 | `DacType`            | Enum of supported DAC hardware                  |
 | `DacDevice`          | Device name + type                              |
 | `DacConnectionState` | Connected or Lost state                         |
@@ -140,7 +140,7 @@ All backends use normalized coordinates:
 
 - **X**: -1.0 (left) to 1.0 (right)
 - **Y**: -1.0 (bottom) to 1.0 (top)
-- **Colors**: 0-255 for R, G, B, and intensity
+- **Colors**: 0-65535 for R, G, B, and intensity
 
 Each backend handles conversion to its native format internally.
 
