@@ -1,0 +1,57 @@
+[package]
+name = "laser-dac"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kees Kluskens <kees@kees.im>"]
+description = "Unified laser DAC abstraction supporting multiple protocols"
+license = "MIT"
+keywords = ["laser", "dac", "ilda", "helios", "etherdream", "lasercube", "idn"]
+categories = ["hardware-support"]
+readme = "README.md"
+repository = "https://github.com/SpaceK33z/laser-dac-rs"
+homepage = "https://github.com/SpaceK33z/laser-dac-rs"
+documentation = "https://docs.rs/laser-dac"
+rust-version = "1.75"
+
+[features]
+default = ["all-dacs"]
+
+# Meta features
+all-dacs = ["usb-dacs", "network-dacs"]
+usb-dacs = ["helios", "lasercube-usb"]
+network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
+
+# Individual DAC protocols
+helios = ["dep:rusb"]
+lasercube-usb = ["dep:rusb"]
+ether-dream = []
+idn = []
+lasercube-wifi = ["dep:socket2", "dep:libc"]
+
+# Optional serialization
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror = "1.0"
+bitflags = "2"
+byteorder = "1.5"
+
+# USB DACs (optional)
+rusb = { version = "0.9", optional = true }
+
+# Network DACs (optional for lasercube-wifi)
+socket2 = { version = "0.5", features = ["all"], optional = true }
+
+# Optional serialization
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+# Unix-only for lasercube-wifi
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[[example]]
+name = "unified"
+path = "examples/unified.rs"
+
+[package.metadata.docs.rs]
+features = ["all-dacs"]
