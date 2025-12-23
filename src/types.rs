@@ -20,7 +20,8 @@ use std::fmt;
 /// This allows each DAC to convert to its native format:
 /// - Helios: 12-bit unsigned (0-4095), inverted
 /// - EtherDream: 16-bit signed (-32768 to 32767)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LaserPoint {
     /// X coordinate, -1.0 to 1.0
     pub x: f32,
@@ -63,7 +64,8 @@ impl LaserPoint {
 }
 
 /// A DAC-agnostic laser frame with full-precision coordinates.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LaserFrame {
     /// Points per second output rate
     pub pps: u32,
@@ -136,7 +138,7 @@ impl fmt::Display for DacType {
 }
 
 /// Set of enabled DAC types for discovery.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct EnabledDacTypes {
     types: HashSet<DacType>,
@@ -164,12 +166,53 @@ impl EnabledDacTypes {
     }
 
     /// Enables or disables a DAC type.
+    #[deprecated(since = "0.4.0", note = "use `enable` or `disable` instead")]
     pub fn set_enabled(&mut self, dac_type: DacType, enabled: bool) {
         if enabled {
             self.types.insert(dac_type);
         } else {
             self.types.remove(&dac_type);
         }
+    }
+
+    /// Enables a DAC type for discovery.
+    ///
+    /// Returns `&mut Self` to allow method chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use laser_dac::{EnabledDacTypes, DacType};
+    ///
+    /// let mut enabled = EnabledDacTypes::none();
+    /// enabled.enable(DacType::Helios).enable(DacType::EtherDream);
+    ///
+    /// assert!(enabled.is_enabled(DacType::Helios));
+    /// assert!(enabled.is_enabled(DacType::EtherDream));
+    /// ```
+    pub fn enable(&mut self, dac_type: DacType) -> &mut Self {
+        self.types.insert(dac_type);
+        self
+    }
+
+    /// Disables a DAC type for discovery.
+    ///
+    /// Returns `&mut Self` to allow method chaining.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use laser_dac::{EnabledDacTypes, DacType};
+    ///
+    /// let mut enabled = EnabledDacTypes::all();
+    /// enabled.disable(DacType::Helios).disable(DacType::EtherDream);
+    ///
+    /// assert!(!enabled.is_enabled(DacType::Helios));
+    /// assert!(!enabled.is_enabled(DacType::EtherDream));
+    /// ```
+    pub fn disable(&mut self, dac_type: DacType) -> &mut Self {
+        self.types.remove(&dac_type);
+        self
     }
 
     /// Returns an iterator over enabled DAC types.
@@ -191,9 +234,24 @@ impl Default for EnabledDacTypes {
     }
 }
 
+impl std::iter::FromIterator<DacType> for EnabledDacTypes {
+    fn from_iter<I: IntoIterator<Item = DacType>>(iter: I) -> Self {
+        Self {
+            types: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl Extend<DacType> for EnabledDacTypes {
+    fn extend<I: IntoIterator<Item = DacType>>(&mut self, iter: I) {
+        self.types.extend(iter);
+    }
+}
+
 /// Information about a discovered DAC device.
 /// The name is the unique identifier for the device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DacDevice {
     pub name: String,
     pub dac_type: DacType,
@@ -206,7 +264,8 @@ impl DacDevice {
 }
 
 /// Connection state for a single DAC device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DacConnectionState {
     /// Successfully connected and ready to receive frames.
     Connected { name: String },
@@ -215,7 +274,8 @@ pub enum DacConnectionState {
 }
 
 /// Information about a discovered DAC device.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DiscoveredDac {
     /// The type of DAC.
     pub dac_type: DacType,
@@ -319,21 +379,21 @@ mod tests {
     }
 
     #[test]
-    fn test_enabled_dac_types_set_enabled_toggles_correctly() {
+    fn test_enabled_dac_types_enable_disable_toggles_correctly() {
         let mut enabled = EnabledDacTypes::none();
 
         // Enable one
-        enabled.set_enabled(DacType::Helios, true);
+        enabled.enable(DacType::Helios);
         assert!(enabled.is_enabled(DacType::Helios));
         assert!(!enabled.is_enabled(DacType::EtherDream));
 
         // Enable another
-        enabled.set_enabled(DacType::EtherDream, true);
+        enabled.enable(DacType::EtherDream);
         assert!(enabled.is_enabled(DacType::Helios));
         assert!(enabled.is_enabled(DacType::EtherDream));
 
         // Disable first
-        enabled.set_enabled(DacType::Helios, false);
+        enabled.disable(DacType::Helios);
         assert!(!enabled.is_enabled(DacType::Helios));
         assert!(enabled.is_enabled(DacType::EtherDream));
     }
@@ -341,8 +401,8 @@ mod tests {
     #[test]
     fn test_enabled_dac_types_iter_only_returns_enabled() {
         let mut enabled = EnabledDacTypes::none();
-        enabled.set_enabled(DacType::Helios, true);
-        enabled.set_enabled(DacType::Idn, true);
+        enabled.enable(DacType::Helios);
+        enabled.enable(DacType::Idn);
 
         let types: Vec<DacType> = enabled.iter().collect();
         assert_eq!(types.len(), 2);
@@ -365,14 +425,26 @@ mod tests {
         let mut enabled = EnabledDacTypes::none();
 
         // Enabling twice should have same effect as once
-        enabled.set_enabled(DacType::Helios, true);
-        enabled.set_enabled(DacType::Helios, true);
+        enabled.enable(DacType::Helios);
+        enabled.enable(DacType::Helios);
         assert!(enabled.is_enabled(DacType::Helios));
 
         // Disabling twice should have same effect as once
-        enabled.set_enabled(DacType::Helios, false);
-        enabled.set_enabled(DacType::Helios, false);
+        enabled.disable(DacType::Helios);
+        enabled.disable(DacType::Helios);
         assert!(!enabled.is_enabled(DacType::Helios));
+    }
+
+    #[test]
+    fn test_enabled_dac_types_chaining() {
+        let mut enabled = EnabledDacTypes::none();
+        enabled
+            .enable(DacType::Helios)
+            .enable(DacType::EtherDream)
+            .disable(DacType::Helios);
+
+        assert!(!enabled.is_enabled(DacType::Helios));
+        assert!(enabled.is_enabled(DacType::EtherDream));
     }
 
     // ==========================================================================

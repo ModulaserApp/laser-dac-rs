@@ -23,6 +23,7 @@ pub struct Stream {
 pub enum QueuedCommand {
     PrepareStream,
     Begin(protocol::command::Begin),
+    Update(protocol::command::Update),
     PointRate(protocol::command::PointRate),
     Data(ops::Range<usize>),
     Stop,
@@ -135,6 +136,17 @@ impl<'a> CommandQueue<'a> {
         self
     }
 
+    pub fn update(self, low_water_mark: u16, point_rate: u32) -> Self {
+        let update = protocol::command::Update {
+            low_water_mark,
+            point_rate,
+        };
+        self.stream
+            .command_buffer
+            .push(QueuedCommand::Update(update));
+        self
+    }
+
     pub fn point_rate(self, point_rate: u32) -> Self {
         let point_rate = protocol::command::PointRate(point_rate);
         self.stream
@@ -197,12 +209,16 @@ impl<'a> CommandQueue<'a> {
                     stream.send_command(begin)?;
                     command_bytes.push(protocol::command::Begin::START_BYTE);
                 }
+                QueuedCommand::Update(update) => {
+                    stream.send_command(update)?;
+                    command_bytes.push(protocol::command::Update::START_BYTE);
+                }
                 QueuedCommand::PointRate(point_rate) => {
                     stream.send_command(point_rate)?;
                     command_bytes.push(protocol::command::PointRate::START_BYTE);
                 }
                 QueuedCommand::Data(range) => {
-                    let points = Cow::Borrowed(&stream.point_buffer[range]);
+                    let points = Cow::Borrowed(&stream.point_buffer[range.clone()]);
                     let data = protocol::command::Data { points };
                     send_command(&mut stream.bytes, &mut stream.tcp_writer, data)?;
                     command_bytes.push(protocol::command::Data::START_BYTE);
@@ -405,7 +421,10 @@ fn recv_response_buffered(
     bytes.resize(protocol::DacResponse::SIZE_BYTES, 0);
     tcp_reader.read_exact(bytes)?;
     let response = (&bytes[..]).read_bytes::<protocol::DacResponse>()?;
-    response.check_errors(expected_command)?;
+
+    // Update status before returning errors so callers can react to DAC state
+    // changes even when the response is a NAK.
     dac.update_status(&response.dac_status)?;
+    response.check_errors(expected_command)?;
     Ok(())
 }

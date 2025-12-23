@@ -115,6 +115,7 @@ bitflags! {
 pub enum Command<'a> {
     PrepareStream(command::PrepareStream),
     Begin(command::Begin),
+    Update(command::Update),
     PointRate(command::PointRate),
     Data(command::Data<'a>),
     Stop(command::Stop),
@@ -335,6 +336,7 @@ impl ReadFromBytes for Command<'static> {
         let kind = match cmd {
             command::PrepareStream::START_BYTE => command::PrepareStream.into(),
             command::Begin::START_BYTE => command::Begin::read_fields(reader)?.into(),
+            command::Update::START_BYTE => command::Update::read_fields(reader)?.into(),
             command::PointRate::START_BYTE => command::PointRate::read_fields(reader)?.into(),
             command::Data::START_BYTE => command::Data::read_fields(reader)?.into(),
             command::Stop::START_BYTE => command::Stop.into(),
@@ -358,6 +360,7 @@ impl<'a> WriteToBytes for Command<'a> {
         match *self {
             Command::PrepareStream(ref cmd) => cmd.write_to_bytes(writer),
             Command::Begin(ref cmd) => cmd.write_to_bytes(writer),
+            Command::Update(ref cmd) => cmd.write_to_bytes(writer),
             Command::PointRate(ref cmd) => cmd.write_to_bytes(writer),
             Command::Data(ref cmd) => cmd.write_to_bytes(writer),
             Command::Stop(ref cmd) => cmd.write_to_bytes(writer),
@@ -376,6 +379,11 @@ impl<'a> From<command::PrepareStream> for Command<'a> {
 impl<'a> From<command::Begin> for Command<'a> {
     fn from(command: command::Begin) -> Self {
         Command::Begin(command)
+    }
+}
+impl<'a> From<command::Update> for Command<'a> {
+    fn from(command: command::Update) -> Self {
+        Command::Update(command)
     }
 }
 impl<'a> From<command::PointRate> for Command<'a> {

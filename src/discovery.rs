@@ -1,15 +1,15 @@
 //! DAC device discovery.
 //!
-//! Provides a unified interface for discovering and connecting to laser DAC devices
+//! Provides a DAC interface for discovering and connecting to laser DAC devices
 //! from multiple manufacturers.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use laser_dac::{UnifiedDiscovery, EnabledDacTypes, DacWorker};
+//! use laser_dac::{DacDiscovery, EnabledDacTypes, DacWorker};
 //!
 //! // Create discovery with all DAC types enabled
-//! let mut discovery = UnifiedDiscovery::new(EnabledDacTypes::all());
+//! let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
 //!
 //! // Scan for devices
 //! let devices = discovery.scan();
@@ -82,7 +82,7 @@ use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
 /// A discovered but not-yet-connected DAC device.
 ///
-/// Use `UnifiedDiscovery::connect()` to establish a connection and get a backend.
+/// Use `DacDiscovery::connect()` to establish a connection and get a backend.
 pub struct DiscoveredDevice {
     name: String,
     dac_type: DacType,
@@ -207,7 +207,9 @@ impl EtherDreamDiscovery {
     /// Create a new Ether Dream discovery instance.
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_millis(100),
+            // Ether Dream DACs broadcast once per second, so we need
+            // at least 1.5s to reliably catch a broadcast
+            timeout: Duration::from_millis(1500),
         }
     }
 
@@ -215,7 +217,9 @@ impl EtherDreamDiscovery {
     pub fn scan(&mut self) -> Vec<DiscoveredDevice> {
         let mut rx = match recv_dac_broadcasts() {
             Ok(rx) => rx,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                return Vec::new();
+            }
         };
 
         if rx.set_timeout(Some(self.timeout)).is_err() {
@@ -223,17 +227,32 @@ impl EtherDreamDiscovery {
         }
 
         let mut discovered = Vec::new();
-        for _ in 0..10 {
+        let mut seen_macs = std::collections::HashSet::new();
+
+        // Only try 3 iterations max - we just need one device
+        for _ in 0..3 {
             let (broadcast, source_addr) = match rx.next_broadcast() {
                 Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
-                Err(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    break;
+                }
+                Err(_) => {
+                    break; // Stop on any error instead of continuing
+                }
             };
 
             let mac = dac::MacAddress(broadcast.mac_address);
             let name = mac.to_string();
             let ip = source_addr.ip();
+
+            // Skip duplicate MACs - but keep polling to find other devices
+            if seen_macs.contains(&broadcast.mac_address) {
+                continue;
+            }
+            seen_macs.insert(broadcast.mac_address);
 
             discovered.push(DiscoveredDevice {
                 name,
@@ -437,14 +456,14 @@ impl LasercubeUsbDiscovery {
 }
 
 // =============================================================================
-// Unified Discovery
+// DAC Discovery
 // =============================================================================
 
-/// Unified discovery coordinator for all DAC types.
+/// DAC discovery coordinator for all DAC types.
 ///
 /// This provides a single entry point for discovering and connecting to any
 /// supported DAC hardware.
-pub struct UnifiedDiscovery {
+pub struct DacDiscovery {
     #[cfg(feature = "helios")]
     helios: Option<HeliosDiscovery>,
     #[cfg(feature = "ether-dream")]
@@ -458,8 +477,8 @@ pub struct UnifiedDiscovery {
     enabled: EnabledDacTypes,
 }
 
-impl UnifiedDiscovery {
-    /// Create a new unified discovery instance.
+impl DacDiscovery {
+    /// Create a new DAC discovery instance.
     ///
     /// This initializes USB controllers, so it should be called from the main thread.
     /// If a USB controller fails to initialize, that DAC type will be unavailable

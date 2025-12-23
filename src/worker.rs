@@ -4,14 +4,18 @@
 //! to any DAC backend. Frames are sent via a bounded channel (capacity 1),
 //! and old frames are automatically dropped if the device is busy.
 
-use std::sync::mpsc::{self, Receiver as MpscReceiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver as MpscReceiver, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 
 use crate::backend::{DacBackend, WriteResult};
 use crate::types::{DacConnectionState, DacType, LaserFrame};
 
+/// Channel for notifying when a device disconnects (used by discovery worker).
+pub(crate) type DisconnectNotifier = Sender<String>;
+
 /// Command sent to the worker thread.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WorkerCommand {
     /// Write a frame to the DAC.
     WriteFrame(LaserFrame),
@@ -22,7 +26,8 @@ pub enum WorkerCommand {
 }
 
 /// Status update from the worker thread.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WorkerStatus {
     /// Device is ready for frames.
     Ready,
@@ -69,12 +74,31 @@ impl DacWorker {
     ///
     /// The backend is moved into a background thread that handles frame writing.
     pub fn new(device_name: String, dac_type: DacType, backend: Box<dyn DacBackend>) -> Self {
+        Self::new_internal(device_name, dac_type, backend, None)
+    }
+
+    /// Internal constructor that optionally accepts a disconnect notifier.
+    pub(crate) fn new_with_disconnect_notifier(
+        device_name: String,
+        dac_type: DacType,
+        backend: Box<dyn DacBackend>,
+        disconnect_tx: DisconnectNotifier,
+    ) -> Self {
+        Self::new_internal(device_name, dac_type, backend, Some(disconnect_tx))
+    }
+
+    fn new_internal(
+        device_name: String,
+        dac_type: DacType,
+        backend: Box<dyn DacBackend>,
+        disconnect_tx: Option<DisconnectNotifier>,
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::sync_channel::<WorkerCommand>(1);
         let (status_tx, status_rx) = mpsc::channel::<WorkerStatus>();
 
-        let name_for_log = device_name.clone();
+        let name_for_loop = device_name.clone();
         let handle = thread::spawn(move || {
-            Self::worker_loop(backend, command_rx, status_tx, &name_for_log);
+            Self::worker_loop(backend, command_rx, status_tx, name_for_loop, disconnect_tx);
         });
 
         Self {
@@ -159,22 +183,40 @@ impl DacWorker {
         mut backend: Box<dyn DacBackend>,
         command_rx: MpscReceiver<WorkerCommand>,
         status_tx: mpsc::Sender<WorkerStatus>,
-        device_name: &str,
+        device_name: String,
+        disconnect_tx: Option<DisconnectNotifier>,
     ) {
+        // Connect if not already connected
+        if !backend.is_connected() {
+            if let Err(e) = backend.connect() {
+                let _ = status_tx.send(WorkerStatus::ConnectionLost(e.to_string()));
+                if let Some(ref tx) = disconnect_tx {
+                    let _ = tx.send(device_name);
+                }
+                return;
+            }
+        }
+
         while let Ok(command) = command_rx.recv() {
             match command {
-                WorkerCommand::WriteFrame(frame) => match backend.write_frame(&frame) {
-                    Ok(WriteResult::Written) => {
-                        let _ = status_tx.send(WorkerStatus::Ready);
+                WorkerCommand::WriteFrame(frame) => {
+                    match backend.write_frame(&frame) {
+                        Ok(WriteResult::Written) => {
+                            let _ = status_tx.send(WorkerStatus::Ready);
+                        }
+                        Ok(WriteResult::DeviceBusy) => {
+                            let _ = status_tx.send(WorkerStatus::Busy);
+                        }
+                        Err(e) => {
+                            let _ = status_tx.send(WorkerStatus::ConnectionLost(e.to_string()));
+                            // Notify discovery worker so device can be reconnected
+                            if let Some(ref tx) = disconnect_tx {
+                                let _ = tx.send(device_name.clone());
+                            }
+                            return;
+                        }
                     }
-                    Ok(WriteResult::DeviceBusy) => {
-                        let _ = status_tx.send(WorkerStatus::Busy);
-                    }
-                    Err(e) => {
-                        let _ = status_tx.send(WorkerStatus::ConnectionLost(e.to_string()));
-                        break;
-                    }
-                },
+                }
                 WorkerCommand::StopOutput => {
                     let _ = backend.stop();
                     let _ = status_tx.send(WorkerStatus::Ready);
@@ -185,9 +227,6 @@ impl DacWorker {
                 }
             }
         }
-
-        // Log is not available in this crate, so we just exit silently
-        let _ = device_name; // suppress unused warning
     }
 }
 

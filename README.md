@@ -26,117 +26,46 @@ The DACs that are not verified, I have not tested with the DAC itself yet. Help 
 
 ## Quick Start
 
-The easiest way to use this crate is with `DacDiscoveryWorker`:
+Connect your Laser DAC and run an example:
 
-```rust
-use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, LaserFrame, LaserPoint};
-use std::thread;
-use std::time::Duration;
-
-fn main() {
-    // Start background discovery (finds all connected DACs)
-    let discovery = DacDiscoveryWorker::new(EnabledDacTypes::all());
-
-    // Collect workers as devices are found
-    let mut workers = Vec::new();
-    for _ in 0..50 {
-        for worker in discovery.poll_new_workers() {
-            println!("Found: {} ({})", worker.device_name(), worker.dac_type());
-            workers.push(worker);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Create a frame
-    let frame = LaserFrame::new(30000, vec![
-        LaserPoint::blanked(-0.5, -0.5),
-        LaserPoint::new(-0.5, -0.5, 255, 0, 0, 255),
-        LaserPoint::new(0.5, -0.5, 0, 255, 0, 255),
-        LaserPoint::new(0.0, 0.5, 0, 0, 255, 255),
-        LaserPoint::new(-0.5, -0.5, 255, 0, 0, 255),
-    ]);
-
-    // Send frames to all connected DACs
-    for worker in &mut workers {
-        worker.update();
-        worker.submit_frame(frame.clone());
-    }
-
-    // Stop output when done
-    for worker in &workers {
-        worker.stop_output();
-    }
-}
+```bash
+cargo run --example high_level -- circle
+# or:
+cargo run --example high_level -- triangle
 ```
 
-## Low-Level API
+The examples run continuously until you press Ctrl+C.
 
-For more control, use `UnifiedDiscovery` directly:
+## Discovery Behavior
+
+There are two discovery APIs:
+
+- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices, yielding ready-to-use `DacWorker` instances.
+- `DacDiscovery` is manual: you call `scan()` and decide if/when to `connect()` each `DiscoveredDevice`.
+
+`DacDiscoveryWorker` runs a background thread that:
+
+1. **Scans every 2 seconds** for new devices across all enabled DAC types
+2. **Tracks known devices** to avoid duplicate connections
+3. **Automatic reconnection** - after you call `mark_disconnected`, the device is removed from tracking and will reconnect on the next scan
+
+Multiple devices of the same type are supported - each is identified by a unique name (MAC address for Ether Dream, serial number for LaserCube, etc.)
+
+You can also provide a device filter predicate to allowlist devices before the worker connects:
 
 ```rust
-use laser_dac::{UnifiedDiscovery, DacWorker, EnabledDacTypes};
+use laser_dac::{DacDiscoveryWorker, DacType, EnabledDacTypes};
 
-fn main() -> Result<(), String> {
-    // Create discovery (initializes USB controllers)
-    let mut discovery = UnifiedDiscovery::new(EnabledDacTypes::all());
+let discovery = DacDiscoveryWorker::new_with_device_filter(
+    EnabledDacTypes::all(),
+    |device| device.dac_type() == DacType::EtherDream,
+);
 
-    // Scan for devices
-    let devices = discovery.scan();
-
-    for device in devices {
-        println!("Found: {} ({})", device.name(), device.dac_type());
-
-        // Connect when ready
-        let backend = discovery.connect(device)?;
-
-        // Create worker from backend
-        let worker = DacWorker::new(
-            device.name().to_string(),
-            device.dac_type(),
-            backend,
-        );
-
-        // Use worker...
-    }
-
-    Ok(())
-}
+// Update the predicate later while the worker is running.
+discovery.set_device_filter(|device| {
+    device.dac_type() == DacType::EtherDream && device.name().starts_with("ED-")
+});
 ```
-
-## API Overview
-
-### High-Level (Recommended)
-
-| Type                 | Description                                              |
-| -------------------- | -------------------------------------------------------- |
-| `DacDiscoveryWorker` | Background discovery that produces ready-to-use workers  |
-| `DacWorker`          | Background frame writer with channel-based communication |
-| `EnabledDacTypes`    | Configure which DAC types to discover                    |
-
-### Mid-Level
-
-| Type               | Description                           |
-| ------------------ | ------------------------------------- |
-| `UnifiedDiscovery` | Manual scan/connect for all DAC types |
-| `DiscoveredDevice` | Device info returned by scan          |
-
-### Low-Level
-
-| Type                                       | Description                                    |
-| ------------------------------------------ | ---------------------------------------------- |
-| `DacBackend`                               | Trait for direct frame writing                 |
-| `HeliosBackend`, `EtherDreamBackend`, etc. | Per-DAC backend implementations                |
-| `WriteResult`                              | Result of write operation (Written/DeviceBusy) |
-
-### Data Types
-
-| Type                 | Description                                     |
-| -------------------- | ----------------------------------------------- |
-| `LaserFrame`         | Collection of points + PPS rate                 |
-| `LaserPoint`         | Single point with position (f32) and color (u16) |
-| `DacType`            | Enum of supported DAC hardware                  |
-| `DacDevice`          | Device name + type                              |
-| `DacConnectionState` | Connected or Lost state                         |
 
 ## Coordinate System
 
@@ -148,12 +77,15 @@ All backends use normalized coordinates:
 
 Each backend handles conversion to its native format internally.
 
-## Running Examples
+## Data Types
 
-```bash
-# Run the unified example (discovers devices and sends test frames)
-cargo run --example unified
-```
+| Type                 | Description                                     |
+| -------------------- | ----------------------------------------------- |
+| `LaserFrame`         | Collection of points + PPS rate                 |
+| `LaserPoint`         | Single point with position (f32) and color (u16) |
+| `DacType`            | Enum of supported DAC hardware                  |
+| `DacDevice`          | Device name + type                              |
+| `DacConnectionState` | Connected or Lost state                         |
 
 ## Features
 
@@ -172,6 +104,13 @@ By default, all DAC protocols are enabled via the `all-dacs` feature.
 | `idn`            | ILDA Digital Network DAC                                    |
 | `lasercube-wifi` | LaserCube WiFi DAC                                          |
 
+For example, to enable only network DACs:
+
+```toml
+[dependencies]
+laser-dac = { version = "0.3", default-features = false, features = ["network-dacs"] }
+```
+
 ### Other Features
 
 | Feature | Description                                                    |
@@ -181,22 +120,6 @@ By default, all DAC protocols are enabled via the `all-dacs` feature.
 ### USB DAC Requirements
 
 USB DACs (`helios`, `lasercube-usb`) use [rusb](https://crates.io/crates/rusb) which requires CMake to build.
-
-### Examples
-
-Enable only network DACs:
-
-```toml
-[dependencies]
-laser-dac = { version = "0.1", default-features = false, features = ["network-dacs"] }
-```
-
-Enable only Helios:
-
-```toml
-[dependencies]
-laser-dac = { version = "0.1", default-features = false, features = ["helios"] }
-```
 
 # Acknowledgements
 

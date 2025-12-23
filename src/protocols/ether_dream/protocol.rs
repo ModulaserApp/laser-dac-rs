@@ -321,6 +321,12 @@ pub mod command {
     }
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct Update {
+        pub low_water_mark: u16,
+        pub point_rate: u32,
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct PointRate(pub u32);
 
     #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -346,6 +352,15 @@ pub mod command {
     impl Begin {
         pub fn read_fields<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
             Ok(Begin {
+                low_water_mark: reader.read_u16::<LE>()?,
+                point_rate: reader.read_u32::<LE>()?,
+            })
+        }
+    }
+
+    impl Update {
+        pub fn read_fields<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
+            Ok(Update {
                 low_water_mark: reader.read_u16::<LE>()?,
                 point_rate: reader.read_u32::<LE>()?,
             })
@@ -401,6 +416,9 @@ pub mod command {
     impl Command for Begin {
         const START_BYTE: u8 = 0x62;
     }
+    impl Command for Update {
+        const START_BYTE: u8 = 0x75;
+    }
     impl Command for PointRate {
         const START_BYTE: u8 = 0x74;
     }
@@ -429,6 +447,9 @@ pub mod command {
     impl SizeBytes for Begin {
         const SIZE_BYTES: usize = 7;
     }
+    impl SizeBytes for Update {
+        const SIZE_BYTES: usize = 7;
+    }
     impl SizeBytes for PointRate {
         const SIZE_BYTES: usize = 5;
     }
@@ -452,6 +473,15 @@ pub mod command {
     }
 
     impl WriteToBytes for Begin {
+        fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
+            writer.write_u8(Self::START_BYTE)?;
+            writer.write_u16::<LE>(self.low_water_mark)?;
+            writer.write_u32::<LE>(self.point_rate)?;
+            Ok(())
+        }
+    }
+
+    impl WriteToBytes for Update {
         fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
             writer.write_u8(Self::START_BYTE)?;
             writer.write_u16::<LE>(self.low_water_mark)?;
@@ -529,6 +559,18 @@ pub mod command {
     }
 
     impl ReadFromBytes for Begin {
+        fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
+            if reader.read_u8()? != Self::START_BYTE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid command",
+                ));
+            }
+            Self::read_fields(reader)
+        }
+    }
+
+    impl ReadFromBytes for Update {
         fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
             if reader.read_u8()? != Self::START_BYTE {
                 return Err(io::Error::new(

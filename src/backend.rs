@@ -11,7 +11,8 @@ use crate::types::{DacType, LaserFrame};
 // =============================================================================
 
 /// Result of attempting to write a frame to a DAC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WriteResult {
     /// Frame was successfully written.
     Written,
@@ -196,7 +197,7 @@ pub use helios_backend::HeliosBackend;
 #[cfg(feature = "ether-dream")]
 mod ether_dream_backend {
     use super::*;
-    use crate::protocols::ether_dream::dac::{stream, Playback};
+    use crate::protocols::ether_dream::dac::{stream, LightEngine, Playback, PlaybackFlags};
     use crate::protocols::ether_dream::protocol::{DacBroadcast, DacPoint};
     use std::net::IpAddr;
     use std::time::Duration;
@@ -253,14 +254,50 @@ mod ether_dream_backend {
                 .ok_or_else(|| Error::msg("Not connected"))?;
 
             let points: Vec<DacPoint> = frame.points.iter().map(|p| p.into()).collect();
+            if points.is_empty() {
+                return Ok(WriteResult::DeviceBusy);
+            }
+
+            // Check light engine state first - must handle emergency stop before any other operations
+            let light_engine = stream.dac().status.light_engine;
+
+            match light_engine {
+                LightEngine::EmergencyStop => {
+                    stream
+                        .queue_commands()
+                        .clear_emergency_stop()
+                        .submit()
+                        .map_err(|e| Error::context("Failed to clear emergency stop", e))?;
+
+                    // Ping to refresh state
+                    stream
+                        .queue_commands()
+                        .ping()
+                        .submit()
+                        .map_err(|e| Error::context("Failed to ping after clearing e-stop", e))?;
+
+                    // Check if e-stop cleared
+                    if stream.dac().status.light_engine == LightEngine::EmergencyStop {
+                        return Err(Error::msg(
+                            "DAC stuck in emergency stop - check hardware interlock",
+                        ));
+                    }
+                    // Fall through - DAC should now be in Ready state, playback will be Idle
+                }
+                LightEngine::Warmup | LightEngine::Cooldown => {
+                    return Ok(WriteResult::DeviceBusy);
+                }
+                LightEngine::Ready => {
+                    // Normal operation - continue
+                }
+            }
 
             // Check buffer space
-            let available = stream.dac().buffer_capacity as usize
-                - stream.dac().status.buffer_fullness as usize
-                - 1;
+            let buffer_capacity = stream.dac().buffer_capacity;
+            let buffer_fullness = stream.dac().status.buffer_fullness;
+            let available = buffer_capacity as usize - buffer_fullness as usize - 1;
 
-            let to_send = points.len().min(available);
-            if to_send == 0 {
+            if available == 0 {
                 return Ok(WriteResult::DeviceBusy);
             }
 
@@ -270,39 +307,145 @@ mod ether_dream_backend {
                 stream.dac().max_point_rate / 16
             };
 
-            let status = &stream.dac().status;
-            let result = match status.playback {
-                Playback::Idle => {
-                    stream
-                        .queue_commands()
-                        .prepare_stream()
-                        .submit()
-                        .map_err(|e| Error::context("Failed to prepare stream", e))?;
+            // Minimum points that must be buffered before sending begin command.
+            const MIN_POINTS_BEFORE_BEGIN: u16 = 500;
+            let target_buffer_points = (point_rate / 20).max(MIN_POINTS_BEFORE_BEGIN as u32) as usize;
+            let target_len = target_buffer_points.min(available).max(points.len().min(available));
 
-                    stream
-                        .queue_commands()
-                        .data(points.into_iter().take(to_send))
-                        .begin(0, point_rate)
-                        .submit()
+            let mut points_to_send = points;
+            if points_to_send.len() > available {
+                points_to_send.truncate(available);
+            } else if points_to_send.len() < target_len {
+                let seed = points_to_send.clone();
+                let mut idx = 0;
+                while points_to_send.len() < target_len {
+                    points_to_send.push(seed[idx % seed.len()]);
+                    idx += 1;
                 }
-                Playback::Prepared => stream
+            }
+
+            let playback_flags = stream.dac().status.playback_flags;
+            let playback = stream.dac().status.playback;
+            let current_point_rate = stream.dac().status.point_rate;
+
+            let mut force_begin = false;
+            if playback_flags.contains(PlaybackFlags::UNDERFLOWED) {
+                stream
                     .queue_commands()
-                    .data(points.into_iter().take(to_send))
-                    .begin(0, point_rate)
-                    .submit(),
-                Playback::Playing => {
-                    let current_rate = status.point_rate;
-                    if current_rate != frame.pps {
+                    .prepare_stream()
+                    .submit()
+                    .map_err(|e| Error::context("Failed to recover stream", e))?;
+                force_begin = true;
+            }
+
+            let result = if force_begin {
+                // After underflow recovery, send data first, then begin separately
+                stream
+                    .queue_commands()
+                    .data(points_to_send.clone().into_iter())
+                    .submit()
+                    .map_err(|e| Error::context("Failed to send data", e))?;
+
+                // Check buffer fullness after sending data
+                let buffer_fullness = stream.dac().status.buffer_fullness;
+
+                if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
+                    stream.queue_commands().begin(0, point_rate).submit()
+                } else {
+                    Ok(())
+                }
+            } else {
+                match playback {
+                    Playback::Idle => {
                         stream
                             .queue_commands()
-                            .point_rate(frame.pps)
-                            .data(points.into_iter().take(to_send))
+                            .prepare_stream()
                             .submit()
-                    } else {
+                            .map_err(|e| Error::context("Failed to prepare stream", e))?;
+
+                        // Send data first
                         stream
                             .queue_commands()
-                            .data(points.into_iter().take(to_send))
+                            .data(points_to_send.clone().into_iter())
                             .submit()
+                            .map_err(|e| Error::context("Failed to send data", e))?;
+
+                        // Check buffer fullness after sending data, only begin if enough points buffered
+                        let buffer_fullness = stream.dac().status.buffer_fullness;
+
+                        if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
+                            stream.queue_commands().begin(0, point_rate).submit()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Playback::Prepared => {
+                        // Send data first
+                        stream
+                            .queue_commands()
+                            .data(points_to_send.clone().into_iter())
+                            .submit()
+                            .map_err(|e| Error::context("Failed to send data", e))?;
+
+                        // Check buffer fullness after sending data, only begin if enough points buffered
+                        let buffer_fullness = stream.dac().status.buffer_fullness;
+
+                        if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
+                            stream.queue_commands().begin(0, point_rate).submit()
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Playback::Playing => {
+                        let send_result = if current_point_rate != point_rate {
+                            stream
+                                .queue_commands()
+                                .update(0, point_rate)
+                                .data(points_to_send.clone().into_iter())
+                                .submit()
+                        } else {
+                            stream
+                                .queue_commands()
+                                .data(points_to_send.clone().into_iter())
+                                .submit()
+                        };
+
+                        // Handle underflow: if DAC went Idle while we thought it was Playing,
+                        // we get NAK_INVALID. Recover by re-preparing the stream.
+                        if send_result.is_err() {
+                            let current_playback = stream.dac().status.playback;
+
+                            if current_playback == Playback::Idle {
+                                // DAC underflowed and went back to Idle - need full restart
+                                stream
+                                    .queue_commands()
+                                    .prepare_stream()
+                                    .submit()
+                                    .map_err(|e| {
+                                        Error::context("Failed to recover from underflow", e)
+                                    })?;
+
+                                stream
+                                    .queue_commands()
+                                    .data(points_to_send.clone().into_iter())
+                                    .submit()
+                                    .map_err(|e| {
+                                        Error::context("Failed to send data after recovery", e)
+                                    })?;
+
+                                let buffer_fullness = stream.dac().status.buffer_fullness;
+                                if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
+                                    stream.queue_commands().begin(0, point_rate).submit()
+                                } else {
+                                    Ok(())
+                                }
+                            } else {
+                                // Some other error - propagate it
+                                send_result
+                            }
+                        } else {
+                            send_result
+                        }
                     }
                 }
             };
