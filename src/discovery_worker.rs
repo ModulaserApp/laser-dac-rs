@@ -41,6 +41,13 @@ type DeviceFilter = dyn Fn(&DiscoveredDevice) -> bool + Send + Sync + 'static;
 /// How often to scan for DAC devices.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Shared configuration for the discovery loop thread.
+struct SharedConfig {
+    enabled_types: Arc<Mutex<EnabledDacTypes>>,
+    device_filter: Arc<Mutex<Arc<DeviceFilter>>>,
+    discovery_interval: Arc<Mutex<Duration>>,
+}
+
 fn allow_all_devices(_: &DiscoveredDevice) -> bool {
     true
 }
@@ -92,15 +99,19 @@ impl DacDiscoveryWorker {
             DacDiscovery::new(enabled_types.lock().map(|e| e.clone()).unwrap_or_default());
 
         let disconnect_tx_for_loop = disconnect_tx.clone();
+        let shared_config = SharedConfig {
+            enabled_types: enabled_types_clone,
+            device_filter: device_filter_clone,
+            discovery_interval: discovery_interval_clone,
+        };
+
         let handle = thread::spawn(move || {
             Self::discovery_loop(
                 discovery,
                 worker_tx,
                 disconnect_tx_for_loop,
                 disconnect_rx,
-                enabled_types_clone,
-                device_filter_clone,
-                discovery_interval_clone,
+                shared_config,
                 running_clone,
             );
         });
@@ -191,9 +202,7 @@ impl DacDiscoveryWorker {
         worker_tx: mpsc::Sender<DacWorker>,
         disconnect_tx: DisconnectNotifier,
         disconnect_rx: Receiver<String>,
-        enabled_types: Arc<Mutex<EnabledDacTypes>>,
-        device_filter: Arc<Mutex<Arc<DeviceFilter>>>,
-        discovery_interval: Arc<Mutex<Duration>>,
+        config: SharedConfig,
         running: Arc<AtomicBool>,
     ) {
         let mut known_devices: HashSet<String> = HashSet::new();
@@ -201,7 +210,8 @@ impl DacDiscoveryWorker {
 
         while running.load(Ordering::Relaxed) {
             // Get current discovery interval
-            let interval = discovery_interval
+            let interval = config
+                .discovery_interval
                 .lock()
                 .map(|d| *d)
                 .unwrap_or(DISCOVERY_INTERVAL);
@@ -219,13 +229,14 @@ impl DacDiscoveryWorker {
             }
 
             // Update enabled types
-            if let Ok(enabled) = enabled_types.lock() {
+            if let Ok(enabled) = config.enabled_types.lock() {
                 discovery.set_enabled(enabled.clone());
             }
 
             // Scan for devices
             let devices = discovery.scan();
-            let filter = device_filter
+            let filter = config
+                .device_filter
                 .lock()
                 .map(|f| Arc::clone(&*f))
                 .unwrap_or_else(|_| Arc::new(allow_all_devices));
