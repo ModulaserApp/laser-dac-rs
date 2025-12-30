@@ -55,6 +55,7 @@ pub struct DacDiscoveryWorker {
     worker_rx: Receiver<DacWorker>,
     enabled_types: Arc<Mutex<EnabledDacTypes>>,
     device_filter: Arc<Mutex<Arc<DeviceFilter>>>,
+    discovery_interval: Arc<Mutex<Duration>>,
     disconnect_tx: Sender<String>,
     _running: Arc<AtomicBool>,
     _handle: JoinHandle<()>,
@@ -81,6 +82,8 @@ impl DacDiscoveryWorker {
         let enabled_types_clone = Arc::clone(&enabled_types);
         let device_filter = Arc::new(Mutex::new(Arc::new(filter) as Arc<DeviceFilter>));
         let device_filter_clone = Arc::clone(&device_filter);
+        let discovery_interval = Arc::new(Mutex::new(DISCOVERY_INTERVAL));
+        let discovery_interval_clone = Arc::clone(&discovery_interval);
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
 
@@ -97,6 +100,7 @@ impl DacDiscoveryWorker {
                 disconnect_rx,
                 enabled_types_clone,
                 device_filter_clone,
+                discovery_interval_clone,
                 running_clone,
             );
         });
@@ -105,6 +109,7 @@ impl DacDiscoveryWorker {
             worker_rx,
             enabled_types,
             device_filter,
+            discovery_interval,
             disconnect_tx,
             _running: running,
             _handle: handle,
@@ -155,6 +160,23 @@ impl DacDiscoveryWorker {
         }
     }
 
+    /// Sets the discovery scan interval.
+    ///
+    /// Changes take effect on the next discovery cycle. Defaults to 2 seconds.
+    pub fn set_discovery_interval(&self, interval: Duration) {
+        if let Ok(mut discovery_interval) = self.discovery_interval.lock() {
+            *discovery_interval = interval;
+        }
+    }
+
+    /// Returns the current discovery scan interval.
+    pub fn discovery_interval(&self) -> Duration {
+        self.discovery_interval
+            .lock()
+            .map(|d| *d)
+            .unwrap_or(DISCOVERY_INTERVAL)
+    }
+
     /// Marks a device as disconnected, allowing it to be rediscovered.
     ///
     /// Call this when a `DacWorker` enters the `DacConnectionState::Lost` state
@@ -171,16 +193,23 @@ impl DacDiscoveryWorker {
         disconnect_rx: Receiver<String>,
         enabled_types: Arc<Mutex<EnabledDacTypes>>,
         device_filter: Arc<Mutex<Arc<DeviceFilter>>>,
+        discovery_interval: Arc<Mutex<Duration>>,
         running: Arc<AtomicBool>,
     ) {
         let mut known_devices: HashSet<String> = HashSet::new();
         let mut last_discovery = Instant::now() - DISCOVERY_INTERVAL;
 
         while running.load(Ordering::Relaxed) {
+            // Get current discovery interval
+            let interval = discovery_interval
+                .lock()
+                .map(|d| *d)
+                .unwrap_or(DISCOVERY_INTERVAL);
+
             // Sleep until next discovery interval
             let elapsed = last_discovery.elapsed();
-            if elapsed < DISCOVERY_INTERVAL {
-                thread::sleep(DISCOVERY_INTERVAL - elapsed);
+            if elapsed < interval {
+                thread::sleep(interval - elapsed);
             }
             last_discovery = Instant::now();
 

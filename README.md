@@ -1,5 +1,11 @@
 # laser-dac
 
+[![Crates.io](https://img.shields.io/crates/v/laser-dac.svg)](https://crates.io/crates/laser-dac)
+[![Documentation](https://docs.rs/laser-dac/badge.svg)](https://docs.rs/laser-dac)
+[![CI](https://github.com/SpaceK33z/laser-dac-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SpaceK33z/laser-dac-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://blog.rust-lang.org/2025/05/15/Rust-1.87.0.html)
+
 Unified DAC backend abstraction for laser projectors.
 
 This crate provides a complete solution for communicating with various laser DAC hardware:
@@ -14,19 +20,19 @@ This crate does not apply any additional processing on points (like blanking), e
 
 ## Supported DACs
 
-| DAC                       | Connection                     | Features | Verified
-| ------------------------- | ------------------------------ | -------- | --------
-| Helios                    | USB                            | 12-bit   | ✅
-| Ether Dream               | Network                        | 16-bit   | ❌
-| IDN                       | Network (ILDA Digital Network) | 16-bit   | ✅
-| LaserCube WiFi            | WiFi                           | 16-bit   | ❌
-| LaserCube USB / Laserdock | USB                            | 12-bit   | ✅
+| DAC                        | Connection | Features | Verified |
+| -------------------------- | ---------- | -------- | -------- |
+| Helios                     | USB        | 12-bit   | ✅       |
+| Ether Dream                | Network    | 16-bit   | ❌       |
+| IDN (ILDA Digital Network) | Network    | 16-bit   | ✅       |
+| LaserCube WiFi             | WiFi       | 16-bit   | ❌       |
+| LaserCube USB / Laserdock  | USB        | 12-bit   | ✅       |
 
 The DACs that are not verified, I have not tested with the DAC itself yet. Help to test these would be very welcome!
 
 ## Quick Start
 
-Connect your Laser DAC and run an example:
+Connect your laser DAC and run an example. For full API details, see the [documentation](https://docs.rs/laser-dac).
 
 ```bash
 cargo run --example high_level -- circle
@@ -45,7 +51,7 @@ There are two discovery APIs:
 
 `DacDiscoveryWorker` runs a background thread that:
 
-1. **Scans every 2 seconds** for new devices across all enabled DAC types
+1. **Scans periodically** (default: every 2 seconds, configurable via `set_discovery_interval()`) for new devices across all enabled DAC types
 2. **Tracks known devices** to avoid duplicate connections
 3. **Automatic reconnection** - when a device connection fails, it's removed from tracking and will reconnect on the next scan
 
@@ -79,13 +85,13 @@ Each backend handles conversion to its native format internally.
 
 ## Data Types
 
-| Type                 | Description                                     |
-| -------------------- | ----------------------------------------------- |
-| `LaserFrame`         | Collection of points + PPS rate                 |
+| Type                 | Description                                      |
+| -------------------- | ------------------------------------------------ |
+| `LaserFrame`         | Collection of points + PPS rate                  |
 | `LaserPoint`         | Single point with position (f32) and color (u16) |
-| `DacType`            | Enum of supported DAC hardware                  |
-| `DacDevice`          | Device name + type                              |
-| `DacConnectionState` | Connected or Lost state                         |
+| `DacType`            | Enum of supported DAC hardware                   |
+| `DacDevice`          | Device name + type                               |
+| `DacConnectionState` | Connected or Lost state                          |
 
 ## Features
 
@@ -121,12 +127,12 @@ laser-dac = { version = "0.3", default-features = false, features = ["network-da
 
 USB DACs (`helios`, `lasercube-usb`) use [rusb](https://crates.io/crates/rusb) which requires CMake to build.
 
-# Acknowledgements
+## Acknowledgements
 
-* Helios DAC: heavily inspired from [helios-dac](https://github.com/maxjoehnk/helios-dac-rs)
-* Ether Dream DAC: heavily inspired from [ether-dream](https://github.com/nannou-org/ether-dream)
-* Lasercube USB / WIFI: inspired from [ildagen](https://github.com/Grix/ildagen) (ported from C++ to Rust)
-* IDN: inspired from [helios_dac](https://github.com/Grix/helios_dac) (ported from C++ to Rust)
+- Helios DAC: heavily inspired from [helios-dac](https://github.com/maxjoehnk/helios-dac-rs)
+- Ether Dream DAC: heavily inspired from [ether-dream](https://github.com/nannou-org/ether-dream)
+- Lasercube USB / WIFI: inspired from [ildagen](https://github.com/Grix/ildagen) (ported from C++ to Rust)
+- IDN: inspired from [helios_dac](https://github.com/Grix/helios_dac) (ported from C++ to Rust)
 
 ## License
 

@@ -36,10 +36,7 @@ fn main() {
     }
 
     let frame = create_frame(args.shape, args.min_points);
-    println!(
-        "\nSending {}... Press Ctrl+C to stop\n",
-        args.shape.name()
-    );
+    println!("\nSending {}... Press Ctrl+C to stop\n", args.shape.name());
 
     loop {
         for worker in &mut workers {

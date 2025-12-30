@@ -165,16 +165,6 @@ impl EnabledDacTypes {
         self.types.contains(&dac_type)
     }
 
-    /// Enables or disables a DAC type.
-    #[deprecated(since = "0.4.0", note = "use `enable` or `disable` instead")]
-    pub fn set_enabled(&mut self, dac_type: DacType, enabled: bool) {
-        if enabled {
-            self.types.insert(dac_type);
-        } else {
-            self.types.remove(&dac_type);
-        }
-    }
-
     /// Enables a DAC type for discovery.
     ///
     /// Returns `&mut Self` to allow method chaining.
