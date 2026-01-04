@@ -40,6 +40,8 @@ Connect your laser DAC and run an example. For full API details, see the [docume
 cargo run --example automatic -- circle
 # or:
 cargo run --example automatic -- triangle
+# callback mode (DAC-driven timing):
+cargo run --example callback -- circle
 ```
 
 The examples run continuously until you press Ctrl+C.
@@ -82,6 +84,67 @@ for worker in discovery.poll_new_workers() {
     println!("Connected: {}", worker.device_name());
 }
 ```
+
+## Streaming Modes
+
+There are two ways to stream frames to a DAC:
+
+### Push Mode (DacWorker)
+
+You control timing by calling `submit_frame()` in your main loop. Simple and works well for most cases:
+
+```rust
+use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, LaserFrame};
+
+let discovery = DacDiscoveryWorker::builder()
+    .enabled_types(EnabledDacTypes::all())
+    .build();
+
+// Get workers from discovery...
+let mut workers: Vec<_> = discovery.poll_new_workers().collect();
+
+loop {
+    let frame = create_your_frame();
+    for worker in &mut workers {
+        worker.update();
+        worker.submit_frame(frame.clone());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(33));
+}
+```
+
+### Callback Mode (DacCallbackWorker)
+
+The DAC drives timing by invoking your callback whenever it's ready for more data. This is ideal when you want the DAC to control the frame rate, or when generating frames on-demand:
+
+```rust
+use laser_dac::{DacCallbackWorker, CallbackError, LaserFrame};
+use laser_dac::discovery::DacDiscovery;
+
+let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
+for device in discovery.scan() {
+    let backend = discovery.connect(device.clone())?;
+    let mut worker = DacCallbackWorker::new(
+        device.name().to_string(),
+        device.dac_type(),
+        backend,
+    );
+
+    worker.start(
+        // Data callback - invoked when device needs more data
+        |ctx| {
+            let frame = generate_frame(ctx.frames_written);
+            Some(frame)
+        },
+        // Error callback - invoked on connection loss
+        |err: CallbackError| {
+            eprintln!("Error: {:?}", err);
+        },
+    );
+}
+```
+
+The callback receives a context with `frames_written` count. Return `Some(frame)` to send data, or `None` to signal completion.
 
 ## Coordinate System
 

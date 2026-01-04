@@ -51,8 +51,8 @@ impl<T: UsbContext> Stream<T> {
             handle,
             info: DeviceInfo::default(),
             status: DeviceStatus::Unknown,
-            flip_x: true, // Default from C++ code
-            flip_y: false,
+            flip_x: true,
+            flip_y: true,
         };
 
         // Read device information

@@ -37,13 +37,20 @@ fn main() {
         return;
     }
 
-    let frame = create_frame(args.shape, args.min_points);
     println!("\nSending {}... Press Ctrl+C to stop\n", args.shape.name());
 
+    let mut frame_count = 0usize;
     loop {
+        let frame = create_frame(args.shape, args.min_points, frame_count);
+        let mut any_accepted = false;
         for worker in &mut workers {
             worker.update();
-            worker.submit_frame(frame.clone());
+            if worker.submit_frame(frame.clone()) {
+                any_accepted = true;
+            }
+        }
+        if any_accepted {
+            frame_count = frame_count.wrapping_add(1);
         }
         thread::sleep(Duration::from_millis(33));
     }

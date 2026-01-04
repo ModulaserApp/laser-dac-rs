@@ -44,15 +44,17 @@ fn main() -> Result<()> {
         let mut worker = DacCallbackWorker::new(device_name.clone(), device_type, backend);
 
         // Phase 2: Start with callbacks
-        let frame = create_frame(args.shape, args.min_points);
+        let shape = args.shape;
+        let min_points = args.min_points;
         let counter = Arc::clone(&total_frames);
         let name_for_error = device_name;
 
         worker.start(
             // Data callback - invoked when device needs more data
-            move |_ctx| {
+            move |ctx| {
                 counter.fetch_add(1, Ordering::Relaxed);
-                Some(frame.clone())
+                let frame = create_frame(shape, min_points, ctx.frames_written as usize);
+                Some(frame)
             },
             // Error callback - invoked on connection loss or panic
             move |err: CallbackError| {

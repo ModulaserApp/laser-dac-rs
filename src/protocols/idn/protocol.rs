@@ -922,9 +922,10 @@ impl From<&LaserPoint> for PointXyrgbi {
     ///
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// IDN PointXyrgbi uses i16 signed coordinates (-32768 to 32767) and u8 colors.
+    /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let x = (p.x.clamp(-1.0, 1.0) * -32767.0) as i16;
+        let y = (p.y.clamp(-1.0, 1.0) * -32767.0) as i16;
         PointXyrgbi::new(
             x,
             y,
@@ -1230,22 +1231,22 @@ mod tests {
 
     #[test]
     fn test_idn_conversion_min() {
-        // Min point (-1, -1) should map to (-32767, -32767)
+        // Min point (-1, -1) should map to (32767, 32767) due to axis inversion
         let laser_point = LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0);
-        let idn_point: PointXyrgbi = (&laser_point).into();
-
-        assert_eq!(idn_point.x, -32767);
-        assert_eq!(idn_point.y, -32767);
-    }
-
-    #[test]
-    fn test_idn_conversion_max() {
-        // Max point (1, 1) should map to (32767, 32767)
-        let laser_point = LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
         assert_eq!(idn_point.x, 32767);
         assert_eq!(idn_point.y, 32767);
+    }
+
+    #[test]
+    fn test_idn_conversion_max() {
+        // Max point (1, 1) should map to (-32767, -32767) due to axis inversion
+        let laser_point = LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535);
+        let idn_point: PointXyrgbi = (&laser_point).into();
+
+        assert_eq!(idn_point.x, -32767);
+        assert_eq!(idn_point.y, -32767);
         // Max u16 (65535) >> 8 = 255
         assert_eq!(idn_point.r, 255);
         assert_eq!(idn_point.g, 255);
@@ -1258,19 +1259,19 @@ mod tests {
         let laser_point = LaserPoint::new(0.5, -0.5, 100 * 257, 100 * 257, 100 * 257, 100 * 257);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
-        // 0.5 * 32767 = 16383.5 -> 16383
-        assert_eq!(idn_point.x, 16383);
-        assert_eq!(idn_point.y, -16383);
+        // 0.5 * -32767 = -16383.5 -> -16383 (axis inverted)
+        assert_eq!(idn_point.x, -16383);
+        assert_eq!(idn_point.y, 16383);
     }
 
     #[test]
     fn test_idn_conversion_clamps_out_of_range() {
-        // Out of range values should clamp
+        // Out of range values should clamp, then invert
         let laser_point = LaserPoint::new(2.0, -3.0, 65535, 65535, 65535, 65535);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
-        assert_eq!(idn_point.x, 32767);
-        assert_eq!(idn_point.y, -32767);
+        assert_eq!(idn_point.x, -32767);
+        assert_eq!(idn_point.y, 32767);
     }
 
     #[test]
@@ -1289,8 +1290,8 @@ mod tests {
         let laser_point = LaserPoint::new(f32::INFINITY, f32::NEG_INFINITY, 0, 0, 0, 0);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
-        assert_eq!(idn_point.x, 32767);
-        assert_eq!(idn_point.y, -32767);
+        assert_eq!(idn_point.x, -32767);
+        assert_eq!(idn_point.y, 32767);
     }
 
     // ==========================================================================

@@ -2,6 +2,7 @@
 
 use clap::{Parser, ValueEnum};
 use laser_dac::{LaserFrame, LaserPoint};
+use serde::Deserialize;
 use std::f32::consts::PI;
 
 #[derive(Parser)]
@@ -20,6 +21,8 @@ pub struct Args {
 pub enum Shape {
     Triangle,
     Circle,
+    OrbitingCircle,
+    TestPattern,
 }
 
 impl Shape {
@@ -27,14 +30,18 @@ impl Shape {
         match self {
             Shape::Triangle => "triangle",
             Shape::Circle => "circle",
+            Shape::OrbitingCircle => "orbiting-circle",
+            Shape::TestPattern => "test-pattern",
         }
     }
 }
 
-pub fn create_frame(shape: Shape, min_points: usize) -> LaserFrame {
+pub fn create_frame(shape: Shape, min_points: usize, frame_count: usize) -> LaserFrame {
     match shape {
         Shape::Triangle => create_triangle_frame(min_points),
         Shape::Circle => create_circle_frame(min_points),
+        Shape::OrbitingCircle => create_orbiting_circle_frame(min_points, frame_count),
+        Shape::TestPattern => create_test_pattern_frame(),
     }
 }
 
@@ -109,6 +116,43 @@ fn create_circle_frame(num_points: usize) -> LaserFrame {
     LaserFrame::new(30000, points)
 }
 
+/// Create a small rainbow circle that orbits around the center.
+fn create_orbiting_circle_frame(num_points: usize, frame_count: usize) -> LaserFrame {
+    let mut points = Vec::with_capacity(num_points + 10);
+
+    const BLANK_COUNT: usize = 5;
+    const CIRCLE_RADIUS: f32 = 0.15;
+    const ORBIT_RADIUS: f32 = 0.4;
+    const ORBIT_SPEED: f32 = 0.02;
+
+    // Calculate the center of the small circle based on frame count
+    let orbit_angle = frame_count as f32 * ORBIT_SPEED;
+    let center_x = ORBIT_RADIUS * orbit_angle.cos();
+    let center_y = ORBIT_RADIUS * orbit_angle.sin();
+
+    // Starting position for blanking
+    let start_x = center_x + CIRCLE_RADIUS;
+    let start_y = center_y;
+
+    for _ in 0..BLANK_COUNT {
+        points.push(LaserPoint::blanked(start_x, start_y));
+    }
+
+    // Draw the small circle at the orbiting position
+    for i in 0..=num_points {
+        let angle = (i as f32 / num_points as f32) * 2.0 * PI;
+        let x = center_x + CIRCLE_RADIUS * angle.cos();
+        let y = center_y + CIRCLE_RADIUS * angle.sin();
+
+        let hue = i as f32 / num_points as f32;
+        let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+
+        points.push(LaserPoint::new(x, y, r, g, b, 65535));
+    }
+
+    LaserFrame::new(30000, points)
+}
+
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u16, u16, u16) {
     let h = h * 6.0;
     let i = h.floor() as i32;
@@ -131,4 +175,34 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u16, u16, u16) {
         (g * 65535.0) as u16,
         (b * 65535.0) as u16,
     )
+}
+
+#[derive(Deserialize)]
+struct PatternPoint {
+    x: f32,
+    y: f32,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+fn create_test_pattern_frame() -> LaserFrame {
+    let json_str = include_str!("test-pattern.json");
+    let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
+
+    let points: Vec<LaserPoint> = pattern_points
+        .into_iter()
+        .map(|p| {
+            LaserPoint::new(
+                p.x,
+                p.y,
+                p.r as u16 * 65535,
+                p.g as u16 * 65535,
+                p.b as u16 * 65535,
+                65535,
+            )
+        })
+        .collect();
+
+    LaserFrame::new(30000, points)
 }
