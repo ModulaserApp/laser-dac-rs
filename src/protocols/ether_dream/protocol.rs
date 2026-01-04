@@ -247,9 +247,10 @@ impl From<&LaserPoint> for DacPoint {
     ///
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// Ether Dream uses i16 signed coordinates and u16 colors (direct mapping).
+    /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let x = (p.x.clamp(-1.0, 1.0) * -32767.0) as i16;
+        let y = (p.y.clamp(-1.0, 1.0) * -32767.0) as i16;
 
         DacPoint {
             control: 0,
@@ -686,27 +687,27 @@ mod tests {
 
     #[test]
     fn test_ether_dream_conversion_boundaries() {
-        // Min point (-1, -1) should map to (-32767, -32767)
+        // Min point (-1, -1) should map to (32767, 32767) due to axis inversion
         let min = LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0);
         let min_dac: DacPoint = (&min).into();
-        assert_eq!(min_dac.x, -32767);
-        assert_eq!(min_dac.y, -32767);
+        assert_eq!(min_dac.x, 32767);
+        assert_eq!(min_dac.y, 32767);
 
-        // Max point (1, 1) should map to (32767, 32767)
+        // Max point (1, 1) should map to (-32767, -32767) due to axis inversion
         let max = LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535);
         let max_dac: DacPoint = (&max).into();
-        assert_eq!(max_dac.x, 32767);
-        assert_eq!(max_dac.y, 32767);
+        assert_eq!(max_dac.x, -32767);
+        assert_eq!(max_dac.y, -32767);
     }
 
     #[test]
     fn test_ether_dream_conversion_clamps_out_of_range() {
-        // Out of range values should clamp
+        // Out of range values should clamp, then invert
         let laser_point = LaserPoint::new(2.0, -3.0, 65535, 65535, 65535, 65535);
         let dac_point: DacPoint = (&laser_point).into();
 
-        assert_eq!(dac_point.x, 32767);
-        assert_eq!(dac_point.y, -32767);
+        assert_eq!(dac_point.x, -32767);
+        assert_eq!(dac_point.y, 32767);
     }
 
     #[test]
@@ -737,7 +738,7 @@ mod tests {
         let laser_point = LaserPoint::new(f32::INFINITY, f32::NEG_INFINITY, 0, 0, 0, 0);
         let dac_point: DacPoint = (&laser_point).into();
 
-        assert_eq!(dac_point.x, 32767);
-        assert_eq!(dac_point.y, -32767);
+        assert_eq!(dac_point.x, -32767);
+        assert_eq!(dac_point.y, 32767);
     }
 }

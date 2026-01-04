@@ -3,53 +3,9 @@
 //! The `DacDiscoveryWorker` runs discovery in a background thread and produces
 //! ready-to-use worker instances as devices are found.
 //!
-//! # Push Mode (Default)
-//!
-//! By default, the discovery worker produces [`DacWorker`] instances:
-//!
-//! ```ignore
-//! use laser_dac::{DacDiscoveryWorker, EnabledDacTypes};
-//! use std::time::Duration;
-//! use std::thread;
-//!
-//! let discovery = DacDiscoveryWorker::builder()
-//!     .enabled_types(EnabledDacTypes::all())
-//!     .device_filter(|info| info.name().contains("preferred"))
-//!     .discovery_interval(Duration::from_secs(1))
-//!     .build();
-//!
-//! // Poll for connected workers
-//! for worker in discovery.poll_new_workers() {
-//!     println!("Connected: {}", worker.device_name());
-//!     worker.submit_frame(frame.clone());  // Push frames
-//! }
-//! ```
-//!
-//! # Callback Mode
-//!
-//! Use [`use_callback_workers()`](DacDiscoveryWorkerBuilder::use_callback_workers) to get
-//! [`DacCallbackWorker`] instances instead, where the DAC drives timing via callbacks:
-//!
-//! ```ignore
-//! use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, CallbackError};
-//!
-//! let discovery = DacDiscoveryWorker::builder()
-//!     .enabled_types(EnabledDacTypes::all())
-//!     .use_callback_workers()  // Enable callback mode
-//!     .build();
-//!
-//! // Poll for callback workers (not yet started)
-//! for mut worker in discovery.poll_new_callback_workers() {
-//!     let name = worker.device_name().to_string();
-//!     println!("Found: {}", name);
-//!
-//!     // Start with your callbacks
-//!     worker.start(
-//!         move |ctx| Some(generate_frame()),
-//!         move |err| eprintln!("{}: {:?}", name, err),
-//!     );
-//! }
-//! ```
+//! By default, the discovery worker produces [`DacWorker`] instances. Use
+//! [`use_callback_workers()`](DacDiscoveryWorkerBuilder::use_callback_workers) to get
+//! [`DacCallbackWorker`] instances instead, where the DAC drives timing via callbacks.
 
 use std::collections::HashSet;
 #[cfg(all(feature = "idn", feature = "testutils"))]

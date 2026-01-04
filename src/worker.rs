@@ -4,55 +4,21 @@
 //!
 //! ## Push-based: [`DacWorker`]
 //!
-//! Use when you have a main loop that generates frames at its own pace:
-//! - You call [`DacWorker::submit_frame()`] whenever you have a new frame
-//! - If the device is busy, the frame is dropped (returns `false`)
-//! - Good for: game loops, animation systems, GUI applications
-//!
-//! ```ignore
-//! // Push-based example
-//! let mut worker = DacWorker::new(name, dac_type, backend);
-//!
-//! loop {
-//!     let frame = generate_frame(time);
-//!     worker.submit_frame(frame);  // Non-blocking, may drop frame
-//!     worker.update();             // Poll for status updates
-//!     thread::sleep(Duration::from_millis(16));
-//! }
-//! ```
+//! Use when you have a main loop that generates frames at its own pace.
+//! You call [`DacWorker::submit_frame()`] whenever you have a new frame.
+//! If the device is busy, the frame is dropped (returns `false`).
+//! Good for: game loops, animation systems, GUI applications.
 //!
 //! ## Callback-based: [`DacCallbackWorker`]
 //!
-//! Use when you want the DAC to drive the timing:
-//! - Your callback is invoked from the worker thread when device needs data
-//! - Frames are never dropped - the callback is called when device is ready
-//! - Good for: audio-synced output, precise timing, streaming from file
+//! Use when you want the DAC to drive the timing.
+//! Your callback is invoked from the worker thread when device needs data.
+//! Frames are never dropped - the callback is called when device is ready.
+//! Good for: audio-synced output, precise timing, streaming from file.
 //!
-//! ```ignore
-//! // Callback-based example
-//! let mut frame_iter = frames.into_iter();
-//!
-//! let worker = DacCallbackWorker::new(
-//!     name, dac_type, backend,
-//!     move |_ctx| frame_iter.next(),           // Data callback
-//!     |err| eprintln!("Error: {:?}", err),     // Error callback
-//! );
-//!
-//! // Worker runs autonomously, poll status periodically
-//! while worker.is_running() {
-//!     worker.update();
-//!     thread::sleep(Duration::from_millis(100));
-//! }
-//! ```
-//!
-//! ## Callback Contract
-//!
-//! The data callback for [`DacCallbackWorker`] runs on a dedicated worker thread:
-//! - Called sequentially (never concurrent with itself)
-//! - Called as fast as the device can consume frames
-//! - Should return quickly to maintain smooth output
-//! - May capture state via `Arc<Mutex<...>>` for dynamic behavior
-//! - Return `None` to signal graceful shutdown
+//! The data callback runs on a dedicated worker thread, is called sequentially
+//! (never concurrent with itself), and should return quickly to maintain smooth
+//! output. Return `None` to signal graceful shutdown.
 //!
 //! **Thread Safety**: The callback must be `Send + 'static`. Use `Arc<Mutex<T>>`
 //! or channels to share state with the main thread.
@@ -140,25 +106,6 @@ enum CallbackStatus {
 ///
 /// Frames are sent via a bounded channel (capacity 1). If the consumer is busy,
 /// old frames are automatically dropped to prevent backlog.
-///
-/// # Example
-///
-/// ```ignore
-/// use laser_dac::{DacWorker, DacType, LaserFrame, LaserPoint};
-///
-/// // Assume `backend` is a connected [`DacBackend`]
-/// let worker = DacWorker::new("My DAC".to_string(), DacType::Helios, backend);
-///
-/// // Submit frames (non-blocking)
-/// let frame = LaserFrame::new(30000, vec![...]);
-/// worker.submit_frame(frame);
-///
-/// // Poll for status updates
-/// worker.update();
-///
-/// // Stop output when done
-/// worker.stop_output();
-/// ```
 pub struct DacWorker {
     device_name: String,
     dac_type: DacType,
@@ -361,8 +308,6 @@ impl Drop for DacWorker {
 /// This is similar to how audio libraries (CPAL, PortAudio) work - the hardware
 /// drives the timing, and your callback provides data when requested.
 ///
-/// # Two-phase construction
-///
 /// The worker is created in two phases:
 /// 1. [`new()`](Self::new) - Creates a connected but idle worker
 /// 2. [`start()`](Self::start) - Starts the worker thread with your callbacks
@@ -370,45 +315,6 @@ impl Drop for DacWorker {
 /// This allows you to inspect the device (name, type) before deciding what
 /// callbacks to use, and is required when using [`DacDiscoveryWorker`](crate::DacDiscoveryWorker)
 /// with callback workers.
-///
-/// # Example
-///
-/// ```ignore
-/// use laser_dac::{DacCallbackWorker, DacDiscovery, EnabledDacTypes, LaserFrame, LaserPoint};
-/// use std::sync::atomic::{AtomicUsize, Ordering};
-/// use std::sync::Arc;
-///
-/// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-/// let device = discovery.scan().into_iter().next().unwrap();
-/// let backend = discovery.connect(device).unwrap();
-///
-/// // Phase 1: Create worker (connected but not running)
-/// let mut worker = DacCallbackWorker::new(
-///     "My DAC".to_string(),
-///     DacType::Helios,
-///     backend,
-/// );
-///
-/// println!("Found device: {}", worker.device_name());
-///
-/// // Phase 2: Start with callbacks
-/// let frame_count = Arc::new(AtomicUsize::new(0));
-/// let counter = Arc::clone(&frame_count);
-///
-/// worker.start(
-///     move |ctx| {
-///         let n = counter.fetch_add(1, Ordering::Relaxed);
-///         if n >= 1000 { return None; }  // Stop after 1000 frames
-///         Some(generate_frame(n))
-///     },
-///     |err| eprintln!("Error: {:?}", err),
-/// );
-///
-/// while worker.is_running() {
-///     worker.update();
-///     std::thread::sleep(std::time::Duration::from_millis(100));
-/// }
-/// ```
 pub struct DacCallbackWorker {
     device_name: String,
     dac_type: DacType,

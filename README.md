@@ -20,13 +20,13 @@ This crate does not apply any additional processing on points (like blanking), e
 
 ## Supported DACs
 
-| DAC                        | Connection | Features | Verified |
-| -------------------------- | ---------- | -------- | -------- |
-| Helios                     | USB        | 12-bit   | ✅       |
-| Ether Dream                | Network    | 16-bit   | ✅       |
-| IDN (ILDA Digital Network) | Network    | 16-bit   | ✅       |
-| LaserCube WiFi             | WiFi       | 16-bit   | ❌       |
-| LaserCube USB / Laserdock  | USB        | 12-bit   | ✅       |
+| DAC                        | Connection | Verified |
+| -------------------------- | ---------- | -------- |
+| Helios                     | USB        | ✅       |
+| Ether Dream                | Network    | ✅       |
+| IDN (ILDA Digital Network) | Network    | ✅       |
+| LaserCube WiFi             | Network    | ❌       |
+| LaserCube USB / Laserdock  | USB        | ✅       |
 
 The DACs that are not verified, I have not tested with the DAC itself yet. Help to test these would be very welcome!
 

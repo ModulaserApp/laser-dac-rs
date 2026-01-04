@@ -2,30 +2,6 @@
 //!
 //! Provides a DAC interface for discovering and connecting to laser DAC devices
 //! from multiple manufacturers.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use laser_dac::{DacDiscovery, EnabledDacTypes, DacWorker};
-//!
-//! // Create discovery with all DAC types enabled
-//! let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-//!
-//! // Scan for devices
-//! let devices = discovery.scan();
-//! for device in devices {
-//!     println!("Found: {} ({})", device.name(), device.dac_type());
-//!
-//!     // Connect when ready
-//!     match discovery.connect(device) {
-//!         Ok(backend) => {
-//!             let worker = DacWorker::new(device.name().to_string(), device.dac_type(), backend);
-//!             // Use worker...
-//!         }
-//!         Err(e) => eprintln!("Failed to connect: {}", e),
-//!     }
-//! }
-//! ```
 
 use std::io;
 use std::net::IpAddr;
