@@ -174,7 +174,7 @@ impl DacWorker {
 
     /// Returns the DAC type.
     pub fn dac_type(&self) -> DacType {
-        self.dac_type
+        self.dac_type.clone()
     }
 
     /// Returns the current connection state.
@@ -407,7 +407,7 @@ impl DacCallbackWorker {
         let (status_tx, status_rx) = mpsc::channel::<CallbackStatus>();
 
         let name_for_loop = self.device_name.clone();
-        let dac_type = self.dac_type;
+        let dac_type = self.dac_type.clone();
         let stop_flag_for_loop = Arc::clone(&stop_flag);
         let disconnect_tx_for_loop = self.disconnect_tx.clone();
 
@@ -441,7 +441,7 @@ impl DacCallbackWorker {
 
     /// Returns the DAC type.
     pub fn dac_type(&self) -> DacType {
-        self.dac_type
+        self.dac_type.clone()
     }
 
     /// Returns the current connection state.

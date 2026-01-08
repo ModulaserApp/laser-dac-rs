@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::backend::DacBackend;
 use crate::error::{Error, Result};
-use crate::types::{DacType, EnabledDacTypes};
+use crate::types::{DacType, DiscoveredDac, EnabledDacTypes};
 
 // Feature-gated imports from internal protocol modules
 
@@ -55,6 +55,77 @@ use crate::protocols::lasercube_usb::rusb;
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
 // =============================================================================
+// Custom Discovery Source
+// =============================================================================
+
+/// Trait for implementing custom DAC discovery sources.
+///
+/// Implement this trait to add support for third-party or closed-source DAC
+/// hardware to the discovery system. Custom sources are polled alongside
+/// built-in backends by [`crate::DacDiscoveryWorker`].
+///
+/// # Example
+///
+/// ```ignore
+/// use laser_dac::{CustomDiscoverySource, DiscoveredDac, DacBackend, DacType};
+///
+/// struct MyCustomDiscovery {
+///     // Your discovery state
+/// }
+///
+/// impl CustomDiscoverySource for MyCustomDiscovery {
+///     fn poll_devices(&mut self) -> Vec<DiscoveredDac> {
+///         // Scan for your custom DAC hardware
+///         vec![DiscoveredDac {
+///             dac_type: DacType::Custom("MyDAC".to_string()),
+///             id: "device-001".to_string(),
+///             name: "My Custom DAC".to_string(),
+///             address: Some("192.168.1.100".to_string()),
+///             metadata: None,
+///         }]
+///     }
+///
+///     fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn DacBackend>> {
+///         // Return your backend implementation
+///         // Some(Box::new(MyCustomBackend::new(device)))
+///         None
+///     }
+/// }
+/// ```
+///
+/// # Integration with DacDiscoveryWorker
+///
+/// Register your custom source with the discovery worker builder:
+///
+/// ```ignore
+/// use laser_dac::DacDiscoveryWorker;
+///
+/// let discovery = DacDiscoveryWorker::builder()
+///     .add_custom_source(MyCustomDiscovery::new())
+///     .build();
+///
+/// // Poll for workers as usual
+/// for worker in discovery.poll_new_workers() {
+///     println!("Found: {}", worker.device_name());
+/// }
+/// ```
+pub trait CustomDiscoverySource: Send + 'static {
+    /// Poll for available devices.
+    ///
+    /// Called periodically by the discovery worker (default: every 2 seconds).
+    /// Return all currently visible devices - the worker handles deduplication
+    /// based on the device's `id` field.
+    fn poll_devices(&mut self) -> Vec<DiscoveredDac>;
+
+    /// Create a backend for connecting to a discovered device.
+    ///
+    /// Called when the discovery worker wants to connect to a device that
+    /// passed the device filter. Return `None` if the device is no longer
+    /// available or connection failed.
+    fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn DacBackend>>;
+}
+
+// =============================================================================
 // DiscoveredDevice
 // =============================================================================
 
@@ -89,13 +160,13 @@ impl DiscoveredDevice {
 
     /// Returns the DAC type.
     pub fn dac_type(&self) -> DacType {
-        self.dac_type
+        self.dac_type.clone()
     }
 
     /// Returns a lightweight, cloneable info struct for this device.
     pub fn info(&self) -> DiscoveredDeviceInfo {
         DiscoveredDeviceInfo {
-            dac_type: self.dac_type,
+            dac_type: self.dac_type.clone(),
             ip_address: self.ip_address,
             mac_address: self.mac_address,
             hostname: self.hostname.clone(),
@@ -138,6 +209,19 @@ impl DiscoveredDeviceInfo {
             usb.clone()
         } else {
             "Unknown".to_string()
+        }
+    }
+}
+
+impl From<&DiscoveredDac> for DiscoveredDeviceInfo {
+    fn from(dac: &DiscoveredDac) -> Self {
+        DiscoveredDeviceInfo {
+            dac_type: dac.dac_type.clone(),
+            ip_address: dac.address.as_ref().and_then(|a| a.parse().ok()),
+            mac_address: None,
+            hostname: None,
+            usb_address: None,
+            hardware_name: Some(dac.name.clone()),
         }
     }
 }

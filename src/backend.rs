@@ -20,16 +20,12 @@ pub enum WriteResult {
     DeviceBusy,
 }
 
-mod private {
-    pub trait Sealed {}
-}
-
 /// Unified interface for all DAC backends.
 ///
 /// Each backend handles its own point conversion and device-specific protocol.
 ///
-/// This trait is sealed and cannot be implemented outside of this crate.
-pub trait DacBackend: private::Sealed + Send + 'static {
+/// Implement this trait to add support for custom DAC hardware.
+pub trait DacBackend: Send + 'static {
     /// Get the DAC type.
     fn dac_type(&self) -> DacType;
 
@@ -71,8 +67,6 @@ mod helios_backend {
         dac: Option<HeliosDac>,
         device_index: usize,
     }
-
-    impl super::private::Sealed for HeliosBackend {}
 
     impl HeliosBackend {
         /// Create a new Helios backend for the given device index.
@@ -208,8 +202,6 @@ mod ether_dream_backend {
         ip_addr: IpAddr,
         stream: Option<stream::Stream>,
     }
-
-    impl super::private::Sealed for EtherDreamBackend {}
 
     impl EtherDreamBackend {
         pub fn new(broadcast: DacBroadcast, ip_addr: IpAddr) -> Self {
@@ -490,8 +482,6 @@ mod idn_backend {
         stream: Option<stream::Stream>,
     }
 
-    impl super::private::Sealed for IdnBackend {}
-
     impl IdnBackend {
         pub fn new(server: ServerInfo, service: ServiceInfo) -> Self {
             Self {
@@ -589,8 +579,6 @@ mod lasercube_wifi_backend {
         stream: Option<stream::Stream>,
     }
 
-    impl super::private::Sealed for LasercubeWifiBackend {}
-
     impl LasercubeWifiBackend {
         pub fn new(addressed: Addressed) -> Self {
             Self {
@@ -679,8 +667,6 @@ mod lasercube_usb_backend {
         device: Option<rusb::Device<rusb::Context>>,
         stream: Option<Stream<rusb::Context>>,
     }
-
-    impl super::private::Sealed for LasercubeUsbBackend {}
 
     impl LasercubeUsbBackend {
         pub fn new(device: rusb::Device<rusb::Context>) -> Self {

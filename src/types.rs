@@ -81,7 +81,7 @@ impl LaserFrame {
 }
 
 /// Types of laser DAC hardware supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum DacType {
     /// Helios laser DAC (USB connection).
@@ -94,6 +94,8 @@ pub enum DacType {
     LasercubeWifi,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
     LasercubeUsb,
+    /// Custom DAC implementation (for external/third-party backends).
+    Custom(String),
 }
 
 impl DacType {
@@ -109,13 +111,14 @@ impl DacType {
     }
 
     /// Returns the display name for this DAC type.
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(&self) -> &str {
         match self {
             DacType::Helios => "Helios",
             DacType::EtherDream => "Ether Dream",
             DacType::Idn => "IDN",
             DacType::LasercubeWifi => "LaserCube WiFi",
             DacType::LasercubeUsb => "LaserCube USB (Laserdock)",
+            DacType::Custom(name) => name,
         }
     }
 
@@ -127,6 +130,7 @@ impl DacType {
             DacType::Idn => "ILDA Digital Network laser DAC",
             DacType::LasercubeWifi => "WiFi laser DAC",
             DacType::LasercubeUsb => "USB laser DAC",
+            DacType::Custom(_) => "Custom DAC",
         }
     }
 }
@@ -148,7 +152,7 @@ impl EnabledDacTypes {
     /// Creates a new set with all DAC types enabled.
     pub fn all() -> Self {
         Self {
-            types: DacType::all().iter().copied().collect(),
+            types: DacType::all().iter().cloned().collect(),
         }
     }
 
@@ -208,7 +212,7 @@ impl EnabledDacTypes {
     /// Returns an iterator over enabled DAC types.
     #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = DacType> + '_ {
-        self.types.iter().copied()
+        self.types.iter().cloned()
     }
 
     /// Returns true if no DAC types are enabled.
@@ -349,7 +353,7 @@ mod tests {
         let enabled = EnabledDacTypes::all();
         for dac_type in DacType::all() {
             assert!(
-                enabled.is_enabled(*dac_type),
+                enabled.is_enabled(dac_type.clone()),
                 "{:?} should be enabled",
                 dac_type
             );
@@ -362,7 +366,7 @@ mod tests {
         let enabled = EnabledDacTypes::none();
         for dac_type in DacType::all() {
             assert!(
-                !enabled.is_enabled(*dac_type),
+                !enabled.is_enabled(dac_type.clone()),
                 "{:?} should be disabled",
                 dac_type
             );
@@ -408,7 +412,7 @@ mod tests {
         let enabled = EnabledDacTypes::default();
         // Default should be same as all()
         for dac_type in DacType::all() {
-            assert!(enabled.is_enabled(*dac_type));
+            assert!(enabled.is_enabled(dac_type.clone()));
         }
     }
 
