@@ -153,14 +153,19 @@ impl From<&LaserPoint> for Point {
     /// Convert a LaserPoint to a LaserCube WiFi Point.
     ///
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
-    /// LaserCube WiFi uses offset binary coordinates and 12-bit colors (0-4095).
+    /// LaserCube WiFi uses 12-bit coordinates (0-4095) with inverted axes, and 12-bit colors.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * 32767.0) as i16;
-        let r = p.r >> 4;
-        let g = p.g >> 4;
-        let b = p.b >> 4;
-        Point::from_signed(x, y, r, g, b)
+        // Map [-1..1] -> [0..1] -> invert -> [0..4095]
+        let x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
+        let y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
+
+        Point {
+            x,
+            y,
+            r: p.r >> 4,
+            g: p.g >> 4,
+            b: p.b >> 4,
+        }
     }
 }
 

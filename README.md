@@ -20,17 +20,15 @@ This crate does not apply any additional processing on points (like blanking), e
 
 ## Supported DACs
 
-| DAC                        | Connection | Verified |
-| -------------------------- | ---------- | -------- |
+| DAC                        | Connection | Verified | Notes                                                                                                  |
+| -------------------------- | ---------- | -------- | ------------------------------------------------------------------------------------------------------ |
 | Helios                     | USB        | ✅       |
 | Ether Dream                | Network    | ✅       |
-| IDN (ILDA Digital Network) | Network    | ✅       |
-| LaserCube WiFi             | Network    | ❌       |
+| IDN (ILDA Digital Network) | Network    | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
+| LaserCube WiFi             | Network    | ✅       | Recommend to not use through WiFi mode                                                                 |
 | LaserCube USB / Laserdock  | USB        | ✅       |
 
-The DACs that are not verified, I have not tested with the DAC itself yet. Help to test these would be very welcome!
-
-IDN a standardized protocol. So any DAC that supports IDN would be supported. The implementation was tested with the [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/).
+All DACs are manually verified to work.
 
 ## Quick Start
 
