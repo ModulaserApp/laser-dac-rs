@@ -197,6 +197,39 @@ laser-dac = { version = "*", default-features = false, features = ["network-dacs
 
 USB DACs (`helios`, `lasercube-usb`) use [rusb](https://crates.io/crates/rusb) which requires CMake to build.
 
+## Development Tools
+
+### IDN Simulator
+
+The repository includes a debug simulator (in `tools/idn-simulator/`) that acts as a virtual IDN laser DAC. This is useful for testing and development without physical hardware.
+
+```bash
+# Build and run the simulator
+cargo run -p idn-simulator
+
+# With custom options
+cargo run -p idn-simulator -- --hostname "Test-DAC" --service-name "Simulator" --port 7255
+```
+
+**Features:**
+- Responds to IDN discovery (appears as a real DAC)
+- Renders received laser frames as connected lines
+- Handles blanking (intensity=0 creates gaps between shapes)
+- Shows frame statistics (frame count, point count, client address)
+
+**Usage:**
+
+When the simulator is running, launch your work that scans for IDN devices. You can use this crate, or any other tool that supports IDN!
+
+For a simple test, you can run one of our examples: `cargo run --example automatic -- circle`
+
+**CLI Options:**
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-n, --hostname` | Hostname in scan responses | `IDN-Simulator` |
+| `-s, --service-name` | Service name in service map | `Simulator Laser` |
+| `-p, --port` | UDP port to listen on | `7255` |
+
 ## Acknowledgements
 
 - Helios DAC: heavily inspired from [helios-dac](https://github.com/maxjoehnk/helios-dac-rs)

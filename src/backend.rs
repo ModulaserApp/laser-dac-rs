@@ -168,7 +168,7 @@ mod helios_backend {
         }
 
         fn stop(&mut self) -> Result<()> {
-            if let Some(ref dac) = self.dac {
+            if let Some(dac) = &self.dac {
                 dac.stop()
                     .map_err(|e| Error::context("Failed to stop", e))?;
             }
@@ -226,7 +226,7 @@ mod ether_dream_backend {
         }
 
         fn disconnect(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 let _ = stream.queue_commands().stop().submit();
             }
             self.stream = None;
@@ -420,7 +420,7 @@ mod ether_dream_backend {
         }
 
         fn stop(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 stream
                     .queue_commands()
                     .stop()
@@ -431,7 +431,6 @@ mod ether_dream_backend {
         }
 
         fn set_shutter(&mut self, _open: bool) -> Result<()> {
-            // Ether Dream doesn't have explicit shutter control
             Ok(())
         }
     }
@@ -479,7 +478,7 @@ mod idn_backend {
         }
 
         fn disconnect(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 let _ = stream.close();
             }
             self.stream = None;
@@ -521,16 +520,14 @@ mod idn_backend {
         }
 
         fn stop(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
-                let blank_point = PointXyrgbi::new(0, 0, 0, 0, 0, 0);
-                let blank_frame = vec![blank_point; 10];
+            if let Some(stream) = &mut self.stream {
+                let blank_frame = vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); 10];
                 let _ = stream.write_frame(&blank_frame);
             }
             Ok(())
         }
 
         fn set_shutter(&mut self, _open: bool) -> Result<()> {
-            // IDN doesn't have explicit shutter control
             Ok(())
         }
     }
@@ -579,7 +576,7 @@ mod lasercube_wifi_backend {
         }
 
         fn disconnect(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 let _ = stream.stop();
             }
             self.stream = None;
@@ -596,17 +593,17 @@ mod lasercube_wifi_backend {
                 .as_mut()
                 .ok_or_else(|| Error::msg("Not connected"))?;
 
-            let lc_points: Vec<LasercubePoint> = frame.points.iter().map(|p| p.into()).collect();
+            let points: Vec<LasercubePoint> = frame.points.iter().map(|p| p.into()).collect();
 
             stream
-                .write_frame(&lc_points, frame.pps)
+                .write_frame(&points, frame.pps)
                 .map_err(|e| Error::context("Failed to write frame", e))?;
 
             Ok(WriteResult::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 stream
                     .stop()
                     .map_err(|e| Error::context("Failed to stop", e))?;
@@ -615,7 +612,7 @@ mod lasercube_wifi_backend {
         }
 
         fn set_shutter(&mut self, open: bool) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 stream
                     .set_output(open)
                     .map_err(|e| Error::context("Failed to set shutter", e))?;
@@ -688,7 +685,7 @@ mod lasercube_usb_backend {
         }
 
         fn disconnect(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 let _ = stream.stop();
             }
             self.stream = None;
@@ -715,7 +712,7 @@ mod lasercube_usb_backend {
         }
 
         fn stop(&mut self) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 stream
                     .stop()
                     .map_err(|e| Error::context("Failed to stop", e))?;
@@ -724,7 +721,7 @@ mod lasercube_usb_backend {
         }
 
         fn set_shutter(&mut self, open: bool) -> Result<()> {
-            if let Some(ref mut stream) = self.stream {
+            if let Some(stream) = &mut self.stream {
                 if open {
                     stream
                         .enable_output()

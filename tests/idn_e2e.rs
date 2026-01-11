@@ -5,12 +5,16 @@
 
 #![cfg(all(feature = "idn", feature = "testutils"))]
 
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
+
+use idn_mock_server::{
+    MockIdnServer, MockRelay, MockService, ServerBehavior, ServerConfig, ServerHandle,
+    IDNCMD_RT_CNLMSG, IDNFLG_STATUS_REALTIME,
+};
 
 use laser_dac::types::{DacConnectionState, DacType, EnabledDacTypes, LaserFrame, LaserPoint};
 use laser_dac::DacDiscoveryWorker;
@@ -22,407 +26,81 @@ fn idn_only() -> EnabledDacTypes {
     types
 }
 
-// IDN Protocol constants (matching src/protocols/idn/protocol.rs)
-const IDNCMD_PING_REQUEST: u8 = 0x08;
-const IDNCMD_PING_RESPONSE: u8 = 0x09;
-const IDNCMD_SCAN_REQUEST: u8 = 0x10;
-const IDNCMD_SCAN_RESPONSE: u8 = 0x11;
-const IDNCMD_SERVICEMAP_REQUEST: u8 = 0x12;
-const IDNCMD_SERVICEMAP_RESPONSE: u8 = 0x13;
-const IDNCMD_RT_CNLMSG: u8 = 0x40;
-const IDNVAL_STYPE_LAPRO: u8 = 0x80;
+// =============================================================================
+// Test Behavior Implementation
+// =============================================================================
 
-/// Configuration for a mock service.
-#[derive(Clone)]
-pub struct MockService {
-    pub service_id: u8,
-    pub service_type: u8,
-    pub name: String,
-    pub flags: u8,
-    pub relay_number: u8,
+/// Test-specific behavior for the mock server.
+pub struct TestBehavior {
+    pub disconnected: Arc<AtomicBool>,
+    pub silent: bool,
+    pub received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub status: u8,
+    pub ack_error_code: u8,
 }
 
-impl MockService {
-    /// Create a laser projector service.
-    pub fn laser_projector(service_id: u8, name: &str) -> Self {
+impl TestBehavior {
+    pub fn new() -> Self {
         Self {
-            service_id,
-            service_type: IDNVAL_STYPE_LAPRO,
-            name: name.to_string(),
-            flags: 0,
-            relay_number: 0,
-        }
-    }
-
-    /// Create a DMX512 service.
-    pub fn dmx512(service_id: u8, name: &str) -> Self {
-        Self {
-            service_id,
-            service_type: 0x05, // IDNVAL_STYPE_DMX512
-            name: name.to_string(),
-            flags: 0,
-            relay_number: 0,
-        }
-    }
-
-    /// Set the relay number this service is attached to.
-    pub fn with_relay(mut self, relay_number: u8) -> Self {
-        self.relay_number = relay_number;
-        self
-    }
-
-    /// Set the DSID flag (default service for type).
-    pub fn with_dsid(mut self) -> Self {
-        self.flags |= 0x01; // IDNFLG_SERVICEMAP_DSID
-        self
-    }
-}
-
-/// Configuration for a mock relay.
-#[derive(Clone)]
-pub struct MockRelay {
-    pub relay_number: u8,
-    pub name: String,
-}
-
-impl MockRelay {
-    pub fn new(relay_number: u8, name: &str) -> Self {
-        Self {
-            relay_number,
-            name: name.to_string(),
-        }
-    }
-}
-
-/// Builder for MockIdnServer with configurable options.
-pub struct MockIdnServerBuilder {
-    hostname: String,
-    unit_id: [u8; 16],
-    protocol_version: u8,
-    status: u8,
-    services: Vec<MockService>,
-    relays: Vec<MockRelay>,
-    silent: bool,
-}
-
-impl MockIdnServerBuilder {
-    /// Create a new builder with the given hostname.
-    pub fn new(hostname: &str) -> Self {
-        // Generate a deterministic unit_id from hostname
-        let mut unit_id = [0u8; 16];
-        let bytes = hostname.as_bytes();
-        for (i, &b) in bytes.iter().enumerate().take(16) {
-            unit_id[i] = b;
-        }
-
-        Self {
-            hostname: hostname.to_string(),
-            unit_id,
-            protocol_version: 0x10, // Version 1.0
-            status: 0,
-            services: vec![MockService::laser_projector(1, "Laser1")],
-            relays: Vec::new(),
+            disconnected: Arc::new(AtomicBool::new(false)),
             silent: false,
+            received_packets: Arc::new(Mutex::new(Vec::new())),
+            status: IDNFLG_STATUS_REALTIME,
+            ack_error_code: 0x00,
         }
     }
 
-    /// Set a custom unit ID.
-    pub fn unit_id(mut self, unit_id: [u8; 16]) -> Self {
-        self.unit_id = unit_id;
+    pub fn silent(mut self) -> Self {
+        self.silent = true;
         self
     }
 
-    /// Set the protocol version (major.minor packed into single byte).
-    pub fn protocol_version(mut self, major: u8, minor: u8) -> Self {
-        self.protocol_version = (major << 4) | (minor & 0x0F);
-        self
-    }
-
-    /// Set the status byte.
-    pub fn status(mut self, status: u8) -> Self {
+    pub fn with_status(mut self, status: u8) -> Self {
         self.status = status;
         self
     }
-
-    /// Set the services this server provides.
-    pub fn services(mut self, services: Vec<MockService>) -> Self {
-        self.services = services;
-        self
-    }
-
-    /// Set the relays this server provides.
-    pub fn relays(mut self, relays: Vec<MockRelay>) -> Self {
-        self.relays = relays;
-        self
-    }
-
-    /// Enable silent mode (server receives but never responds).
-    pub fn silent(mut self, silent: bool) -> Self {
-        self.silent = silent;
-        self
-    }
-
-    /// Build the MockIdnServer.
-    pub fn build(self) -> io::Result<MockIdnServer> {
-        MockIdnServer::from_builder(self)
-    }
 }
 
-/// Mock IDN server that responds to scan, servicemap, and ping requests.
-pub struct MockIdnServer {
-    socket: UdpSocket,
-    unit_id: [u8; 16],
-    hostname: String,
-    protocol_version: u8,
-    status: u8,
-    services: Vec<MockService>,
-    relays: Vec<MockRelay>,
-    running: Arc<AtomicBool>,
-    disconnected: Arc<AtomicBool>,
-    received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
-    silent: bool,
-}
-
-impl MockIdnServer {
-    /// Create a new mock IDN server bound to localhost on an ephemeral port.
-    pub fn new(hostname: &str) -> io::Result<Self> {
-        Self::builder(hostname).build()
+impl ServerBehavior for TestBehavior {
+    fn on_packet_received(&mut self, raw_data: &[u8]) {
+        self.received_packets
+            .lock()
+            .unwrap()
+            .push(raw_data.to_vec());
     }
 
-    /// Create a builder for more configuration options.
-    pub fn builder(hostname: &str) -> MockIdnServerBuilder {
-        MockIdnServerBuilder::new(hostname)
+    fn on_frame_received(&mut self, _raw_data: &[u8]) {
+        // Frame data is already captured in on_packet_received
     }
 
-    fn from_builder(builder: MockIdnServerBuilder) -> io::Result<Self> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
-        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-
-        Ok(Self {
-            socket,
-            unit_id: builder.unit_id,
-            hostname: builder.hostname,
-            protocol_version: builder.protocol_version,
-            status: builder.status,
-            services: builder.services,
-            relays: builder.relays,
-            running: Arc::new(AtomicBool::new(false)),
-            disconnected: Arc::new(AtomicBool::new(false)),
-            received_packets: Arc::new(Mutex::new(Vec::new())),
-            silent: builder.silent,
-        })
+    fn should_respond(&self, _command: u8) -> bool {
+        !self.silent && !self.disconnected.load(Ordering::SeqCst)
     }
 
-    /// Get the configured unit_id.
-    pub fn unit_id(&self) -> [u8; 16] {
-        self.unit_id
-    }
-
-    /// Get the configured hostname.
-    pub fn hostname(&self) -> &str {
-        &self.hostname
-    }
-
-    /// Get the configured protocol version.
-    pub fn protocol_version(&self) -> (u8, u8) {
-        (self.protocol_version >> 4, self.protocol_version & 0x0F)
-    }
-
-    /// Get the configured status.
-    pub fn status(&self) -> u8 {
+    fn get_status_byte(&self) -> u8 {
         self.status
     }
 
-    /// Get the configured services.
-    pub fn services(&self) -> &[MockService] {
-        &self.services
-    }
-
-    /// Get the configured relays.
-    pub fn relays(&self) -> &[MockRelay] {
-        &self.relays
-    }
-
-    /// Get the server's local address.
-    pub fn addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
-    }
-
-    /// Start the server in a background thread.
-    pub fn run(self) -> MockIdnServerHandle {
-        let running = Arc::clone(&self.running);
-        let disconnected = Arc::clone(&self.disconnected);
-        let received_packets = Arc::clone(&self.received_packets);
-
-        running.store(true, Ordering::SeqCst);
-
-        let addr = self.addr();
-        let handle = thread::spawn(move || {
-            self.server_loop();
-        });
-
-        MockIdnServerHandle {
-            addr,
-            running,
-            disconnected,
-            received_packets,
-            handle: Some(handle),
-        }
-    }
-
-    fn server_loop(self) {
-        let mut buf = [0u8; 1500];
-
-        while self.running.load(Ordering::SeqCst) {
-            let (len, src) = match self.socket.recv_from(&mut buf) {
-                Ok(result) => result,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
-                Err(_) => break,
-            };
-
-            // Store received packet
-            {
-                let mut packets = self.received_packets.lock().unwrap();
-                packets.push(buf[..len].to_vec());
-            }
-
-            // If silent mode or disconnected, don't respond
-            if self.silent || self.disconnected.load(Ordering::SeqCst) {
-                continue;
-            }
-
-            if len < 4 {
-                continue;
-            }
-
-            let command = buf[0];
-            let flags = buf[1];
-            let sequence = u16::from_be_bytes([buf[2], buf[3]]);
-
-            match command {
-                IDNCMD_SCAN_REQUEST => {
-                    let response = self.build_scan_response(flags, sequence);
-                    let _ = self.socket.send_to(&response, src);
-                }
-                IDNCMD_SERVICEMAP_REQUEST => {
-                    let response = self.build_servicemap_response(flags, sequence);
-                    let _ = self.socket.send_to(&response, src);
-                }
-                IDNCMD_PING_REQUEST => {
-                    let response = self.build_ping_response(flags, sequence);
-                    let _ = self.socket.send_to(&response, src);
-                }
-                IDNCMD_RT_CNLMSG => {
-                    // Frame data - just accept silently (UDP fire and forget)
-                }
-                _ => {
-                    // Unknown command, ignore
-                }
-            }
-        }
-    }
-
-    fn build_scan_response(&self, flags: u8, sequence: u16) -> Vec<u8> {
-        let mut response = Vec::with_capacity(44);
-
-        // Packet header (4 bytes)
-        response.push(IDNCMD_SCAN_RESPONSE);
-        response.push(flags);
-        response.extend_from_slice(&sequence.to_be_bytes());
-
-        // ScanResponse (40 bytes)
-        response.push(40); // struct_size
-        response.push(self.protocol_version);
-        response.push(self.status);
-        response.push(0x00); // reserved
-        response.extend_from_slice(&self.unit_id);
-
-        // Hostname (20 bytes, null-padded)
-        let mut hostname_bytes = [0u8; 20];
-        let name_bytes = self.hostname.as_bytes();
-        let len = name_bytes.len().min(20);
-        hostname_bytes[..len].copy_from_slice(&name_bytes[..len]);
-        response.extend_from_slice(&hostname_bytes);
-
-        response
-    }
-
-    fn build_servicemap_response(&self, flags: u8, sequence: u16) -> Vec<u8> {
-        let relay_count = self.relays.len() as u8;
-        let service_count = self.services.len() as u8;
-        let capacity = 4 + 4 + (relay_count as usize + service_count as usize) * 24;
-        let mut response = Vec::with_capacity(capacity);
-
-        // Packet header (4 bytes)
-        response.push(IDNCMD_SERVICEMAP_RESPONSE);
-        response.push(flags);
-        response.extend_from_slice(&sequence.to_be_bytes());
-
-        // ServiceMapResponseHeader (4 bytes)
-        response.push(4); // struct_size
-        response.push(24); // entry_size
-        response.push(relay_count);
-        response.push(service_count);
-
-        // Relay entries (24 bytes each)
-        for relay in &self.relays {
-            response.push(0x00); // service_id (must be 0 for relays)
-            response.push(0x00); // service_type (unused for relays)
-            response.push(0x00); // flags
-            response.push(relay.relay_number); // relay_number (!=0 for relays)
-
-            // Relay name (20 bytes, null-padded)
-            let mut name_bytes = [0u8; 20];
-            let name = relay.name.as_bytes();
-            let len = name.len().min(20);
-            name_bytes[..len].copy_from_slice(&name[..len]);
-            response.extend_from_slice(&name_bytes);
-        }
-
-        // Service entries (24 bytes each)
-        for service in &self.services {
-            response.push(service.service_id);
-            response.push(service.service_type);
-            response.push(service.flags);
-            response.push(service.relay_number);
-
-            // Service name (20 bytes, null-padded)
-            let mut name_bytes = [0u8; 20];
-            let name = service.name.as_bytes();
-            let len = name.len().min(20);
-            name_bytes[..len].copy_from_slice(&name[..len]);
-            response.extend_from_slice(&name_bytes);
-        }
-
-        response
-    }
-
-    fn build_ping_response(&self, flags: u8, sequence: u16) -> Vec<u8> {
-        let mut response = Vec::with_capacity(4);
-
-        // Packet header (4 bytes)
-        response.push(IDNCMD_PING_RESPONSE);
-        response.push(flags);
-        response.extend_from_slice(&sequence.to_be_bytes());
-
-        response
+    fn get_ack_result_code(&self) -> u8 {
+        self.ack_error_code
     }
 }
 
-/// Handle to a running mock IDN server.
-pub struct MockIdnServerHandle {
-    addr: SocketAddr,
-    running: Arc<AtomicBool>,
-    disconnected: Arc<AtomicBool>,
-    received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
-    handle: Option<JoinHandle<()>>,
+// =============================================================================
+// Test Server Handle
+// =============================================================================
+
+/// Handle to a running mock IDN server with test utilities.
+pub struct TestServerHandle {
+    inner: ServerHandle,
+    pub disconnected: Arc<AtomicBool>,
+    pub received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-impl MockIdnServerHandle {
+impl TestServerHandle {
     /// Get the server's address.
     pub fn addr(&self) -> SocketAddr {
-        self.addr
+        self.inner.addr
     }
 
     /// Simulate a disconnection (server stops responding).
@@ -454,14 +132,85 @@ impl MockIdnServerHandle {
     }
 }
 
-impl Drop for MockIdnServerHandle {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+// =============================================================================
+// Test Server Builder
+// =============================================================================
+
+/// Builder for test mock servers.
+pub struct TestServerBuilder {
+    config: ServerConfig,
+    behavior: TestBehavior,
+}
+
+impl TestServerBuilder {
+    /// Create a new builder with the given hostname.
+    pub fn new(hostname: &str) -> Self {
+        Self {
+            config: ServerConfig::new(hostname),
+            behavior: TestBehavior::new(),
         }
     }
+
+    /// Set a custom unit ID.
+    pub fn unit_id(mut self, unit_id: [u8; 16]) -> Self {
+        self.config = self.config.with_unit_id(unit_id);
+        self
+    }
+
+    /// Set the protocol version (major.minor packed into single byte).
+    pub fn protocol_version(mut self, major: u8, minor: u8) -> Self {
+        self.config = self.config.with_protocol_version(major, minor);
+        self
+    }
+
+    /// Set the status byte.
+    pub fn status(mut self, status: u8) -> Self {
+        self.behavior = self.behavior.with_status(status);
+        self
+    }
+
+    /// Set the services this server provides.
+    pub fn services(mut self, services: Vec<MockService>) -> Self {
+        self.config = self.config.with_services(services);
+        self
+    }
+
+    /// Set the relays this server provides.
+    pub fn relays(mut self, relays: Vec<MockRelay>) -> Self {
+        self.config = self.config.with_relays(relays);
+        self
+    }
+
+    /// Enable silent mode (server receives but never responds).
+    pub fn silent(mut self) -> Self {
+        self.behavior = self.behavior.silent();
+        self
+    }
+
+    /// Build and start the server.
+    pub fn build(self) -> std::io::Result<TestServerHandle> {
+        let disconnected = Arc::clone(&self.behavior.disconnected);
+        let received_packets = Arc::clone(&self.behavior.received_packets);
+
+        let server = MockIdnServer::new(self.config, self.behavior)?;
+        let inner = server.spawn();
+
+        Ok(TestServerHandle {
+            inner,
+            disconnected,
+            received_packets,
+        })
+    }
 }
+
+/// Create a simple test server with default configuration.
+pub fn test_server(hostname: &str) -> std::io::Result<TestServerHandle> {
+    TestServerBuilder::new(hostname).build()
+}
+
+// =============================================================================
+// Test Utilities
+// =============================================================================
 
 /// Create a simple test frame.
 fn create_test_frame() -> LaserFrame {
@@ -484,9 +233,9 @@ fn wait_for_worker(
         let _: Vec<_> = discovery.poll_discovered_devices().collect();
 
         // Check for workers
-        let workers: Vec<_> = discovery.poll_new_workers().collect();
-        if !workers.is_empty() {
-            return workers.into_iter().next();
+        let mut workers = discovery.poll_new_workers();
+        if let Some(worker) = workers.next() {
+            return Some(worker);
         }
 
         thread::sleep(Duration::from_millis(50));
@@ -502,11 +251,9 @@ fn wait_for_worker(
 fn test_scanner_direct() {
     use laser_dac::protocols::idn::ServerScanner;
 
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
     eprintln!("Mock server listening on: {}", server_addr);
-
-    let _handle = server.run();
 
     // Give server time to start
     thread::sleep(Duration::from_millis(50));
@@ -529,11 +276,10 @@ fn test_scanner_direct() {
 fn test_idn_discovery_direct() {
     use laser_dac::discovery::IdnDiscovery;
 
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
     eprintln!("Mock server listening on: {}", server_addr);
 
-    let _handle = server.run();
     thread::sleep(Duration::from_millis(50));
 
     let mut idn_discovery = IdnDiscovery::new();
@@ -552,10 +298,9 @@ fn test_idn_discovery_direct() {
 
 #[test]
 fn test_discover_and_connect() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
     eprintln!("Mock server listening on: {}", server_addr);
-    let handle = server.run();
 
     // Give server time to start
     thread::sleep(Duration::from_millis(50));
@@ -601,9 +346,8 @@ fn test_discover_and_connect() {
 
 #[test]
 fn test_send_frame() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -636,9 +380,8 @@ fn test_send_frame() {
 
 #[test]
 fn test_connection_loss_detection() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -684,9 +427,8 @@ fn test_connection_loss_detection() {
 
 #[test]
 fn test_reconnection_after_loss() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -716,11 +458,10 @@ fn test_reconnection_after_loss() {
     handle.resume();
 
     // Wait for rediscovery
-    let new_worker = wait_for_worker(&discovery, Duration::from_secs(2))
+    let mut new_worker = wait_for_worker(&discovery, Duration::from_secs(2))
         .expect("Should reconnect with a new worker after server resumes");
 
     // Verify new worker is connected
-    let mut new_worker = new_worker;
     new_worker.update();
     assert!(
         matches!(new_worker.state(), DacConnectionState::Connected { .. }),
@@ -730,9 +471,8 @@ fn test_reconnection_after_loss() {
 
 #[test]
 fn test_full_lifecycle() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -802,7 +542,7 @@ fn test_parsed_server_metadata() {
         0x10,
     ];
 
-    let server = MockIdnServer::builder("MetadataTest")
+    let handle = TestServerBuilder::new("MetadataTest")
         .unit_id(unit_id)
         .protocol_version(2, 5)
         .status(0x42)
@@ -815,9 +555,8 @@ fn test_parsed_server_metadata() {
     let expected_hostname = "MetadataTest";
     let expected_version = (2, 5);
     let expected_status = 0x42;
-    let server_addr = server.addr();
+    let server_addr = handle.addr();
 
-    let _handle = server.run();
     thread::sleep(Duration::from_millis(50));
 
     // Scan and get ServerInfo
@@ -877,7 +616,7 @@ fn test_parsed_server_metadata() {
 fn test_parsed_multiple_services() {
     use laser_dac::protocols::idn::{ServerScanner, ServiceType};
 
-    let server = MockIdnServer::builder("MultiService")
+    let handle = TestServerBuilder::new("MultiService")
         .services(vec![
             MockService::laser_projector(1, "Laser1").with_dsid(),
             MockService::laser_projector(2, "Laser2"),
@@ -886,8 +625,7 @@ fn test_parsed_multiple_services() {
         .build()
         .unwrap();
 
-    let server_addr = server.addr();
-    let _handle = server.run();
+    let server_addr = handle.addr();
     thread::sleep(Duration::from_millis(50));
 
     let mut scanner = ServerScanner::new(0).unwrap();
@@ -926,7 +664,7 @@ fn test_parsed_multiple_services() {
 fn test_parsed_relays_and_services() {
     use laser_dac::protocols::idn::{ServerScanner, ServiceType};
 
-    let server = MockIdnServer::builder("RelayTest")
+    let handle = TestServerBuilder::new("RelayTest")
         .relays(vec![
             MockRelay::new(1, "Relay1"),
             MockRelay::new(2, "Relay2"),
@@ -938,8 +676,7 @@ fn test_parsed_relays_and_services() {
         .build()
         .unwrap();
 
-    let server_addr = server.addr();
-    let _handle = server.run();
+    let server_addr = handle.addr();
     thread::sleep(Duration::from_millis(50));
 
     let mut scanner = ServerScanner::new(0).unwrap();
@@ -985,14 +722,13 @@ fn test_discovered_device_info_metadata() {
     use laser_dac::discovery::IdnDiscovery;
     use std::net::IpAddr;
 
-    let server = MockIdnServer::builder("DiscoveryTest")
+    let handle = TestServerBuilder::new("DiscoveryTest")
         .protocol_version(1, 2)
         .services(vec![MockService::laser_projector(5, "TestLaser")])
         .build()
         .unwrap();
 
-    let server_addr = server.addr();
-    let _handle = server.run();
+    let server_addr = handle.addr();
     thread::sleep(Duration::from_millis(50));
 
     let mut idn_discovery = IdnDiscovery::new();
@@ -1039,13 +775,12 @@ fn test_server_never_responds_timeout() {
     use laser_dac::protocols::idn::ServerScanner;
 
     // Create a silent mock server that receives but never responds
-    let server = MockIdnServer::builder("SilentServer")
-        .silent(true)
+    let handle = TestServerBuilder::new("SilentServer")
+        .silent()
         .build()
         .unwrap();
-    let server_addr = server.addr();
+    let server_addr = handle.addr();
 
-    let handle = server.run();
     thread::sleep(Duration::from_millis(50));
 
     // Test 1: ServerScanner should return empty results after timeout
@@ -1083,9 +818,8 @@ fn test_server_never_responds_timeout() {
 #[test]
 fn test_discovery_timeout_on_established_connection() {
     // Test that an established connection properly times out when server goes silent
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -1175,9 +909,8 @@ fn test_connection_to_nonexistent_server() {
 
 #[test]
 fn test_rapid_frame_submission_back_pressure() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
@@ -1254,9 +987,8 @@ fn test_rapid_frame_submission_back_pressure() {
 
 #[test]
 fn test_submit_frame_returns_false_when_busy() {
-    let server = MockIdnServer::new("TestDAC").unwrap();
-    let server_addr = server.addr();
-    let _handle = server.run();
+    let handle = test_server("TestDAC").unwrap();
+    let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 

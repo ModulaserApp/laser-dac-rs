@@ -1,0 +1,16 @@
+[package]
+name = "idn-simulator"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kees Kluskens <kees@kees.im>"]
+description = "IDN protocol laser DAC simulator for testing and development"
+license = "MIT"
+repository = "https://github.com/SpaceK33z/laser-dac-rs"
+
+[dependencies]
+byteorder = "1.5"
+log = "0.4"
+eframe = { version = "0.30", default-features = false, features = ["default_fonts", "glow"] }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+idn-mock-server = { path = "../idn-mock-server" }

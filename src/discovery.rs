@@ -151,7 +151,7 @@ impl DiscoveredDevice {
             .map(|ip| ip.to_string())
             .or_else(|| self.hardware_name.clone())
             .or_else(|| self.usb_address.clone())
-            .unwrap_or_else(|| "Unknown".to_string())
+            .unwrap_or_else(|| "Unknown".into())
     }
 
     /// Returns the DAC type.
@@ -201,7 +201,7 @@ impl DiscoveredDeviceInfo {
             .map(|ip| ip.to_string())
             .or_else(|| self.hardware_name.clone())
             .or_else(|| self.usb_address.clone())
-            .unwrap_or_else(|| "Unknown".to_string())
+            .unwrap_or_else(|| "Unknown".into())
     }
 }
 
@@ -290,9 +290,7 @@ impl HeliosDiscovery {
                 Err(_) => continue,
             };
 
-            let hardware_name = opened
-                .name()
-                .unwrap_or_else(|_| "Unknown Helios".to_string());
+            let hardware_name = opened.name().unwrap_or_else(|_| "Unknown Helios".into());
             discovered.push(DiscoveredDevice {
                 dac_type: DacType::Helios,
                 ip_address: None,
