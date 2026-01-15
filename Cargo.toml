@@ -62,6 +62,8 @@ env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 idn-mock-server = { path = "tools/idn-mock-server" }
+cpal = "0.15"
+rustfft = "6.2"
 
 [[example]]
 name = "automatic"
@@ -70,6 +72,14 @@ path = "examples/automatic.rs"
 [[example]]
 name = "manual"
 path = "examples/manual.rs"
+
+[[example]]
+name = "callback"
+path = "examples/callback.rs"
+
+[[example]]
+name = "audio"
+path = "examples/audio.rs"
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

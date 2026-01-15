@@ -1,52 +1,55 @@
-//! Manual discovery example using DacDiscovery.
+//! Manual discovery example using the streaming API.
 //!
-//! This gives you more control over device discovery and connection,
-//! while still using the unified abstraction layer.
+//! This example demonstrates using DacDiscovery to find devices,
+//! then streaming to them using the blocking mode API.
 //!
 //! Run with: `cargo run --example manual -- [triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_frame, Args};
-use laser_dac::discovery::DacDiscovery;
-use laser_dac::{DacWorker, EnabledDacTypes, Result};
-use std::thread;
-use std::time::Duration;
+use common::{create_points, Args};
+use laser_dac::{list_devices, open_device, StreamConfig, Result};
 
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
     println!("Scanning for DACs...\n");
-    let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    let devices = discovery.scan();
+    let devices = list_devices()?;
 
     if devices.is_empty() {
         println!("No DACs found.");
         return Ok(());
     }
 
-    let mut workers = Vec::new();
-    for device in devices {
-        let device_name = device.name().to_string();
-        let device_type = device.dac_type();
-        println!("  Found: {} ({})", device_name, device_type);
+    // Open first device
+    let device_info = &devices[0];
+    println!("  Found: {} ({})", device_info.name, device_info.kind);
 
-        let backend = discovery.connect(device)?;
-        workers.push(DacWorker::new(device_name, device_type, backend));
-    }
+    let device = open_device(&device_info.id)?;
 
-    println!("\nSending {}... Press Ctrl+C to stop\n", args.shape.name());
+    // Start streaming
+    let config = StreamConfig::new(30_000);
+    let (mut stream, info) = device.start_stream(config)?;
 
-    let mut frame_count = 0usize;
+    println!(
+        "\nStreaming {} to {}... Press Ctrl+C to stop\n",
+        args.shape.name(),
+        info.name
+    );
+
+    // Arm the output (allow laser to fire)
+    stream.control().arm()?;
+
+    let mut chunk_count = 0usize;
     loop {
-        let frame = create_frame(args.shape, args.min_points, frame_count);
-        workers.iter_mut().for_each(|w| w.update());
-        let any_accepted = workers.iter_mut().any(|w| w.submit_frame(frame.clone()));
-        if any_accepted {
-            frame_count = frame_count.wrapping_add(1);
-        }
-        thread::sleep(Duration::from_millis(33));
+        let req = stream.next_request()?;
+
+        // Generate points for this chunk
+        let points = create_points(args.shape, req.n_points, chunk_count);
+
+        stream.write(&req, &points)?;
+        chunk_count = chunk_count.wrapping_add(1);
     }
 }

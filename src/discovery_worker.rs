@@ -1,13 +1,9 @@
 //! Background worker for non-blocking DAC device discovery.
 //!
 //! The `DacDiscoveryWorker` runs discovery in a background thread and produces
-//! ready-to-use worker instances as devices are found.
-//!
-//! By default, the discovery worker produces [`DacWorker`] instances. Use
-//! [`use_callback_workers()`](DacDiscoveryWorkerBuilder::use_callback_workers) to get
-//! [`DacCallbackWorker`] instances instead, where the DAC drives timing via callbacks.
+//! ready-to-use [`Device`] instances as devices are found.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 #[cfg(all(feature = "idn", feature = "testutils"))]
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::discovery::{CustomDiscoverySource, DacDiscovery, DiscoveredDeviceInfo};
-use crate::types::{DiscoveredDac, EnabledDacTypes};
-use crate::worker::{DacCallbackWorker, DacWorker, DisconnectNotifier};
+use crate::stream::Device;
+use crate::types::{DeviceInfo, EnabledDacTypes};
 
 type DeviceFilter = dyn Fn(&DiscoveredDeviceInfo) -> bool + Send + Sync + 'static;
 
@@ -36,7 +32,6 @@ pub struct DacDiscoveryWorkerBuilder {
     enabled_types: EnabledDacTypes,
     device_filter: Option<Arc<DeviceFilter>>,
     discovery_interval: Duration,
-    use_callback_workers: bool,
     custom_sources: Vec<Box<dyn CustomDiscoverySource>>,
     #[cfg(all(feature = "idn", feature = "testutils"))]
     idn_scan_addresses: Vec<SocketAddr>,
@@ -49,7 +44,6 @@ impl DacDiscoveryWorkerBuilder {
             enabled_types: EnabledDacTypes::default(),
             device_filter: None,
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
-            use_callback_workers: false,
             custom_sources: Vec::new(),
             #[cfg(all(feature = "idn", feature = "testutils"))]
             idn_scan_addresses: Vec::new(),
@@ -66,7 +60,7 @@ impl DacDiscoveryWorkerBuilder {
     ///
     /// Devices that return `false` from the filter will still be reported via
     /// `poll_discovered_devices()`, but will not be automatically connected
-    /// (and thus won't appear in `poll_new_workers()`).
+    /// (and thus won't appear in `poll_new_devices()`).
     pub fn device_filter<F>(mut self, filter: F) -> Self
     where
         F: Fn(&DiscoveredDeviceInfo) -> bool + Send + Sync + 'static,
@@ -83,33 +77,11 @@ impl DacDiscoveryWorkerBuilder {
         self
     }
 
-    /// Produce [`DacCallbackWorker`] instances instead of [`DacWorker`].
-    ///
-    /// When enabled, use [`poll_new_callback_workers()`](DacDiscoveryWorker::poll_new_callback_workers)
-    /// instead of [`poll_new_workers()`](DacDiscoveryWorker::poll_new_workers).
-    ///
-    /// The callback workers are created in an idle state - you must call
-    /// [`DacCallbackWorker::start()`] on each one to begin the callback loop.
-    pub fn use_callback_workers(mut self) -> Self {
-        self.use_callback_workers = true;
-        self
-    }
-
     /// Adds a custom discovery source.
     ///
     /// Custom sources are polled alongside built-in backends at the configured
     /// discovery interval. You can add multiple custom sources by calling this
     /// method multiple times.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use laser_dac::{DacDiscoveryWorker, CustomDiscoverySource};
-    ///
-    /// let discovery = DacDiscoveryWorker::builder()
-    ///     .add_custom_source(MyCustomSource::new())
-    ///     .build();
-    /// ```
     pub fn add_custom_source<S: CustomDiscoverySource>(mut self, source: S) -> Self {
         self.custom_sources.push(Box::new(source));
         self
@@ -132,17 +104,10 @@ impl DacDiscoveryWorkerBuilder {
     ///
     /// This initializes USB controllers, so it should be called from the main thread.
     pub fn build(self) -> DacDiscoveryWorker {
-        let (worker_tx, worker_rx) = mpsc::channel::<DacWorker>();
-        let (device_tx, device_rx) = mpsc::channel::<DiscoveredDeviceInfo>();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel::<String>();
+        let (device_out_tx, device_out_rx) = mpsc::channel::<Device>();
+        let (device_info_tx, device_info_rx) = mpsc::channel::<DiscoveredDeviceInfo>();
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
-
-        // Create callback worker channel if requested
-        let (callback_worker_tx, callback_worker_rx) = self
-            .use_callback_workers
-            .then(mpsc::channel::<DacCallbackWorker>)
-            .unzip();
 
         let device_filter = self
             .device_filter
@@ -161,11 +126,8 @@ impl DacDiscoveryWorkerBuilder {
         let handle = thread::spawn(move || {
             discovery_loop(
                 discovery,
-                worker_tx,
-                callback_worker_tx,
-                device_tx,
-                disconnect_tx,
-                disconnect_rx,
+                device_out_tx,
+                device_info_tx,
                 self.enabled_types,
                 device_filter,
                 self.discovery_interval,
@@ -175,12 +137,10 @@ impl DacDiscoveryWorkerBuilder {
         });
 
         DacDiscoveryWorker {
-            worker_rx,
-            callback_worker_rx,
-            device_rx,
+            device_rx: device_out_rx,
+            device_info_rx,
             running,
             handle: Some(handle),
-            callback_mode: self.use_callback_workers,
         }
     }
 }
@@ -195,20 +155,16 @@ impl Default for DacDiscoveryWorkerBuilder {
 ///
 /// USB enumeration and device opening happen in a dedicated thread. All discovered
 /// devices are reported via `poll_discovered_devices()`, while only devices that
-/// pass the filter are automatically connected and available via `poll_new_workers()`
-/// or `poll_new_callback_workers()` (depending on builder configuration).
+/// pass the filter are automatically connected and available via `poll_new_devices()`.
 ///
 /// Use `DacDiscoveryWorker::builder()` to create and configure a new worker.
 ///
 /// The background thread is automatically stopped when the worker is dropped.
 pub struct DacDiscoveryWorker {
-    worker_rx: Receiver<DacWorker>,
-    callback_worker_rx: Option<Receiver<DacCallbackWorker>>,
-    device_rx: Receiver<DiscoveredDeviceInfo>,
+    device_rx: Receiver<Device>,
+    device_info_rx: Receiver<DiscoveredDeviceInfo>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
-    /// Whether callback mode is enabled (for runtime validation).
-    callback_mode: bool,
 }
 
 impl DacDiscoveryWorker {
@@ -222,51 +178,16 @@ impl DacDiscoveryWorker {
     /// Returns an iterator of `DiscoveredDeviceInfo` for all devices discovered
     /// since the last call, regardless of whether they pass the device filter.
     pub fn poll_discovered_devices(&self) -> impl Iterator<Item = DiscoveredDeviceInfo> + '_ {
+        std::iter::from_fn(|| self.device_info_rx.try_recv().ok())
+    }
+
+    /// Polls for newly connected devices.
+    ///
+    /// Returns an iterator of [`Device`] handles for devices that were discovered
+    /// and passed the device filter since the last call. These devices are already
+    /// connected and ready to start streaming.
+    pub fn poll_new_devices(&self) -> impl Iterator<Item = Device> + '_ {
         std::iter::from_fn(|| self.device_rx.try_recv().ok())
-    }
-
-    /// Polls for newly connected DAC workers.
-    ///
-    /// Returns an iterator of `DacWorker` handles for devices that were discovered
-    /// and passed the device filter since the last call. These workers are already
-    /// connected and ready to receive frames.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called when [`use_callback_workers()`](DacDiscoveryWorkerBuilder::use_callback_workers)
-    /// was enabled. Use [`poll_new_callback_workers()`](Self::poll_new_callback_workers) instead.
-    pub fn poll_new_workers(&self) -> impl Iterator<Item = DacWorker> + '_ {
-        assert!(
-            !self.callback_mode,
-            "poll_new_workers() called but use_callback_workers() was enabled; \
-             use poll_new_callback_workers() instead"
-        );
-        std::iter::from_fn(|| self.worker_rx.try_recv().ok())
-    }
-
-    /// Polls for newly connected callback workers.
-    ///
-    /// Returns an iterator of `DacCallbackWorker` handles for devices that were
-    /// discovered and passed the device filter since the last call.
-    ///
-    /// These workers are connected but **not yet started** - you must call
-    /// [`DacCallbackWorker::start()`] on each one to begin the callback loop.
-    ///
-    /// # Panics
-    ///
-    /// Panics if called when [`use_callback_workers()`](DacDiscoveryWorkerBuilder::use_callback_workers)
-    /// was **not** enabled. Use [`poll_new_workers()`](Self::poll_new_workers) instead.
-    pub fn poll_new_callback_workers(&self) -> impl Iterator<Item = DacCallbackWorker> + '_ {
-        assert!(
-            self.callback_mode,
-            "poll_new_callback_workers() called but use_callback_workers() was not enabled; \
-             use poll_new_workers() instead"
-        );
-        std::iter::from_fn(|| {
-            self.callback_worker_rx
-                .as_ref()
-                .and_then(|rx| rx.try_recv().ok())
-        })
     }
 }
 
@@ -289,11 +210,8 @@ impl Drop for DacDiscoveryWorker {
 #[allow(clippy::too_many_arguments)]
 fn discovery_loop(
     mut discovery: DacDiscovery,
-    worker_tx: Sender<DacWorker>,
-    callback_worker_tx: Option<Sender<DacCallbackWorker>>,
-    device_tx: Sender<DiscoveredDeviceInfo>,
-    disconnect_tx: DisconnectNotifier,
-    disconnect_rx: Receiver<String>,
+    device_tx: Sender<Device>,
+    device_info_tx: Sender<DiscoveredDeviceInfo>,
     enabled_types: EnabledDacTypes,
     device_filter: Arc<DeviceFilter>,
     discovery_interval: Duration,
@@ -302,9 +220,6 @@ fn discovery_loop(
 ) {
     let mut reported_devices: HashSet<String> = HashSet::new();
     let mut last_discovery = Instant::now() - discovery_interval;
-
-    // Store custom devices for connection attempts (id -> DiscoveredDac)
-    let mut custom_devices: HashMap<String, DiscoveredDac> = HashMap::new();
 
     // Set initial enabled types
     discovery.set_enabled(enabled_types);
@@ -317,16 +232,10 @@ fn discovery_loop(
         }
         last_discovery = Instant::now();
 
-        // Process disconnect notifications
-        while let Ok(device_name) = disconnect_rx.try_recv() {
-            reported_devices.remove(&device_name);
-        }
-
         // Scan for built-in devices
         let devices = discovery.scan();
         for device in devices {
             let info = device.info();
-
             let name = info.name();
 
             // Skip already-reported devices
@@ -334,7 +243,7 @@ fn discovery_loop(
                 continue;
             }
 
-            if device_tx.send(info.clone()).is_err() {
+            if device_info_tx.send(info.clone()).is_err() {
                 return;
             }
             reported_devices.insert(name.clone());
@@ -352,27 +261,15 @@ fn discovery_loop(
                 }
             };
 
-            // Create callback worker or regular worker depending on mode
-            if let Some(ref tx) = callback_worker_tx {
-                let worker = DacCallbackWorker::new_with_disconnect_notifier(
-                    name.clone(),
-                    info.dac_type,
-                    backend,
-                    disconnect_tx.clone(),
-                );
-                if tx.send(worker).is_err() {
-                    return;
-                }
-            } else {
-                let worker = DacWorker::new_with_disconnect_notifier(
-                    name.clone(),
-                    info.dac_type,
-                    backend,
-                    disconnect_tx.clone(),
-                );
-                if worker_tx.send(worker).is_err() {
-                    return;
-                }
+            let device_info = DeviceInfo {
+                id: name.clone(),
+                name: name.clone(),
+                kind: info.dac_type,
+                caps: backend.caps().clone(),
+            };
+            let device = Device::new(device_info, backend);
+            if device_tx.send(device).is_err() {
+                return;
             }
         }
 
@@ -389,14 +286,13 @@ fn discovery_loop(
 
                 let info: DiscoveredDeviceInfo = (&dac).into();
 
-                if device_tx.send(info.clone()).is_err() {
+                if device_info_tx.send(info.clone()).is_err() {
                     return;
                 }
                 reported_devices.insert(id.clone());
 
                 // Only connect if filter passes
                 if !device_filter(&info) {
-                    custom_devices.insert(id, dac);
                     continue;
                 }
 
@@ -405,29 +301,16 @@ fn discovery_loop(
                     continue;
                 };
 
-                // Create callback worker or regular worker depending on mode
-                if let Some(ref tx) = callback_worker_tx {
-                    let worker = DacCallbackWorker::new_with_disconnect_notifier(
-                        id.clone(),
-                        info.dac_type.clone(),
-                        backend,
-                        disconnect_tx.clone(),
-                    );
-                    if tx.send(worker).is_err() {
-                        return;
-                    }
-                } else {
-                    let worker = DacWorker::new_with_disconnect_notifier(
-                        id.clone(),
-                        info.dac_type.clone(),
-                        backend,
-                        disconnect_tx.clone(),
-                    );
-                    if worker_tx.send(worker).is_err() {
-                        return;
-                    }
+                let device_info = DeviceInfo {
+                    id: id.clone(),
+                    name: id.clone(),
+                    kind: info.dac_type.clone(),
+                    caps: backend.caps().clone(),
+                };
+                let device = Device::new(device_info, backend);
+                if device_tx.send(device).is_err() {
+                    return;
                 }
-                custom_devices.insert(id, dac);
             }
         }
     }

@@ -1,58 +1,76 @@
-//! DAC backend abstraction and point conversion.
+//! DAC backend trait and implementations for the streaming API.
 //!
-//! Provides a unified [`DacBackend`] trait for all DAC types and handles
-//! point conversion from [`LaserFrame`] to device-specific formats.
+//! This module provides the [`StreamBackend`] trait that all DAC backends must
+//! implement, as well as implementations for all supported DAC types.
 
-use crate::error::{Error, Result};
-use crate::types::{DacType, LaserFrame};
+use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+
+// Re-export error types for backwards compatibility
+pub use crate::error::{Error, Result};
 
 // =============================================================================
-// DAC Backend Trait
+// StreamBackend Trait
 // =============================================================================
 
-/// Result of attempting to write a frame to a DAC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum WriteResult {
-    /// Frame was successfully written.
+/// Write result from a backend chunk submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The chunk was accepted and written.
     Written,
-    /// Device was busy, frame was dropped.
-    DeviceBusy,
+    /// The device cannot accept more data right now.
+    WouldBlock,
 }
 
-/// Unified interface for all DAC backends.
+/// Backend trait for streaming DAC output.
 ///
-/// Each backend handles its own point conversion and device-specific protocol.
-///
-/// Implement this trait to add support for custom DAC hardware.
-pub trait DacBackend: Send + 'static {
-    /// Get the DAC type.
+/// All backends must implement this trait to support the streaming API.
+/// The key contract is uniform backpressure: `try_write_chunk` must return
+/// `WriteOutcome::WouldBlock` when the device cannot accept more data,
+/// enabling the stream scheduler to pace output correctly.
+pub trait StreamBackend: Send + 'static {
+    /// Returns the DAC type for this backend.
     fn dac_type(&self) -> DacType;
 
-    /// Connect to the DAC.
+    /// Returns the device capabilities.
+    fn caps(&self) -> &Caps;
+
+    /// Connect to the device.
     fn connect(&mut self) -> Result<()>;
 
-    /// Disconnect from the DAC.
+    /// Disconnect from the device.
     fn disconnect(&mut self) -> Result<()>;
 
-    /// Check if connected to the DAC.
+    /// Returns whether the device is connected.
     fn is_connected(&self) -> bool;
 
-    /// Write a frame to the DAC.
+    /// Attempt to write a chunk of points at the given PPS.
     ///
-    /// Returns `Ok(WriteResult::Written)` on success, `Ok(WriteResult::DeviceBusy)`
-    /// if the device couldn't accept the frame, or `Err` on connection failure.
-    fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult>;
+    /// # Contract
+    ///
+    /// This is the core backpressure mechanism. Implementations must:
+    ///
+    /// 1. Return `WriteOutcome::WouldBlock` when the device cannot accept more data
+    ///    (buffer full, not ready, etc.).
+    /// 2. Return `WriteOutcome::Written` when the chunk was accepted.
+    /// 3. Return `Err(...)` only for actual errors (disconnection, protocol errors).
+    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome>;
 
-    /// Stop laser output.
+    /// Stop output (if supported by the device).
     fn stop(&mut self) -> Result<()>;
 
-    /// Set shutter state (open = laser enabled, closed = laser disabled).
+    /// Open/close the shutter (if supported by the device).
     fn set_shutter(&mut self, open: bool) -> Result<()>;
+
+    /// Best-effort estimate of points currently queued in the device.
+    ///
+    /// Not all devices can report this. Return `None` if unavailable.
+    fn queued_points(&self) -> Option<u64> {
+        None
+    }
 }
 
 // =============================================================================
-// Conditional Backend Implementations
+// Helios Backend
 // =============================================================================
 
 #[cfg(feature = "helios")]
@@ -66,6 +84,7 @@ mod helios_backend {
     pub struct HeliosBackend {
         dac: Option<HeliosDac>,
         device_index: usize,
+        caps: Caps,
     }
 
     impl HeliosBackend {
@@ -74,6 +93,7 @@ mod helios_backend {
             Self {
                 dac: None,
                 device_index,
+                caps: caps_for_dac_type(&DacType::Helios),
             }
         }
 
@@ -82,43 +102,58 @@ mod helios_backend {
             Self {
                 dac: Some(dac),
                 device_index: 0,
+                caps: caps_for_dac_type(&DacType::Helios),
             }
         }
 
         /// Discover all Helios DACs on the system.
         pub fn discover() -> Result<Vec<HeliosDac>> {
-            let controller = HeliosDacController::new()
-                .map_err(|e| Error::context("Failed to create controller", e))?;
-            controller
-                .list_devices()
-                .map_err(|e| Error::context("Failed to list devices", e))
+            let controller =
+                HeliosDacController::new().map_err(|e| Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create controller: {}", e),
+                )))?;
+            controller.list_devices().map_err(|e| Error::backend(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to list devices: {}", e),
+            )))
         }
     }
 
-    impl DacBackend for HeliosBackend {
+    impl StreamBackend for HeliosBackend {
         fn dac_type(&self) -> DacType {
             DacType::Helios
+        }
+
+        fn caps(&self) -> &Caps {
+            &self.caps
         }
 
         fn connect(&mut self) -> Result<()> {
             if let Some(dac) = self.dac.take() {
                 // Already have a DAC, try to open it if idle
-                self.dac = Some(
-                    dac.open()
-                        .map_err(|e| Error::context("Failed to open device", e))?,
-                );
+                self.dac = Some(dac.open().map_err(|e| {
+                    Error::backend(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to open device: {}", e),
+                    ))
+                })?);
                 return Ok(());
             }
 
             // Discover and open the device at the specified index
-            let controller = HeliosDacController::new()
-                .map_err(|e| Error::context("Failed to create controller", e))?;
-            let mut dacs = controller
-                .list_devices()
-                .map_err(|e| Error::context("Failed to list devices", e))?;
+            let controller =
+                HeliosDacController::new().map_err(|e| Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to create controller: {}", e),
+                )))?;
+            let mut dacs = controller.list_devices().map_err(|e| Error::backend(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to list devices: {}", e),
+            )))?;
 
             if self.device_index >= dacs.len() {
-                return Err(Error::msg(format!(
+                return Err(Error::disconnected(format!(
                     "Device index {} out of range (found {} devices)",
                     self.device_index,
                     dacs.len()
@@ -126,15 +161,17 @@ mod helios_backend {
             }
 
             let dac = dacs.remove(self.device_index);
-            let dac = dac
-                .open()
-                .map_err(|e| Error::context("Failed to open device", e))?;
+            let dac = dac.open().map_err(|e| {
+                Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to open device: {}", e),
+                ))
+            })?;
             self.dac = Some(dac);
             Ok(())
         }
 
         fn disconnect(&mut self) -> Result<()> {
-            // HeliosDac doesn't have an explicit close; it closes when dropped
             self.dac = None;
             Ok(())
         }
@@ -143,41 +180,52 @@ mod helios_backend {
             matches!(self.dac, Some(HeliosDac::Open { .. }))
         }
 
-        fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult> {
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let dac = self
                 .dac
                 .as_mut()
-                .ok_or_else(|| Error::msg("Not connected"))?;
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
 
             // Check device status
             match dac.status() {
                 Ok(DeviceStatus::Ready) => {}
-                Ok(DeviceStatus::NotReady) => return Ok(WriteResult::DeviceBusy),
-                Err(e) => return Err(Error::context("Failed to get status", e)),
+                Ok(DeviceStatus::NotReady) => return Ok(WriteOutcome::WouldBlock),
+                Err(e) => {
+                    return Err(Error::backend(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to get status: {}", e),
+                    )))
+                }
             }
 
-            // Convert LaserFrame to Helios Frame
-            let helios_points: Vec<HeliosPoint> = frame.points.iter().map(|p| p.into()).collect();
+            // Convert LaserPoints to Helios Points
+            let helios_points: Vec<HeliosPoint> = points.iter().map(|p| p.into()).collect();
+            let helios_frame = Frame::new(pps, helios_points);
 
-            let helios_frame = Frame::new(frame.pps, helios_points);
+            dac.write_frame(helios_frame).map_err(|e| {
+                Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to write frame: {}", e),
+                ))
+            })?;
 
-            dac.write_frame(helios_frame)
-                .map_err(|e| Error::context("Failed to write frame", e))?;
-
-            Ok(WriteResult::Written)
+            Ok(WriteOutcome::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
             if let Some(dac) = &self.dac {
-                dac.stop()
-                    .map_err(|e| Error::context("Failed to stop", e))?;
+                dac.stop().map_err(|e| {
+                    Error::backend(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to stop: {}", e),
+                    ))
+                })?;
             }
             Ok(())
         }
 
         fn set_shutter(&mut self, _open: bool) -> Result<()> {
-            // The helios-dac crate doesn't expose a shutter control method
-            // Shutter state is implicitly controlled by output state
+            // Helios doesn't have explicit shutter control
             Ok(())
         }
     }
@@ -185,6 +233,10 @@ mod helios_backend {
 
 #[cfg(feature = "helios")]
 pub use helios_backend::HeliosBackend;
+
+// =============================================================================
+// Ether Dream Backend
+// =============================================================================
 
 #[cfg(feature = "ether-dream")]
 mod ether_dream_backend {
@@ -199,6 +251,7 @@ mod ether_dream_backend {
         broadcast: DacBroadcast,
         ip_addr: IpAddr,
         stream: Option<stream::Stream>,
+        caps: Caps,
     }
 
     impl EtherDreamBackend {
@@ -207,19 +260,24 @@ mod ether_dream_backend {
                 broadcast,
                 ip_addr,
                 stream: None,
+                caps: caps_for_dac_type(&DacType::EtherDream),
             }
         }
     }
 
-    impl DacBackend for EtherDreamBackend {
+    impl StreamBackend for EtherDreamBackend {
         fn dac_type(&self) -> DacType {
             DacType::EtherDream
+        }
+
+        fn caps(&self) -> &Caps {
+            &self.caps
         }
 
         fn connect(&mut self) -> Result<()> {
             let stream =
                 stream::connect_timeout(&self.broadcast, self.ip_addr, Duration::from_secs(5))
-                    .map_err(|e| Error::context("Failed to connect", e))?;
+                    .map_err(|e| Error::backend(e))?;
 
             self.stream = Some(stream);
             Ok(())
@@ -237,18 +295,18 @@ mod ether_dream_backend {
             self.stream.is_some()
         }
 
-        fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult> {
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let stream = self
                 .stream
                 .as_mut()
-                .ok_or_else(|| Error::msg("Not connected"))?;
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-            let points: Vec<DacPoint> = frame.points.iter().map(|p| p.into()).collect();
-            if points.is_empty() {
-                return Ok(WriteResult::DeviceBusy);
+            let dac_points: Vec<DacPoint> = points.iter().map(|p| p.into()).collect();
+            if dac_points.is_empty() {
+                return Ok(WriteOutcome::WouldBlock);
             }
 
-            // Check light engine state first - must handle emergency stop before any other operations
+            // Check light engine state
             let light_engine = stream.dac().status.light_engine;
 
             match light_engine {
@@ -257,25 +315,22 @@ mod ether_dream_backend {
                         .queue_commands()
                         .clear_emergency_stop()
                         .submit()
-                        .map_err(|e| Error::context("Failed to clear emergency stop", e))?;
+                        .map_err(|e| Error::backend(e))?;
 
-                    // Ping to refresh state
                     stream
                         .queue_commands()
                         .ping()
                         .submit()
-                        .map_err(|e| Error::context("Failed to ping after clearing e-stop", e))?;
+                        .map_err(|e| Error::backend(e))?;
 
-                    // Check if e-stop cleared
                     if stream.dac().status.light_engine == LightEngine::EmergencyStop {
-                        return Err(Error::msg(
+                        return Err(Error::disconnected(
                             "DAC stuck in emergency stop - check hardware interlock",
                         ));
                     }
-                    // Fall through - DAC should now be in Ready state, playback will be Idle
                 }
                 LightEngine::Warmup | LightEngine::Cooldown => {
-                    return Ok(WriteResult::DeviceBusy);
+                    return Ok(WriteOutcome::WouldBlock);
                 }
                 LightEngine::Ready => {}
             }
@@ -286,11 +341,11 @@ mod ether_dream_backend {
             let available = buffer_capacity as usize - buffer_fullness as usize - 1;
 
             if available == 0 {
-                return Ok(WriteResult::DeviceBusy);
+                return Ok(WriteOutcome::WouldBlock);
             }
 
-            let point_rate = if frame.pps > 0 {
-                frame.pps
+            let point_rate = if pps > 0 {
+                pps
             } else {
                 stream.dac().max_point_rate / 16
             };
@@ -300,9 +355,9 @@ mod ether_dream_backend {
                 (point_rate / 20).max(MIN_POINTS_BEFORE_BEGIN as u32) as usize;
             let target_len = target_buffer_points
                 .min(available)
-                .max(points.len().min(available));
+                .max(dac_points.len().min(available));
 
-            let mut points_to_send = points;
+            let mut points_to_send = dac_points;
             if points_to_send.len() > available {
                 points_to_send.truncate(available);
             } else if points_to_send.len() < target_len {
@@ -320,103 +375,105 @@ mod ether_dream_backend {
                     .queue_commands()
                     .prepare_stream()
                     .submit()
-                    .map_err(|e| Error::context("Failed to recover stream", e))?;
+                    .map_err(|e| Error::backend(e))?;
                 force_begin = true;
             }
 
-            let result =
-                if force_begin {
-                    // After underflow recovery, send data first, then begin separately
+            let result = if force_begin {
+                stream
+                    .queue_commands()
+                    .data(points_to_send.clone())
+                    .submit()
+                    .map_err(|e| Error::backend(e))?;
+
+                let buffer_fullness = stream.dac().status.buffer_fullness;
+
+                if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
                     stream
                         .queue_commands()
-                        .data(points_to_send.clone())
+                        .begin(0, point_rate)
                         .submit()
-                        .map_err(|e| Error::context("Failed to send data", e))?;
-
-                    // Check buffer fullness after sending data
-                    let buffer_fullness = stream.dac().status.buffer_fullness;
-
-                    if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
-                        stream.queue_commands().begin(0, point_rate).submit()
-                    } else {
-                        Ok(())
-                    }
+                        .map_err(|e| Error::backend(e))
                 } else {
-                    match playback {
-                        Playback::Idle | Playback::Prepared => {
-                            if playback == Playback::Idle {
+                    Ok(())
+                }
+            } else {
+                match playback {
+                    Playback::Idle | Playback::Prepared => {
+                        if playback == Playback::Idle {
+                            stream
+                                .queue_commands()
+                                .prepare_stream()
+                                .submit()
+                                .map_err(|e| Error::backend(e))?;
+                        }
+
+                        stream
+                            .queue_commands()
+                            .data(points_to_send.clone())
+                            .submit()
+                            .map_err(|e| Error::backend(e))?;
+
+                        let buffer_fullness = stream.dac().status.buffer_fullness;
+                        if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
+                            stream
+                                .queue_commands()
+                                .begin(0, point_rate)
+                                .submit()
+                                .map_err(|e| Error::backend(e))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Playback::Playing => {
+                        let send_result = if current_point_rate != point_rate {
+                            stream
+                                .queue_commands()
+                                .update(0, point_rate)
+                                .data(points_to_send.clone())
+                                .submit()
+                        } else {
+                            stream.queue_commands().data(points_to_send.clone()).submit()
+                        };
+
+                        if send_result.is_err() {
+                            let current_playback = stream.dac().status.playback;
+
+                            if current_playback == Playback::Idle {
                                 stream
                                     .queue_commands()
                                     .prepare_stream()
                                     .submit()
-                                    .map_err(|e| Error::context("Failed to prepare stream", e))?;
-                            }
+                                    .map_err(|e| Error::backend(e))?;
 
-                            stream
-                                .queue_commands()
-                                .data(points_to_send.clone())
-                                .submit()
-                                .map_err(|e| Error::context("Failed to send data", e))?;
-
-                            let buffer_fullness = stream.dac().status.buffer_fullness;
-                            if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
-                                stream.queue_commands().begin(0, point_rate).submit()
-                            } else {
-                                Ok(())
-                            }
-                        }
-                        Playback::Playing => {
-                            let send_result = if current_point_rate != point_rate {
-                                stream
-                                    .queue_commands()
-                                    .update(0, point_rate)
-                                    .data(points_to_send.clone())
-                                    .submit()
-                            } else {
                                 stream
                                     .queue_commands()
                                     .data(points_to_send.clone())
                                     .submit()
-                            };
+                                    .map_err(|e| Error::backend(e))?;
 
-                            // Handle underflow: if DAC went Idle while we thought it was Playing,
-                            // we get NAK_INVALID. Recover by re-preparing the stream.
-                            if send_result.is_err() {
-                                let current_playback = stream.dac().status.playback;
-
-                                if current_playback == Playback::Idle {
-                                    // DAC underflowed and went back to Idle - need full restart
-                                    stream.queue_commands().prepare_stream().submit().map_err(
-                                        |e| Error::context("Failed to recover from underflow", e),
-                                    )?;
-
+                                let buffer_fullness = stream.dac().status.buffer_fullness;
+                                if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
                                     stream
                                         .queue_commands()
-                                        .data(points_to_send.clone())
+                                        .begin(0, point_rate)
                                         .submit()
-                                        .map_err(|e| {
-                                            Error::context("Failed to send data after recovery", e)
-                                        })?;
-
-                                    let buffer_fullness = stream.dac().status.buffer_fullness;
-                                    if buffer_fullness >= MIN_POINTS_BEFORE_BEGIN {
-                                        stream.queue_commands().begin(0, point_rate).submit()
-                                    } else {
-                                        Ok(())
-                                    }
+                                        .map_err(|e| Error::backend(e))
                                 } else {
-                                    // Some other error - propagate it
-                                    send_result
+                                    Ok(())
                                 }
                             } else {
-                                send_result
+                                send_result.map_err(|e| Error::backend(e))
                             }
+                        } else {
+                            send_result.map_err(|e| Error::backend(e))
                         }
                     }
-                };
+                }
+            };
 
-            result.map_err(|e| Error::context("Failed to write frame", e))?;
-            Ok(WriteResult::Written)
+            result?;
+            Ok(WriteOutcome::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
@@ -425,7 +482,7 @@ mod ether_dream_backend {
                     .queue_commands()
                     .stop()
                     .submit()
-                    .map_err(|e| Error::context("Failed to stop", e))?;
+                    .map_err(|e| Error::backend(e))?;
             }
             Ok(())
         }
@@ -433,11 +490,21 @@ mod ether_dream_backend {
         fn set_shutter(&mut self, _open: bool) -> Result<()> {
             Ok(())
         }
+
+        fn queued_points(&self) -> Option<u64> {
+            self.stream
+                .as_ref()
+                .map(|s| s.dac().status.buffer_fullness as u64)
+        }
     }
 }
 
 #[cfg(feature = "ether-dream")]
 pub use ether_dream_backend::EtherDreamBackend;
+
+// =============================================================================
+// IDN Backend
+// =============================================================================
 
 #[cfg(feature = "idn")]
 mod idn_backend {
@@ -452,6 +519,7 @@ mod idn_backend {
         server: ServerInfo,
         service: ServiceInfo,
         stream: Option<stream::Stream>,
+        caps: Caps,
     }
 
     impl IdnBackend {
@@ -460,18 +528,23 @@ mod idn_backend {
                 server,
                 service,
                 stream: None,
+                caps: caps_for_dac_type(&DacType::Idn),
             }
         }
     }
 
-    impl DacBackend for IdnBackend {
+    impl StreamBackend for IdnBackend {
         fn dac_type(&self) -> DacType {
             DacType::Idn
         }
 
+        fn caps(&self) -> &Caps {
+            &self.caps
+        }
+
         fn connect(&mut self) -> Result<()> {
             let stream = stream::connect(&self.server, self.service.service_id)
-                .map_err(|e| Error::context("Failed to connect", e))?;
+                .map_err(|e| Error::backend(e))?;
 
             self.stream = Some(stream);
             Ok(())
@@ -489,34 +562,31 @@ mod idn_backend {
             self.stream.is_some()
         }
 
-        fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult> {
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let stream = self
                 .stream
                 .as_mut()
-                .ok_or_else(|| Error::msg("Not connected"))?;
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-            // Check if we need to send keepalive to verify server is still reachable
-            // (IDN uses UDP, so write_frame won't detect connection loss)
+            // Check if we need to send keepalive
             if stream.needs_keepalive() {
                 match stream.ping(Duration::from_millis(200)) {
-                    Ok(_) => {} // Server is alive
+                    Ok(_) => {}
                     Err(CommunicationError::Response(ResponseError::Timeout)) => {
-                        return Err(Error::msg("Connection lost: ping timeout"));
+                        return Err(Error::disconnected("Connection lost: ping timeout"));
                     }
                     Err(e) => {
-                        return Err(Error::context("Connection lost", e));
+                        return Err(Error::backend(e));
                     }
                 }
             }
 
-            stream.set_scan_speed(frame.pps);
-            let points: Vec<PointXyrgbi> = frame.points.iter().map(|p| p.into()).collect();
+            stream.set_scan_speed(pps);
+            let idn_points: Vec<PointXyrgbi> = points.iter().map(|p| p.into()).collect();
 
-            stream
-                .write_frame(&points)
-                .map_err(|e| Error::context("Failed to write frame", e))?;
+            stream.write_frame(&idn_points).map_err(|e| Error::backend(e))?;
 
-            Ok(WriteResult::Written)
+            Ok(WriteOutcome::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
@@ -536,6 +606,10 @@ mod idn_backend {
 #[cfg(feature = "idn")]
 pub use idn_backend::IdnBackend;
 
+// =============================================================================
+// LaserCube WiFi Backend
+// =============================================================================
+
 #[cfg(feature = "lasercube-wifi")]
 mod lasercube_wifi_backend {
     use super::*;
@@ -547,6 +621,7 @@ mod lasercube_wifi_backend {
     pub struct LasercubeWifiBackend {
         addressed: Addressed,
         stream: Option<stream::Stream>,
+        caps: Caps,
     }
 
     impl LasercubeWifiBackend {
@@ -554,6 +629,7 @@ mod lasercube_wifi_backend {
             Self {
                 addressed,
                 stream: None,
+                caps: caps_for_dac_type(&DacType::LasercubeWifi),
             }
         }
 
@@ -562,14 +638,18 @@ mod lasercube_wifi_backend {
         }
     }
 
-    impl DacBackend for LasercubeWifiBackend {
+    impl StreamBackend for LasercubeWifiBackend {
         fn dac_type(&self) -> DacType {
             DacType::LasercubeWifi
         }
 
+        fn caps(&self) -> &Caps {
+            &self.caps
+        }
+
         fn connect(&mut self) -> Result<()> {
-            let stream = stream::connect(&self.addressed)
-                .map_err(|e| Error::context("Failed to connect", e))?;
+            let stream =
+                stream::connect(&self.addressed).map_err(|e| Error::backend(e))?;
 
             self.stream = Some(stream);
             Ok(())
@@ -587,43 +667,49 @@ mod lasercube_wifi_backend {
             self.stream.is_some()
         }
 
-        fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult> {
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let stream = self
                 .stream
                 .as_mut()
-                .ok_or_else(|| Error::msg("Not connected"))?;
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-            let points: Vec<LasercubePoint> = frame.points.iter().map(|p| p.into()).collect();
+            let lc_points: Vec<LasercubePoint> = points.iter().map(|p| p.into()).collect();
 
             stream
-                .write_frame(&points, frame.pps)
-                .map_err(|e| Error::context("Failed to write frame", e))?;
+                .write_frame(&lc_points, pps)
+                .map_err(|e| Error::backend(e))?;
 
-            Ok(WriteResult::Written)
+            Ok(WriteOutcome::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
             if let Some(stream) = &mut self.stream {
-                stream
-                    .stop()
-                    .map_err(|e| Error::context("Failed to stop", e))?;
+                stream.stop().map_err(|e| Error::backend(e))?;
             }
             Ok(())
         }
 
         fn set_shutter(&mut self, open: bool) -> Result<()> {
             if let Some(stream) = &mut self.stream {
-                stream
-                    .set_output(open)
-                    .map_err(|e| Error::context("Failed to set shutter", e))?;
+                stream.set_output(open).map_err(|e| Error::backend(e))?;
             }
             Ok(())
+        }
+
+        fn queued_points(&self) -> Option<u64> {
+            // LaserCube WiFi reports free buffer space, but we don't know the max buffer size
+            // to calculate used points. Return None for now.
+            None
         }
     }
 }
 
 #[cfg(feature = "lasercube-wifi")]
 pub use lasercube_wifi_backend::LasercubeWifiBackend;
+
+// =============================================================================
+// LaserCube USB Backend
+// =============================================================================
 
 #[cfg(feature = "lasercube-usb")]
 mod lasercube_usb_backend {
@@ -636,6 +722,7 @@ mod lasercube_usb_backend {
     pub struct LasercubeUsbBackend {
         device: Option<rusb::Device<rusb::Context>>,
         stream: Option<Stream<rusb::Context>>,
+        caps: Caps,
     }
 
     impl LasercubeUsbBackend {
@@ -643,6 +730,7 @@ mod lasercube_usb_backend {
             Self {
                 device: Some(device),
                 stream: None,
+                caps: caps_for_dac_type(&DacType::LasercubeUsb),
             }
         }
 
@@ -650,17 +738,22 @@ mod lasercube_usb_backend {
             Self {
                 device: None,
                 stream: Some(stream),
+                caps: caps_for_dac_type(&DacType::LasercubeUsb),
             }
         }
 
         pub fn discover_devices() -> Result<Vec<rusb::Device<rusb::Context>>> {
-            discover_dacs().map_err(|e| Error::context("Failed to discover devices", e))
+            discover_dacs().map_err(|e| Error::backend(e))
         }
     }
 
-    impl DacBackend for LasercubeUsbBackend {
+    impl StreamBackend for LasercubeUsbBackend {
         fn dac_type(&self) -> DacType {
             DacType::LasercubeUsb
+        }
+
+        fn caps(&self) -> &Caps {
+            &self.caps
         }
 
         fn connect(&mut self) -> Result<()> {
@@ -671,14 +764,11 @@ mod lasercube_usb_backend {
             let device = self
                 .device
                 .take()
-                .ok_or_else(|| Error::msg("No device available"))?;
+                .ok_or_else(|| Error::disconnected("No device available"))?;
 
-            let mut stream =
-                Stream::open(device).map_err(|e| Error::context("Failed to open device", e))?;
+            let mut stream = Stream::open(device).map_err(|e| Error::backend(e))?;
 
-            stream
-                .enable_output()
-                .map_err(|e| Error::context("Failed to enable output", e))?;
+            stream.enable_output().map_err(|e| Error::backend(e))?;
 
             self.stream = Some(stream);
             Ok(())
@@ -696,26 +786,24 @@ mod lasercube_usb_backend {
             self.stream.is_some()
         }
 
-        fn write_frame(&mut self, frame: &LaserFrame) -> Result<WriteResult> {
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let stream = self
                 .stream
                 .as_mut()
-                .ok_or_else(|| Error::msg("Not connected"))?;
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-            let samples: Vec<LasercubeUsbSample> = frame.points.iter().map(|p| p.into()).collect();
+            let samples: Vec<LasercubeUsbSample> = points.iter().map(|p| p.into()).collect();
 
             stream
-                .write_frame(&samples, frame.pps)
-                .map_err(|e| Error::context("Failed to write frame", e))?;
+                .write_frame(&samples, pps)
+                .map_err(|e| Error::backend(e))?;
 
-            Ok(WriteResult::Written)
+            Ok(WriteOutcome::Written)
         }
 
         fn stop(&mut self) -> Result<()> {
             if let Some(stream) = &mut self.stream {
-                stream
-                    .stop()
-                    .map_err(|e| Error::context("Failed to stop", e))?;
+                stream.stop().map_err(|e| Error::backend(e))?;
             }
             Ok(())
         }
@@ -723,16 +811,19 @@ mod lasercube_usb_backend {
         fn set_shutter(&mut self, open: bool) -> Result<()> {
             if let Some(stream) = &mut self.stream {
                 if open {
-                    stream
-                        .enable_output()
-                        .map_err(|e| Error::context("Failed to enable output", e))?;
+                    stream.enable_output().map_err(|e| Error::backend(e))?;
                 } else {
-                    stream
-                        .disable_output()
-                        .map_err(|e| Error::context("Failed to disable output", e))?;
+                    stream.disable_output().map_err(|e| Error::backend(e))?;
                 }
             }
             Ok(())
+        }
+
+        fn queued_points(&self) -> Option<u64> {
+            // LaserCube USB reports free ringbuffer space, but requires &mut self
+            // and we don't know the max buffer size to calculate used points.
+            // Return None for now.
+            None
         }
     }
 }

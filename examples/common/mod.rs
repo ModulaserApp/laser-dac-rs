@@ -1,7 +1,7 @@
 //! Shared code for examples.
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{LaserFrame, LaserPoint};
+use laser_dac::LaserPoint;
 use serde::Deserialize;
 use std::f32::consts::PI;
 
@@ -36,17 +36,21 @@ impl Shape {
     }
 }
 
-pub fn create_frame(shape: Shape, min_points: usize, frame_count: usize) -> LaserFrame {
+/// Create points for the given shape.
+///
+/// The `n_points` parameter specifies the number of points to generate.
+/// The `frame_count` parameter is used for animated shapes.
+pub fn create_points(shape: Shape, n_points: usize, frame_count: usize) -> Vec<LaserPoint> {
     match shape {
-        Shape::Triangle => create_triangle_frame(min_points),
-        Shape::Circle => create_circle_frame(min_points),
-        Shape::OrbitingCircle => create_orbiting_circle_frame(min_points, frame_count),
-        Shape::TestPattern => create_test_pattern_frame(),
+        Shape::Triangle => create_triangle_points(n_points),
+        Shape::Circle => create_circle_points(n_points),
+        Shape::OrbitingCircle => create_orbiting_circle_points(n_points, frame_count),
+        Shape::TestPattern => create_test_pattern_points(n_points),
     }
 }
 
-/// Create an RGB triangle frame with proper blanking and interpolation.
-fn create_triangle_frame(min_points: usize) -> LaserFrame {
+/// Create an RGB triangle with proper blanking and interpolation.
+fn create_triangle_points(min_points: usize) -> Vec<LaserPoint> {
     let vertices = [
         (-0.5_f32, -0.5_f32, 65535_u16, 0_u16, 0_u16),
         (0.5_f32, -0.5_f32, 0_u16, 65535_u16, 0_u16),
@@ -89,11 +93,11 @@ fn create_triangle_frame(min_points: usize) -> LaserFrame {
         points.push(LaserPoint::new(x, y, r, g, b, 65535));
     }
 
-    LaserFrame::new(30000, points)
+    points
 }
 
-/// Create a rainbow circle frame.
-fn create_circle_frame(num_points: usize) -> LaserFrame {
+/// Create a rainbow circle.
+fn create_circle_points(num_points: usize) -> Vec<LaserPoint> {
     let mut points = Vec::with_capacity(num_points + 10);
 
     const BLANK_COUNT: usize = 5;
@@ -113,11 +117,11 @@ fn create_circle_frame(num_points: usize) -> LaserFrame {
         points.push(LaserPoint::new(x, y, r, g, b, 65535));
     }
 
-    LaserFrame::new(30000, points)
+    points
 }
 
 /// Create a small rainbow circle that orbits around the center.
-fn create_orbiting_circle_frame(num_points: usize, frame_count: usize) -> LaserFrame {
+fn create_orbiting_circle_points(num_points: usize, frame_count: usize) -> Vec<LaserPoint> {
     let mut points = Vec::with_capacity(num_points + 10);
 
     const BLANK_COUNT: usize = 5;
@@ -150,7 +154,7 @@ fn create_orbiting_circle_frame(num_points: usize, frame_count: usize) -> LaserF
         points.push(LaserPoint::new(x, y, r, g, b, 65535));
     }
 
-    LaserFrame::new(30000, points)
+    points
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u16, u16, u16) {
@@ -186,11 +190,12 @@ struct PatternPoint {
     b: u8,
 }
 
-fn create_test_pattern_frame() -> LaserFrame {
+fn create_test_pattern_points(n_points: usize) -> Vec<LaserPoint> {
     let json_str = include_str!("test-pattern.json");
     let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
 
-    let points: Vec<LaserPoint> = pattern_points
+    // Scale to requested number of points by repeating/truncating
+    let mut points: Vec<LaserPoint> = pattern_points
         .into_iter()
         .map(|p| {
             LaserPoint::new(
@@ -204,5 +209,19 @@ fn create_test_pattern_frame() -> LaserFrame {
         })
         .collect();
 
-    LaserFrame::new(30000, points)
+    // Repeat pattern to fill requested points
+    if points.len() < n_points {
+        let original = points.clone();
+        while points.len() < n_points {
+            for p in &original {
+                points.push(*p);
+                if points.len() >= n_points {
+                    break;
+                }
+            }
+        }
+    }
+
+    points.truncate(n_points);
+    points
 }

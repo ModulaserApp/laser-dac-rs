@@ -1,72 +1,70 @@
 //! Unified DAC backend abstraction for laser projectors.
 //!
 //! This crate provides a common interface for communicating with various
-//! laser DAC (Digital-to-Analog Converter) hardware, allowing you to write
-//! laser frames without worrying about device-specific protocols.
+//! laser DAC (Digital-to-Analog Converter) hardware using a streaming API
+//! that provides uniform pacing and backpressure across all device types.
 //!
 //! # Getting Started
 //!
-//! The easiest way to use this crate is with [`DacDiscoveryWorker`], which handles
-//! device discovery and connection in the background:
+//! The streaming API provides two modes of operation:
+//!
+//! ## Blocking Mode
+//!
+//! Use `next_request()` to get what to produce, then `write()` to send points:
 //!
 //! ```no_run
-//! use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, LaserFrame, LaserPoint};
-//! use std::thread;
-//! use std::time::Duration;
+//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint};
 //!
-//! // Start background discovery for all DAC types
-//! let discovery = DacDiscoveryWorker::builder()
-//!     .enabled_types(EnabledDacTypes::all())
-//!     .build();
+//! // Discover devices
+//! let devices = list_devices().unwrap();
+//! println!("Found {} devices", devices.len());
 //!
-//! // Collect discovered devices
-//! let mut workers = Vec::new();
-//! for _ in 0..50 {
-//!     for worker in discovery.poll_new_workers() {
-//!         println!("Found: {} ({})", worker.device_name(), worker.dac_type());
-//!         workers.push(worker);
-//!     }
-//!     thread::sleep(Duration::from_millis(100));
-//! }
+//! // Open and start streaming
+//! let device = open_device(&devices[0].id).unwrap();
+//! let config = StreamConfig::new(30_000); // 30k points per second
+//! let (mut stream, info) = device.start_stream(config).unwrap();
 //!
-//! // Create a frame (simple square)
-//! let points = vec![
-//!     LaserPoint::blanked(-0.5, -0.5),
-//!     LaserPoint::new(-0.5, -0.5, 65535, 0, 0, 65535),
-//!     LaserPoint::new(0.5, -0.5, 0, 65535, 0, 65535),
-//!     LaserPoint::new(0.5, 0.5, 0, 0, 65535, 65535),
-//!     LaserPoint::new(-0.5, 0.5, 65535, 65535, 0, 65535),
-//!     LaserPoint::new(-0.5, -0.5, 65535, 0, 0, 65535),
-//! ];
-//! let frame = LaserFrame::new(30000, points);
+//! // Arm the output (allow laser to fire)
+//! stream.control().arm().unwrap();
 //!
-//! // Send frames to all connected DACs
+//! // Streaming loop
 //! loop {
-//!     for worker in &mut workers {
-//!         worker.update();
-//!         // Returns false if previous frame hasn't been consumed yet (frame dropped)
-//!         let _accepted = worker.submit_frame(frame.clone());
-//!     }
-//!     thread::sleep(Duration::from_millis(33));
+//!     let req = stream.next_request().unwrap();
+//!
+//!     // Generate points for this chunk
+//!     let points: Vec<LaserPoint> = (0..req.n_points)
+//!         .map(|i| {
+//!             let t = (req.start.points() + i as u64) as f32 / req.pps as f32;
+//!             let angle = t * std::f32::consts::TAU;
+//!             LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535)
+//!         })
+//!         .collect();
+//!
+//!     stream.write(&req, &points).unwrap();
 //! }
 //! ```
 //!
-//! For more control over discovery and connection, use [`DacDiscovery`] directly:
+//! ## Callback Mode
+//!
+//! Use `run()` with a producer closure for simpler code:
 //!
 //! ```no_run
-//! use laser_dac::{DacDiscovery, DacWorker, EnabledDacTypes, LaserFrame, LaserPoint};
+//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest};
 //!
-//! let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-//! let devices = discovery.scan();
+//! let device = open_device("my-device").unwrap();
+//! let config = StreamConfig::new(30_000);
+//! let (stream, _info) = device.start_stream(config).unwrap();
 //!
-//! for device in devices {
-//!     let name = device.name().to_string();
-//!     let dac_type = device.dac_type();
-//!     let backend = discovery.connect(device).expect("connection failed");
-//!     let mut worker = DacWorker::new(name, dac_type, backend);
+//! stream.control().arm().unwrap();
 //!
-//!     // Use worker.update() and worker.submit_frame() in your render loop
-//! }
+//! let exit = stream.run(
+//!     |req: ChunkRequest| {
+//!         // Return Some(points) to continue, None to stop
+//!         let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+//!         Some(points)
+//!     },
+//!     |err| eprintln!("Stream error: {}", err),
+//! );
 //! ```
 //!
 //! # Supported DACs
@@ -92,31 +90,41 @@
 //!
 //! Each backend handles conversion to its native format internally.
 
+mod frame_adapter;
 pub mod backend;
 pub mod discovery;
-pub mod discovery_worker;
+mod discovery_worker;
 mod error;
 pub mod protocols;
+pub mod stream;
 pub mod types;
-pub mod worker;
 
-// Error types
+// Crate-level error types
 pub use error::{Error, Result};
 
-// Backend trait and common types
-pub use backend::{DacBackend, WriteResult};
+// Backend trait and types
+pub use backend::{StreamBackend, WriteOutcome};
 
-// Discovery and worker types
+
+// Discovery types
 pub use discovery::{CustomDiscoverySource, DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo};
 pub use discovery_worker::{DacDiscoveryWorker, DacDiscoveryWorkerBuilder};
-pub use worker::{
-    CallbackContext, CallbackError, DacCallbackWorker, DacWorker, WorkerCommand, WorkerStatus,
+
+// Core types
+pub use types::{
+    // DAC types
+    caps_for_dac_type, DacConnectionState, DacDevice, DacType, DiscoveredDac, EnabledDacTypes,
+    LaserPoint,
+    // Streaming types
+    Caps, ChunkRequest, DeviceInfo, OutputModel, RunExit, StreamConfig, StreamInstant,
+    StreamStats, StreamStatus, UnderrunPolicy,
 };
 
-// Types
-pub use types::{
-    DacConnectionState, DacDevice, DacType, DiscoveredDac, EnabledDacTypes, LaserFrame, LaserPoint,
-};
+// Stream and Device types
+pub use stream::{Device, OwnedDevice, Stream, StreamControl};
+
+// Frame adapters
+pub use frame_adapter::{Frame, FrameAdapter, FrameSource, SharedFrameAdapter};
 
 // Conditional exports based on features
 
@@ -153,3 +161,60 @@ pub use protocols::lasercube_usb;
 // Re-export rusb for consumers that need the Context type (for LaserCube USB)
 #[cfg(feature = "lasercube-usb")]
 pub use protocols::lasercube_usb::rusb;
+
+// =============================================================================
+// Device Discovery Functions
+// =============================================================================
+
+use backend::Result as BackendResult;
+
+/// List all available devices.
+///
+/// Returns device info for each discovered device, including capabilities.
+pub fn list_devices() -> BackendResult<Vec<DeviceInfo>> {
+    list_devices_filtered(&EnabledDacTypes::all())
+}
+
+/// List available devices filtered by DAC type.
+pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<Vec<DeviceInfo>> {
+    let mut discovery = DacDiscovery::new(enabled_types.clone());
+    let discovered = discovery.scan();
+
+    let mut devices = Vec::new();
+    for device in discovered {
+        let caps = caps_for_dac_type(&device.dac_type());
+        devices.push(DeviceInfo {
+            id: device.name().to_string(),
+            name: device.name().to_string(),
+            kind: device.dac_type(),
+            caps,
+        });
+    }
+
+    Ok(devices)
+}
+
+/// Open a device by ID.
+///
+/// The ID should match one returned by [`list_devices`].
+pub fn open_device(id: &str) -> BackendResult<Device> {
+    let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
+    let discovered = discovery.scan();
+
+    let device = discovered
+        .into_iter()
+        .find(|d| d.name() == id)
+        .ok_or_else(|| backend::Error::disconnected(format!("device not found: {}", id)))?;
+
+    let dac_type = device.dac_type();
+    let stream_backend = discovery.connect(device)?;
+
+    let info = DeviceInfo {
+        id: id.to_string(),
+        name: id.to_string(),
+        kind: dac_type,
+        caps: stream_backend.caps().clone(),
+    };
+
+    Ok(Device::new(info, stream_backend))
+}

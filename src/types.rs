@@ -60,23 +60,6 @@ impl LaserPoint {
     }
 }
 
-/// A DAC-agnostic laser frame with full-precision coordinates.
-#[derive(Debug, Clone, PartialEq, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct LaserFrame {
-    /// Points per second output rate
-    pub pps: u32,
-    /// Points in this frame
-    pub points: Vec<LaserPoint>,
-}
-
-impl LaserFrame {
-    /// Creates a new laser frame.
-    pub fn new(pps: u32, points: Vec<LaserPoint>) -> Self {
-        Self { pps, points }
-    }
-}
-
 /// Types of laser DAC hardware supported.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -280,6 +263,333 @@ pub struct DiscoveredDac {
     pub address: Option<String>,
     /// Additional metadata about the DAC.
     pub metadata: Option<String>,
+}
+
+// =============================================================================
+// Streaming Types
+// =============================================================================
+
+/// Device capabilities that inform the stream scheduler about safe chunk sizes and behaviors.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Caps {
+    /// Minimum points-per-second (hardware/protocol limit where known).
+    ///
+    /// A value of 1 means no known protocol constraint. Helios (7) and
+    /// Ether Dream (1) have true hardware minimums. Note that very low PPS
+    /// increases point dwell time and can produce flickery output.
+    pub pps_min: u32,
+    /// Maximum supported points-per-second (hardware limit).
+    pub pps_max: u32,
+    /// Maximum number of points allowed per chunk submission.
+    pub max_points_per_chunk: usize,
+    /// Some DACs dislike per-chunk PPS changes.
+    pub prefers_constant_pps: bool,
+    /// Best-effort: can we estimate device queue depth/latency?
+    pub can_estimate_queue: bool,
+    /// The scheduler-relevant output model.
+    pub output_model: OutputModel,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self {
+            pps_min: 1,
+            pps_max: 100_000,
+            max_points_per_chunk: 4096,
+            prefers_constant_pps: false,
+            can_estimate_queue: false,
+            output_model: OutputModel::NetworkFifo,
+        }
+    }
+}
+
+/// Get default capabilities for a DAC type.
+///
+/// This is the single source of truth for DAC capabilities, used by both
+/// device discovery (before connection) and backend implementations.
+///
+/// These are conservative "safe defaults" that should work across all models
+/// of each DAC type. For optimal performance, backends should query actual
+/// device capabilities at runtime where the protocol supports it (e.g.,
+/// LaserCube's `max_dac_rate` and ringbuffer queries).
+pub fn caps_for_dac_type(dac_type: &DacType) -> Caps {
+    match dac_type {
+        DacType::Helios => Caps {
+            pps_min: 7,
+            pps_max: 65535,
+            max_points_per_chunk: 4095,
+            prefers_constant_pps: true,
+            can_estimate_queue: false,
+            output_model: OutputModel::UsbFrameSwap,
+        },
+        DacType::EtherDream => Caps {
+            pps_min: 1,
+            pps_max: 100_000,
+            max_points_per_chunk: 1799,
+            prefers_constant_pps: true,
+            can_estimate_queue: true,
+            output_model: OutputModel::NetworkFifo,
+        },
+        // Generic IDN defaults - conservative for unknown devices.
+        // IDN has no protocol-defined pps_min (rate is derived from sampleCount/chunkDuration).
+        // Note: Helios-via-IDN (OpenIDN adapter) has different limits (pps 7-65535,
+        // max 4095 points). Consider adding DacType::HeliosIdn if needed.
+        DacType::Idn => Caps {
+            pps_min: 1,
+            pps_max: 100_000,
+            max_points_per_chunk: 4096,
+            prefers_constant_pps: false,
+            can_estimate_queue: false,
+            output_model: OutputModel::UdpTimed,
+        },
+        // LaserCube has no documented pps_min; the device accepts any u32 > 0.
+        DacType::LasercubeWifi => Caps {
+            pps_min: 1,
+            pps_max: 30_000,
+            max_points_per_chunk: 6000,
+            prefers_constant_pps: false,
+            can_estimate_queue: false,
+            output_model: OutputModel::UdpTimed,
+        },
+        DacType::LasercubeUsb => Caps {
+            pps_min: 1,
+            pps_max: 35_000,
+            max_points_per_chunk: 4096,
+            prefers_constant_pps: false,
+            can_estimate_queue: false,
+            output_model: OutputModel::UsbFrameSwap,
+        },
+        DacType::Custom(_) => Caps::default(),
+    }
+}
+
+/// The scheduler-relevant output model for a DAC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum OutputModel {
+    /// Frame swap / limited queue depth (e.g., Helios-style double-buffering).
+    UsbFrameSwap,
+    /// FIFO-ish buffer where "top up" is natural (e.g., Ether Dream-style).
+    NetworkFifo,
+    /// Timed UDP chunks where OS send may not reflect hardware pacing.
+    UdpTimed,
+}
+
+/// A point in stream time, measured in points since stream start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct StreamInstant(pub u64);
+
+impl StreamInstant {
+    /// Create a new stream instant from a point count.
+    pub fn new(points: u64) -> Self {
+        Self(points)
+    }
+
+    /// Returns the number of points since stream start.
+    pub fn points(&self) -> u64 {
+        self.0
+    }
+
+    /// Convert this instant to seconds at the given points-per-second rate.
+    pub fn as_seconds(&self, pps: u32) -> f64 {
+        self.0 as f64 / pps as f64
+    }
+
+    /// Create a stream instant from a duration in seconds at the given PPS.
+    pub fn from_seconds(seconds: f64, pps: u32) -> Self {
+        Self((seconds * pps as f64) as u64)
+    }
+
+    /// Add a number of points to this instant.
+    pub fn add_points(&self, points: u64) -> Self {
+        Self(self.0.saturating_add(points))
+    }
+
+    /// Subtract a number of points from this instant (saturating at 0).
+    pub fn sub_points(&self, points: u64) -> Self {
+        Self(self.0.saturating_sub(points))
+    }
+}
+
+impl std::ops::Add<u64> for StreamInstant {
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self::Output {
+        self.add_points(rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for StreamInstant {
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self::Output {
+        self.sub_points(rhs)
+    }
+}
+
+impl std::ops::AddAssign<u64> for StreamInstant {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 = self.0.saturating_add(rhs);
+    }
+}
+
+impl std::ops::SubAssign<u64> for StreamInstant {
+    fn sub_assign(&mut self, rhs: u64) {
+        self.0 = self.0.saturating_sub(rhs);
+    }
+}
+
+/// Configuration for starting a stream.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct StreamConfig {
+    /// Points per second output rate.
+    pub pps: u32,
+    /// Exact chunk size to request/write. If `None`, the library chooses a default.
+    pub chunk_points: Option<usize>,
+    /// Target amount of queued data expressed in points.
+    pub target_queue_points: usize,
+    /// What to do when the producer can't keep up.
+    pub underrun: UnderrunPolicy,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            pps: 30_000,
+            chunk_points: None,
+            target_queue_points: 3000,
+            underrun: UnderrunPolicy::default(),
+        }
+    }
+}
+
+impl StreamConfig {
+    /// Create a new stream configuration with the given PPS.
+    pub fn new(pps: u32) -> Self {
+        Self {
+            pps,
+            ..Default::default()
+        }
+    }
+
+    /// Set the chunk size (builder pattern).
+    pub fn with_chunk_points(mut self, chunk_points: usize) -> Self {
+        self.chunk_points = Some(chunk_points);
+        self
+    }
+
+    /// Set the target queue depth in points (builder pattern).
+    pub fn with_target_queue_points(mut self, points: usize) -> Self {
+        self.target_queue_points = points;
+        self
+    }
+
+    /// Set the underrun policy (builder pattern).
+    pub fn with_underrun(mut self, policy: UnderrunPolicy) -> Self {
+        self.underrun = policy;
+        self
+    }
+}
+
+/// Policy for what to do when the producer can't keep up with the stream.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum UnderrunPolicy {
+    /// Repeat the last chunk of points.
+    RepeatLast,
+    /// Output blanked points (laser off).
+    Blank,
+    /// Park the beam at a specific position with laser off.
+    Park { x: f32, y: f32 },
+    /// Stop the stream entirely on underrun.
+    Stop,
+}
+
+impl Default for UnderrunPolicy {
+    fn default() -> Self {
+        Self::Blank
+    }
+}
+
+/// A request from the stream for a chunk of points.
+#[derive(Clone, Debug)]
+pub struct ChunkRequest {
+    /// The stream instant at which this chunk starts.
+    pub start: StreamInstant,
+    /// The points-per-second rate for this chunk.
+    pub pps: u32,
+    /// Number of points requested for this chunk.
+    pub n_points: usize,
+    /// How many points are currently scheduled ahead of `start`.
+    pub scheduled_ahead_points: u64,
+    /// Best-effort: points reported by the device as queued.
+    pub device_queued_points: Option<u64>,
+}
+
+/// Current status of a stream.
+#[derive(Clone, Debug)]
+pub struct StreamStatus {
+    /// Whether the device is connected.
+    pub connected: bool,
+    /// The resolved chunk size chosen for this stream.
+    pub chunk_points: usize,
+    /// Library-owned scheduled amount.
+    pub scheduled_ahead_points: u64,
+    /// Best-effort device/backend estimate.
+    pub device_queued_points: Option<u64>,
+    /// Optional statistics for diagnostics.
+    pub stats: Option<StreamStats>,
+}
+
+/// Stream statistics for diagnostics and debugging.
+#[derive(Clone, Debug, Default)]
+pub struct StreamStats {
+    /// Number of times the stream underran.
+    pub underrun_count: u64,
+    /// Number of chunks that arrived late.
+    pub late_chunk_count: u64,
+    /// Number of times the device reconnected.
+    pub reconnect_count: u64,
+    /// Total chunks written since stream start.
+    pub chunks_written: u64,
+    /// Total points written since stream start.
+    pub points_written: u64,
+}
+
+/// How a callback-mode stream run ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunExit {
+    /// A stop request was issued via out-of-band control.
+    Stopped,
+    /// The producer returned `None` (graceful completion).
+    ProducerEnded,
+}
+
+/// Information about a discovered device before connection.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct DeviceInfo {
+    /// Stable, unique identifier used for (re)selecting devices.
+    pub id: String,
+    /// Human-readable name for the device.
+    pub name: String,
+    /// The type of DAC hardware.
+    pub kind: DacType,
+    /// Device capabilities.
+    pub caps: Caps,
+}
+
+impl DeviceInfo {
+    /// Create a new device info.
+    pub fn new(id: impl Into<String>, name: impl Into<String>, kind: DacType, caps: Caps) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            kind,
+            caps,
+        }
+    }
 }
 
 #[cfg(test)]

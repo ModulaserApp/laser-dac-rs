@@ -11,8 +11,8 @@ Unified DAC backend abstraction for laser projectors.
 This crate provides a complete solution for communicating with various laser DAC hardware:
 
 - **Discovery**: Automatically find connected DAC devices (USB and network)
-- **Workers**: Background threads for non-blocking frame output
-- **Backends**: Unified `DacBackend` trait for all DAC types
+- **Streaming**: Blocking and callback modes with backpressure handling
+- **Backends**: Unified interface for all DAC types
 
 This crate does not apply any additional processing on points (like blanking), except to make it compatible with the target DAC.
 
@@ -40,6 +40,10 @@ cargo run --example automatic -- circle
 cargo run --example automatic -- triangle
 # callback mode (DAC-driven timing):
 cargo run --example callback -- circle
+# frame-based mode (using FrameAdapter):
+cargo run --example frame_adapter -- circle
+# audio-reactive (requires microphone):
+cargo run --example audio
 ```
 
 The examples run continuously until you press Ctrl+C.
@@ -48,14 +52,14 @@ The examples run continuously until you press Ctrl+C.
 
 There are two discovery APIs:
 
-- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices (predicate optional), yielding ready-to-use `DacWorker` instances.
+- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices (predicate optional), yielding ready-to-use `Device` instances.
 - `DacDiscovery` is manual: you call `scan()` and decide if/when to `connect()` each `DiscoveredDevice`.
 
 `DacDiscoveryWorker` runs a background thread that:
 
 1. **Scans periodically** (default: every 2 seconds, configurable via `discovery_interval()`) for new devices across all enabled DAC types
 2. **Reports all discovered devices** via `poll_discovered_devices()` regardless of filter
-3. **Auto-connects to filtered devices** and yields ready-to-use workers via `poll_new_workers()`
+3. **Auto-connects to filtered devices** and yields ready-to-use devices via `poll_new_devices()`
 4. **Automatic reconnection** - when a device connection fails, it's removed from tracking and will reconnect on the next scan
 
 Multiple devices of the same type are supported - each is identified by a unique name (MAC address for Ether Dream, serial number for LaserCube, etc.)
@@ -77,71 +81,66 @@ for device in discovery.poll_discovered_devices() {
     println!("Found: {} ({:?})", device.name(), device.dac_type);
 }
 
-// Only filtered devices become workers
-for worker in discovery.poll_new_workers() {
-    println!("Connected: {}", worker.device_name());
+// Only filtered devices become ready-to-use Device instances
+for device in discovery.poll_new_devices() {
+    println!("Connected: {}", device.name());
+    // Start streaming with device.start_stream(config)...
 }
 ```
 
 ## Streaming Modes
 
-There are two ways to stream frames to a DAC:
+There are two ways to stream points to a DAC:
 
-### Push Mode (DacWorker)
+### Blocking Mode
 
-You control timing by calling `submit_frame()` in your main loop. Simple and works well for most cases:
+You control timing by calling `next_request()` which blocks until the DAC needs more data:
 
 ```rust
-use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, LaserFrame};
+use laser_dac::{list_devices, open_device, StreamConfig};
 
-let discovery = DacDiscoveryWorker::builder()
-    .enabled_types(EnabledDacTypes::all())
-    .build();
+let devices = list_devices()?;
+let device = open_device(&devices[0].id)?;
 
-// Get workers from discovery...
-let mut workers: Vec<_> = discovery.poll_new_workers().collect();
+let config = StreamConfig::new(30_000); // 30k points per second
+let (mut stream, info) = device.start_stream(config)?;
+
+stream.control().arm()?; // Enable laser output
 
 loop {
-    let frame = create_your_frame();
-    for worker in &mut workers {
-        worker.update();
-        // Returns false if previous frame hasn't been consumed yet (frame dropped)
-        let _accepted = worker.submit_frame(frame.clone());
-    }
-    std::thread::sleep(std::time::Duration::from_millis(33));
+    let req = stream.next_request()?; // Blocks until DAC ready
+    let points = generate_points(req.n_points);
+    stream.write(&req, &points)?;
 }
 ```
 
-### Callback Mode (DacCallbackWorker)
+### Callback Mode
 
-The DAC drives timing by invoking your callback whenever it's ready for more data. This is ideal when you want the DAC to control the frame rate, or when generating frames on-demand:
+The DAC drives timing by invoking your callback whenever it's ready for more data:
 
 ```rust
-use laser_dac::{DacCallbackWorker, CallbackError, EnabledDacTypes, LaserFrame};
-use laser_dac::discovery::DacDiscovery;
+use laser_dac::{list_devices, open_device, ChunkRequest, StreamConfig};
 
-let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-for device in discovery.scan() {
-    let name = device.name().to_string();
-    let dac_type = device.dac_type();
-    let backend = discovery.connect(device)?;
-    let mut worker = DacCallbackWorker::new(name, dac_type, backend);
+let devices = list_devices()?;
+let device = open_device(&devices[0].id)?;
 
-    worker.start(
-        // Data callback - invoked when device needs more data
-        |ctx| {
-            let frame = generate_frame(ctx.frames_written);
-            Some(frame)
-        },
-        // Error callback - invoked on connection loss
-        |err: CallbackError| {
-            eprintln!("Error: {:?}", err);
-        },
-    );
-}
+let config = StreamConfig::new(30_000);
+let (stream, info) = device.start_stream(config)?;
+
+stream.control().arm()?;
+
+let exit = stream.run(
+    // Producer callback - invoked when device needs more data
+    |req: ChunkRequest| {
+        let points = generate_points(req.n_points);
+        Some(points) // Return None to stop
+    },
+    // Error callback
+    |err| eprintln!("Stream error: {}", err),
+)?;
 ```
 
-The callback receives a context with `frames_written` count. Return `Some(frame)` to send data, or `None` to signal completion.
+Return `Some(points)` to continue streaming, or `None` to signal completion.
 
 ## Coordinate System
 
@@ -155,13 +154,15 @@ Each backend handles conversion to its native format internally.
 
 ## Data Types
 
-| Type                 | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `LaserFrame`         | Collection of points + PPS rate                  |
-| `LaserPoint`         | Single point with position (f32) and color (u16) |
-| `DacType`            | Enum of supported DAC hardware                   |
-| `DacDevice`          | Device name + type                               |
-| `DacConnectionState` | Connected or Lost state                          |
+| Type           | Description                                      |
+| -------------- | ------------------------------------------------ |
+| `DeviceInfo`   | Device metadata (name, type, capabilities)       |
+| `Device`       | Opened device ready for streaming                |
+| `Stream`       | Active streaming session                         |
+| `StreamConfig` | Stream settings (PPS, chunk size)                |
+| `ChunkRequest` | Request for points from the DAC                  |
+| `LaserPoint`   | Single point with position (f32) and color (u16) |
+| `DacType`      | Enum of supported DAC hardware                   |
 
 ## Features
 

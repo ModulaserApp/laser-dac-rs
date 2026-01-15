@@ -1,52 +1,67 @@
 //! Automatic discovery example using DacDiscoveryWorker.
 //!
-//! This is the easiest way to use this crate - background discovery
-//! automatically finds and connects to DAC devices.
+//! This example demonstrates background discovery that automatically
+//! finds and connects to DAC devices. The worker runs in a background
+//! thread and yields ready-to-use Device instances.
 //!
 //! Run with: `cargo run --example automatic -- [triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_frame, Args};
-use laser_dac::{DacDiscoveryWorker, EnabledDacTypes};
+use common::{create_points, Args};
+use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, StreamConfig, Result};
 use std::thread;
 use std::time::Duration;
 
-fn main() {
+fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("Starting DAC discovery...");
+    println!("Starting background discovery...\n");
+
+    // Create a discovery worker that scans in the background
     let discovery = DacDiscoveryWorker::builder()
         .enabled_types(EnabledDacTypes::all())
         .build();
 
-    let mut workers = Vec::new();
-    println!("Scanning for 5 seconds...\n");
+    // Wait for a device to be discovered and connected
+    println!("Scanning for DACs (5 seconds)...\n");
+    let mut device = None;
     for _ in 0..50 {
-        for worker in discovery.poll_new_workers() {
-            println!("  Found: {} ({})", worker.device_name(), worker.dac_type());
-            workers.push(worker);
+        // poll_new_devices() returns already-connected Device instances
+        if let Some(d) = discovery.poll_new_devices().next() {
+            device = Some(d);
+            break;
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    if workers.is_empty() {
+    let Some(device) = device else {
         println!("No DACs found.");
-        return;
-    }
+        return Ok(());
+    };
 
-    println!("\nSending {}... Press Ctrl+C to stop\n", args.shape.name());
+    println!("  Connected: {} ({})", device.info().name, device.info().kind);
 
-    let mut frame_count = 0usize;
+    // Start streaming
+    let config = StreamConfig::new(30_000);
+    let (mut stream, info) = device.start_stream(config)?;
+
+    println!(
+        "\nStreaming {} to {}... Press Ctrl+C to stop\n",
+        args.shape.name(),
+        info.name
+    );
+
+    // Arm the output
+    stream.control().arm()?;
+
+    let mut chunk_count = 0usize;
     loop {
-        let frame = create_frame(args.shape, args.min_points, frame_count);
-        workers.iter_mut().for_each(|w| w.update());
-        let any_accepted = workers.iter_mut().any(|w| w.submit_frame(frame.clone()));
-        if any_accepted {
-            frame_count = frame_count.wrapping_add(1);
-        }
-        thread::sleep(Duration::from_millis(33));
+        let req = stream.next_request()?;
+        let points = create_points(args.shape, req.n_points, chunk_count);
+        stream.write(&req, &points)?;
+        chunk_count = chunk_count.wrapping_add(1);
     }
 }

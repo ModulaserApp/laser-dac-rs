@@ -1,6 +1,6 @@
-//! Callback-based example using DacCallbackWorker.
+//! Callback-based example using Stream::run().
 //!
-//! This demonstrates the callback/pull approach where the DAC drives timing.
+//! This demonstrates the callback/pull approach where the stream drives timing.
 //! The callback is invoked whenever the device is ready for more data.
 //!
 //! Run with: `cargo run --example callback -- [triangle|circle]`
@@ -8,84 +8,70 @@
 mod common;
 
 use clap::Parser;
-use common::{create_frame, Args};
-use laser_dac::discovery::DacDiscovery;
-use laser_dac::{CallbackError, DacCallbackWorker, EnabledDacTypes, Result};
+use common::{create_points, Args};
+use laser_dac::{list_devices, open_device, ChunkRequest, StreamConfig, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
 
     println!("Scanning for DACs...\n");
-    let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    let devices = discovery.scan();
+    let devices = list_devices()?;
 
     if devices.is_empty() {
         println!("No DACs found.");
         return Ok(());
     }
 
-    // Track total frames written across all workers
-    let total_frames = Arc::new(AtomicU64::new(0));
+    // Open first device
+    let device_info = &devices[0];
+    println!("  Found: {} ({})", device_info.name, device_info.kind);
 
-    let mut workers = Vec::new();
-    for device in devices {
-        let device_name = device.name().to_string();
-        let device_type = device.dac_type();
-        println!("  Found: {} ({})", device_name, device_type);
+    let device = open_device(&device_info.id)?;
 
-        let backend = discovery.connect(device)?;
+    // Track chunks written
+    let chunk_count = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&chunk_count);
 
-        // Phase 1: Create worker (connected but not running)
-        let mut worker = DacCallbackWorker::new(device_name.clone(), device_type, backend);
-
-        // Phase 2: Start with callbacks
-        let shape = args.shape;
-        let min_points = args.min_points;
-        let counter = Arc::clone(&total_frames);
-        let name_for_error = device_name;
-
-        worker.start(
-            // Data callback - invoked when device needs more data
-            move |ctx| {
-                counter.fetch_add(1, Ordering::Relaxed);
-                let frame = create_frame(shape, min_points, ctx.frames_written as usize);
-                Some(frame)
-            },
-            // Error callback - invoked on connection loss or panic
-            move |err: CallbackError| {
-                eprintln!("Error on {}: {:?}", name_for_error, err);
-            },
-        );
-
-        workers.push(worker);
-    }
+    // Start streaming
+    let config = StreamConfig::new(30_000);
+    let (stream, info) = device.start_stream(config)?;
 
     println!(
-        "\nStreaming {} via callback... Press Ctrl+C to stop\n",
-        args.shape.name()
+        "\nStreaming {} via callback to {}... Press Ctrl+C to stop\n",
+        args.shape.name(),
+        info.name
     );
 
-    // Main loop just monitors status - the callbacks do the real work
-    loop {
-        workers.iter_mut().for_each(|w| w.update());
-        let any_alive = workers.iter().any(|w| w.is_running());
+    // Arm the output
+    stream.control().arm()?;
 
-        // Print frame count periodically
-        let frames = total_frames.load(Ordering::Relaxed);
-        print!("\rFrames sent: {}", frames);
+    let shape = args.shape;
 
-        if !any_alive {
-            println!("\nAll workers stopped.");
-            break;
-        }
+    // Run in callback mode
+    let exit = stream.run(
+        // Producer callback - invoked when device needs more data
+        move |req: ChunkRequest| {
+            let count = counter.fetch_add(1, Ordering::Relaxed);
+            let points = create_points(shape, req.n_points, count as usize);
 
-        thread::sleep(Duration::from_millis(100));
-    }
+            // Print progress periodically
+            if count % 100 == 0 {
+                println!("Chunks sent: {}", count);
+            }
+
+            Some(points)
+        },
+        // Error callback
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
+
+    println!("\nStream ended: {:?}", exit);
+    println!("Total chunks: {}", chunk_count.load(Ordering::Relaxed));
 
     Ok(())
 }

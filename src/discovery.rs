@@ -7,8 +7,7 @@ use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use crate::backend::DacBackend;
-use crate::error::{Error, Result};
+use crate::backend::{Error, Result, StreamBackend};
 use crate::types::{DacType, DiscoveredDac, EnabledDacTypes};
 
 // Feature-gated imports from internal protocol modules
@@ -33,9 +32,9 @@ use crate::protocols::idn::dac::ServerInfo as IdnServerInfo;
 use crate::protocols::idn::dac::ServiceInfo as IdnServiceInfo;
 #[cfg(feature = "idn")]
 use crate::protocols::idn::scan_for_servers;
-#[cfg(feature = "idn")]
+#[cfg(all(feature = "idn", feature = "testutils"))]
 use crate::protocols::idn::ServerScanner;
-#[cfg(feature = "idn")]
+#[cfg(all(feature = "idn", feature = "testutils"))]
 use std::net::SocketAddr;
 
 #[cfg(feature = "lasercube-wifi")]
@@ -85,7 +84,7 @@ use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 ///         }]
 ///     }
 ///
-///     fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn DacBackend>> {
+///     fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn StreamBackend>> {
 ///         // Return your backend implementation
 ///         // Some(Box::new(MyCustomBackend::new(device)))
 ///         None
@@ -104,9 +103,9 @@ use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 ///     .add_custom_source(MyCustomDiscovery::new())
 ///     .build();
 ///
-/// // Poll for workers as usual
-/// for worker in discovery.poll_new_workers() {
-///     println!("Found: {}", worker.device_name());
+/// // Poll for devices as usual
+/// for device in discovery.poll_new_devices() {
+///     println!("Found: {}", device.name());
 /// }
 /// ```
 pub trait CustomDiscoverySource: Send + 'static {
@@ -117,12 +116,12 @@ pub trait CustomDiscoverySource: Send + 'static {
     /// based on the device's `id` field.
     fn poll_devices(&mut self) -> Vec<DiscoveredDac>;
 
-    /// Create a backend for connecting to a discovered device.
+    /// Create a streaming backend for connecting to a discovered device.
     ///
     /// Called when the discovery worker wants to connect to a device that
     /// passed the device filter. Return `None` if the device is no longer
     /// available or connection failed.
-    fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn DacBackend>>;
+    fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn StreamBackend>>;
 }
 
 // =============================================================================
@@ -305,9 +304,9 @@ impl HeliosDiscovery {
     }
 
     /// Connect to a discovered Helios device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::Helios(dac) = device.inner else {
-            return Err(Error::msg("Invalid device type for Helios"));
+            return Err(Error::invalid_config("Invalid device type for Helios"));
         };
         Ok(Box::new(HeliosBackend::from_dac(dac)))
     }
@@ -372,9 +371,9 @@ impl EtherDreamDiscovery {
     }
 
     /// Connect to a discovered Ether Dream device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::EtherDream { broadcast, ip } = device.inner else {
-            return Err(Error::msg("Invalid device type for EtherDream"));
+            return Err(Error::invalid_config("Invalid device type for EtherDream"));
         };
 
         let backend = EtherDreamBackend::new(broadcast, ip);
@@ -433,9 +432,9 @@ impl IdnDiscovery {
     }
 
     /// Connect to a discovered IDN device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::Idn { server, service } = device.inner else {
-            return Err(Error::msg("Invalid device type for IDN"));
+            return Err(Error::invalid_config("Invalid device type for IDN"));
         };
 
         Ok(Box::new(IdnBackend::new(server, service)))
@@ -445,6 +444,9 @@ impl IdnDiscovery {
     ///
     /// This is useful for testing with mock servers on localhost where
     /// broadcast won't work.
+    ///
+    /// This method is only available with the `testutils` feature.
+    #[cfg(feature = "testutils")]
     pub fn scan_address(&mut self, addr: SocketAddr) -> Vec<DiscoveredDevice> {
         let Ok(mut scanner) = ServerScanner::new(0) else {
             return Vec::new();
@@ -537,9 +539,9 @@ impl LasercubeWifiDiscovery {
     }
 
     /// Connect to a discovered LaserCube WiFi device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::LasercubeWifi { info, source_addr } = device.inner else {
-            return Err(Error::msg("Invalid device type for LaserCube WiFi"));
+            return Err(Error::invalid_config("Invalid device type for LaserCube WiFi"));
         };
 
         let addressed = LasercubeAddressed::from_discovery(&info, source_addr);
@@ -596,9 +598,9 @@ impl LasercubeUsbDiscovery {
     }
 
     /// Connect to a discovered LaserCube USB device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::LasercubeUsb(usb_device) = device.inner else {
-            return Err(Error::msg("Invalid device type for LaserCube USB"));
+            return Err(Error::invalid_config("Invalid device type for LaserCube USB"));
         };
 
         let backend = LasercubeUsbBackend::new(usb_device);
@@ -734,17 +736,15 @@ impl DacDiscovery {
         devices
     }
 
-    /// Connect to a discovered device.
-    ///
-    /// Returns a boxed backend that can be used with [`crate::DacWorker`].
+    /// Connect to a discovered device and return a streaming backend.
     #[allow(unreachable_patterns)]
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn DacBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         match device.dac_type {
             #[cfg(feature = "helios")]
             DacType::Helios => self
                 .helios
                 .as_ref()
-                .ok_or_else(|| Error::msg("Helios discovery not available"))?
+                .ok_or_else(|| Error::disconnected("Helios discovery not available"))?
                 .connect(device),
             #[cfg(feature = "ether-dream")]
             DacType::EtherDream => self.etherdream.connect(device),
@@ -756,9 +756,9 @@ impl DacDiscovery {
             DacType::LasercubeUsb => self
                 .lasercube_usb
                 .as_ref()
-                .ok_or_else(|| Error::msg("LaserCube USB discovery not available"))?
+                .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
                 .connect(device),
-            _ => Err(Error::msg(format!(
+            _ => Err(Error::invalid_config(format!(
                 "DAC type {:?} not supported in this build",
                 device.dac_type
             ))),
