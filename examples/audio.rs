@@ -2,18 +2,16 @@
 //!
 //! This example captures audio from the default input device and renders it to the laser:
 //!
-//! - **Mono (1 channel)**: Displays frequency spectrum on Y axis with linear X ramp
+//! - **Mono (1 channel)**: Time-domain oscilloscope (X=time, Y=amplitude)
 //! - **Stereo (2+ channels)**: XY oscilloscope mode (left=X, right=Y)
 //!
-//! In XY mode, the laser is blanked when the signal is very low to prevent beam dwell.
-//! In mono mode, a horizontal line is always drawn even with no signal.
+//! In both modes, the laser is blanked when the signal is very low to prevent beam dwell.
 //!
 //! Run with: `cargo run --example audio`
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, StreamConfig, Result};
 use log::{debug, error, info, warn};
-use rustfft::{num_complex::Complex, FftPlanner};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +27,7 @@ const POINTS_PER_CHUNK: usize = 512;
 /// Audio mode based on channel count
 #[derive(Debug, Clone, Copy)]
 enum AudioMode {
-    /// Mono: frequency spectrum on Y, linear ramp on X
+    /// Mono: time-domain oscilloscope (X=time, Y=amplitude)
     Mono,
     /// Stereo: XY oscilloscope (left=X, right=Y)
     Stereo,
@@ -39,6 +37,8 @@ enum AudioMode {
 struct AudioState {
     /// Latest audio samples (interleaved if stereo)
     samples: Vec<f32>,
+    /// Number of valid samples in the buffer
+    sample_count: usize,
     /// Number of channels
     channels: usize,
     /// Audio mode
@@ -57,6 +57,7 @@ impl AudioState {
 
         Self {
             samples: vec![0.0; AUDIO_BUFFER_SIZE * channels],
+            sample_count: 0,
             channels,
             mode,
         }
@@ -65,6 +66,7 @@ impl AudioState {
     fn update_samples(&mut self, new_samples: &[f32]) {
         let copy_len = new_samples.len().min(self.samples.len());
         self.samples[..copy_len].copy_from_slice(&new_samples[..copy_len]);
+        self.sample_count = copy_len;
     }
 }
 
@@ -173,10 +175,6 @@ fn main() -> Result<()> {
     stream.control().arm()?;
     info!("Laser output armed");
 
-    // FFT setup for mono mode
-    let fft_planner = Arc::new(Mutex::new(FftPlanner::new()));
-    let fft = fft_planner.lock().unwrap().plan_fft_forward(AUDIO_BUFFER_SIZE);
-
     info!("Streaming audio to laser - press Ctrl+C to stop");
 
     // Track chunks for logging
@@ -188,15 +186,16 @@ fn main() -> Result<()> {
         move |req: ChunkRequest| {
             let count = counter.fetch_add(1, Ordering::Relaxed);
 
-            // Get current audio state
+            // Get current audio state (only the valid samples)
             let (mode, samples, channels_count) = {
                 let state = audio_state.lock().unwrap();
-                (state.mode, state.samples.clone(), state.channels)
+                let valid_samples = state.samples[..state.sample_count].to_vec();
+                (state.mode, valid_samples, state.channels)
             };
 
             // Generate laser points based on mode
             let points = match mode {
-                AudioMode::Mono => generate_mono_spectrum(&samples, req.n_points, &fft),
+                AudioMode::Mono => generate_mono_oscilloscope(&samples, req.n_points),
                 AudioMode::Stereo => generate_xy_oscilloscope(&samples, req.n_points, channels_count),
             };
 
@@ -217,83 +216,54 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Generate laser points for mono frequency spectrum display
-fn generate_mono_spectrum(
-    samples: &[f32],
-    n_points: usize,
-    fft: &Arc<dyn rustfft::Fft<f32>>,
-) -> Vec<LaserPoint> {
-    let mut fft_buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); AUDIO_BUFFER_SIZE];
-    let mut fft_scratch: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+/// Generate laser points for mono time-domain oscilloscope display
+fn generate_mono_oscilloscope(samples: &[f32], n_points: usize) -> Vec<LaserPoint> {
+    // Calculate signal amplitude for silence detection
+    let amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
-    // Copy samples to FFT buffer
-    let copy_len = samples.len().min(fft_buffer.len());
-    for i in 0..fft_buffer.len() {
-        if i < copy_len {
-            fft_buffer[i] = Complex::new(samples[i], 0.0);
-        } else {
-            fft_buffer[i] = Complex::new(0.0, 0.0);
-        }
+    let is_silent = amplitude < SILENCE_THRESHOLD;
+
+    if is_silent {
+        debug!("Signal below threshold ({:.4}), blanking output", amplitude);
+        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
     }
 
-    // Apply Hann window
-    let buffer_len = fft_buffer.len();
-    for (i, sample) in fft_buffer.iter_mut().enumerate() {
-        let window =
-            0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (buffer_len - 1) as f32).cos());
-        sample.re *= window;
-    }
+    debug!("Mono amplitude: {:.4}", amplitude);
 
-    // Perform FFT
-    fft.process_with_scratch(&mut fft_buffer, &mut fft_scratch);
+    // Normalize to use full range
+    let scale = (1.0 / amplitude.max(0.1)).min(1.0);
 
-    // Get magnitudes (only first half is meaningful)
-    let half_len = fft_buffer.len() / 2;
-    let magnitudes: Vec<f32> = fft_buffer[..half_len]
-        .iter()
-        .map(|c| (c.re * c.re + c.im * c.im).sqrt())
-        .collect();
-
-    // Find max magnitude for normalization
-    let max_mag = magnitudes.iter().cloned().fold(0.0f32, f32::max).max(0.001);
-
-    // Generate points with linear X ramp and frequency on Y
+    // Generate points
     let mut points = Vec::with_capacity(n_points);
 
     // Add leading blank points
     let blank_count = 3;
+    let first_y = samples.first().copied().unwrap_or(0.0) * scale;
     for _ in 0..blank_count {
-        points.push(LaserPoint::blanked(-1.0, 0.0));
+        points.push(LaserPoint::blanked(-1.0, first_y));
     }
 
-    // Map frequency bins to points
+    // Map samples to laser points: X = time (linear ramp), Y = amplitude
     let usable_points = n_points.saturating_sub(blank_count * 2);
     for i in 0..usable_points {
         let t = i as f32 / usable_points as f32;
         let x = t * 2.0 - 1.0; // -1 to 1
 
-        // Map to frequency bin (logarithmic-ish mapping for better visualization)
-        let bin_idx = ((t * t) * (half_len as f32 * 0.8)) as usize;
-        let bin_idx = bin_idx.min(half_len - 1);
+        // Map point index to sample index
+        let sample_idx = (t * (samples.len() - 1) as f32) as usize;
+        let sample_idx = sample_idx.min(samples.len() - 1);
 
-        // Get normalized magnitude
-        let mag = magnitudes[bin_idx] / max_mag;
-        let y = (mag * 1.5 - 0.75).clamp(-0.9, 0.9); // Center around 0, clamp to safe range
+        let y = (samples[sample_idx] * scale).clamp(-1.0, 1.0);
 
-        // Color based on frequency (low=red, mid=green, high=blue)
-        let (r, g, b) = frequency_to_color(t);
-
-        points.push(LaserPoint::new(x, y, r, g, b, 65535));
+        // Green color for mono oscilloscope
+        let intensity = ((y.abs() * 0.5 + 0.5) * 65535.0) as u16;
+        points.push(LaserPoint::new(x, y, 0, intensity, 0, intensity));
     }
 
     // Add trailing blank points
+    let last_y = samples.last().copied().unwrap_or(0.0) * scale;
     for _ in 0..blank_count {
-        let last_x = if !points.is_empty() {
-            points.last().unwrap().x
-        } else {
-            1.0
-        };
-        points.push(LaserPoint::blanked(last_x, 0.0));
+        points.push(LaserPoint::blanked(1.0, last_y));
     }
 
     // Ensure we have exactly n_points
@@ -384,13 +354,4 @@ fn generate_xy_oscilloscope(samples: &[f32], n_points: usize, channels: usize) -
     points.truncate(n_points);
 
     points
-}
-
-/// Map frequency (0-1) to RGB color
-fn frequency_to_color(t: f32) -> (u16, u16, u16) {
-    // Low frequencies = red, mid = green, high = blue
-    let r = ((1.0 - t * 2.0).max(0.0) * 65535.0) as u16;
-    let g = ((1.0 - (t - 0.5).abs() * 4.0).max(0.0) * 65535.0) as u16;
-    let b = ((t * 2.0 - 1.0).max(0.0) * 65535.0) as u16;
-    (r, g, b)
 }
