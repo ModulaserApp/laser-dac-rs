@@ -38,14 +38,36 @@ impl Shape {
 
 /// Create points for the given shape.
 ///
-/// The `n_points` parameter specifies the number of points to generate.
+/// The `n_points` parameter specifies the exact number of points to generate.
 /// The `frame_count` parameter is used for animated shapes.
 pub fn create_points(shape: Shape, n_points: usize, frame_count: usize) -> Vec<LaserPoint> {
-    match shape {
+    let mut points = match shape {
         Shape::Triangle => create_triangle_points(n_points),
         Shape::Circle => create_circle_points(n_points),
         Shape::OrbitingCircle => create_orbiting_circle_points(n_points, frame_count),
         Shape::TestPattern => create_test_pattern_points(n_points),
+    };
+
+    // Ensure exactly n_points are returned (pad or truncate as needed)
+    normalize_point_count(&mut points, n_points);
+    points
+}
+
+/// Normalize a point vector to exactly `target` points.
+///
+/// If there are too few points, pads with the last point (or blanked origin).
+/// If there are too many points, truncates.
+fn normalize_point_count(points: &mut Vec<LaserPoint>, target: usize) {
+    match points.len().cmp(&target) {
+        std::cmp::Ordering::Less => {
+            // Pad with last point (or blanked origin if empty)
+            let pad_point = points.last().copied().unwrap_or(LaserPoint::blanked(0.0, 0.0));
+            points.resize(target, pad_point);
+        }
+        std::cmp::Ordering::Greater => {
+            points.truncate(target);
+        }
+        std::cmp::Ordering::Equal => {}
     }
 }
 
