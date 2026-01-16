@@ -144,6 +144,12 @@ pub struct StreamConfig {
     pub target_queue_points: usize,
 
     pub underrun: UnderrunPolicy,
+
+    /// Whether to automatically open the hardware output gate when arming.
+    /// When `false` (default), `arm()` only enables software output.
+    /// When `true`, `arm()` will also open the hardware gate.
+    /// Note: `disarm()` always closes the hardware gate for safety.
+    pub open_output_gate_on_arm: bool,
 }
 
 pub enum UnderrunPolicy {
@@ -155,15 +161,24 @@ pub enum UnderrunPolicy {
 
 impl Device {
     pub fn caps(&self) -> &Caps;
+    pub fn info(&self) -> &DeviceInfo;
+    pub fn id(&self) -> &str;
+    pub fn name(&self) -> &str;
+    pub fn kind(&self) -> &DacType;
+    pub fn has_backend(&self) -> bool;
+    pub fn is_connected(&self) -> bool;
 
-    /// Starts a streaming session on this device.
+    /// Starts a streaming session, consuming the device.
     ///
-    /// Note: `Device` is not consumed. This keeps the door open for stop/restart and
-    /// for exposing device metadata while a stream exists.
+    /// The `Device` is consumed because each device can only have one active stream
+    /// at a time. The backend is moved into the `Stream` to ensure exclusive access.
+    /// This prevents accidental reuse of a device that's already streaming.
     ///
-    /// Contract: at most one active `Stream` per physical device at a time.
-    /// (Calling `start_stream` while a stream is active should return `InvalidConfig`.)
-    pub fn start_stream(&mut self, cfg: StreamConfig) -> Result<Stream, Error>;
+    /// Returns both the `Stream` and a copy of `DeviceInfo`, so you retain access
+    /// to device metadata (id, name, capabilities) after starting.
+    ///
+    /// To recover the device for reuse, call `stream.into_device()`.
+    pub fn start_stream(self, cfg: StreamConfig) -> Result<(Stream, DeviceInfo), Error>;
 }
 ```
 
@@ -184,7 +199,9 @@ pub struct StreamControl { /* ... */ }
 impl StreamControl {
     pub fn arm(&self) -> Result<(), Error>;
     pub fn disarm(&self) -> Result<(), Error>;
+    pub fn is_armed(&self) -> bool;
     pub fn stop(&self) -> Result<(), Error>;
+    pub fn is_stop_requested(&self) -> bool;
 }
 
 impl Stream {
@@ -204,8 +221,10 @@ pub enum Error {
     /// Note: in the blocking API, `next_request()` should not normally surface this. It exists to
     /// enforce a uniform backend contract and to support potential future non-blocking APIs.
     WouldBlock,
+    /// The stream was explicitly stopped via `StreamControl::stop()`.
+    Stopped,
     /// The device disconnected or became unreachable.
-    Disconnected,
+    Disconnected(String),
     /// Invalid configuration or API misuse.
     InvalidConfig(String),
     /// Backend/protocol error (wrapped).
@@ -238,7 +257,10 @@ pub struct ChunkRequest {
 }
 
 impl Stream {
-    pub fn status(&mut self) -> Result<StreamStatus, Error>;
+    pub fn info(&self) -> &DeviceInfo;
+    pub fn config(&self) -> &StreamConfig;
+    pub fn control(&self) -> StreamControl;
+    pub fn status(&self) -> Result<StreamStatus, Error>;
 
     /// Blocks until the stream wants the next chunk.
     pub fn next_request(&mut self) -> Result<ChunkRequest, Error>;
@@ -252,6 +274,21 @@ impl Stream {
     ///
     /// Semantics: fixed for the lifetime of the stream.
     pub fn chunk_points(&self) -> usize;
+
+    /// Manually open the hardware output gate.
+    pub fn open_output_gate(&mut self) -> Result<(), Error>;
+
+    /// Manually close the hardware output gate.
+    pub fn close_output_gate(&mut self) -> Result<(), Error>;
+
+    /// Returns whether the hardware output gate is currently open.
+    pub fn is_output_gate_open(&self) -> bool;
+
+    /// Consume the stream and recover the device for reuse.
+    ///
+    /// This stops the stream, closes the output gate, and returns the
+    /// underlying `Device` along with the final `StreamStats`.
+    pub fn into_device(self) -> (Device, StreamStats);
 }
 
 pub struct StreamStatus {
@@ -274,6 +311,8 @@ pub struct StreamStats {
     pub underrun_count: u64,
     pub late_chunk_count: u64,
     pub reconnect_count: u64,
+    pub chunks_written: u64,
+    pub points_written: u64,
 }
 ```
 
@@ -305,6 +344,8 @@ pub enum RunExit {
     Stopped,
     /// The producer returned `None` (graceful completion).
     ProducerEnded,
+    /// The device disconnected or became unreachable.
+    Disconnected,
 }
 
 impl Stream {
@@ -335,30 +376,48 @@ The request model enables audio-like correctness and makes stream behavior obser
 Frames remain supported as a convenience. They are not written to DACs directly; instead they feed a stream as a `ChunkRequest -> Vec<LaserPoint>` producer.
 
 ```rust
+/// A point buffer to be cycled by the adapter.
 pub struct Frame {
     pub points: Vec<LaserPoint>,
-    /// Conceptual frame rate for authoring sources.
-    pub fps: f32,
 }
 
-pub trait FrameSource: Send {
-    fn next_frame(&mut self, t: StreamInstant, pps: u32) -> Frame;
+impl Frame {
+    pub fn new(points: Vec<LaserPoint>) -> Self;
+    pub fn empty() -> Self;
 }
 
-/// Converts frames to chunks matching each `ChunkRequest`.
+/// Converts a point buffer (frame) into a continuous stream.
+///
+/// The adapter cycles through the frame's points, producing exactly
+/// `req.n_points` on each `next_chunk()` call.
 pub struct FrameAdapter { /* ... */ }
 
 impl FrameAdapter {
-    /// “Latest frame” mode: you push frames in (UI/render loop), stream pulls chunks out.
-    pub fn latest(fps: f32) -> Self;
+    /// Creates a new adapter with an empty frame.
+    /// Call `update()` to set the initial frame before streaming.
+    pub fn new() -> Self;
 
-    pub fn update_frame(&mut self, frame: Frame);
-
-    /// Pull-based mode: adapter pulls frames from a `FrameSource`.
-    pub fn from_source(source: Box<dyn FrameSource>) -> Self;
+    /// Sets the pending frame.
+    ///
+    /// The frame becomes current at the start of the next `next_chunk()` after
+    /// a wrap. If called multiple times before a swap, only the most recent
+    /// frame is kept (latest-wins).
+    pub fn update(&mut self, frame: Frame);
 
     /// Must always return exactly `req.n_points` points.
     pub fn next_chunk(&mut self, req: &ChunkRequest) -> Vec<LaserPoint>;
+
+    /// Returns a thread-safe handle for updating frames from another thread.
+    pub fn shared(self) -> SharedFrameAdapter;
+}
+
+/// Thread-safe handle for updating frames from another thread.
+#[derive(Clone)]
+pub struct SharedFrameAdapter { /* ... */ }
+
+impl SharedFrameAdapter {
+    pub fn update(&self, frame: Frame);
+    pub fn next_chunk(&self, req: &ChunkRequest) -> Vec<LaserPoint>;
 }
 ```
 
@@ -367,12 +426,13 @@ The expected usage is:
 - Blocking: `let req = stream.next_request()?; points = adapter.next_chunk(&req); stream.write(&req, &points)?;`
 - Callback: `stream.run(move |req| Some(adapter.next_chunk(&req)), |_| {});`
 
-**FrameAdapter expectations (initially)**
+**FrameAdapter behavior**
 
-- Latest-frame mode uses the most recently provided `Frame` until a new one arrives.
-- Chunks are produced by resampling to `req.n_points` (point-count resampling, not spatial optimization).
-- Start simple: maintain a cursor through the frame across chunks (cycle when reaching the end).
-- When a new frame arrives, switch at the next chunk boundary and reset the cursor (initially).
+- Latest-wins: `update()` sets the pending frame; multiple calls before a swap keep only the most recent.
+- Wrap-boundary swaps: the pending frame becomes current only at wrap boundaries (when the point index cycles back to 0), ensuring clean transitions without mid-cycle jumps.
+- Chunks are produced by cycling through the frame's points (integer index, no resampling).
+- Empty frames output blanked points at the last known position.
+- For time-varying animation, use the streaming API directly with a point generator instead of FrameAdapter.
 
 ## Internal architecture (target layering)
 
