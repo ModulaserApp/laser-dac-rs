@@ -1,5 +1,7 @@
 //! Shared code for examples.
 
+pub mod audio;
+
 use clap::{Parser, ValueEnum};
 use laser_dac::LaserPoint;
 use serde::Deserialize;
@@ -23,6 +25,7 @@ pub enum Shape {
     Circle,
     OrbitingCircle,
     TestPattern,
+    Audio,
 }
 
 impl Shape {
@@ -32,6 +35,7 @@ impl Shape {
             Shape::Circle => "circle",
             Shape::OrbitingCircle => "orbiting-circle",
             Shape::TestPattern => "test-pattern",
+            Shape::Audio => "audio",
         }
     }
 }
@@ -46,6 +50,7 @@ pub fn create_points(shape: Shape, n_points: usize, frame_count: usize) -> Vec<L
         Shape::Circle => create_circle_points(n_points),
         Shape::OrbitingCircle => create_orbiting_circle_points(n_points, frame_count),
         Shape::TestPattern => create_test_pattern_points(n_points),
+        Shape::Audio => audio::create_audio_points(n_points),
     };
 
     // Ensure exactly n_points are returned (pad or truncate as needed)
