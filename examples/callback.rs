@@ -55,7 +55,7 @@ fn main() -> Result<()> {
         // Producer callback - invoked when device needs more data
         move |req: ChunkRequest| {
             let count = counter.fetch_add(1, Ordering::Relaxed);
-            let points = create_points(shape, req.n_points, count as usize);
+            let points = create_points(shape, &req);
 
             // Print progress periodically
             if count % 100 == 0 {

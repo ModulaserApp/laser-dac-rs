@@ -3,9 +3,9 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::LaserPoint;
+use laser_dac::{ChunkRequest, LaserPoint, StreamInstant};
 use serde::Deserialize;
-use std::f32::consts::PI;
+use std::f32::consts::{PI, TAU};
 
 #[derive(Parser)]
 #[command(about = "Send test patterns to connected laser DACs")]
@@ -40,15 +40,15 @@ impl Shape {
     }
 }
 
-/// Create points for the given shape.
+/// Create points for the given shape (streaming API).
 ///
-/// The `n_points` parameter specifies the exact number of points to generate.
-/// The `frame_count` parameter is used for animated shapes.
-pub fn create_points(shape: Shape, n_points: usize, frame_count: usize) -> Vec<LaserPoint> {
+/// The `req` parameter provides timing info for time-based shapes.
+pub fn create_points(shape: Shape, req: &ChunkRequest) -> Vec<LaserPoint> {
+    let n_points = req.n_points;
     let mut points = match shape {
         Shape::Triangle => create_triangle_points(n_points),
         Shape::Circle => create_circle_points(n_points),
-        Shape::OrbitingCircle => create_orbiting_circle_points(n_points, frame_count),
+        Shape::OrbitingCircle => create_orbiting_circle_points(req),
         Shape::TestPattern => create_test_pattern_points(n_points),
         Shape::Audio => audio::create_audio_points(n_points),
     };
@@ -56,6 +56,25 @@ pub fn create_points(shape: Shape, n_points: usize, frame_count: usize) -> Vec<L
     // Ensure exactly n_points are returned (pad or truncate as needed)
     normalize_point_count(&mut points, n_points);
     points
+}
+
+/// Create points for frame-based usage (no stream timing).
+///
+/// For shapes that need stream time (OrbitingCircle), this produces
+/// a static frame at t=0. Use `create_points` with a real ChunkRequest
+/// for time-based animation.
+#[allow(dead_code)] // Used by frame_adapter example, not all examples
+pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
+    // Create a dummy request for frame-based usage
+    let dummy_req = ChunkRequest {
+        start: StreamInstant::new(0),
+        pps: 30_000,
+        n_points,
+        scheduled_ahead_points: 0,
+        device_queued_points: None,
+    };
+
+    create_points(shape, &dummy_req)
 }
 
 /// Normalize a point vector to exactly `target` points.
@@ -147,35 +166,38 @@ fn create_circle_points(num_points: usize) -> Vec<LaserPoint> {
     points
 }
 
-/// Create a small rainbow circle that orbits around the center.
-fn create_orbiting_circle_points(num_points: usize, frame_count: usize) -> Vec<LaserPoint> {
-    let mut points = Vec::with_capacity(num_points + 10);
-
-    const BLANK_COUNT: usize = 5;
+/// Create a time-based orbiting circle with smooth continuous motion.
+///
+/// Each point's position is calculated from its exact stream timestamp,
+/// so the orbit advances smoothly even within a single chunk.
+/// No blanking - the beam continuously traces the circle as it orbits.
+fn create_orbiting_circle_points(req: &ChunkRequest) -> Vec<LaserPoint> {
+    const ORBIT_RADIUS: f32 = 0.5;
     const CIRCLE_RADIUS: f32 = 0.15;
-    const ORBIT_RADIUS: f32 = 0.4;
-    const ORBIT_SPEED: f32 = 0.02;
+    const ORBIT_PERIOD_SECS: f32 = 4.0;
+    const POINTS_PER_CIRCLE: usize = 200;
 
-    // Calculate the center of the small circle based on frame count
-    let orbit_angle = frame_count as f32 * ORBIT_SPEED;
-    let center_x = ORBIT_RADIUS * orbit_angle.cos();
-    let center_y = ORBIT_RADIUS * orbit_angle.sin();
+    let mut points = Vec::with_capacity(req.n_points);
+    let pps = req.pps as f64;
 
-    // Starting position for blanking
-    let start_x = center_x + CIRCLE_RADIUS;
-    let start_y = center_y;
+    for i in 0..req.n_points {
+        let point_index = req.start.0 + i as u64;
+        let t_secs = point_index as f64 / pps;
 
-    for _ in 0..BLANK_COUNT {
-        points.push(LaserPoint::blanked(start_x, start_y));
-    }
+        // Orbit position based on exact time (continuous, not stepped)
+        let orbit_angle = (t_secs as f32 / ORBIT_PERIOD_SECS) * TAU;
+        let center_x = ORBIT_RADIUS * orbit_angle.cos();
+        let center_y = ORBIT_RADIUS * orbit_angle.sin();
 
-    // Draw the small circle at the orbiting position
-    for i in 0..=num_points {
-        let angle = (i as f32 / num_points as f32) * 2.0 * PI;
-        let x = center_x + CIRCLE_RADIUS * angle.cos();
-        let y = center_y + CIRCLE_RADIUS * angle.sin();
+        // Circle position based on point index
+        let circle_angle = (point_index % POINTS_PER_CIRCLE as u64) as f32
+            / POINTS_PER_CIRCLE as f32
+            * TAU;
+        let x = center_x + CIRCLE_RADIUS * circle_angle.cos();
+        let y = center_y + CIRCLE_RADIUS * circle_angle.sin();
 
-        let hue = i as f32 / num_points as f32;
+        // Rainbow color that shifts with time
+        let hue = (t_secs as f32 / 3.0) % 1.0;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
         points.push(LaserPoint::new(x, y, r, g, b, 65535));

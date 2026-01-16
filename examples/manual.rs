@@ -42,14 +42,12 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire)
     stream.control().arm()?;
 
-    let mut chunk_count = 0usize;
     loop {
         let req = stream.next_request()?;
 
         // Generate points for this chunk
-        let points = create_points(args.shape, req.n_points, chunk_count);
+        let points = create_points(args.shape, &req);
 
         stream.write(&req, &points)?;
-        chunk_count = chunk_count.wrapping_add(1);
     }
 }
