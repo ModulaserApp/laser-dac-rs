@@ -5,7 +5,8 @@
 //! connected devices that can start streaming sessions.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
@@ -18,10 +19,27 @@ use crate::types::{
 // Stream Control
 // =============================================================================
 
+/// Control messages sent from StreamControl to Stream.
+///
+/// These messages allow out-of-band control actions to take effect immediately,
+/// even when the stream is waiting (pacing, backpressure, etc.).
+#[derive(Debug, Clone, Copy)]
+enum ControlMsg {
+    /// Arm the output (may open gate if configured).
+    Arm,
+    /// Disarm the output and close the hardware gate.
+    Disarm,
+    /// Request the stream to stop.
+    Stop,
+}
+
 /// Thread-safe control handle for safety-critical actions.
 ///
 /// This allows out-of-band control of the stream (arm/disarm/stop) from
 /// a different thread, e.g., for E-stop functionality.
+///
+/// Control actions take effect as soon as possible - the stream processes
+/// control messages at every opportunity (during waits, between retries, etc.).
 #[derive(Clone)]
 pub struct StreamControl {
     inner: Arc<StreamControlInner>,
@@ -32,27 +50,53 @@ struct StreamControlInner {
     armed: AtomicBool,
     /// Whether a stop has been requested.
     stop_requested: AtomicBool,
+    /// Channel for sending control messages to the stream loop.
+    /// Wrapped in Mutex because Sender is Send but not Sync.
+    control_tx: Mutex<Sender<ControlMsg>>,
 }
 
 impl StreamControl {
-    fn new() -> Self {
+    fn new(control_tx: Sender<ControlMsg>) -> Self {
         Self {
             inner: Arc::new(StreamControlInner {
                 armed: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
+                control_tx: Mutex::new(control_tx),
             }),
         }
     }
 
     /// Arm the output (allow laser to fire).
+    ///
+    /// If `StreamConfig::open_output_gate_on_arm` is `true`, the hardware output
+    /// gate will be opened as soon as the stream processes this command.
     pub fn arm(&self) -> Result<()> {
         self.inner.armed.store(true, Ordering::SeqCst);
+        // Send message to stream for immediate gate control
+        if let Ok(tx) = self.inner.control_tx.lock() {
+            let _ = tx.send(ControlMsg::Arm);
+        }
         Ok(())
     }
 
     /// Disarm the output (force laser off).
+    ///
+    /// This immediately:
+    /// 1. Sets the armed flag to false (subsequent points will be blanked in software)
+    /// 2. Sends a message to close the hardware output gate as soon as possible
+    ///
+    /// # Safety Note
+    ///
+    /// Software cannot unschedule points that have already been sent to the device
+    /// buffer. "Immediate" means the output gate closes ASAP and all future points
+    /// will be safe (blanked). The `target_queue_points` configuration bounds the
+    /// maximum latency before the gate closes.
     pub fn disarm(&self) -> Result<()> {
         self.inner.armed.store(false, Ordering::SeqCst);
+        // Send message to stream for immediate gate control
+        if let Ok(tx) = self.inner.control_tx.lock() {
+            let _ = tx.send(ControlMsg::Disarm);
+        }
         Ok(())
     }
 
@@ -64,6 +108,10 @@ impl StreamControl {
     /// Request the stream to stop.
     pub fn stop(&self) -> Result<()> {
         self.inner.stop_requested.store(true, Ordering::SeqCst);
+        // Send message to stream for immediate stop
+        if let Ok(tx) = self.inner.control_tx.lock() {
+            let _ = tx.send(ControlMsg::Stop);
+        }
         Ok(())
     }
 
@@ -128,6 +176,8 @@ pub struct Stream {
     chunk_points: usize,
     /// Thread-safe control handle.
     control: StreamControl,
+    /// Receiver for control messages from StreamControl.
+    control_rx: Receiver<ControlMsg>,
     /// Stream state.
     state: StreamState,
 }
@@ -140,12 +190,14 @@ impl Stream {
         config: StreamConfig,
         chunk_points: usize,
     ) -> Self {
+        let (control_tx, control_rx) = mpsc::channel();
         Self {
             info,
             backend: Some(backend),
             config,
             chunk_points,
-            control: StreamControl::new(),
+            control: StreamControl::new(control_tx),
+            control_rx,
             state: StreamState::new(),
         }
     }
@@ -449,6 +501,11 @@ impl Stream {
                 }
             };
 
+            // Process control messages before calling producer
+            if self.process_control_messages() {
+                return Ok(RunExit::Stopped);
+            }
+
             // Call producer
             match producer(req.clone()) {
                 Some(points) => {
@@ -460,11 +517,16 @@ impl Stream {
                                 // Backend buffer full - yield first for low-latency scenarios,
                                 // then sleep briefly if still blocked
                                 std::thread::yield_now();
-                                if self.control.is_stop_requested() {
+
+                                // Process control messages for immediate gate control
+                                if self.process_control_messages() {
                                     return Ok(RunExit::Stopped);
                                 }
+
                                 std::thread::sleep(Duration::from_micros(100));
-                                if self.control.is_stop_requested() {
+
+                                // Check stop again after sleep
+                                if self.process_control_messages() {
                                     return Ok(RunExit::Stopped);
                                 }
                                 continue;
@@ -502,8 +564,52 @@ impl Stream {
     // Internal helpers
     // =========================================================================
 
+    /// Process any pending control messages from StreamControl.
+    ///
+    /// This method drains the control message queue and takes immediate action:
+    /// - `Arm`: Opens the output gate if configured
+    /// - `Disarm`: Closes the output gate immediately
+    /// - `Stop`: Returns `true` to signal the caller to stop
+    ///
+    /// Returns `true` if stop was requested, `false` otherwise.
+    fn process_control_messages(&mut self) -> bool {
+        loop {
+            match self.control_rx.try_recv() {
+                Ok(ControlMsg::Arm) => {
+                    // Open gate if configured and not already open
+                    if self.config.open_output_gate_on_arm && !self.state.output_gate_open {
+                        if let Some(backend) = &mut self.backend {
+                            let _ = backend.set_shutter(true);
+                        }
+                        self.state.output_gate_open = true;
+                    }
+                }
+                Ok(ControlMsg::Disarm) => {
+                    // Close gate immediately for safety
+                    if self.state.output_gate_open {
+                        if let Some(backend) = &mut self.backend {
+                            let _ = backend.set_shutter(false);
+                        }
+                        self.state.output_gate_open = false;
+                    }
+                }
+                Ok(ControlMsg::Stop) => {
+                    return true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        false
+    }
+
     /// Wait until we're ready for the next chunk (pacing).
+    ///
+    /// Sleeps in small slices to allow processing control messages promptly.
     fn wait_for_ready(&mut self) -> Result<()> {
+        // Maximum sleep slice - controls responsiveness to control messages
+        const SLEEP_SLICE: Duration = Duration::from_millis(5);
+
         let target = self.config.target_queue_points as u64;
 
         // Use the more accurate queue depth when available from the device.
@@ -527,7 +633,18 @@ impl Stream {
         let seconds_to_wait = points_to_drain as f64 / self.config.pps as f64;
         let wait_duration = Duration::from_secs_f64(seconds_to_wait.min(0.1));
 
-        std::thread::sleep(wait_duration);
+        // Sleep in small slices to process control messages promptly
+        let mut remaining = wait_duration;
+        while remaining > Duration::ZERO {
+            let slice = remaining.min(SLEEP_SLICE);
+            std::thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+
+            // Process control messages - handle gate close immediately
+            if self.process_control_messages() {
+                return Err(Error::Stopped);
+            }
+        }
 
         let elapsed = wait_duration.as_secs_f64();
         let points_drained = (elapsed * self.config.pps as f64) as u64;
@@ -537,25 +654,43 @@ impl Stream {
     }
 
     /// Handle an underrun by applying the underrun policy.
+    ///
+    /// # Safety Behavior
+    ///
+    /// When disarmed, this always outputs blanked points regardless of the underrun
+    /// policy. The `RepeatLast` policy means "repeat last armed content" - when
+    /// disarmed, repeating content would be unsafe.
     fn handle_underrun(&mut self, req: &ChunkRequest) -> Result<()> {
         self.state.stats.underrun_count += 1;
 
-        let fill_points: Vec<LaserPoint> = match &self.config.underrun {
-            UnderrunPolicy::RepeatLast => {
-                self.state
-                    .last_chunk
-                    .clone()
-                    .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points])
-            }
-            UnderrunPolicy::Blank => {
-                vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
-            }
-            UnderrunPolicy::Park { x, y } => {
-                vec![LaserPoint::blanked(*x, *y); req.n_points]
-            }
-            UnderrunPolicy::Stop => {
-                self.control.stop()?;
-                return Err(Error::Stopped);
+        let is_armed = self.control.is_armed();
+
+        // Handle output gate transitions (same safety behavior as write())
+        self.handle_output_gate_transition(is_armed);
+
+        // Determine fill points based on arm state and policy
+        let fill_points: Vec<LaserPoint> = if !is_armed {
+            // When disarmed, always output blanked points for safety
+            // RepeatLast means "repeat last armed content" - meaningless when disarmed
+            vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
+        } else {
+            match &self.config.underrun {
+                UnderrunPolicy::RepeatLast => {
+                    self.state
+                        .last_chunk
+                        .clone()
+                        .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points])
+                }
+                UnderrunPolicy::Blank => {
+                    vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
+                }
+                UnderrunPolicy::Park { x, y } => {
+                    vec![LaserPoint::blanked(*x, *y); req.n_points]
+                }
+                UnderrunPolicy::Stop => {
+                    self.control.stop()?;
+                    return Err(Error::Stopped);
+                }
             }
         };
 
@@ -564,7 +699,10 @@ impl Stream {
                 Ok(WriteOutcome::Written) => {
                     // Update stream state to keep timebase accurate
                     let n_points = fill_points.len();
-                    self.state.last_chunk = Some(fill_points);
+                    // Only update last_chunk when armed (it's the "last armed content")
+                    if is_armed {
+                        self.state.last_chunk = Some(fill_points);
+                    }
                     self.state.current_instant += n_points as u64;
                     self.state.scheduled_ahead += n_points as u64;
                     self.state.stats.chunks_written += 1;
@@ -767,6 +905,8 @@ mod tests {
         would_block_count: Arc<AtomicUsize>,
         /// Simulated queue depth
         queued: Arc<AtomicU64>,
+        /// Track shutter state for testing
+        shutter_open: Arc<AtomicBool>,
     }
 
     impl TestBackend {
@@ -784,6 +924,7 @@ mod tests {
                 write_count: Arc::new(AtomicUsize::new(0)),
                 would_block_count: Arc::new(AtomicUsize::new(0)),
                 queued: Arc::new(AtomicU64::new(0)),
+                shutter_open: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -834,7 +975,8 @@ mod tests {
             Ok(())
         }
 
-        fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.shutter_open.store(open, Ordering::SeqCst);
             Ok(())
         }
 
@@ -845,7 +987,8 @@ mod tests {
 
     #[test]
     fn test_stream_control_arm_disarm() {
-        let control = StreamControl::new();
+        let (tx, _rx) = mpsc::channel();
+        let control = StreamControl::new(tx);
         assert!(!control.is_armed());
 
         control.arm().unwrap();
@@ -857,7 +1000,8 @@ mod tests {
 
     #[test]
     fn test_stream_control_stop() {
-        let control = StreamControl::new();
+        let (tx, _rx) = mpsc::channel();
+        let control = StreamControl::new(tx);
         assert!(!control.is_stop_requested());
 
         control.stop().unwrap();
@@ -866,7 +1010,8 @@ mod tests {
 
     #[test]
     fn test_stream_control_clone_shares_state() {
-        let control1 = StreamControl::new();
+        let (tx, _rx) = mpsc::channel();
+        let control1 = StreamControl::new(tx);
         let control2 = control1.clone();
 
         control1.arm().unwrap();
@@ -973,5 +1118,86 @@ mod tests {
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
         // Should have attempted write 4 times (3 WouldBlock + 1 success)
         assert_eq!(write_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_disarm_closes_gate_via_control_message() {
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DeviceInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_open_output_gate_on_arm(true);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Manually open the gate to simulate armed state
+        stream.open_output_gate().unwrap();
+        assert!(shutter_open.load(Ordering::SeqCst));
+        assert!(stream.is_output_gate_open());
+
+        // Get control handle and disarm (this sends ControlMsg::Disarm)
+        let control = stream.control();
+        control.disarm().unwrap();
+
+        // Process control messages - this should close the gate
+        let stopped = stream.process_control_messages();
+        assert!(!stopped);
+
+        // Gate should be closed now
+        assert!(!shutter_open.load(Ordering::SeqCst));
+        assert!(!stream.is_output_gate_open());
+    }
+
+    #[test]
+    fn test_handle_underrun_blanks_when_disarmed() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DeviceInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use RepeatLast policy - but when disarmed, should still blank
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Set some last_chunk with colored points
+        stream.state.last_chunk = Some(vec![
+            LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
+            100
+        ]);
+
+        // Ensure disarmed (default state)
+        assert!(!stream.control.is_armed());
+
+        let req = ChunkRequest {
+            start: StreamInstant::new(0),
+            pps: 30000,
+            n_points: 100,
+            scheduled_ahead_points: 0,
+            device_queued_points: None,
+        };
+
+        // Handle underrun while disarmed
+        stream.handle_underrun(&req).unwrap();
+
+        // last_chunk should NOT be updated (we're disarmed)
+        // The actual write was blanked points, but we don't update last_chunk when disarmed
+        // because "last armed content" hasn't changed
+        let last = stream.state.last_chunk.as_ref().unwrap();
+        assert_eq!(last[0].r, 65535); // Still the old colored points
     }
 }
