@@ -85,7 +85,10 @@ fn normalize_point_count(points: &mut Vec<LaserPoint>, target: usize) {
     match points.len().cmp(&target) {
         std::cmp::Ordering::Less => {
             // Pad with last point (or blanked origin if empty)
-            let pad_point = points.last().copied().unwrap_or(LaserPoint::blanked(0.0, 0.0));
+            let pad_point = points
+                .last()
+                .copied()
+                .unwrap_or(LaserPoint::blanked(0.0, 0.0));
             points.resize(target, pad_point);
         }
         std::cmp::Ordering::Greater => {
@@ -190,9 +193,8 @@ fn create_orbiting_circle_points(req: &ChunkRequest) -> Vec<LaserPoint> {
         let center_y = ORBIT_RADIUS * orbit_angle.sin();
 
         // Circle position based on point index
-        let circle_angle = (point_index % POINTS_PER_CIRCLE as u64) as f32
-            / POINTS_PER_CIRCLE as f32
-            * TAU;
+        let circle_angle =
+            (point_index % POINTS_PER_CIRCLE as u64) as f32 / POINTS_PER_CIRCLE as f32 * TAU;
         let x = center_x + CIRCLE_RADIUS * circle_angle.cos();
         let y = center_y + CIRCLE_RADIUS * circle_angle.sin();
 

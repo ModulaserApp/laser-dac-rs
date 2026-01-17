@@ -14,9 +14,7 @@ use crate::persistence_buffer::{PersistenceBuffer, BUFFER_RESOLUTION};
 use crate::protocol_handler::RenderPoint;
 use crate::renderer::{self, RenderSettings};
 use crate::server::ServerEvent;
-use crate::settings::{
-    AckErrorOption, BeamStyle, ColorMode, RenderMode, SimulatorSettings,
-};
+use crate::settings::{AckErrorOption, BeamStyle, ColorMode, RenderMode, SimulatorSettings};
 use crate::timing::{TimedPoint, TimestampUnwrapper};
 
 /// Maximum stream time to keep in buffer (seconds).
@@ -142,7 +140,9 @@ impl eframe::App for SimulatorApp {
         };
 
         // Update stats periodically (every 500ms)
-        let stats_elapsed = now_real.duration_since(self.stats_window_start).as_secs_f64();
+        let stats_elapsed = now_real
+            .duration_since(self.stats_window_start)
+            .as_secs_f64();
         if stats_elapsed >= 0.5 {
             self.current_pps = self.points_in_window as f64 / stats_elapsed;
             self.current_cps = self.chunks_in_window as f64 / stats_elapsed;
@@ -352,8 +352,13 @@ impl eframe::App for SimulatorApp {
                     match beam_style {
                         BeamStyle::Dots => {
                             // Dots mode: deposit only at point location
-                            self.persistence_buffer
-                                .deposit(px as usize, py as usize, total_r, total_g, total_b);
+                            self.persistence_buffer.deposit(
+                                px as usize,
+                                py as usize,
+                                total_r,
+                                total_g,
+                                total_b,
+                            );
                         }
                         BeamStyle::Lines => {
                             // Lines mode: draw energy-conserving line from previous point
@@ -553,7 +558,9 @@ impl eframe::App for SimulatorApp {
                                     });
                             })
                             .response
-                            .on_hover_text("Dots: debug point density. Lines: realistic brightness.");
+                            .on_hover_text(
+                                "Dots: debug point density. Lines: realistic brightness.",
+                            );
 
                             ui.horizontal(|ui| {
                                 ui.label("Persistence (ms):");

@@ -9,7 +9,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_points, Args};
-use laser_dac::{list_devices, open_device, ChunkRequest, StreamConfig, Result};
+use laser_dac::{list_devices, open_device, ChunkRequest, Result, StreamConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
             let points = create_points(shape, &req);
 
             // Print progress periodically
-            if count % 100 == 0 {
+            if count.is_multiple_of(100) {
                 println!("Chunks sent: {}", count);
             }
 

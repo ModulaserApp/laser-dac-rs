@@ -30,9 +30,11 @@
 //! }
 //! ```
 
+pub mod backend;
 mod frame;
 mod native;
 
+pub use backend::HeliosBackend;
 pub use frame::*;
 pub use native::*;
 

@@ -30,12 +30,14 @@
 //! }
 //! ```
 
+pub mod backend;
 pub mod dac;
 pub mod protocol;
 
 pub use self::protocol::{
     DacBroadcast, DacPoint, DacResponse, DacStatus, ReadBytes, SizeBytes, WriteBytes,
 };
+pub use backend::EtherDreamBackend;
 
 use std::{io, net};
 

@@ -26,6 +26,7 @@
 //! }
 //! ```
 
+pub mod backend;
 pub mod dac;
 pub mod error;
 pub mod protocol;
@@ -43,6 +44,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::{Duration, Instant};
 
 // Re-exports for convenience
+pub use backend::IdnBackend;
 pub use dac::{stream, Addressed, ServiceType};
 pub use error::{CommunicationError, ProtocolError, ResponseError, Result};
 pub use protocol::{AcknowledgeResponse, Point, PointExtended, PointXyrgbHighRes, PointXyrgbi};

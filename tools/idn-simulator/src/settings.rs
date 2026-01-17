@@ -70,8 +70,8 @@ pub struct SimulatorSettings {
     pub show_grid: bool,
     pub show_blanking: bool,
     pub invert_y: bool,
-    pub color_mode: ColorMode,           // Analog vs TTL
-    pub highlight_chunk_start: bool,     // Draw circle at first point of each chunk
+    pub color_mode: ColorMode,       // Analog vs TTL
+    pub highlight_chunk_start: bool, // Draw circle at first point of each chunk
 
     // Time-based rendering (persistence buffer) - Beam mode
     pub beam_style: BeamStyle,

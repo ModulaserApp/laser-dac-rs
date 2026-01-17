@@ -141,11 +141,7 @@ impl FpsEstimator {
         fft.process(&mut buffer);
 
         // Compute magnitude (only need first half due to symmetry)
-        buffer
-            .iter()
-            .take(n / 2)
-            .map(|c| c.norm())
-            .collect()
+        buffer.iter().take(n / 2).map(|c| c.norm()).collect()
     }
 
     /// Find the fundamental frequency from the combined magnitude spectrum.
@@ -200,7 +196,8 @@ impl FpsEstimator {
             let candidate_bin = strongest_bin / divisor;
             if candidate_bin >= min_bin {
                 // Look for a peak near the candidate bin (within 1 bin tolerance)
-                for check_bin in candidate_bin.saturating_sub(1)..=(candidate_bin + 1).min(max_bin - 1)
+                for check_bin in
+                    candidate_bin.saturating_sub(1)..=(candidate_bin + 1).min(max_bin - 1)
                 {
                     if let Some(&(_, sub_mag)) = peaks.iter().find(|(b, _)| *b == check_bin) {
                         // Sub-harmonic should be at least 10% as strong as the main peak

@@ -14,7 +14,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_frame_points, Args};
-use laser_dac::{list_devices, open_device, Frame, FrameAdapter, StreamConfig, Result};
+use laser_dac::{list_devices, open_device, Frame, FrameAdapter, Result, StreamConfig};
 use std::thread;
 use std::time::Duration;
 

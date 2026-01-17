@@ -32,9 +32,12 @@
 #[cfg(unix)]
 extern crate libc;
 
+pub mod backend;
 pub mod dac;
 pub mod error;
 pub mod protocol;
+
+pub use backend::LasercubeWifiBackend;
 
 use protocol::{command, DeviceInfo, CMD_PORT};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};

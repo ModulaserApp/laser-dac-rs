@@ -516,21 +516,17 @@ impl StreamConfig {
 /// Policy for what to do when the producer can't keep up with the stream.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Default)]
 pub enum UnderrunPolicy {
     /// Repeat the last chunk of points.
     RepeatLast,
     /// Output blanked points (laser off).
+    #[default]
     Blank,
     /// Park the beam at a specific position with laser off.
     Park { x: f32, y: f32 },
     /// Stop the stream entirely on underrun.
     Stop,
-}
-
-impl Default for UnderrunPolicy {
-    fn default() -> Self {
-        Self::Blank
-    }
 }
 
 /// A request from the stream for a chunk of points.

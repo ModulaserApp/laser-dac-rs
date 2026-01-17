@@ -35,6 +35,7 @@
 //! }
 //! ```
 
+pub mod backend;
 pub mod dac;
 pub mod error;
 pub mod protocol;
@@ -42,6 +43,7 @@ pub mod protocol;
 pub use crate::protocols::lasercube_usb::dac::{DeviceInfo, DeviceStatus, FirmwareVersion, Stream};
 pub use crate::protocols::lasercube_usb::error::{Error, Result};
 pub use crate::protocols::lasercube_usb::protocol::Sample;
+pub use backend::LasercubeUsbBackend;
 
 // Re-export rusb for consumers that need the Context type
 pub use rusb;

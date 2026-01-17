@@ -10,7 +10,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_points, Args};
-use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, StreamConfig, Result};
+use laser_dac::{DacDiscoveryWorker, EnabledDacTypes, Result, StreamConfig};
 use std::thread;
 use std::time::Duration;
 
@@ -42,7 +42,11 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    println!("  Connected: {} ({})", device.info().name, device.info().kind);
+    println!(
+        "  Connected: {} ({})",
+        device.info().name,
+        device.info().kind
+    );
 
     // Start streaming
     let config = StreamConfig::new(30_000);

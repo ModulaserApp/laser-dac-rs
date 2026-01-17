@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    Caps, ChunkRequest, DeviceInfo, DacType, LaserPoint, RunExit, StreamConfig, StreamInstant,
+    Caps, ChunkRequest, DacType, DeviceInfo, LaserPoint, RunExit, StreamConfig, StreamInstant,
     StreamStats, StreamStatus, UnderrunPolicy,
 };
 
@@ -675,12 +675,11 @@ impl Stream {
             vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
         } else {
             match &self.config.underrun {
-                UnderrunPolicy::RepeatLast => {
-                    self.state
-                        .last_chunk
-                        .clone()
-                        .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points])
-                }
+                UnderrunPolicy::RepeatLast => self
+                    .state
+                    .last_chunk
+                    .clone()
+                    .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points]),
                 UnderrunPolicy::Blank => {
                     vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
                 }

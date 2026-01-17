@@ -9,7 +9,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_points, Args};
-use laser_dac::{list_devices, open_device, StreamConfig, Result};
+use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();

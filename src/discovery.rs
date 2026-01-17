@@ -608,7 +608,9 @@ impl LasercubeWifiDiscovery {
     /// Connect to a discovered LaserCube WiFi device.
     pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::LasercubeWifi { info, source_addr } = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for LaserCube WiFi"));
+            return Err(Error::invalid_config(
+                "Invalid device type for LaserCube WiFi",
+            ));
         };
 
         let addressed = LasercubeAddressed::from_discovery(&info, source_addr);
@@ -667,7 +669,9 @@ impl LasercubeUsbDiscovery {
     /// Connect to a discovered LaserCube USB device.
     pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
         let DiscoveredDeviceInner::LasercubeUsb(usb_device) = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for LaserCube USB"));
+            return Err(Error::invalid_config(
+                "Invalid device type for LaserCube USB",
+            ));
         };
 
         let backend = LasercubeUsbBackend::new(usb_device);

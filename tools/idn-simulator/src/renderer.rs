@@ -26,7 +26,11 @@ impl Default for RenderSettings {
 
 /// Render laser points as connected lines on an egui canvas.
 /// Returns the rect used for rendering (for drawing overlays like grids).
-pub fn render_laser_canvas(ui: &mut egui::Ui, points: &[RenderPoint], settings: &RenderSettings) -> Rect {
+pub fn render_laser_canvas(
+    ui: &mut egui::Ui,
+    points: &[RenderPoint],
+    settings: &RenderSettings,
+) -> Rect {
     let available_size = ui.available_size();
     let (response, painter) = ui.allocate_painter(available_size, egui::Sense::hover());
     let rect = response.rect;
@@ -141,7 +145,10 @@ pub fn draw_grid_overlay(painter: &egui::Painter, img_rect: Rect) {
     // X-axis labels (bottom edge, inset)
     // -1 at left
     painter.text(
-        Pos2::new(img_rect.left() + label_offset, img_rect.bottom() - label_offset),
+        Pos2::new(
+            img_rect.left() + label_offset,
+            img_rect.bottom() - label_offset,
+        ),
         egui::Align2::LEFT_BOTTOM,
         "-1",
         font_id.clone(),
@@ -149,7 +156,10 @@ pub fn draw_grid_overlay(painter: &egui::Painter, img_rect: Rect) {
     );
     // +1 at right
     painter.text(
-        Pos2::new(img_rect.right() - label_offset, img_rect.bottom() - label_offset),
+        Pos2::new(
+            img_rect.right() - label_offset,
+            img_rect.bottom() - label_offset,
+        ),
         egui::Align2::RIGHT_BOTTOM,
         "+1",
         font_id.clone(),
@@ -167,7 +177,10 @@ pub fn draw_grid_overlay(painter: &egui::Painter, img_rect: Rect) {
     // Y-axis labels (left edge, inset)
     // +1 at top
     painter.text(
-        Pos2::new(img_rect.left() + label_offset, img_rect.top() + label_offset),
+        Pos2::new(
+            img_rect.left() + label_offset,
+            img_rect.top() + label_offset,
+        ),
         egui::Align2::LEFT_TOP,
         "+1",
         font_id.clone(),
@@ -175,7 +188,10 @@ pub fn draw_grid_overlay(painter: &egui::Painter, img_rect: Rect) {
     );
     // -1 at bottom
     painter.text(
-        Pos2::new(img_rect.left() + label_offset, img_rect.bottom() - label_offset),
+        Pos2::new(
+            img_rect.left() + label_offset,
+            img_rect.bottom() - label_offset,
+        ),
         egui::Align2::LEFT_BOTTOM,
         "-1",
         font_id.clone(),

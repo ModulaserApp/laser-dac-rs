@@ -90,11 +90,11 @@
 //!
 //! Each backend handles conversion to its native format internally.
 
-mod frame_adapter;
 pub mod backend;
 pub mod discovery;
 mod discovery_worker;
 mod error;
+mod frame_adapter;
 pub mod protocols;
 pub mod stream;
 pub mod types;
@@ -105,7 +105,6 @@ pub use error::{Error, Result};
 // Backend trait and types
 pub use backend::{StreamBackend, WriteOutcome};
 
-
 // Discovery types
 pub use discovery::{CustomDiscoverySource, DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo};
 pub use discovery_worker::{DacDiscoveryWorker, DacDiscoveryWorkerBuilder};
@@ -113,11 +112,24 @@ pub use discovery_worker::{DacDiscoveryWorker, DacDiscoveryWorkerBuilder};
 // Core types
 pub use types::{
     // DAC types
-    caps_for_dac_type, DacConnectionState, DacDevice, DacType, DiscoveredDac, EnabledDacTypes,
-    LaserPoint,
+    caps_for_dac_type,
     // Streaming types
-    Caps, ChunkRequest, DeviceInfo, OutputModel, RunExit, StreamConfig, StreamInstant,
-    StreamStats, StreamStatus, UnderrunPolicy,
+    Caps,
+    ChunkRequest,
+    DacConnectionState,
+    DacDevice,
+    DacType,
+    DeviceInfo,
+    DiscoveredDac,
+    EnabledDacTypes,
+    LaserPoint,
+    OutputModel,
+    RunExit,
+    StreamConfig,
+    StreamInstant,
+    StreamStats,
+    StreamStatus,
+    UnderrunPolicy,
 };
 
 // Stream and Device types
