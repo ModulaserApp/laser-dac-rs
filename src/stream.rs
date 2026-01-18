@@ -1190,4 +1190,74 @@ mod tests {
         let last = stream.state.last_chunk.as_ref().unwrap();
         assert_eq!(last[0].r, 65535); // Still the old colored points
     }
+
+    #[test]
+    fn test_stop_closes_shutter() {
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DeviceInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm first to open shutter
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        // Stop should close shutter
+        stream.stop().unwrap();
+        assert!(!shutter_open.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_arm_disarm_arm_cycle() {
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DeviceInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let control = stream.control();
+
+        // Initial state: disarmed
+        assert!(!control.is_armed());
+        assert!(!shutter_open.load(Ordering::SeqCst));
+
+        // Arm
+        control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(control.is_armed());
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        // Disarm
+        control.disarm().unwrap();
+        stream.process_control_messages();
+        assert!(!control.is_armed());
+        assert!(!shutter_open.load(Ordering::SeqCst));
+
+        // Arm again
+        control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(control.is_armed());
+        assert!(shutter_open.load(Ordering::SeqCst));
+    }
 }
