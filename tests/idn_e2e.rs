@@ -16,7 +16,7 @@ use idn_mock_server::{
     IDNCMD_RT_CNLMSG, IDNFLG_STATUS_REALTIME,
 };
 
-use laser_dac::stream::Device;
+use laser_dac::stream::Dac;
 use laser_dac::types::{DacType, EnabledDacTypes, LaserPoint, StreamConfig};
 use laser_dac::DacDiscoveryWorker;
 
@@ -216,7 +216,7 @@ pub fn test_server(hostname: &str) -> std::io::Result<TestServerHandle> {
 // =============================================================================
 
 /// Wait for a device to appear from the discovery worker.
-fn wait_for_device(discovery: &DacDiscoveryWorker, timeout: Duration) -> Option<Device> {
+fn wait_for_device(discovery: &DacDiscoveryWorker, timeout: Duration) -> Option<Dac> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         // Drain discovered devices

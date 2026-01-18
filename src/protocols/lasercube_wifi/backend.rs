@@ -4,14 +4,14 @@ use crate::backend::{StreamBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::lasercube_wifi::dac::{stream, Addressed};
 use crate::protocols::lasercube_wifi::protocol::{DeviceInfo, Point as LasercubePoint};
-use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::net::SocketAddr;
 
 /// LaserCube WiFi DAC backend.
 pub struct LasercubeWifiBackend {
     addressed: Addressed,
     stream: Option<stream::Stream>,
-    caps: Caps,
+    caps: DacCapabilities,
 }
 
 impl LasercubeWifiBackend {
@@ -19,7 +19,7 @@ impl LasercubeWifiBackend {
         Self {
             addressed,
             stream: None,
-            caps: caps_for_dac_type(&DacType::LasercubeWifi),
+            caps: super::default_capabilities(),
         }
     }
 
@@ -33,7 +33,7 @@ impl StreamBackend for LasercubeWifiBackend {
         DacType::LasercubeWifi
     }
 
-    fn caps(&self) -> &Caps {
+    fn caps(&self) -> &DacCapabilities {
         &self.caps
     }
 

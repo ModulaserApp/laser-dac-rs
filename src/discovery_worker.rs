@@ -1,7 +1,7 @@
-//! Background worker for non-blocking DAC device discovery.
+//! Background worker for non-blocking DAC discovery.
 //!
 //! The `DacDiscoveryWorker` runs discovery in a background thread and produces
-//! ready-to-use [`Device`] instances as devices are found.
+//! ready-to-use [`Dac`] instances as DACs are found.
 
 use std::collections::HashMap;
 #[cfg(all(feature = "idn", feature = "testutils"))]
@@ -13,8 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::discovery::{CustomDiscoverySource, DacDiscovery, DiscoveredDeviceInfo};
-use crate::stream::Device;
-use crate::types::{DeviceInfo, EnabledDacTypes};
+use crate::stream::Dac;
+use crate::types::{DacInfo, EnabledDacTypes};
 
 type DeviceFilter = dyn Fn(&DiscoveredDeviceInfo) -> bool + Send + Sync + 'static;
 
@@ -108,7 +108,7 @@ impl DacDiscoveryWorkerBuilder {
     ///
     /// This initializes USB controllers, so it should be called from the main thread.
     pub fn build(self) -> DacDiscoveryWorker {
-        let (device_out_tx, device_out_rx) = mpsc::channel::<Device>();
+        let (device_out_tx, device_out_rx) = mpsc::channel::<Dac>();
         let (device_info_tx, device_info_rx) = mpsc::channel::<DiscoveredDeviceInfo>();
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
@@ -165,7 +165,7 @@ impl Default for DacDiscoveryWorkerBuilder {
 ///
 /// The background thread is automatically stopped when the worker is dropped.
 pub struct DacDiscoveryWorker {
-    device_rx: Receiver<Device>,
+    device_rx: Receiver<Dac>,
     device_info_rx: Receiver<DiscoveredDeviceInfo>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -185,12 +185,12 @@ impl DacDiscoveryWorker {
         std::iter::from_fn(|| self.device_info_rx.try_recv().ok())
     }
 
-    /// Polls for newly connected devices.
+    /// Polls for newly connected DACs.
     ///
-    /// Returns an iterator of [`Device`] handles for devices that were discovered
-    /// and passed the device filter since the last call. These devices are already
+    /// Returns an iterator of [`Dac`] handles for DACs that were discovered
+    /// and passed the filter since the last call. These DACs are already
     /// connected and ready to start streaming.
-    pub fn poll_new_devices(&self) -> impl Iterator<Item = Device> + '_ {
+    pub fn poll_new_devices(&self) -> impl Iterator<Item = Dac> + '_ {
         std::iter::from_fn(|| self.device_rx.try_recv().ok())
     }
 }
@@ -214,7 +214,7 @@ impl Drop for DacDiscoveryWorker {
 #[allow(clippy::too_many_arguments)]
 fn discovery_loop(
     mut discovery: DacDiscovery,
-    device_tx: Sender<Device>,
+    device_tx: Sender<Dac>,
     device_info_tx: Sender<DiscoveredDeviceInfo>,
     enabled_types: EnabledDacTypes,
     device_filter: Arc<DeviceFilter>,
@@ -272,13 +272,13 @@ fn discovery_loop(
                 }
             };
 
-            let device_info = DeviceInfo {
+            let device_info = DacInfo {
                 id: stable_id.clone(),
                 name: info.name(),
                 kind: info.dac_type,
                 caps: backend.caps().clone(),
             };
-            let device = Device::new(device_info, backend);
+            let device = Dac::new(device_info, backend);
             if device_tx.send(device).is_err() {
                 return;
             }
@@ -313,13 +313,13 @@ fn discovery_loop(
                     continue;
                 };
 
-                let device_info = DeviceInfo {
+                let device_info = DacInfo {
                     id: stable_id.clone(),
                     name: dac.name.clone(),
                     kind: info.dac_type.clone(),
                     caps: backend.caps().clone(),
                 };
-                let device = Device::new(device_info, backend);
+                let device = Dac::new(device_info, backend);
                 if device_tx.send(device).is_err() {
                     return;
                 }

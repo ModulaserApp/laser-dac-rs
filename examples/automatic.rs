@@ -1,8 +1,8 @@
 //! Automatic discovery example using DacDiscoveryWorker.
 //!
 //! This example demonstrates background discovery that automatically
-//! finds and connects to DAC devices. The worker runs in a background
-//! thread and yields ready-to-use Device instances.
+//! finds and connects to DACs. The worker runs in a background
+//! thread and yields ready-to-use Dac instances.
 //!
 //! Run with: `cargo run --example automatic -- [triangle|circle]`
 
@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     println!("Scanning for DACs (5 seconds)...\n");
     let mut device = None;
     for _ in 0..50 {
-        // poll_new_devices() returns already-connected Device instances
+        // poll_new_devices() returns already-connected Dac instances
         if let Some(d) = discovery.poll_new_devices().next() {
             device = Some(d);
             break;

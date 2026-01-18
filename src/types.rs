@@ -269,10 +269,10 @@ pub struct DiscoveredDac {
 // Streaming Types
 // =============================================================================
 
-/// Device capabilities that inform the stream scheduler about safe chunk sizes and behaviors.
+/// DAC capabilities that inform the stream scheduler about safe chunk sizes and behaviors.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Caps {
+pub struct DacCapabilities {
     /// Minimum points-per-second (hardware/protocol limit where known).
     ///
     /// A value of 1 means no known protocol constraint. Helios (7) and
@@ -291,7 +291,7 @@ pub struct Caps {
     pub output_model: OutputModel,
 }
 
-impl Default for Caps {
+impl Default for DacCapabilities {
     fn default() -> Self {
         Self {
             pps_min: 1,
@@ -306,61 +306,38 @@ impl Default for Caps {
 
 /// Get default capabilities for a DAC type.
 ///
-/// This is the single source of truth for DAC capabilities, used by both
-/// device discovery (before connection) and backend implementations.
-///
-/// These are conservative "safe defaults" that should work across all models
-/// of each DAC type. For optimal performance, backends should query actual
-/// device capabilities at runtime where the protocol supports it (e.g.,
-/// LaserCube's `max_dac_rate` and ringbuffer queries).
-pub fn caps_for_dac_type(dac_type: &DacType) -> Caps {
+/// This delegates to each protocol's `default_capabilities()` function.
+/// For optimal performance, backends should query actual device capabilities
+/// at runtime where the protocol supports it (e.g., LaserCube's `max_dac_rate`
+/// and ringbuffer queries).
+pub fn caps_for_dac_type(dac_type: &DacType) -> DacCapabilities {
     match dac_type {
-        DacType::Helios => Caps {
-            pps_min: 7,
-            pps_max: 65535,
-            max_points_per_chunk: 4095,
-            prefers_constant_pps: true,
-            can_estimate_queue: false,
-            output_model: OutputModel::UsbFrameSwap,
-        },
-        DacType::EtherDream => Caps {
-            pps_min: 1,
-            pps_max: 100_000,
-            max_points_per_chunk: 1799,
-            prefers_constant_pps: true,
-            can_estimate_queue: true,
-            output_model: OutputModel::NetworkFifo,
-        },
-        // Generic IDN defaults - conservative for unknown devices.
-        // IDN has no protocol-defined pps_min (rate is derived from sampleCount/chunkDuration).
-        // Note: Helios-via-IDN (OpenIDN adapter) has different limits (pps 7-65535,
-        // max 4095 points). Consider adding DacType::HeliosIdn if needed.
-        DacType::Idn => Caps {
-            pps_min: 1,
-            pps_max: 100_000,
-            max_points_per_chunk: 4096,
-            prefers_constant_pps: false,
-            can_estimate_queue: false,
-            output_model: OutputModel::UdpTimed,
-        },
-        // LaserCube has no documented pps_min; the device accepts any u32 > 0.
-        DacType::LasercubeWifi => Caps {
-            pps_min: 1,
-            pps_max: 30_000,
-            max_points_per_chunk: 6000,
-            prefers_constant_pps: false,
-            can_estimate_queue: false,
-            output_model: OutputModel::UdpTimed,
-        },
-        DacType::LasercubeUsb => Caps {
-            pps_min: 1,
-            pps_max: 35_000,
-            max_points_per_chunk: 4096,
-            prefers_constant_pps: false,
-            can_estimate_queue: false,
-            output_model: OutputModel::UsbFrameSwap,
-        },
-        DacType::Custom(_) => Caps::default(),
+        #[cfg(feature = "helios")]
+        DacType::Helios => crate::protocols::helios::default_capabilities(),
+        #[cfg(not(feature = "helios"))]
+        DacType::Helios => DacCapabilities::default(),
+
+        #[cfg(feature = "ether-dream")]
+        DacType::EtherDream => crate::protocols::ether_dream::default_capabilities(),
+        #[cfg(not(feature = "ether-dream"))]
+        DacType::EtherDream => DacCapabilities::default(),
+
+        #[cfg(feature = "idn")]
+        DacType::Idn => crate::protocols::idn::default_capabilities(),
+        #[cfg(not(feature = "idn"))]
+        DacType::Idn => DacCapabilities::default(),
+
+        #[cfg(feature = "lasercube-wifi")]
+        DacType::LasercubeWifi => crate::protocols::lasercube_wifi::default_capabilities(),
+        #[cfg(not(feature = "lasercube-wifi"))]
+        DacType::LasercubeWifi => DacCapabilities::default(),
+
+        #[cfg(feature = "lasercube-usb")]
+        DacType::LasercubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
+        #[cfg(not(feature = "lasercube-usb"))]
+        DacType::LasercubeUsb => DacCapabilities::default(),
+
+        DacType::Custom(_) => DacCapabilities::default(),
     }
 }
 
@@ -564,23 +541,28 @@ pub enum RunExit {
     Disconnected,
 }
 
-/// Information about a discovered device before connection.
+/// Information about a discovered DAC before connection.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct DeviceInfo {
-    /// Stable, unique identifier used for (re)selecting devices.
+pub struct DacInfo {
+    /// Stable, unique identifier used for (re)selecting DACs.
     pub id: String,
-    /// Human-readable name for the device.
+    /// Human-readable name for the DAC.
     pub name: String,
     /// The type of DAC hardware.
     pub kind: DacType,
-    /// Device capabilities.
-    pub caps: Caps,
+    /// DAC capabilities.
+    pub caps: DacCapabilities,
 }
 
-impl DeviceInfo {
-    /// Create a new device info.
-    pub fn new(id: impl Into<String>, name: impl Into<String>, kind: DacType, caps: Caps) -> Self {
+impl DacInfo {
+    /// Create a new DAC info.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        kind: DacType,
+        caps: DacCapabilities,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),

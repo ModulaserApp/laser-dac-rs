@@ -39,7 +39,20 @@ pub mod protocol;
 
 pub use backend::LasercubeWifiBackend;
 
+use crate::types::{DacCapabilities, OutputModel};
 use protocol::{command, DeviceInfo, CMD_PORT};
+
+/// Returns the default capabilities for LaserCube WiFi DACs.
+pub fn default_capabilities() -> DacCapabilities {
+    DacCapabilities {
+        pps_min: 1,
+        pps_max: 30_000,
+        max_points_per_chunk: 6000,
+        prefers_constant_pps: false,
+        can_estimate_queue: false,
+        output_model: OutputModel::UdpTimed,
+    }
+}
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};

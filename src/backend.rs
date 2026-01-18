@@ -3,7 +3,7 @@
 //! This module provides the [`StreamBackend`] trait that all DAC backends must
 //! implement, as well as implementations for all supported DAC types.
 
-use crate::types::{Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 // Re-export error types for backwards compatibility
 pub use crate::error::{Error, Result};
@@ -32,7 +32,7 @@ pub trait StreamBackend: Send + 'static {
     fn dac_type(&self) -> DacType;
 
     /// Returns the device capabilities.
-    fn caps(&self) -> &Caps;
+    fn caps(&self) -> &DacCapabilities;
 
     /// Connect to the device.
     fn connect(&mut self) -> Result<()>;

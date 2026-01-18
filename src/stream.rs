@@ -1,7 +1,7 @@
-//! Stream and Device types for point output.
+//! Stream and Dac types for point output.
 //!
 //! This module provides the `Stream` type for streaming point chunks to a DAC,
-//! `StreamControl` for out-of-band control (arm/disarm/stop), and `Device` for
+//! `StreamControl` for out-of-band control (arm/disarm/stop), and `Dac` for
 //! connected devices that can start streaming sessions.
 //!
 //! # Armed/Disarmed Model
@@ -23,7 +23,7 @@
 //!
 //! # Disconnect Behavior
 //!
-//! No automatic reconnection. On disconnect, create a new `Device` and `Stream`.
+//! No automatic reconnection. On disconnect, create a new `Dac` and `Stream`.
 //! New streams always start disarmed for safety.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    Caps, ChunkRequest, DacType, DeviceInfo, LaserPoint, RunExit, StreamConfig, StreamInstant,
-    StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit, StreamConfig,
+    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -192,7 +192,7 @@ impl StreamState {
 /// The stream owns pacing, backpressure, and the timebase (`StreamInstant`).
 pub struct Stream {
     /// Device info for this stream.
-    info: DeviceInfo,
+    info: DacInfo,
     /// The backend.
     backend: Option<Box<dyn StreamBackend>>,
     /// Stream configuration.
@@ -210,7 +210,7 @@ pub struct Stream {
 impl Stream {
     /// Create a new stream with a backend.
     pub(crate) fn with_backend(
-        info: DeviceInfo,
+        info: DacInfo,
         backend: Box<dyn StreamBackend>,
         config: StreamConfig,
         chunk_points: usize,
@@ -228,7 +228,7 @@ impl Stream {
     }
 
     /// Returns the device info.
-    pub fn info(&self) -> &DeviceInfo {
+    pub fn info(&self) -> &DacInfo {
         &self.info
     }
 
@@ -413,7 +413,7 @@ impl Stream {
     /// Consume the stream and recover the device for reuse.
     ///
     /// This method disarms and stops the stream (software blanking + hardware shutter),
-    /// then returns the underlying `Device` along with the final `StreamStats`.
+    /// then returns the underlying `Dac` along with the final `StreamStats`.
     /// The device can then be used to start a new stream with different configuration.
     ///
     /// # Example
@@ -421,14 +421,14 @@ impl Stream {
     /// ```ignore
     /// let (stream, info) = device.start_stream(config)?;
     /// // ... stream for a while ...
-    /// let (device, stats) = stream.into_device();
+    /// let (device, stats) = stream.into_dac();
     /// println!("Streamed {} points", stats.points_written);
     ///
     /// // Restart with different config
     /// let new_config = StreamConfig::new(60_000);
     /// let (stream2, _) = device.start_stream(new_config)?;
     /// ```
-    pub fn into_device(mut self) -> (Device, StreamStats) {
+    pub fn into_dac(mut self) -> (Dac, StreamStats) {
         // Disarm (software blanking) and close shutter before stopping
         let _ = self.control.disarm();
         let _ = self.control.stop();
@@ -441,12 +441,12 @@ impl Stream {
         let backend = self.backend.take();
         let stats = self.state.stats.clone();
 
-        let device = Device {
+        let dac = Dac {
             info: self.info.clone(),
             backend,
         };
 
-        (device, stats)
+        (dac, stats)
     }
 
     /// Run the stream in callback mode.
@@ -725,7 +725,7 @@ impl Drop for Stream {
 /// A connected device that can start streaming sessions.
 ///
 /// When starting a stream, the device is consumed and the backend ownership
-/// transfers to the stream. The `DeviceInfo` is returned alongside the stream
+/// transfers to the stream. The `DacInfo` is returned alongside the stream
 /// so metadata remains accessible.
 ///
 /// # Example
@@ -736,14 +736,14 @@ impl Drop for Stream {
 /// let (stream, info) = device.start_stream(config)?;
 /// println!("Streaming to: {}", info.name);
 /// ```
-pub struct Device {
-    info: DeviceInfo,
+pub struct Dac {
+    info: DacInfo,
     backend: Option<Box<dyn StreamBackend>>,
 }
 
-impl Device {
+impl Dac {
     /// Create a new device from a backend.
-    pub fn new(info: DeviceInfo, backend: Box<dyn StreamBackend>) -> Self {
+    pub fn new(info: DacInfo, backend: Box<dyn StreamBackend>) -> Self {
         Self {
             info,
             backend: Some(backend),
@@ -751,7 +751,7 @@ impl Device {
     }
 
     /// Returns the device info.
-    pub fn info(&self) -> &DeviceInfo {
+    pub fn info(&self) -> &DacInfo {
         &self.info
     }
 
@@ -771,7 +771,7 @@ impl Device {
     }
 
     /// Returns the device capabilities.
-    pub fn caps(&self) -> &Caps {
+    pub fn caps(&self) -> &DacCapabilities {
         &self.info.caps
     }
 
@@ -792,12 +792,12 @@ impl Device {
     ///
     /// # Ownership
     ///
-    /// This method consumes the `Device` because:
+    /// This method consumes the `Dac` because:
     /// - Each device can only have one active stream at a time.
     /// - The backend is moved into the `Stream` to ensure exclusive access.
     /// - This prevents accidental reuse of a device that's already streaming.
     ///
-    /// The method returns both the `Stream` and a copy of `DeviceInfo`, so you
+    /// The method returns both the `Stream` and a copy of `DacInfo`, so you
     /// retain access to device metadata (id, name, capabilities) after starting.
     ///
     /// # Connection
@@ -812,7 +812,7 @@ impl Device {
     /// - The device backend has already been used for a stream.
     /// - The configuration is invalid (PPS out of range, invalid chunk size, etc.).
     /// - The backend fails to connect.
-    pub fn start_stream(mut self, cfg: StreamConfig) -> Result<(Stream, DeviceInfo)> {
+    pub fn start_stream(mut self, cfg: StreamConfig) -> Result<(Stream, DacInfo)> {
         let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
@@ -833,7 +833,7 @@ impl Device {
         Ok((stream, self.info))
     }
 
-    fn validate_config(caps: &Caps, cfg: &StreamConfig) -> Result<()> {
+    fn validate_config(caps: &DacCapabilities, cfg: &StreamConfig) -> Result<()> {
         if cfg.pps < caps.pps_min || cfg.pps > caps.pps_max {
             return Err(Error::invalid_config(format!(
                 "PPS {} is outside device range [{}, {}]",
@@ -860,7 +860,11 @@ impl Device {
         Ok(())
     }
 
-    fn compute_default_chunk_size(caps: &Caps, pps: u32, target_queue_points: usize) -> usize {
+    fn compute_default_chunk_size(
+        caps: &DacCapabilities,
+        pps: u32,
+        target_queue_points: usize,
+    ) -> usize {
         // Target ~10ms worth of points per chunk
         let target_chunk_ms = 10;
         let time_based_points = (pps as usize * target_chunk_ms) / 1000;
@@ -877,7 +881,7 @@ impl Device {
 }
 
 /// Legacy alias for compatibility.
-pub type OwnedDevice = Device;
+pub type OwnedDac = Dac;
 
 #[cfg(test)]
 mod tests {
@@ -888,7 +892,7 @@ mod tests {
 
     /// A test backend for unit testing stream behavior.
     struct TestBackend {
-        caps: Caps,
+        caps: DacCapabilities,
         connected: bool,
         /// Count of write attempts
         write_count: Arc<AtomicUsize>,
@@ -903,7 +907,7 @@ mod tests {
     impl TestBackend {
         fn new() -> Self {
             Self {
-                caps: Caps {
+                caps: DacCapabilities {
                     pps_min: 1000,
                     pps_max: 100000,
                     max_points_per_chunk: 1000,
@@ -930,7 +934,7 @@ mod tests {
             DacType::Custom("Test".to_string())
         }
 
-        fn caps(&self) -> &Caps {
+        fn caps(&self) -> &DacCapabilities {
             &self.caps
         }
 
@@ -1015,13 +1019,13 @@ mod tests {
     #[test]
     fn test_device_start_stream_connects_backend() {
         let backend = TestBackend::new();
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Device::new(info, Box::new(backend));
+        let device = Dac::new(info, Box::new(backend));
 
         // Device should not be connected initially
         assert!(!device.is_connected());
@@ -1039,7 +1043,7 @@ mod tests {
     fn test_handle_underrun_advances_state() {
         let mut backend = TestBackend::new();
         backend.connected = true;
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1082,7 +1086,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1119,7 +1123,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1157,7 +1161,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1203,7 +1207,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1231,7 +1235,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),

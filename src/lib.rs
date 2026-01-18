@@ -113,13 +113,13 @@ pub use discovery_worker::{DacDiscoveryWorker, DacDiscoveryWorkerBuilder};
 pub use types::{
     // DAC types
     caps_for_dac_type,
-    // Streaming types
-    Caps,
     ChunkRequest,
+    // Streaming types
+    DacCapabilities,
     DacConnectionState,
     DacDevice,
+    DacInfo,
     DacType,
-    DeviceInfo,
     DiscoveredDac,
     EnabledDacTypes,
     LaserPoint,
@@ -132,8 +132,8 @@ pub use types::{
     UnderrunPolicy,
 };
 
-// Stream and Device types
-pub use stream::{Device, OwnedDevice, Stream, StreamControl};
+// Stream and Dac types
+pub use stream::{Dac, OwnedDac, Stream, StreamControl};
 
 // Frame adapters (converts point buffers to continuous streams)
 pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
@@ -180,15 +180,15 @@ pub use protocols::lasercube_usb::rusb;
 
 use backend::Result as BackendResult;
 
-/// List all available devices.
+/// List all available DACs.
 ///
-/// Returns device info for each discovered device, including capabilities.
-pub fn list_devices() -> BackendResult<Vec<DeviceInfo>> {
+/// Returns DAC info for each discovered DAC, including capabilities.
+pub fn list_devices() -> BackendResult<Vec<DacInfo>> {
     list_devices_filtered(&EnabledDacTypes::all())
 }
 
-/// List available devices filtered by DAC type.
-pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<Vec<DeviceInfo>> {
+/// List available DACs filtered by DAC type.
+pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<Vec<DacInfo>> {
     let mut discovery = DacDiscovery::new(enabled_types.clone());
     let discovered = discovery.scan();
 
@@ -196,7 +196,7 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
     for device in discovered {
         let info = device.info();
         let caps = caps_for_dac_type(&device.dac_type());
-        devices.push(DeviceInfo {
+        devices.push(DacInfo {
             id: info.stable_id(),
             name: info.name(),
             kind: device.dac_type(),
@@ -207,31 +207,31 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
     Ok(devices)
 }
 
-/// Open a device by ID.
+/// Open a DAC by ID.
 ///
 /// The ID should match the `id` field returned by [`list_devices`].
 /// IDs are namespaced by protocol (e.g., `etherdream:aa:bb:cc:dd:ee:ff`,
 /// `idn:hostname.local`, `helios:serial`).
-pub fn open_device(id: &str) -> BackendResult<Device> {
+pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
     let discovered = discovery.scan();
 
     let device = discovered
         .into_iter()
         .find(|d| d.info().stable_id() == id)
-        .ok_or_else(|| backend::Error::disconnected(format!("device not found: {}", id)))?;
+        .ok_or_else(|| backend::Error::disconnected(format!("DAC not found: {}", id)))?;
 
     let info = device.info();
     let name = info.name();
     let dac_type = device.dac_type();
     let stream_backend = discovery.connect(device)?;
 
-    let device_info = DeviceInfo {
+    let dac_info = DacInfo {
         id: id.to_string(),
         name,
         kind: dac_type,
         caps: stream_backend.caps().clone(),
     };
 
-    Ok(Device::new(device_info, stream_backend))
+    Ok(Dac::new(dac_info, stream_backend))
 }
