@@ -144,16 +144,6 @@ pub struct StreamConfig {
     pub target_queue_points: usize,
 
     pub underrun: UnderrunPolicy,
-
-    /// Whether to automatically open the hardware shutter when arming.
-    /// When `false` (default), `arm()` only enables software output.
-    /// When `true`, `arm()` will also open the hardware shutter.
-    /// Note: `disarm()` always closes the hardware shutter for safety.
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - LaserCube USB/WiFi: Actual hardware control
-    /// - Ether Dream, Helios, IDN: No-op (safety relies on software blanking)
-    pub open_shutter_on_arm: bool,
 }
 
 pub enum UnderrunPolicy {
@@ -188,8 +178,11 @@ impl Device {
 
 **Safety defaults (intent)**
 
-- The default `UnderrunPolicy` should be safe (typically `Blank` or `Park`), not “repeat last bright point forever”.
-- Make an explicit armed/disarmed shutter a first-class API so reconnects don't accidentally lase without an explicit enable step.
+- The default `UnderrunPolicy` should be safe (typically `Blank` or `Park`), not "repeat last bright point forever".
+- Binary armed/disarmed model: `arm()` opens shutter + enables output, `disarm()` closes shutter + blanks all points.
+- No separate shutter API — this keeps the mental model simple: armed = laser may emit.
+- Shutter control is best-effort: LaserCube USB/WiFi have actual hardware control; Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
+- New streams always start disarmed so reconnects don't accidentally lase.
 
 **Out-of-band control (target direction)**
 
@@ -278,19 +271,6 @@ impl Stream {
     ///
     /// Semantics: fixed for the lifetime of the stream.
     pub fn chunk_points(&self) -> usize;
-
-    /// Manually open the hardware shutter.
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - LaserCube USB/WiFi: Actual hardware control
-    /// - Ether Dream, Helios, IDN: No-op (safety relies on software blanking)
-    pub fn open_shutter(&mut self) -> Result<(), Error>;
-
-    /// Manually close the hardware shutter.
-    pub fn close_shutter(&mut self) -> Result<(), Error>;
-
-    /// Returns whether the hardware shutter is currently open.
-    pub fn is_shutter_open(&self) -> bool;
 
     /// Consume the stream and recover the device for reuse.
     ///

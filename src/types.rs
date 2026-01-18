@@ -451,23 +451,6 @@ pub struct StreamConfig {
     pub target_queue_points: usize,
     /// What to do when the producer can't keep up.
     pub underrun: UnderrunPolicy,
-    /// Whether to automatically open the hardware shutter when arming.
-    ///
-    /// When `false` (default), `arm()` only enables software output. The hardware
-    /// shutter must be opened separately if needed.
-    ///
-    /// When `true`, `arm()` will also attempt to open the hardware shutter
-    /// (best-effort, errors are ignored).
-    ///
-    /// Note: `disarm()` always closes the hardware shutter for safety,
-    /// regardless of this setting.
-    ///
-    /// # Hardware Support
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - **LaserCube USB/WiFi**: Actual hardware control via CMD_SET_OUTPUT
-    /// - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
-    pub open_shutter_on_arm: bool,
 }
 
 impl Default for StreamConfig {
@@ -477,7 +460,6 @@ impl Default for StreamConfig {
             chunk_points: None,
             target_queue_points: 3000,
             underrun: UnderrunPolicy::default(),
-            open_shutter_on_arm: false,
         }
     }
 }
@@ -506,17 +488,6 @@ impl StreamConfig {
     /// Set the underrun policy (builder pattern).
     pub fn with_underrun(mut self, policy: UnderrunPolicy) -> Self {
         self.underrun = policy;
-        self
-    }
-
-    /// Enable automatic hardware shutter opening on arm (builder pattern).
-    ///
-    /// When enabled, `arm()` will attempt to open the hardware shutter
-    /// in addition to enabling software output. Default is `false`.
-    ///
-    /// See [`StreamConfig::open_shutter_on_arm`] for hardware support details.
-    pub fn with_open_shutter_on_arm(mut self, enable: bool) -> Self {
-        self.open_shutter_on_arm = enable;
         self
     }
 }
@@ -585,11 +556,11 @@ pub struct StreamStats {
 /// How a callback-mode stream run ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunExit {
-    /// A stop request was issued via out-of-band control.
+    /// Stream was stopped via `StreamControl::stop()`.
     Stopped,
-    /// The producer returned `None` (graceful completion).
+    /// Producer returned `None` (graceful completion).
     ProducerEnded,
-    /// The device disconnected or became unreachable.
+    /// Device disconnected. No auto-reconnect; new streams start disarmed.
     Disconnected,
 }
 

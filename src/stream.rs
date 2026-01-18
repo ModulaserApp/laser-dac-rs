@@ -3,6 +3,28 @@
 //! This module provides the `Stream` type for streaming point chunks to a DAC,
 //! `StreamControl` for out-of-band control (arm/disarm/stop), and `Device` for
 //! connected devices that can start streaming sessions.
+//!
+//! # Armed/Disarmed Model
+//!
+//! Streams use a binary armed/disarmed safety model:
+//!
+//! - **Armed**: Content passes through to device, shutter opened (best-effort).
+//! - **Disarmed** (default): Shutter closed, intensity/RGB forced to 0.
+//!
+//! All streams start disarmed. Call `arm()` to enable output.
+//! `arm()` and `disarm()` are the only safety controls — there is no separate
+//! shutter API. This keeps the mental model simple: armed = laser may emit.
+//!
+//! # Hardware Shutter Support
+//!
+//! Shutter control is best-effort and varies by backend:
+//! - **LaserCube USB/WiFi**: Actual hardware control
+//! - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
+//!
+//! # Disconnect Behavior
+//!
+//! No automatic reconnection. On disconnect, create a new `Device` and `Stream`.
+//! New streams always start disarmed for safety.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -25,9 +47,9 @@ use crate::types::{
 /// even when the stream is waiting (pacing, backpressure, etc.).
 #[derive(Debug, Clone, Copy)]
 enum ControlMsg {
-    /// Arm the output (may open shutter if configured).
+    /// Arm the output (opens hardware shutter).
     Arm,
-    /// Disarm the output and close the hardware shutter.
+    /// Disarm the output (closes hardware shutter).
     Disarm,
     /// Request the stream to stop.
     Stop,
@@ -68,8 +90,8 @@ impl StreamControl {
 
     /// Arm the output (allow laser to fire).
     ///
-    /// If `StreamConfig::open_shutter_on_arm` is `true`, the hardware shutter
-    /// will be opened as soon as the stream processes this command.
+    /// When armed, content from the producer passes through unmodified
+    /// and the hardware shutter is opened (best-effort).
     pub fn arm(&self) -> Result<()> {
         self.inner.armed.store(true, Ordering::SeqCst);
         // Send message to stream for immediate shutter control
@@ -79,24 +101,18 @@ impl StreamControl {
         Ok(())
     }
 
-    /// Disarm the output (force laser off).
+    /// Disarm the output (force laser off). Designed for E-stop use.
     ///
-    /// This immediately:
-    /// 1. Sets the armed flag to false (subsequent points will be blanked in software)
-    /// 2. Sends a message to close the hardware shutter as soon as possible
+    /// Immediately sets an atomic flag (works even if stream loop is blocked),
+    /// then sends a message to close the hardware shutter. All future points
+    /// are blanked in software. The stream stays alive outputting blanks -
+    /// use `stop()` to terminate entirely.
     ///
-    /// # Safety Note
+    /// **Latency**: Points already in the device buffer will still play out.
+    /// `target_queue_points` bounds this latency.
     ///
-    /// Software cannot unschedule points that have already been sent to the device
-    /// buffer. "Immediate" means the shutter closes ASAP and all future points
-    /// will be safe (blanked). The `target_queue_points` configuration bounds the
-    /// maximum latency before the shutter closes.
-    ///
-    /// # Hardware Support
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - **LaserCube USB/WiFi**: Actual hardware control via CMD_SET_OUTPUT
-    /// - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
+    /// **Hardware shutter**: Best-effort. LaserCube has actual hardware control;
+    /// Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
     pub fn disarm(&self) -> Result<()> {
         self.inner.armed.store(false, Ordering::SeqCst);
         // Send message to stream for immediate shutter control
@@ -112,6 +128,9 @@ impl StreamControl {
     }
 
     /// Request the stream to stop.
+    ///
+    /// Signals termination; `run()` returns `RunExit::Stopped`.
+    /// For clean shutdown with shutter close, prefer `Stream::stop()`.
     pub fn stop(&self) -> Result<()> {
         self.inner.stop_requested.store(true, Ordering::SeqCst);
         // Send message to stream for immediate stop
@@ -292,8 +311,7 @@ impl Stream {
     ///
     /// This method manages the hardware shutter based on arm state transitions:
     /// - When transitioning from armed to disarmed, the shutter is closed (best-effort).
-    /// - When transitioning from disarmed to armed, the shutter is opened only if
-    ///   `StreamConfig::open_shutter_on_arm` is `true`.
+    /// - When transitioning from disarmed to armed, the shutter is opened (best-effort).
     pub fn write(&mut self, req: &ChunkRequest, points: &[LaserPoint]) -> Result<()> {
         // Validate point count
         if points.len() != req.n_points {
@@ -361,8 +379,8 @@ impl Stream {
                 }
                 self.state.shutter_open = false;
             }
-        } else if !was_armed && is_armed && self.config.open_shutter_on_arm {
-            // Armed with auto-open enabled: open the shutter (best-effort)
+        } else if !was_armed && is_armed {
+            // Armed: open the shutter (best-effort)
             if !self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
                     let _ = backend.set_shutter(true); // Best-effort, ignore errors
@@ -372,69 +390,21 @@ impl Stream {
         }
     }
 
-    /// Stop the stream.
+    /// Stop the stream and terminate output.
+    ///
+    /// Closes the hardware shutter before stopping the backend to prevent
+    /// the "freeze on last bright point" hazard. Use `disarm()` instead if
+    /// you want to keep the stream alive but safe.
     pub fn stop(&mut self) -> Result<()> {
         self.control.stop()?;
 
+        // Close shutter before stopping to prevent freeze-on-last-point hazard
         if let Some(backend) = &mut self.backend {
+            let _ = backend.set_shutter(false);
             backend.stop()?;
         }
 
         Ok(())
-    }
-
-    /// Manually open the hardware shutter.
-    ///
-    /// This provides explicit control over the hardware shutter.
-    /// Returns `Ok(())` on success, or an error if the backend doesn't support it
-    /// or the operation fails.
-    ///
-    /// Note: The shutter is automatically managed based on arm state transitions
-    /// (see `StreamConfig::open_shutter_on_arm`). Use this method only if you
-    /// need manual control beyond the automatic behavior.
-    ///
-    /// # Hardware Support
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - **LaserCube USB/WiFi**: Actual hardware control via CMD_SET_OUTPUT
-    /// - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
-    pub fn open_shutter(&mut self) -> Result<()> {
-        let backend = self
-            .backend
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("no backend"))?;
-        backend.set_shutter(true)?;
-        self.state.shutter_open = true;
-        Ok(())
-    }
-
-    /// Manually close the hardware shutter.
-    ///
-    /// This provides explicit control over the hardware shutter.
-    /// Returns `Ok(())` on success, or an error if the backend doesn't support it
-    /// or the operation fails.
-    ///
-    /// Note: The shutter is automatically closed on `disarm()` for safety.
-    /// Use this method only if you need manual control.
-    ///
-    /// # Hardware Support
-    ///
-    /// Shutter control is best-effort and varies by backend:
-    /// - **LaserCube USB/WiFi**: Actual hardware control via CMD_SET_OUTPUT
-    /// - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
-    pub fn close_shutter(&mut self) -> Result<()> {
-        let backend = self
-            .backend
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("no backend"))?;
-        backend.set_shutter(false)?;
-        self.state.shutter_open = false;
-        Ok(())
-    }
-
-    /// Returns whether the hardware shutter is currently open.
-    pub fn is_shutter_open(&self) -> bool {
-        self.state.shutter_open
     }
 
     /// Consume the stream and recover the device for reuse.
@@ -585,7 +555,7 @@ impl Stream {
     /// Process any pending control messages from StreamControl.
     ///
     /// This method drains the control message queue and takes immediate action:
-    /// - `Arm`: Opens the shutter if configured
+    /// - `Arm`: Opens the shutter (best-effort)
     /// - `Disarm`: Closes the shutter immediately
     /// - `Stop`: Returns `true` to signal the caller to stop
     ///
@@ -594,8 +564,8 @@ impl Stream {
         loop {
             match self.control_rx.try_recv() {
                 Ok(ControlMsg::Arm) => {
-                    // Open shutter if configured and not already open
-                    if self.config.open_shutter_on_arm && !self.state.shutter_open {
+                    // Open shutter (best-effort) if not already open
+                    if !self.state.shutter_open {
                         if let Some(backend) = &mut self.backend {
                             let _ = backend.set_shutter(true);
                         }
@@ -1138,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_disarm_closes_shutter_via_control_message() {
+    fn test_arm_opens_shutter_disarm_closes_shutter() {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
@@ -1152,25 +1122,28 @@ mod tests {
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_open_shutter_on_arm(true);
+        let cfg = StreamConfig::new(30000);
         let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
 
-        // Manually open the shutter to simulate armed state
-        stream.open_shutter().unwrap();
-        assert!(shutter_open.load(Ordering::SeqCst));
-        assert!(stream.is_shutter_open());
+        // Initially shutter is closed
+        assert!(!shutter_open.load(Ordering::SeqCst));
 
-        // Get control handle and disarm (this sends ControlMsg::Disarm)
+        // Arm via control (this sends ControlMsg::Arm)
         let control = stream.control();
+        control.arm().unwrap();
+
+        // Process control messages - this should open the shutter
+        let stopped = stream.process_control_messages();
+        assert!(!stopped);
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        // Disarm (this sends ControlMsg::Disarm)
         control.disarm().unwrap();
 
         // Process control messages - this should close the shutter
         let stopped = stream.process_control_messages();
         assert!(!stopped);
-
-        // Shutter should be closed now
         assert!(!shutter_open.load(Ordering::SeqCst));
-        assert!(!stream.is_shutter_open());
     }
 
     #[test]
