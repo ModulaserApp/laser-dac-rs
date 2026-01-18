@@ -392,13 +392,16 @@ impl Stream {
 
     /// Stop the stream and terminate output.
     ///
-    /// Closes the hardware shutter before stopping the backend to prevent
-    /// the "freeze on last bright point" hazard. Use `disarm()` instead if
-    /// you want to keep the stream alive but safe.
+    /// Disarms the output (software blanking + hardware shutter) before stopping
+    /// the backend to prevent the "freeze on last bright point" hazard.
+    /// Use `disarm()` instead if you want to keep the stream alive but safe.
     pub fn stop(&mut self) -> Result<()> {
+        // Disarm: sets armed flag for software blanking
+        self.control.disarm()?;
+
         self.control.stop()?;
 
-        // Close shutter before stopping to prevent freeze-on-last-point hazard
+        // Directly close shutter and stop backend (defense-in-depth)
         if let Some(backend) = &mut self.backend {
             let _ = backend.set_shutter(false);
             backend.stop()?;
@@ -409,9 +412,9 @@ impl Stream {
 
     /// Consume the stream and recover the device for reuse.
     ///
-    /// This method stops the stream, closes the shutter, and returns the
-    /// underlying `Device` along with the final `StreamStats`. The device can
-    /// then be used to start a new stream with different configuration.
+    /// This method disarms and stops the stream (software blanking + hardware shutter),
+    /// then returns the underlying `Device` along with the final `StreamStats`.
+    /// The device can then be used to start a new stream with different configuration.
     ///
     /// # Example
     ///
@@ -426,7 +429,8 @@ impl Stream {
     /// let (stream2, _) = device.start_stream(new_config)?;
     /// ```
     pub fn into_device(mut self) -> (Device, StreamStats) {
-        // Stop the stream and close shutter
+        // Disarm (software blanking) and close shutter before stopping
+        let _ = self.control.disarm();
         let _ = self.control.stop();
         if let Some(backend) = &mut self.backend {
             let _ = backend.set_shutter(false);
