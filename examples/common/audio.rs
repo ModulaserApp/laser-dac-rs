@@ -1,21 +1,17 @@
 //! Audio capture and visualization for laser examples.
 //!
-//! Provides audio-reactive point generation that can be used as a Shape variant.
+//! Provides timebase-aligned audio-reactive point generation for Jerobeam-style
+//! XY oscilloscope rendering. Audio samples are aligned to the stream's point
+//! timeline for stable, jitter-free output.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use laser_dac::LaserPoint;
+use laser_dac::{ChunkRequest, LaserPoint};
 use log::{debug, error, info};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-/// Audio buffer size for processing
-const AUDIO_BUFFER_SIZE: usize = 1024;
-
-/// Threshold below which we consider the signal silent (for blanking)
-const SILENCE_THRESHOLD: f32 = 0.01;
-
-/// Number of blank points for the return sweep
-const BLANK_COUNT: usize = 8;
+/// Ring buffer size in frames (stereo pairs) - 2 seconds at 48kHz
+const RING_BUFFER_FRAMES: usize = 96000;
 
 /// Global audio state - lazily initialized on first use
 static AUDIO_STATE: OnceLock<Arc<Mutex<AudioState>>> = OnceLock::new();
@@ -24,7 +20,7 @@ static AUDIO_STATE: OnceLock<Arc<Mutex<AudioState>>> = OnceLock::new();
 static AUDIO_INITIALIZED: OnceLock<bool> = OnceLock::new();
 
 /// Audio mode based on channel count
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AudioMode {
     /// Mono: time-domain oscilloscope (X=time, Y=amplitude)
     Mono,
@@ -32,40 +28,133 @@ pub enum AudioMode {
     Stereo,
 }
 
+/// Configuration for audio rendering
+#[derive(Debug, Clone)]
+pub struct AudioConfig {
+    /// Fixed intensity for all points (0-65535)
+    pub intensity: u16,
+    /// Color: (r, g, b) each 0-65535
+    pub color: (u16, u16, u16),
+    /// Blank when max amplitude is below this threshold (0.0 = never blank, 0.01 = typical)
+    pub blank_threshold: f32,
+    /// Audio delay in milliseconds. Lower = less latency but may cause glitches.
+    /// Typical range: 10-30ms. Must be > audio capture latency (~10ms).
+    pub delay_ms: f32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            intensity: 65535,
+            color: (0, 65535, 65535), // Cyan
+            blank_threshold: 0.01,    // Blank on near-silence
+            delay_ms: 20.0,           // 20ms delay
+        }
+    }
+}
+
 /// Shared audio state between the audio thread and render thread
 struct AudioState {
-    /// Latest audio samples (interleaved if stereo)
-    samples: Vec<f32>,
-    /// Number of valid samples in the buffer
-    sample_count: usize,
-    /// Number of channels
+    /// Ring buffer for left channel samples
+    ring_left: Vec<f32>,
+    /// Ring buffer for right channel samples
+    ring_right: Vec<f32>,
+    /// Write position in ring buffer (next frame to write)
+    write_pos: usize,
+    /// Sample clock: total frames written since start (monotonic)
+    sample_clock: u64,
+    /// Audio sample rate in Hz
+    sample_rate: u32,
+    /// Number of input channels
     channels: usize,
     /// Audio mode
     mode: AudioMode,
 }
 
 impl AudioState {
-    fn new(channels: usize) -> Self {
+    fn new(channels: usize, sample_rate: u32) -> Self {
         let mode = if channels >= 2 {
             AudioMode::Stereo
         } else {
             AudioMode::Mono
         };
 
-        info!("Audio mode: {:?} ({} channels)", mode, channels);
+        info!(
+            "Audio mode: {:?} ({} channels, {} Hz)",
+            mode, channels, sample_rate
+        );
 
         Self {
-            samples: vec![0.0; AUDIO_BUFFER_SIZE * channels],
-            sample_count: 0,
+            ring_left: vec![0.0; RING_BUFFER_FRAMES],
+            ring_right: vec![0.0; RING_BUFFER_FRAMES],
+            write_pos: 0,
+            sample_clock: 0,
+            sample_rate,
             channels,
             mode,
         }
     }
 
     fn update_samples(&mut self, new_samples: &[f32]) {
-        let copy_len = new_samples.len().min(self.samples.len());
-        self.samples[..copy_len].copy_from_slice(&new_samples[..copy_len]);
-        self.sample_count = copy_len;
+        let frame_count = new_samples.len() / self.channels.max(1);
+
+        for i in 0..frame_count {
+            let left = new_samples[i * self.channels];
+            let right = if self.channels >= 2 {
+                new_samples[i * self.channels + 1]
+            } else {
+                left
+            };
+
+            self.ring_left[self.write_pos] = left;
+            self.ring_right[self.write_pos] = right;
+
+            self.write_pos = (self.write_pos + 1) % RING_BUFFER_FRAMES;
+        }
+
+        self.sample_clock += frame_count as u64;
+    }
+
+    /// Read a sample from the ring buffer at a given frame index.
+    /// Returns (left, right).
+    fn read_frame(&self, frame_idx: u64) -> (f32, f32) {
+        let frames_available = self.sample_clock;
+        if frame_idx >= frames_available {
+            // Requested frame is in the future - return last available
+            let idx = if self.write_pos == 0 {
+                RING_BUFFER_FRAMES - 1
+            } else {
+                self.write_pos - 1
+            };
+            return (self.ring_left[idx], self.ring_right[idx]);
+        }
+
+        let frames_back = frames_available - frame_idx;
+        if frames_back > RING_BUFFER_FRAMES as u64 {
+            // Too far back - return oldest available
+            return (
+                self.ring_left[self.write_pos],
+                self.ring_right[self.write_pos],
+            );
+        }
+
+        // Calculate ring buffer index
+        let idx = (self.write_pos + RING_BUFFER_FRAMES - (frames_back as usize % RING_BUFFER_FRAMES))
+            % RING_BUFFER_FRAMES;
+        (self.ring_left[idx], self.ring_right[idx])
+    }
+
+    /// Read a sample with linear interpolation at a fractional frame index.
+    fn read_frame_interp(&self, frame_f: f64) -> (f32, f32) {
+        let frame_idx = frame_f.floor() as u64;
+        let frac = (frame_f - frame_f.floor()) as f32;
+
+        let (l0, r0) = self.read_frame(frame_idx);
+        let (l1, r1) = self.read_frame(frame_idx + 1);
+
+        let l = l0 + (l1 - l0) * frac;
+        let r = r0 + (r1 - r0) * frac;
+        (l, r)
     }
 }
 
@@ -108,13 +197,13 @@ pub fn ensure_audio_initialized() -> bool {
     );
 
     let channels = config.channels() as usize;
-    let audio_state = Arc::new(Mutex::new(AudioState::new(channels)));
+    let sample_rate = config.sample_rate().0;
+    let audio_state = Arc::new(Mutex::new(AudioState::new(channels, sample_rate)));
 
     // Store the state
     let _ = AUDIO_STATE.set(Arc::clone(&audio_state));
 
     // Spawn a thread to own and run the audio stream
-    // The stream must be created and played on the same thread
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
@@ -199,158 +288,120 @@ pub fn ensure_audio_initialized() -> bool {
     true
 }
 
-/// Create laser points from audio input.
-pub fn create_audio_points(n_points: usize) -> Vec<LaserPoint> {
+/// Get the current audio sample rate, or None if audio isn't initialized.
+#[allow(dead_code)]
+pub fn get_audio_sample_rate() -> Option<u32> {
+    let state = AUDIO_STATE.get()?;
+    let state = state.lock().ok()?;
+    Some(state.sample_rate)
+}
+
+/// Get the current audio mode, or None if audio isn't initialized.
+#[allow(dead_code)]
+pub fn get_audio_mode() -> Option<AudioMode> {
+    let state = AUDIO_STATE.get()?;
+    let state = state.lock().ok()?;
+    Some(state.mode)
+}
+
+/// Create laser points from audio input using stream timebase.
+///
+/// This function aligns audio samples to the stream's point timeline, providing
+/// stable, jitter-free rendering. It uses the ChunkRequest's timing info
+/// to render the audio that corresponds to each point's beam position.
+///
+/// - **Stereo**: XY oscilloscope (left=X, right=Y)
+/// - **Mono**: Time-domain oscilloscope (X=time sweep, Y=amplitude from timebase)
+///
+/// # Arguments
+/// * `req` - The chunk request from the stream, containing timing information
+/// * `config` - Audio rendering configuration
+///
+/// # Returns
+/// A vector of exactly `req.n_points` LaserPoints
+pub fn create_audio_points(req: &ChunkRequest, config: &AudioConfig) -> Vec<LaserPoint> {
     if !ensure_audio_initialized() {
-        // Return blanked points if audio isn't available
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
+        return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
     }
 
     let state = match AUDIO_STATE.get() {
         Some(s) => s,
-        None => return vec![LaserPoint::blanked(0.0, 0.0); n_points],
+        None => return vec![LaserPoint::blanked(0.0, 0.0); req.n_points],
     };
 
-    let (mode, samples, channels) = {
-        let state = state.lock().unwrap();
-        let valid_samples = state.samples[..state.sample_count].to_vec();
-        (state.mode, valid_samples, state.channels)
+    let state = match state.lock() {
+        Ok(s) => s,
+        Err(_) => return vec![LaserPoint::blanked(0.0, 0.0); req.n_points],
     };
+
+    let sample_rate = state.sample_rate;
+    let pps = req.pps;
+    let mode = state.mode;
+
+    // Convert points to audio frames ratio
+    let points_to_frames_ratio = sample_rate as f64 / pps as f64;
+
+    // Calculate audio start frame based on configured delay
+    // We render audio that was captured `delay_ms` ago, giving us low-latency output
+    let delay_frames = (config.delay_ms / 1000.0) * sample_rate as f32;
+    let chunk_frames = (req.n_points as f64 * points_to_frames_ratio) as u64;
+    let audio_start_frame = state.sample_clock
+        .saturating_sub(delay_frames as u64)
+        .saturating_sub(chunk_frames);
+
+    // Check for silence by sampling across the chunk
+    if config.blank_threshold > 0.0 {
+        let check_count = (req.n_points / 10).max(10).min(req.n_points);
+        let mut max_amp = 0.0f32;
+        for i in 0..check_count {
+            let audio_frame_f = audio_start_frame as f64 + (i * req.n_points / check_count) as f64 * points_to_frames_ratio;
+            let (l, r) = state.read_frame_interp(audio_frame_f);
+            max_amp = max_amp.max(l.abs()).max(r.abs());
+        }
+        if max_amp < config.blank_threshold {
+            debug!("Audio: silence detected (max_amp={:.4}), blanking", max_amp);
+            return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+        }
+    }
+
+    let mut points = Vec::with_capacity(req.n_points);
+    let (cr, cg, cb) = config.color;
 
     match mode {
-        AudioMode::Mono => generate_mono_oscilloscope(&samples, n_points),
-        AudioMode::Stereo => generate_xy_oscilloscope(&samples, n_points, channels),
-    }
-}
+        AudioMode::Stereo => {
+            // XY mode: left channel = X, right channel = Y
+            for i in 0..req.n_points {
+                let audio_frame_f = audio_start_frame as f64 + i as f64 * points_to_frames_ratio;
+                let (l, r) = state.read_frame_interp(audio_frame_f);
 
-/// Generate laser points for mono time-domain oscilloscope display.
-///
-/// Uses sawtooth sweep (left-to-right) with blanked return for maximum responsiveness.
-/// Each sweep shows the latest audio data.
-fn generate_mono_oscilloscope(samples: &[f32], n_points: usize) -> Vec<LaserPoint> {
-    if samples.is_empty() {
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
-    }
+                let x = l.clamp(-1.0, 1.0);
+                let y = r.clamp(-1.0, 1.0);
 
-    // Calculate signal amplitude for silence detection
-    let amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                points.push(LaserPoint::new(x, y, cr, cg, cb, config.intensity));
+            }
+        }
+        AudioMode::Mono => {
+            // Time-domain mode: X = time sweep (-1 to +1), Y = audio amplitude
+            for i in 0..req.n_points {
+                let t = i as f32 / (req.n_points - 1).max(1) as f32;
+                let x = t * 2.0 - 1.0; // -1 to +1 sweep
 
-    if amplitude < SILENCE_THRESHOLD {
-        debug!("Signal below threshold ({:.4}), blanking output", amplitude);
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
-    }
+                let audio_frame_f = audio_start_frame as f64 + i as f64 * points_to_frames_ratio;
+                let (l, _r) = state.read_frame_interp(audio_frame_f);
+                let y = l.clamp(-1.0, 1.0);
 
-    debug!("Mono amplitude: {:.4}", amplitude);
-
-    // Normalize to use full range
-    let scale = (1.0 / amplitude.max(0.1)).min(1.0);
-
-    let mut points = Vec::with_capacity(n_points);
-
-    // Reserve points for blanked return
-    let visible_points = n_points.saturating_sub(BLANK_COUNT);
-
-    // Sweep left-to-right with audio waveform
-    for i in 0..visible_points {
-        let t = i as f32 / (visible_points - 1).max(1) as f32;
-        let x = t * 2.0 - 1.0; // -1 to +1
-
-        // Map point index to sample index
-        let sample_idx = (t * (samples.len() - 1) as f32) as usize;
-        let sample_idx = sample_idx.min(samples.len() - 1);
-
-        let y = (samples[sample_idx] * scale).clamp(-1.0, 1.0);
-
-        // Green color for mono oscilloscope
-        let intensity = ((y.abs() * 0.5 + 0.5) * 65535.0) as u16;
-        points.push(LaserPoint::new(x, y, 0, intensity, 0, intensity));
+                points.push(LaserPoint::new(x, y, cr, cg, cb, config.intensity));
+            }
+        }
     }
 
-    // Blanked return to start position
-    for _ in 0..BLANK_COUNT {
-        points.push(LaserPoint::blanked(-1.0, 0.0));
-    }
-
-    points
-}
-
-/// Generate laser points for XY oscilloscope display
-fn generate_xy_oscilloscope(samples: &[f32], n_points: usize, channels: usize) -> Vec<LaserPoint> {
-    if channels < 2 || samples.is_empty() {
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
-    }
-
-    // Deinterleave stereo samples
-    let sample_pairs = samples.len() / channels;
-    let mut left: Vec<f32> = Vec::with_capacity(sample_pairs);
-    let mut right: Vec<f32> = Vec::with_capacity(sample_pairs);
-
-    for i in 0..sample_pairs {
-        left.push(samples[i * channels]);
-        right.push(samples[i * channels + 1]);
-    }
-
-    if left.is_empty() {
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
-    }
-
-    // Calculate signal amplitude
-    let amplitude = left
-        .iter()
-        .chain(right.iter())
-        .map(|s| s.abs())
-        .fold(0.0f32, f32::max);
-
-    if amplitude < SILENCE_THRESHOLD {
-        debug!("Signal below threshold ({:.4}), blanking output", amplitude);
-        return vec![LaserPoint::blanked(0.0, 0.0); n_points];
-    }
-
-    debug!("XY amplitude: {:.4}", amplitude);
-
-    // Normalize to use full range
-    let scale = (1.0 / amplitude.max(0.1)).min(1.0);
-
-    let mut points = Vec::with_capacity(n_points);
-
-    // Add leading blank points
-    let blank_count = 3;
-    let first_x = left.first().copied().unwrap_or(0.0) * scale;
-    let first_y = right.first().copied().unwrap_or(0.0) * scale;
-    for _ in 0..blank_count {
-        points.push(LaserPoint::blanked(first_x, first_y));
-    }
-
-    // Map samples to laser points
-    let usable_points = n_points.saturating_sub(blank_count * 2);
-    for i in 0..usable_points {
-        // Map point index to sample index
-        let sample_idx = (i * left.len()) / usable_points;
-        let sample_idx = sample_idx.min(left.len() - 1);
-
-        let x = (left[sample_idx] * scale).clamp(-1.0, 1.0);
-        let y = (right[sample_idx] * scale).clamp(-1.0, 1.0);
-
-        // Color based on amplitude (brighter = more amplitude)
-        let point_amp = (x.abs() + y.abs()) / 2.0;
-        let intensity = ((point_amp * 0.7 + 0.3) * 65535.0) as u16;
-
-        // Cyan color for XY scope
-        points.push(LaserPoint::new(x, y, 0, intensity, intensity, intensity));
-    }
-
-    // Add trailing blank points
-    let last_x = left.last().copied().unwrap_or(0.0) * scale;
-    let last_y = right.last().copied().unwrap_or(0.0) * scale;
-    for _ in 0..blank_count {
-        points.push(LaserPoint::blanked(last_x, last_y));
-    }
-
-    // Ensure we have exactly n_points
-    while points.len() < n_points {
-        points.push(LaserPoint::blanked(0.0, 0.0));
-    }
-    points.truncate(n_points);
+    debug!(
+        "Audio: rendered {} points, mode={:?}, audio_start_frame={}, delay={}ms",
+        points.len(),
+        mode,
+        audio_start_frame,
+        config.delay_ms
+    );
 
     points
 }
