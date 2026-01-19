@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::audio;
+use common::audio::{self, AudioConfig};
 use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
@@ -48,11 +48,13 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire)
     stream.control().arm()?;
 
+    let audio_config = AudioConfig::default();
+
     loop {
         let req = stream.next_request()?;
 
         // Generate audio-reactive points
-        let points = audio::create_audio_points(req.n_points);
+        let points = audio::create_audio_points(&req, &audio_config);
 
         stream.write(&req, &points)?;
     }

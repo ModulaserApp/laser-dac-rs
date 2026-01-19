@@ -51,7 +51,7 @@ pub fn create_points(shape: Shape, req: &ChunkRequest) -> Vec<LaserPoint> {
         Shape::Circle => create_circle_points(n_points),
         Shape::OrbitingCircle => create_orbiting_circle_points(req),
         Shape::TestPattern => create_test_pattern_points(n_points),
-        Shape::Audio => audio::create_audio_points(n_points),
+        Shape::Audio => audio::create_audio_points(req, &audio::AudioConfig::default()),
     };
 
     // Ensure exactly n_points are returned (pad or truncate as needed)
@@ -61,9 +61,9 @@ pub fn create_points(shape: Shape, req: &ChunkRequest) -> Vec<LaserPoint> {
 
 /// Create points for frame-based usage (no stream timing).
 ///
-/// For shapes that need stream time (OrbitingCircle), this produces
+/// For shapes that need stream time (OrbitingCircle, Audio), this produces
 /// a static frame at t=0. Use `create_points` with a real ChunkRequest
-/// for time-based animation.
+/// for proper time-based animation.
 #[allow(dead_code)] // Used by frame_adapter example, not all examples
 pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
     // Create a dummy request for frame-based usage
@@ -74,7 +74,6 @@ pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
         scheduled_ahead_points: 0,
         device_queued_points: None,
     };
-
     create_points(shape, &dummy_req)
 }
 
