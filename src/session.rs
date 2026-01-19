@@ -128,7 +128,7 @@ impl SessionControl {
 /// session.control().arm()?;
 ///
 /// session.run(
-///     |req| Some(generate_points(req.n_points)),
+///     |req| Some(vec![laser_dac::LaserPoint::blanked(0.0, 0.0); req.n_points]),
 ///     |err| eprintln!("Stream error: {}", err),
 /// )?;
 /// # Ok::<(), laser_dac::Error>(())
@@ -204,7 +204,7 @@ impl ReconnectingSession {
     /// let session = ReconnectingSession::new("custom:my-device", StreamConfig::new(30_000))
     ///     .with_discovery(|| {
     ///         let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    ///         // discovery.register_external(my_custom_discoverer);
+    ///         // discovery.register(my_custom_discoverer);
     ///         discovery
     ///     });
     /// ```

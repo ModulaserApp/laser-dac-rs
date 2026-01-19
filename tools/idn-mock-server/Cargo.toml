@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Mock IDN protocol server for testing and simulation"
 license = "MIT"
-repository = "https://github.com/SpaceK33z/laser-dac-rs"
+repository = "https://github.com/ModulaserApp/laser-dac-rs"
 
 [dependencies]
 log = "0.4"

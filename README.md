@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/laser-dac.svg)](https://crates.io/crates/laser-dac)
 [![Documentation](https://docs.rs/laser-dac/badge.svg)](https://docs.rs/laser-dac)
-[![CI](https://github.com/SpaceK33z/laser-dac-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SpaceK33z/laser-dac-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/ModulaserApp/laser-dac-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ModulaserApp/laser-dac-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.87-blue.svg)](https://blog.rust-lang.org/2025/05/15/Rust-1.87.0.html)
 
@@ -211,7 +211,7 @@ cargo run -p idn-simulator -- --hostname "Test-DAC" --service-name "Simulator" -
 
 When the simulator is running, launch your work that scans for IDN devices. You can use this crate, or any other tool that supports IDN!
 
-For a simple test, you can run one of our examples: `cargo run --example manual -- circle`
+For a simple test, you can run one of our examples: `cargo run --example stream -- circle`
 
 **CLI Options:**
 | Option | Description | Default |

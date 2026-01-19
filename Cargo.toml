@@ -8,8 +8,8 @@ license = "MIT"
 keywords = ["laser", "dac", "ilda", "helios", "etherdream"]
 categories = ["hardware-support"]
 readme = "README.md"
-repository = "https://github.com/SpaceK33z/laser-dac-rs"
-homepage = "https://github.com/SpaceK33z/laser-dac-rs"
+repository = "https://github.com/ModulaserApp/laser-dac-rs"
+homepage = "https://github.com/ModulaserApp/laser-dac-rs"
 documentation = "https://docs.rs/laser-dac"
 rust-version = "1.87"
 

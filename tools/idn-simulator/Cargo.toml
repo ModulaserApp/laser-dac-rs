@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Kees Kluskens <kees@kees.im>"]
 description = "IDN protocol laser DAC simulator for testing and development"
 license = "MIT"
-repository = "https://github.com/SpaceK33z/laser-dac-rs"
+repository = "https://github.com/ModulaserApp/laser-dac-rs"
 
 [dependencies]
 byteorder = "1.5"
