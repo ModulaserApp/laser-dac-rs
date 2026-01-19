@@ -30,7 +30,7 @@
 //! ```
 //!
 //! For time-varying animation, use the streaming API directly with a point
-//! generator (see the `automatic` example with `orbiting-circle`).
+//! generator (see the `manual` or `callback` examples with `orbiting-circle`).
 
 use std::sync::{Arc, Mutex};
 
@@ -87,7 +87,6 @@ pub struct FrameAdapter {
     current: Frame,
     pending: Option<Frame>,
     point_index: usize,
-    /// For "hold last" blanking when frame is empty.
     last_position: (f32, f32),
 }
 
@@ -259,10 +258,7 @@ mod tests {
         let points2 = adapter.next_chunk(&req);
         assert_eq!(points2[0].x, 0.0, "First point finishes old frame");
         assert_eq!(points2[1].x, 1.0, "Second point starts new frame");
-        assert!(
-            points2[2..].iter().all(|p| p.x == 1.0),
-            "Rest is new frame"
-        );
+        assert!(points2[2..].iter().all(|p| p.x == 1.0), "Rest is new frame");
     }
 
     #[test]

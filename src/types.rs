@@ -249,22 +249,6 @@ pub enum DacConnectionState {
     Lost { name: String, error: Option<String> },
 }
 
-/// Information about a discovered DAC device.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct DiscoveredDac {
-    /// The type of DAC.
-    pub dac_type: DacType,
-    /// Unique identifier for this DAC.
-    pub id: String,
-    /// Human-readable name for this DAC.
-    pub name: String,
-    /// Network address (if applicable).
-    pub address: Option<String>,
-    /// Additional metadata about the DAC.
-    pub metadata: Option<String>,
-}
-
 // =============================================================================
 // Streaming Types
 // =============================================================================

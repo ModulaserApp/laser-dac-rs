@@ -1,6 +1,6 @@
 # Example Streaming Pipeline  Architecture
 
-This document describes an example high-level streaming pipeline for professional laser show software built on top of the streaming-first API in `streaming.md`.
+This document describes an example high-level streaming pipeline for professional laser show software built on top of `laser_dac`'s streaming API.
 
 The goal is to make **control flow**, **data flow**, and **where “frames” still exist** unambiguous, while keeping implementation details out.
 
@@ -18,11 +18,11 @@ The application does not “push frames on a timer”. Instead, it implements a 
 
 `laser_dac::Stream` decides when it needs more data:
 
-- It emits a `ChunkRequest { start, pps, n_points, scheduled_ahead_points, ... }`.
+- It emits a `ChunkRequest { start, pps, n_points, scheduled_ahead_points, device_queued_points }`.
 - Your show engine produces exactly `n_points` and returns them.
 - The stream writes the chunk to the backend/DAC.
 
-This pull-style control flow is the key difference versus the current worker/frame API.
+This pull-style control flow is the key difference versus traditional "push frames on a timer" APIs.
 
 ```
 DAC needs points
@@ -34,7 +34,7 @@ DAC needs points
 Operationally this happens either via:
 
 - **Blocking mode**: `next_request()` → render → `write()`
-- **Callback mode**: `run(producer, on_error)` calls your producer when needed
+- **Callback mode**: `run(producer, on_error)` calls your producer when needed; returning `None` ends the stream gracefully
 
 ## End-to-end topology
 
@@ -172,7 +172,7 @@ Practical consequence: keep stream queue targets bounded (`target_queue_points`)
 
 ## Non-negotiable contracts with `laser_dac`
 
-- For every `ChunkRequest`, the producer must return **exactly `n_points`**.
-- `scheduled_ahead_points` is the primary signal for “how far ahead am I?”; use it for UI/telemetry and to detect runaway/underrun risk.
-- In blocking mode, `next_request()` is the pacing mechanism; avoid adding your own “sleep loop” on top.
-- For professional safety expectations, treat “disarm” as an **out-of-band control path**, not only as “the producer starts outputting blanks”.
+- For every `ChunkRequest`, the producer must return **exactly `n_points`** (or `None` in callback mode to end the stream).
+- `scheduled_ahead_points` is the primary signal for "how far ahead am I?"; use it for UI/telemetry and to detect runaway/underrun risk. `device_queued_points` provides a device-level estimate when available.
+- In blocking mode, `next_request()` is the pacing mechanism; avoid adding your own "sleep loop" on top.
+- For professional safety expectations, treat "disarm" as an **out-of-band control path** via `StreamControl`, not only as "the producer starts outputting blanks".

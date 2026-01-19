@@ -6,7 +6,7 @@
 //!
 //! Use this when you have pre-computed geometry that should loop continuously.
 //! For time-varying animated content, use the streaming API directly (see
-//! the `automatic` example with `orbiting-circle`).
+//! the `stream` or `callback` examples with `orbiting-circle`).
 //!
 //! Run with: `cargo run --example frame_adapter -- [triangle|circle]`
 

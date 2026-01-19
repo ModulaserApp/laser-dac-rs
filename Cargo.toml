@@ -65,12 +65,8 @@ idn-mock-server = { path = "tools/idn-mock-server" }
 cpal = "0.15"
 
 [[example]]
-name = "automatic"
-path = "examples/automatic.rs"
-
-[[example]]
-name = "manual"
-path = "examples/manual.rs"
+name = "stream"
+path = "examples/stream.rs"
 
 [[example]]
 name = "callback"
@@ -79,6 +75,14 @@ path = "examples/callback.rs"
 [[example]]
 name = "frame_adapter"
 path = "examples/frame_adapter.rs"
+
+[[example]]
+name = "audio"
+path = "examples/audio.rs"
+
+[[example]]
+name = "reconnect"
+path = "examples/reconnect.rs"
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

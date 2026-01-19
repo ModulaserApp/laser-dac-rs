@@ -35,58 +35,20 @@ All DACs have been manually verified to work.
 Connect your laser DAC and run an example. For full API details, see the [documentation](https://docs.rs/laser-dac).
 
 ```bash
-cargo run --example automatic -- circle
+cargo run --example stream -- circle
 # or:
-cargo run --example automatic -- triangle
+cargo run --example stream -- triangle
 # callback mode (DAC-driven timing):
 cargo run --example callback -- circle
 # frame mode (using FrameAdapter):
 cargo run --example frame_adapter -- circle
+# reconnecting session (auto-reconnect on disconnect):
+cargo run --example reconnect -- circle
 # audio-reactive (requires microphone):
 cargo run --example audio
 ```
 
 The examples run continuously until you press Ctrl+C.
-
-## Discovery Behavior
-
-There are two discovery APIs:
-
-- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices (predicate optional), yielding ready-to-use `Dac` instances.
-- `DacDiscovery` is manual: you call `scan()` and decide if/when to `connect()` each `DiscoveredDevice`.
-
-`DacDiscoveryWorker` runs a background thread that:
-
-1. **Scans periodically** (default: every 2 seconds, configurable via `discovery_interval()`) for new devices across all enabled DAC types
-2. **Reports all discovered devices** via `poll_discovered_devices()` regardless of filter
-3. **Auto-connects to filtered devices** and yields ready-to-use devices via `poll_new_devices()`
-4. **Automatic reconnection** - when a device connection fails, it's removed from tracking and will reconnect on the next scan
-
-Multiple devices of the same type are supported - each is identified by a unique name (MAC address for Ether Dream, serial number for LaserCube, etc.)
-
-You can provide a device filter predicate to control which devices are auto-connected:
-
-```rust
-use laser_dac::{DacDiscoveryWorker, DacType, EnabledDacTypes};
-use std::time::Duration;
-
-let discovery = DacDiscoveryWorker::builder()
-    .enabled_types(EnabledDacTypes::all())
-    .device_filter(|info| info.dac_type == DacType::EtherDream)
-    .discovery_interval(Duration::from_secs(1))
-    .build();
-
-// All discovered devices are visible, even those not matching the filter
-for device in discovery.poll_discovered_devices() {
-    println!("Found: {} ({:?})", device.name(), device.dac_type);
-}
-
-// Only filtered devices become ready-to-use Dac instances
-for device in discovery.poll_new_devices() {
-    println!("Connected: {}", device.name());
-    // Start streaming with device.start_stream(config)...
-}
-```
 
 ## Streaming Modes
 
@@ -142,6 +104,32 @@ let exit = stream.run(
 
 Return `Some(points)` to continue streaming, or `None` to signal completion.
 
+### Reconnecting Session (optional)
+
+If you want automatic reconnection by device ID, use `ReconnectingSession`:
+
+```rust
+use laser_dac::{ReconnectingSession, StreamConfig};
+use std::time::Duration;
+
+let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
+    .with_max_retries(5)
+    .with_backoff(Duration::from_secs(1))
+    .on_disconnect(|err| eprintln!("Lost connection: {}", err))
+    .on_reconnect(|info| println!("Reconnected to {}", info.name));
+
+// Arm output as usual (this persists across reconnects)
+session.control().arm()?;
+
+let exit = session.run(
+    |req| Some(generate_points(req.n_points)),
+    |err| eprintln!("Stream error: {}", err),
+)?;
+```
+
+Note: `ReconnectingSession` uses `open_device()` internally, so it won't include
+external discoverers registered on a custom `DacDiscovery`.
+
 ## Coordinate System
 
 All backends use normalized coordinates:
@@ -159,6 +147,7 @@ Each backend handles conversion to its native format internally.
 | `DacInfo`      | DAC metadata (name, type, capabilities)          |
 | `Dac`          | Opened DAC ready for streaming                   |
 | `Stream`       | Active streaming session                         |
+| `ReconnectingSession` | Stream wrapper with automatic reconnect   |
 | `StreamConfig` | Stream settings (PPS, chunk size)                |
 | `ChunkRequest` | Request for points from the DAC                  |
 | `LaserPoint`   | Single point with position (f32) and color (u16) |
@@ -222,7 +211,7 @@ cargo run -p idn-simulator -- --hostname "Test-DAC" --service-name "Simulator" -
 
 When the simulator is running, launch your work that scans for IDN devices. You can use this crate, or any other tool that supports IDN!
 
-For a simple test, you can run one of our examples: `cargo run --example automatic -- circle`
+For a simple test, you can run one of our examples: `cargo run --example manual -- circle`
 
 **CLI Options:**
 | Option | Description | Default |

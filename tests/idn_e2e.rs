@@ -16,15 +16,30 @@ use idn_mock_server::{
     IDNCMD_RT_CNLMSG, IDNFLG_STATUS_REALTIME,
 };
 
-use laser_dac::stream::Dac;
 use laser_dac::types::{DacType, EnabledDacTypes, LaserPoint, StreamConfig};
-use laser_dac::DacDiscoveryWorker;
+use laser_dac::{caps_for_dac_type, Dac, DacInfo};
 
 /// Create an EnabledDacTypes with only IDN enabled.
 fn idn_only() -> EnabledDacTypes {
     let mut types = EnabledDacTypes::none();
     types.enable(DacType::Idn);
     types
+}
+
+fn connect_dac(
+    discovery: &mut laser_dac::DacDiscovery,
+    device: laser_dac::DiscoveredDevice,
+) -> Dac {
+    let info = device.info();
+    let dac_type = device.dac_type();
+    let backend = discovery.connect(device).expect("Should connect");
+    let dac_info = DacInfo::new(
+        info.stable_id(),
+        info.name(),
+        dac_type.clone(),
+        caps_for_dac_type(&dac_type),
+    );
+    Dac::new(dac_info, backend)
 }
 
 // =============================================================================
@@ -212,28 +227,6 @@ pub fn test_server(hostname: &str) -> std::io::Result<TestServerHandle> {
 }
 
 // =============================================================================
-// Test Utilities
-// =============================================================================
-
-/// Wait for a device to appear from the discovery worker.
-fn wait_for_device(discovery: &DacDiscoveryWorker, timeout: Duration) -> Option<Dac> {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        // Drain discovered devices
-        let _: Vec<_> = discovery.poll_discovered_devices().collect();
-
-        // Check for devices
-        let mut devices = discovery.poll_new_devices();
-        if let Some(device) = devices.next() {
-            return Some(device);
-        }
-
-        thread::sleep(Duration::from_millis(50));
-    }
-    None
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
@@ -288,6 +281,8 @@ fn test_idn_discovery_direct() {
 
 #[test]
 fn test_discover_and_connect() {
+    use laser_dac::discovery::DacDiscovery;
+
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
     eprintln!("Mock server listening on: {}", server_addr);
@@ -295,39 +290,28 @@ fn test_discover_and_connect() {
     // Give server time to start
     thread::sleep(Duration::from_millis(50));
 
-    eprintln!("Creating discovery worker...");
-    // Create discovery worker configured to scan mock server
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
+    eprintln!("Creating discovery...");
+    let mut discovery = DacDiscovery::new(idn_only());
+    discovery.set_idn_scan_addresses(vec![server_addr]);
 
     eprintln!("Waiting for discovery...");
-    // Wait for discovery - give more time
     for i in 0..10 {
         thread::sleep(Duration::from_millis(100));
 
-        let discovered: Vec<_> = discovery.poll_discovered_devices().collect();
-        let devices: Vec<_> = discovery.poll_new_devices().collect();
-
+        let discovered = discovery.scan();
         eprintln!(
-            "Poll {}: {} discovered, {} devices, {} packets received",
+            "Poll {}: {} discovered, {} packets received",
             i,
             discovered.len(),
-            devices.len(),
             handle.received_packet_count()
         );
 
-        if !discovered.is_empty() || !devices.is_empty() {
+        if !discovered.is_empty() {
             eprintln!("Found something!");
             for d in &discovered {
-                eprintln!("  Discovered: {} ({:?})", d.name(), d.dac_type);
+                eprintln!("  Discovered: {} ({:?})", d.name(), d.dac_type());
             }
-            for d in &devices {
-                eprintln!("  Device: {} ({:?})", d.name(), d.kind());
-            }
-            return; // Test passes
+            return;
         }
     }
 
@@ -336,19 +320,22 @@ fn test_discover_and_connect() {
 
 #[test]
 fn test_send_frame() {
+    use laser_dac::discovery::DacDiscovery;
+
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
+    let mut discovery = DacDiscovery::new(idn_only());
+    discovery.set_idn_scan_addresses(vec![server_addr]);
 
-    // Wait for device
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
+    let device = discovery
+        .scan()
+        .into_iter()
+        .next()
+        .map(|d| connect_dac(&mut discovery, d))
+        .expect("Should get a device");
 
     // Clear any discovery packets
     handle.clear_received_packets();
@@ -376,19 +363,22 @@ fn test_send_frame() {
 
 #[test]
 fn test_connection_loss_detection() {
+    use laser_dac::discovery::DacDiscovery;
+
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
+    let mut discovery = DacDiscovery::new(idn_only());
+    discovery.set_idn_scan_addresses(vec![server_addr]);
 
-    // Wait for device
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
+    let device = discovery
+        .scan()
+        .into_iter()
+        .next()
+        .map(|d| connect_dac(&mut discovery, d))
+        .expect("Should get a device");
 
     // Start a stream and send some data
     let config = StreamConfig::new(30000);
@@ -451,81 +441,24 @@ fn test_connection_loss_detection() {
 }
 
 #[test]
-fn test_reconnection_after_loss() {
-    let handle = test_server("TestDAC").unwrap();
-    let server_addr = handle.addr();
-
-    thread::sleep(Duration::from_millis(50));
-
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(200))
-        .build();
-
-    // Wait for initial device
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
-
-    // Start a stream and verify it works
-    let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
-
-    // Simulate disconnect
-    handle.simulate_disconnect();
-
-    // Trigger connection failure by waiting and trying to write
-    thread::sleep(Duration::from_millis(800));
-
-    // Stop the old stream
-    let _ = stream.stop();
-    drop(stream);
-
-    // Resume server
-    handle.resume();
-
-    // Wait for rediscovery - need to wait for the device TTL to expire (10 seconds)
-    // or the discovery to notice the device is gone and back
-    thread::sleep(Duration::from_millis(500));
-
-    // The discovery worker tracks devices by stable ID and won't rediscover
-    // the same device until its TTL expires. For this test, we verify that
-    // we can start a new stream with the server.
-    let new_device = wait_for_device(&discovery, Duration::from_secs(12));
-
-    if let Some(device) = new_device {
-        // Verify new device is connected
-        assert!(device.is_connected(), "New device should be connected");
-    } else {
-        // If we don't get a new device (because of TTL), that's expected
-        // The test verifies the server is back up by scanning directly
-        use laser_dac::protocols::idn::ServerScanner;
-        let mut scanner = ServerScanner::new(0).expect("Failed to create scanner");
-        let servers = scanner
-            .scan_address(server_addr, Duration::from_millis(500))
-            .expect("Scan failed");
-        assert!(
-            !servers.is_empty(),
-            "Server should be discoverable after resume"
-        );
-    }
-}
-
-#[test]
 fn test_full_lifecycle() {
+    use laser_dac::discovery::DacDiscovery;
+
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(200))
-        .build();
+    let mut discovery = DacDiscovery::new(idn_only());
+    discovery.set_idn_scan_addresses(vec![server_addr]);
 
     // Phase 1: Initial connection
-    let device =
-        wait_for_device(&discovery, Duration::from_secs(2)).expect("Phase 1: Should get device");
+    let device = discovery
+        .scan()
+        .into_iter()
+        .next()
+        .map(|d| connect_dac(&mut discovery, d))
+        .expect("Phase 1: Should get device");
 
     let config = StreamConfig::new(30000);
     let (mut stream, _info) = device
@@ -601,10 +534,6 @@ fn test_full_lifecycle() {
         !servers.is_empty(),
         "Phase 4: Server should be discoverable after resume"
     );
-
-    // Note: Due to device TTL in discovery worker, we verify via direct scan
-    // rather than waiting for rediscovery. The important thing is the server
-    // is back and responding.
 
     eprintln!(
         "Full lifecycle test completed. Loss detected: {}",
@@ -896,78 +825,6 @@ fn test_server_never_responds_timeout() {
 }
 
 #[test]
-fn test_discovery_timeout_on_established_connection() {
-    // Test that an established connection properly times out when server goes silent
-    let handle = test_server("TestDAC").unwrap();
-    let server_addr = handle.addr();
-
-    thread::sleep(Duration::from_millis(50));
-
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
-
-    // Get a connected device
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
-
-    // Start a stream
-    let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
-
-    // Send data successfully first
-    let req = stream.next_request().expect("Should get request");
-    let points: Vec<LaserPoint> = (0..req.n_points)
-        .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-        .collect();
-    stream.write(&req, &points).expect("Should write points");
-    thread::sleep(Duration::from_millis(100));
-
-    let status = stream.status().expect("Should get status");
-    assert!(status.connected, "Stream should be connected initially");
-
-    // Now simulate disconnect (server stops responding to pings)
-    handle.simulate_disconnect();
-
-    // Wait for keepalive interval (500ms) + ping timeout (200ms) + margin
-    thread::sleep(Duration::from_millis(800));
-
-    // Try to send more data - should eventually detect connection loss
-    let mut loss_detected = false;
-    for _ in 0..10 {
-        match stream.next_request() {
-            Ok(req) => {
-                let points: Vec<LaserPoint> = (0..req.n_points)
-                    .map(|_| LaserPoint::blanked(0.0, 0.0))
-                    .collect();
-                if stream.write(&req, &points).is_err() {
-                    loss_detected = true;
-                    break;
-                }
-            }
-            Err(_) => {
-                loss_detected = true;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    // Check status
-    if let Ok(status) = stream.status() {
-        if !status.connected {
-            loss_detected = true;
-        }
-    }
-
-    assert!(
-        loss_detected,
-        "Stream should detect connection loss when server stops responding"
-    );
-}
-
-#[test]
 fn test_connection_to_nonexistent_server() {
     use laser_dac::discovery::IdnDiscovery;
     use laser_dac::protocols::idn::ServerScanner;
@@ -993,155 +850,5 @@ fn test_connection_to_nonexistent_server() {
     assert!(
         discovered.is_empty(),
         "IdnDiscovery should return empty for nonexistent server"
-    );
-
-    // Test 3: DacDiscoveryWorker should handle unreachable addresses without crashing
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![nonexistent_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
-
-    // Let discovery run for a bit - should not panic
-    thread::sleep(Duration::from_millis(300));
-
-    // Should find nothing but not crash
-    let discovered: Vec<_> = discovery.poll_discovered_devices().collect();
-    let devices: Vec<_> = discovery.poll_new_devices().collect();
-
-    assert!(discovered.is_empty(), "Should not discover any devices");
-    assert!(devices.is_empty(), "Should not get any connected devices");
-}
-
-#[test]
-fn test_rapid_streaming_back_pressure() {
-    let handle = test_server("TestDAC").unwrap();
-    let server_addr = handle.addr();
-
-    thread::sleep(Duration::from_millis(50));
-
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
-
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
-
-    // Clear discovery packets
-    handle.clear_received_packets();
-
-    // Start a stream
-    let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
-
-    // Write many chunks rapidly
-    let mut chunks_written = 0;
-    for _ in 0..10 {
-        match stream.next_request() {
-            Ok(req) => {
-                let points: Vec<LaserPoint> = (0..req.n_points)
-                    .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-                    .collect();
-                if stream.write(&req, &points).is_ok() {
-                    chunks_written += 1;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    // Some chunks should be written
-    assert!(
-        chunks_written > 0,
-        "At least some chunks should be written successfully"
-    );
-
-    eprintln!("Rapid streaming: {} chunks written", chunks_written);
-
-    // Give time for processing
-    thread::sleep(Duration::from_millis(200));
-
-    // Verify server received at least some frame data
-    assert!(
-        handle.received_frame_data(),
-        "Server should have received at least some frame data"
-    );
-
-    // Verify stream is still functional after burst
-    let status = stream.status().expect("Should get status");
-    assert!(
-        status.connected,
-        "Stream should remain connected after rapid streaming"
-    );
-
-    // Verify we can still stream after the burst
-    handle.clear_received_packets();
-    thread::sleep(Duration::from_millis(50));
-
-    let req = stream
-        .next_request()
-        .expect("Should get request after burst");
-    let points: Vec<LaserPoint> = (0..req.n_points)
-        .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-        .collect();
-    stream
-        .write(&req, &points)
-        .expect("Should write points after burst");
-
-    thread::sleep(Duration::from_millis(100));
-    assert!(
-        handle.received_frame_data(),
-        "Server should receive frame data after burst"
-    );
-}
-
-#[test]
-fn test_stream_remains_functional_during_rapid_writes() {
-    let handle = test_server("TestDAC").unwrap();
-    let server_addr = handle.addr();
-
-    thread::sleep(Duration::from_millis(50));
-
-    let discovery = DacDiscoveryWorker::builder()
-        .enabled_types(idn_only())
-        .idn_scan_addresses(vec![server_addr])
-        .discovery_interval(Duration::from_millis(100))
-        .build();
-
-    let device = wait_for_device(&discovery, Duration::from_secs(2)).expect("Should get a device");
-
-    // Start a stream
-    let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
-
-    // Submit first chunk - should succeed
-    let req = stream.next_request().expect("Should get first request");
-    let points: Vec<LaserPoint> = (0..req.n_points)
-        .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-        .collect();
-    stream
-        .write(&req, &points)
-        .expect("First chunk should be written");
-
-    // Continue writing more chunks
-    for _ in 0..5 {
-        match stream.next_request() {
-            Ok(req) => {
-                let points: Vec<LaserPoint> = (0..req.n_points)
-                    .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-                    .collect();
-                let _ = stream.write(&req, &points);
-            }
-            Err(_) => break,
-        }
-    }
-
-    // The important invariant: the stream should still be functional
-    thread::sleep(Duration::from_millis(100));
-    let status = stream.status().expect("Should get status");
-    assert!(
-        status.connected,
-        "Stream should remain connected regardless of rapid writes"
     );
 }

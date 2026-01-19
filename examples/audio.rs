@@ -1,19 +1,26 @@
-//! Manual discovery example using the streaming API.
+//! Audio-reactive laser example.
 //!
-//! This example demonstrates using DacDiscovery to find devices,
-//! then streaming to them using the blocking mode API.
+//! Displays audio input as an oscilloscope pattern:
+//! - Mono input: time-domain oscilloscope (X=time, Y=amplitude)
+//! - Stereo input: XY oscilloscope (left=X, right=Y)
 //!
-//! Run with: `cargo run --example manual -- [triangle|circle]`
+//! Run with: `cargo run --example audio`
+//!
+//! Requires a microphone or audio input device.
 
 mod common;
 
-use clap::Parser;
-use common::{create_points, Args};
+use common::audio;
 use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
-    let args = Args::parse();
+
+    // Initialize audio capture first
+    if !audio::ensure_audio_initialized() {
+        eprintln!("Failed to initialize audio capture. Make sure you have a microphone connected.");
+        return Ok(());
+    }
 
     println!("Scanning for DACs...\n");
     let devices = list_devices()?;
@@ -34,8 +41,7 @@ fn main() -> Result<()> {
     let (mut stream, info) = device.start_stream(config)?;
 
     println!(
-        "\nStreaming {} to {}... Press Ctrl+C to stop\n",
-        args.shape.name(),
+        "\nStreaming audio to {}... Press Ctrl+C to stop\n",
         info.name
     );
 
@@ -45,8 +51,8 @@ fn main() -> Result<()> {
     loop {
         let req = stream.next_request()?;
 
-        // Generate points for this chunk
-        let points = create_points(args.shape, &req);
+        // Generate audio-reactive points
+        let points = audio::create_audio_points(req.n_points);
 
         stream.write(&req, &points)?;
     }

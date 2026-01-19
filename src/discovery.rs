@@ -3,12 +3,98 @@
 //! Provides a DAC interface for discovering and connecting to laser DAC devices
 //! from multiple manufacturers.
 
+use std::any::Any;
 use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend};
-use crate::types::{DacType, DiscoveredDac, EnabledDacTypes};
+use crate::types::{DacType, EnabledDacTypes};
+
+// =============================================================================
+// External Discoverer Support
+// =============================================================================
+
+/// Trait for external DAC discovery implementations.
+///
+/// External crates implement this to integrate their DAC discovery
+/// with the unified `DacDiscovery` system.
+///
+/// # Example
+///
+/// ```ignore
+/// use laser_dac::{
+///     DacDiscovery, ExternalDiscoverer, ExternalDevice,
+///     StreamBackend, DacType, EnabledDacTypes,
+/// };
+/// use std::any::Any;
+///
+/// struct MyClosedDacDiscoverer { /* ... */ }
+///
+/// impl ExternalDiscoverer for MyClosedDacDiscoverer {
+///     fn dac_type(&self) -> DacType {
+///         DacType::Custom("MyClosedDAC".into())
+///     }
+///
+///     fn scan(&mut self) -> Vec<ExternalDevice> {
+///         // Your discovery logic here
+///         vec![]
+///     }
+///
+///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>> {
+///         // Your connection logic here
+///         todo!()
+///     }
+/// }
+/// ```
+pub trait ExternalDiscoverer: Send {
+    /// Returns the DAC type this discoverer handles.
+    fn dac_type(&self) -> DacType;
+
+    /// Scan for devices. Called during `DacDiscovery::scan()`.
+    fn scan(&mut self) -> Vec<ExternalDevice>;
+
+    /// Connect to a previously discovered device.
+    /// The `opaque_data` is the same data returned in `ExternalDevice`.
+    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>>;
+}
+
+/// Device info returned by external discoverers.
+///
+/// This struct contains the common fields that `DacDiscovery` uses to create
+/// a `DiscoveredDevice`. The `opaque_data` field stores protocol-specific
+/// connection information that will be passed back to `connect()`.
+pub struct ExternalDevice {
+    /// IP address for network devices.
+    pub ip_address: Option<IpAddr>,
+    /// MAC address if available.
+    pub mac_address: Option<[u8; 6]>,
+    /// Hostname if available.
+    pub hostname: Option<String>,
+    /// USB address (e.g., "bus:device") for USB devices.
+    pub usb_address: Option<String>,
+    /// Hardware/device name if available.
+    pub hardware_name: Option<String>,
+    /// Opaque data passed back to `connect()`.
+    /// Store whatever your protocol needs to establish a connection.
+    pub opaque_data: Box<dyn Any + Send>,
+}
+
+impl ExternalDevice {
+    /// Create a new external device with the given opaque data.
+    ///
+    /// All other fields default to `None`.
+    pub fn new<T: Any + Send + 'static>(opaque_data: T) -> Self {
+        Self {
+            ip_address: None,
+            mac_address: None,
+            hostname: None,
+            usb_address: None,
+            hardware_name: None,
+            opaque_data: Box::new(opaque_data),
+        }
+    }
+}
 
 // Feature-gated imports from internal protocol modules
 
@@ -52,77 +138,6 @@ use crate::backend::LasercubeUsbBackend;
 use crate::protocols::lasercube_usb::rusb;
 #[cfg(feature = "lasercube-usb")]
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
-
-// =============================================================================
-// Custom Discovery Source
-// =============================================================================
-
-/// Trait for implementing custom DAC discovery sources.
-///
-/// Implement this trait to add support for third-party or closed-source DAC
-/// hardware to the discovery system. Custom sources are polled alongside
-/// built-in backends by [`crate::DacDiscoveryWorker`].
-///
-/// # Example
-///
-/// ```ignore
-/// use laser_dac::{CustomDiscoverySource, DiscoveredDac, DacBackend, DacType};
-///
-/// struct MyCustomDiscovery {
-///     // Your discovery state
-/// }
-///
-/// impl CustomDiscoverySource for MyCustomDiscovery {
-///     fn poll_devices(&mut self) -> Vec<DiscoveredDac> {
-///         // Scan for your custom DAC hardware
-///         vec![DiscoveredDac {
-///             dac_type: DacType::Custom("MyDAC".to_string()),
-///             id: "device-001".to_string(),
-///             name: "My Custom DAC".to_string(),
-///             address: Some("192.168.1.100".to_string()),
-///             metadata: None,
-///         }]
-///     }
-///
-///     fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn StreamBackend>> {
-///         // Return your backend implementation
-///         // Some(Box::new(MyCustomBackend::new(device)))
-///         None
-///     }
-/// }
-/// ```
-///
-/// # Integration with DacDiscoveryWorker
-///
-/// Register your custom source with the discovery worker builder:
-///
-/// ```ignore
-/// use laser_dac::DacDiscoveryWorker;
-///
-/// let discovery = DacDiscoveryWorker::builder()
-///     .add_custom_source(MyCustomDiscovery::new())
-///     .build();
-///
-/// // Poll for devices as usual
-/// for device in discovery.poll_new_devices() {
-///     println!("Found: {}", device.name());
-/// }
-/// ```
-pub trait CustomDiscoverySource: Send + 'static {
-    /// Poll for available devices.
-    ///
-    /// Called periodically by the discovery worker (default: every 2 seconds).
-    /// Return all currently visible devices - the worker handles deduplication
-    /// based on the device's `id` field.
-    fn poll_devices(&mut self) -> Vec<DiscoveredDac>;
-
-    /// Create a streaming backend for connecting to a discovered device.
-    ///
-    /// Called when the discovery worker wants to connect to a device that
-    /// passed the device filter. Return `None` if the device is no longer
-    /// available or connection failed.
-    fn create_backend(&self, device: &DiscoveredDac) -> Option<Box<dyn StreamBackend>>;
-}
 
 // =============================================================================
 // DiscoveredDevice
@@ -212,7 +227,7 @@ impl DiscoveredDeviceInfo {
     /// - LaserCube USB: `lasercube-usb:<serial|bus:addr>`
     /// - LaserCube WiFi: `lasercube-wifi:<ip>` (best available)
     ///
-    /// This is used for device tracking/deduplication in the discovery worker.
+    /// This is used for device tracking/deduplication.
     pub fn stable_id(&self) -> String {
         match &self.dac_type {
             DacType::EtherDream => {
@@ -271,19 +286,6 @@ impl DiscoveredDeviceInfo {
     }
 }
 
-impl From<&DiscoveredDac> for DiscoveredDeviceInfo {
-    fn from(dac: &DiscoveredDac) -> Self {
-        DiscoveredDeviceInfo {
-            dac_type: dac.dac_type.clone(),
-            ip_address: dac.address.as_ref().and_then(|a| a.parse().ok()),
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: Some(dac.name.clone()),
-        }
-    }
-}
-
 /// Internal data needed for connection (opaque to callers).
 enum DiscoveredDeviceInner {
     #[cfg(feature = "helios")]
@@ -305,6 +307,13 @@ enum DiscoveredDeviceInner {
     },
     #[cfg(feature = "lasercube-usb")]
     LasercubeUsb(rusb::Device<rusb::Context>),
+    /// External discoverer device.
+    External {
+        /// Index into `DacDiscovery.external` for the discoverer that found this device.
+        discoverer_index: usize,
+        /// Opaque data passed back to `ExternalDiscoverer::connect()`.
+        opaque_data: Box<dyn Any + Send>,
+    },
     /// Placeholder variant to ensure enum is not empty when no features are enabled
     #[cfg(not(any(
         feature = "helios",
@@ -701,6 +710,8 @@ pub struct DacDiscovery {
     #[cfg(feature = "lasercube-usb")]
     lasercube_usb: Option<LasercubeUsbDiscovery>,
     enabled: EnabledDacTypes,
+    /// External discoverers registered by external crates.
+    external: Vec<Box<dyn ExternalDiscoverer>>,
 }
 
 impl DacDiscovery {
@@ -724,6 +735,7 @@ impl DacDiscovery {
             #[cfg(feature = "lasercube-usb")]
             lasercube_usb: LasercubeUsbDiscovery::new(),
             enabled,
+            external: Vec::new(),
         }
     }
 
@@ -746,6 +758,25 @@ impl DacDiscovery {
     /// Returns the currently enabled DAC types.
     pub fn enabled(&self) -> &EnabledDacTypes {
         &self.enabled
+    }
+
+    /// Register an external discoverer.
+    ///
+    /// External discoverers are called during `scan()` to find additional devices
+    /// beyond the built-in DAC types. This allows external crates to integrate
+    /// their own DAC discovery with the unified discovery system.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
+    /// discovery.register(Box::new(MyClosedDacDiscoverer::new()));
+    ///
+    /// // Now scan() will include devices from the external discoverer
+    /// let devices = discovery.scan();
+    /// ```
+    pub fn register(&mut self, discoverer: Box<dyn ExternalDiscoverer>) {
+        self.external.push(discoverer);
     }
 
     /// Scan for available DAC devices of all enabled types.
@@ -804,12 +835,45 @@ impl DacDiscovery {
             }
         }
 
+        // External discoverers
+        for (index, discoverer) in self.external.iter_mut().enumerate() {
+            let dac_type = discoverer.dac_type();
+            for ext_device in discoverer.scan() {
+                devices.push(DiscoveredDevice {
+                    dac_type: dac_type.clone(),
+                    ip_address: ext_device.ip_address,
+                    mac_address: ext_device.mac_address,
+                    hostname: ext_device.hostname,
+                    usb_address: ext_device.usb_address,
+                    hardware_name: ext_device.hardware_name,
+                    inner: DiscoveredDeviceInner::External {
+                        discoverer_index: index,
+                        opaque_data: ext_device.opaque_data,
+                    },
+                });
+            }
+        }
+
         devices
     }
 
     /// Connect to a discovered device and return a streaming backend.
     #[allow(unreachable_patterns)]
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&mut self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+        // Handle external devices first (check inner variant)
+        if let DiscoveredDeviceInner::External {
+            discoverer_index,
+            opaque_data,
+        } = device.inner
+        {
+            return self
+                .external
+                .get_mut(discoverer_index)
+                .ok_or_else(|| Error::invalid_config("External discoverer not found"))?
+                .connect(opaque_data);
+        }
+
+        // Handle built-in DAC types
         match device.dac_type {
             #[cfg(feature = "helios")]
             DacType::Helios => self
@@ -931,5 +995,201 @@ mod tests {
             hardware_name: None,
         };
         assert_eq!(info.stable_id(), "mydac:10.0.0.1");
+    }
+
+    // =========================================================================
+    // External Discoverer Tests
+    // =========================================================================
+
+    use crate::types::{DacCapabilities, LaserPoint};
+    use crate::WriteOutcome;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Mock connection info for testing.
+    #[derive(Debug, Clone)]
+    struct MockConnectionInfo {
+        _device_id: u32,
+    }
+
+    /// Mock backend for testing external discoverers.
+    struct MockBackend {
+        connected: bool,
+    }
+
+    impl StreamBackend for MockBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("MockDAC".into())
+        }
+
+        fn caps(&self) -> &DacCapabilities {
+            static CAPS: DacCapabilities = DacCapabilities {
+                pps_min: 1,
+                pps_max: 100_000,
+                max_points_per_chunk: 4096,
+                prefers_constant_pps: false,
+                can_estimate_queue: false,
+                output_model: crate::types::OutputModel::NetworkFifo,
+            };
+            &CAPS
+        }
+
+        fn connect(&mut self) -> Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            self.connected = false;
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+
+        fn try_write_chunk(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_shutter(&mut self, _open: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Mock external discoverer for testing.
+    struct MockExternalDiscoverer {
+        scan_count: Arc<AtomicUsize>,
+        connect_called: Arc<AtomicBool>,
+        devices_to_return: Vec<(u32, Option<IpAddr>)>,
+    }
+
+    impl MockExternalDiscoverer {
+        fn new(devices: Vec<(u32, Option<IpAddr>)>) -> Self {
+            Self {
+                scan_count: Arc::new(AtomicUsize::new(0)),
+                connect_called: Arc::new(AtomicBool::new(false)),
+                devices_to_return: devices,
+            }
+        }
+    }
+
+    impl ExternalDiscoverer for MockExternalDiscoverer {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("MockDAC".into())
+        }
+
+        fn scan(&mut self) -> Vec<ExternalDevice> {
+            self.scan_count.fetch_add(1, Ordering::SeqCst);
+            self.devices_to_return
+                .iter()
+                .map(|(id, ip)| {
+                    let mut device = ExternalDevice::new(MockConnectionInfo { _device_id: *id });
+                    device.ip_address = *ip;
+                    device.hardware_name = Some(format!("Mock Device {}", id));
+                    device
+                })
+                .collect()
+        }
+
+        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>> {
+            self.connect_called.store(true, Ordering::SeqCst);
+            let _info = opaque_data
+                .downcast::<MockConnectionInfo>()
+                .map_err(|_| Error::invalid_config("wrong device type"))?;
+            Ok(Box::new(MockBackend { connected: false }))
+        }
+    }
+
+    #[test]
+    fn test_external_discoverer_scan_is_called() {
+        let discoverer = MockExternalDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))]);
+        let scan_count = discoverer.scan_count.clone();
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        assert_eq!(scan_count.load(Ordering::SeqCst), 0);
+        let devices = discovery.scan();
+        assert_eq!(scan_count.load(Ordering::SeqCst), 1);
+        assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn test_external_discoverer_device_info() {
+        let discoverer =
+            MockExternalDiscoverer::new(vec![(42, Some("192.168.1.100".parse().unwrap()))]);
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let devices = discovery.scan();
+        assert_eq!(devices.len(), 1);
+
+        let device = &devices[0];
+        assert_eq!(device.dac_type(), DacType::Custom("MockDAC".into()));
+        assert_eq!(
+            device.info().ip_address,
+            Some("192.168.1.100".parse().unwrap())
+        );
+        assert_eq!(device.info().hardware_name, Some("Mock Device 42".into()));
+    }
+
+    #[test]
+    fn test_external_discoverer_connect() {
+        let discoverer = MockExternalDiscoverer::new(vec![(99, None)]);
+        let connect_called = discoverer.connect_called.clone();
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let devices = discovery.scan();
+        assert_eq!(devices.len(), 1);
+        assert!(!connect_called.load(Ordering::SeqCst));
+
+        let backend = discovery.connect(devices.into_iter().next().unwrap());
+        assert!(backend.is_ok());
+        assert!(connect_called.load(Ordering::SeqCst));
+
+        let backend = backend.unwrap();
+        assert_eq!(backend.dac_type(), DacType::Custom("MockDAC".into()));
+    }
+
+    #[test]
+    fn test_external_discoverer_multiple_devices() {
+        let discoverer = MockExternalDiscoverer::new(vec![
+            (1, Some("10.0.0.1".parse().unwrap())),
+            (2, Some("10.0.0.2".parse().unwrap())),
+            (3, None),
+        ]);
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let devices = discovery.scan();
+        assert_eq!(devices.len(), 3);
+
+        // Verify we can connect to any of them
+        for device in devices {
+            let backend = discovery.connect(device);
+            assert!(backend.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_multiple_external_discoverers() {
+        let discoverer1 = MockExternalDiscoverer::new(vec![(1, None)]);
+        let discoverer2 = MockExternalDiscoverer::new(vec![(2, None), (3, None)]);
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer1));
+        discovery.register(Box::new(discoverer2));
+
+        let devices = discovery.scan();
+        assert_eq!(devices.len(), 3);
     }
 }

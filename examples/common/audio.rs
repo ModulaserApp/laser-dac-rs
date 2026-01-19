@@ -347,10 +347,6 @@ fn generate_xy_oscilloscope(samples: &[f32], n_points: usize, channels: usize) -
     }
 
     // Ensure we have exactly n_points
-    while points.len() < n_points {
-        points.push(LaserPoint::blanked(0.0, 0.0));
-    }
-    points.truncate(n_points);
-
+    points.resize(n_points, LaserPoint::blanked(0.0, 0.0));
     points
 }

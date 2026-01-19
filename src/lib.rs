@@ -92,10 +92,10 @@
 
 pub mod backend;
 pub mod discovery;
-mod discovery_worker;
 mod error;
 mod frame_adapter;
 pub mod protocols;
+pub mod session;
 pub mod stream;
 pub mod types;
 
@@ -106,8 +106,9 @@ pub use error::{Error, Result};
 pub use backend::{StreamBackend, WriteOutcome};
 
 // Discovery types
-pub use discovery::{CustomDiscoverySource, DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo};
-pub use discovery_worker::{DacDiscoveryWorker, DacDiscoveryWorkerBuilder};
+pub use discovery::{
+    DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo, ExternalDevice, ExternalDiscoverer,
+};
 
 // Core types
 pub use types::{
@@ -120,7 +121,6 @@ pub use types::{
     DacDevice,
     DacInfo,
     DacType,
-    DiscoveredDac,
     EnabledDacTypes,
     LaserPoint,
     OutputModel,
@@ -133,6 +133,7 @@ pub use types::{
 };
 
 // Stream and Dac types
+pub use session::{ReconnectingSession, SessionControl};
 pub use stream::{Dac, OwnedDac, Stream, StreamControl};
 
 // Frame adapters (converts point buffers to continuous streams)
@@ -190,19 +191,19 @@ pub fn list_devices() -> BackendResult<Vec<DacInfo>> {
 /// List available DACs filtered by DAC type.
 pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<Vec<DacInfo>> {
     let mut discovery = DacDiscovery::new(enabled_types.clone());
-    let discovered = discovery.scan();
-
-    let mut devices = Vec::new();
-    for device in discovered {
-        let info = device.info();
-        let caps = caps_for_dac_type(&device.dac_type());
-        devices.push(DacInfo {
-            id: info.stable_id(),
-            name: info.name(),
-            kind: device.dac_type(),
-            caps,
-        });
-    }
+    let devices = discovery
+        .scan()
+        .into_iter()
+        .map(|device| {
+            let info = device.info();
+            DacInfo {
+                id: info.stable_id(),
+                name: info.name(),
+                kind: device.dac_type(),
+                caps: caps_for_dac_type(&device.dac_type()),
+            }
+        })
+        .collect();
 
     Ok(devices)
 }

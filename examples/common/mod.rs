@@ -29,6 +29,7 @@ pub enum Shape {
 }
 
 impl Shape {
+    #[allow(dead_code)] // Used by stream/callback/frame_adapter examples, not audio
     pub fn name(&self) -> &'static str {
         match self {
             Shape::Triangle => "triangle",
@@ -82,20 +83,11 @@ pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
 /// If there are too few points, pads with the last point (or blanked origin).
 /// If there are too many points, truncates.
 fn normalize_point_count(points: &mut Vec<LaserPoint>, target: usize) {
-    match points.len().cmp(&target) {
-        std::cmp::Ordering::Less => {
-            // Pad with last point (or blanked origin if empty)
-            let pad_point = points
-                .last()
-                .copied()
-                .unwrap_or(LaserPoint::blanked(0.0, 0.0));
-            points.resize(target, pad_point);
-        }
-        std::cmp::Ordering::Greater => {
-            points.truncate(target);
-        }
-        std::cmp::Ordering::Equal => {}
-    }
+    let pad_point = points
+        .last()
+        .copied()
+        .unwrap_or(LaserPoint::blanked(0.0, 0.0));
+    points.resize(target, pad_point);
 }
 
 /// Create an RGB triangle with proper blanking and interpolation.
@@ -245,8 +237,7 @@ fn create_test_pattern_points(n_points: usize) -> Vec<LaserPoint> {
     let json_str = include_str!("test-pattern.json");
     let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
 
-    // Scale to requested number of points by repeating/truncating
-    let mut points: Vec<LaserPoint> = pattern_points
+    let points: Vec<LaserPoint> = pattern_points
         .into_iter()
         .map(|p| {
             LaserPoint::new(
@@ -260,19 +251,5 @@ fn create_test_pattern_points(n_points: usize) -> Vec<LaserPoint> {
         })
         .collect();
 
-    // Repeat pattern to fill requested points
-    if points.len() < n_points {
-        let original = points.clone();
-        while points.len() < n_points {
-            for p in &original {
-                points.push(*p);
-                if points.len() >= n_points {
-                    break;
-                }
-            }
-        }
-    }
-
-    points.truncate(n_points);
-    points
+    points.iter().cycle().take(n_points).copied().collect()
 }
