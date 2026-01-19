@@ -1,12 +1,13 @@
 //! Audio capture and visualization for laser examples.
 //!
-//! Provides timebase-aligned audio-reactive point generation for Jerobeam-style
-//! XY oscilloscope rendering. Audio samples are aligned to the stream's point
-//! timeline for stable, jitter-free output.
+//! Provides low-latency audio-reactive point generation for Jerobeam-style
+//! XY oscilloscope rendering. Uses wall-clock anchored sampling from a ring
+//! buffer for stable, drift-free output with configurable latency.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use laser_dac::{ChunkRequest, LaserPoint};
 use log::{debug, error, info};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
@@ -14,7 +15,7 @@ use std::thread;
 const RING_BUFFER_FRAMES: usize = 96000;
 
 /// Global audio state - lazily initialized on first use
-static AUDIO_STATE: OnceLock<Arc<Mutex<AudioState>>> = OnceLock::new();
+static AUDIO_STATE: OnceLock<Arc<AudioState>> = OnceLock::new();
 
 /// Flag to track if audio has been initialized
 static AUDIO_INITIALIZED: OnceLock<bool> = OnceLock::new();
@@ -37,9 +38,10 @@ pub struct AudioConfig {
     pub color: (u16, u16, u16),
     /// Blank when max amplitude is below this threshold (0.0 = never blank, 0.01 = typical)
     pub blank_threshold: f32,
-    /// Audio delay in milliseconds. Lower = less latency but may cause glitches.
-    /// Typical range: 10-30ms. Must be > audio capture latency (~10ms).
-    pub delay_ms: f32,
+    /// Extra audio delay in milliseconds for audio capture latency compensation.
+    /// Higher values provide more margin against glitches but increase latency.
+    /// Typical range: 5-20ms. Set to 0 for minimum latency (may cause glitches).
+    pub extra_delay_ms: f32,
 }
 
 impl Default for AudioConfig {
@@ -48,26 +50,34 @@ impl Default for AudioConfig {
             intensity: 65535,
             color: (0, 65535, 65535), // Cyan
             blank_threshold: 0.01,    // Blank on near-silence
-            delay_ms: 20.0,           // 20ms delay
+            extra_delay_ms: 10.0,     // 10ms extra delay for safety
         }
     }
 }
 
+/// Snapshot of audio state for lock-free reading
+struct AudioSnapshot {
+    sample_clock: u64,
+    write_pos: usize,
+    sample_rate: u32,
+    mode: AudioMode,
+}
+
 /// Shared audio state between the audio thread and render thread
 struct AudioState {
-    /// Ring buffer for left channel samples
-    ring_left: Vec<f32>,
-    /// Ring buffer for right channel samples
-    ring_right: Vec<f32>,
-    /// Write position in ring buffer (next frame to write)
-    write_pos: usize,
-    /// Sample clock: total frames written since start (monotonic)
-    sample_clock: u64,
-    /// Audio sample rate in Hz
+    /// Ring buffer for left channel samples (written by audio thread)
+    ring_left: Mutex<Vec<f32>>,
+    /// Ring buffer for right channel samples (written by audio thread)
+    ring_right: Mutex<Vec<f32>>,
+    /// Write position in ring buffer (atomic for lock-free read)
+    write_pos: AtomicU64,
+    /// Sample clock: total frames written since start (atomic for lock-free read)
+    sample_clock: AtomicU64,
+    /// Audio sample rate in Hz (immutable after init)
     sample_rate: u32,
-    /// Number of input channels
+    /// Number of input channels (immutable after init)
     channels: usize,
-    /// Audio mode
+    /// Audio mode (immutable after init)
     mode: AudioMode,
 }
 
@@ -85,83 +95,138 @@ impl AudioState {
         );
 
         Self {
-            ring_left: vec![0.0; RING_BUFFER_FRAMES],
-            ring_right: vec![0.0; RING_BUFFER_FRAMES],
-            write_pos: 0,
-            sample_clock: 0,
+            ring_left: Mutex::new(vec![0.0; RING_BUFFER_FRAMES]),
+            ring_right: Mutex::new(vec![0.0; RING_BUFFER_FRAMES]),
+            write_pos: AtomicU64::new(0),
+            sample_clock: AtomicU64::new(0),
             sample_rate,
             channels,
             mode,
         }
     }
 
-    fn update_samples(&mut self, new_samples: &[f32]) {
+    fn update_samples(&self, new_samples: &[f32]) {
         let frame_count = new_samples.len() / self.channels.max(1);
 
+        // Lock both buffers briefly to write
+        let mut left = self.ring_left.lock().unwrap();
+        let mut right = self.ring_right.lock().unwrap();
+
+        let mut write_pos = self.write_pos.load(Ordering::Relaxed) as usize;
+
         for i in 0..frame_count {
-            let left = new_samples[i * self.channels];
-            let right = if self.channels >= 2 {
+            let l = new_samples[i * self.channels];
+            let r = if self.channels >= 2 {
                 new_samples[i * self.channels + 1]
             } else {
-                left
+                l
             };
 
-            self.ring_left[self.write_pos] = left;
-            self.ring_right[self.write_pos] = right;
+            left[write_pos] = l;
+            right[write_pos] = r;
 
-            self.write_pos = (self.write_pos + 1) % RING_BUFFER_FRAMES;
+            write_pos = (write_pos + 1) % RING_BUFFER_FRAMES;
         }
 
-        self.sample_clock += frame_count as u64;
+        // Update atomics after write completes
+        self.write_pos.store(write_pos as u64, Ordering::Release);
+        self.sample_clock.fetch_add(frame_count as u64, Ordering::Release);
     }
 
-    /// Read a sample from the ring buffer at a given frame index.
-    /// Returns (left, right).
-    fn read_frame(&self, frame_idx: u64) -> (f32, f32) {
-        let frames_available = self.sample_clock;
-        if frame_idx >= frames_available {
-            // Requested frame is in the future - return last available
-            let idx = if self.write_pos == 0 {
+    /// Get a snapshot of current state for lock-free calculations
+    fn snapshot(&self) -> AudioSnapshot {
+        AudioSnapshot {
+            sample_clock: self.sample_clock.load(Ordering::Acquire),
+            write_pos: self.write_pos.load(Ordering::Acquire) as usize,
+            sample_rate: self.sample_rate,
+            mode: self.mode,
+        }
+    }
+
+    /// Read samples for a range with minimal lock hold time.
+    /// Copies the needed window under lock, then interpolates outside the lock.
+    /// Returns a Vec of (left, right) pairs.
+    fn read_samples(&self, start_frame: u64, count: usize, points_to_frames: f64) -> Vec<(f32, f32)> {
+        if count == 0 {
+            return Vec::new();
+        }
+
+        let snap = self.snapshot();
+
+        // Calculate the frame range we need (with +1 for interpolation)
+        let end_frame_f = start_frame as f64 + (count - 1) as f64 * points_to_frames + 1.0;
+        let frames_needed = (end_frame_f.ceil() as u64).saturating_sub(start_frame) + 1;
+        let frames_needed = (frames_needed as usize).min(RING_BUFFER_FRAMES);
+
+        // Copy the needed window under lock
+        let (left_copy, right_copy) = {
+            let left = self.ring_left.lock().unwrap();
+            let right = self.ring_right.lock().unwrap();
+
+            let mut left_copy = Vec::with_capacity(frames_needed);
+            let mut right_copy = Vec::with_capacity(frames_needed);
+
+            for offset in 0..frames_needed {
+                let frame_idx = start_frame + offset as u64;
+                let (l, r) = Self::read_frame_from_slice(&left, &right, frame_idx, &snap);
+                left_copy.push(l);
+                right_copy.push(r);
+            }
+
+            (left_copy, right_copy)
+        };
+        // Lock released here
+
+        // Interpolate from the copy (no lock held)
+        let mut samples = Vec::with_capacity(count);
+        for i in 0..count {
+            let frame_f = i as f64 * points_to_frames;
+            let idx = frame_f.floor() as usize;
+            let frac = (frame_f - frame_f.floor()) as f32;
+
+            let idx0 = idx.min(left_copy.len().saturating_sub(1));
+            let idx1 = (idx + 1).min(left_copy.len().saturating_sub(1));
+
+            let l = left_copy[idx0] + (left_copy[idx1] - left_copy[idx0]) * frac;
+            let r = right_copy[idx0] + (right_copy[idx1] - right_copy[idx0]) * frac;
+            samples.push((l, r));
+        }
+
+        samples
+    }
+
+    fn read_frame_from_slice(
+        left: &[f32],
+        right: &[f32],
+        frame_idx: u64,
+        snap: &AudioSnapshot,
+    ) -> (f32, f32) {
+        if frame_idx >= snap.sample_clock {
+            // Future frame - return last available
+            let idx = if snap.write_pos == 0 {
                 RING_BUFFER_FRAMES - 1
             } else {
-                self.write_pos - 1
+                snap.write_pos - 1
             };
-            return (self.ring_left[idx], self.ring_right[idx]);
+            return (left[idx], right[idx]);
         }
 
-        let frames_back = frames_available - frame_idx;
+        let frames_back = snap.sample_clock - frame_idx;
         if frames_back > RING_BUFFER_FRAMES as u64 {
-            // Too far back - return oldest available
-            return (
-                self.ring_left[self.write_pos],
-                self.ring_right[self.write_pos],
-            );
+            // Too far back - return oldest
+            return (left[snap.write_pos], right[snap.write_pos]);
         }
 
-        // Calculate ring buffer index
-        let idx = (self.write_pos + RING_BUFFER_FRAMES - (frames_back as usize % RING_BUFFER_FRAMES))
+        let idx = (snap.write_pos + RING_BUFFER_FRAMES - (frames_back as usize % RING_BUFFER_FRAMES))
             % RING_BUFFER_FRAMES;
-        (self.ring_left[idx], self.ring_right[idx])
+        (left[idx], right[idx])
     }
 
-    /// Read a sample with linear interpolation at a fractional frame index.
-    fn read_frame_interp(&self, frame_f: f64) -> (f32, f32) {
-        let frame_idx = frame_f.floor() as u64;
-        let frac = (frame_f - frame_f.floor()) as f32;
-
-        let (l0, r0) = self.read_frame(frame_idx);
-        let (l1, r1) = self.read_frame(frame_idx + 1);
-
-        let l = l0 + (l1 - l0) * frac;
-        let r = r0 + (r1 - r0) * frac;
-        (l, r)
-    }
 }
 
 /// Initialize audio capture if not already running.
 /// Returns true if audio is available.
 pub fn ensure_audio_initialized() -> bool {
-    // Check if already initialized
     if let Some(&initialized) = AUDIO_INITIALIZED.get() {
         return initialized;
     }
@@ -198,12 +263,10 @@ pub fn ensure_audio_initialized() -> bool {
 
     let channels = config.channels() as usize;
     let sample_rate = config.sample_rate().0;
-    let audio_state = Arc::new(Mutex::new(AudioState::new(channels, sample_rate)));
+    let audio_state = Arc::new(AudioState::new(channels, sample_rate));
 
-    // Store the state
     let _ = AUDIO_STATE.set(Arc::clone(&audio_state));
 
-    // Spawn a thread to own and run the audio stream
     let sample_format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
@@ -216,9 +279,7 @@ pub fn ensure_audio_initialized() -> bool {
                 input_device.build_input_stream(
                     &stream_config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut state) = state.lock() {
-                            state.update_samples(data);
-                        }
+                        state.update_samples(data);
                     },
                     err_fn,
                     None,
@@ -229,11 +290,9 @@ pub fn ensure_audio_initialized() -> bool {
                 input_device.build_input_stream(
                     &stream_config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut state) = state.lock() {
-                            let float_data: Vec<f32> =
-                                data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                            state.update_samples(&float_data);
-                        }
+                        let float_data: Vec<f32> =
+                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                        state.update_samples(&float_data);
                     },
                     err_fn,
                     None,
@@ -244,13 +303,11 @@ pub fn ensure_audio_initialized() -> bool {
                 input_device.build_input_stream(
                     &stream_config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                        if let Ok(mut state) = state.lock() {
-                            let float_data: Vec<f32> = data
-                                .iter()
-                                .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                                .collect();
-                            state.update_samples(&float_data);
-                        }
+                        let float_data: Vec<f32> = data
+                            .iter()
+                            .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                            .collect();
+                        state.update_samples(&float_data);
                     },
                     err_fn,
                     None,
@@ -269,8 +326,6 @@ pub fn ensure_audio_initialized() -> bool {
                     return;
                 }
                 info!("Audio stream started");
-
-                // Keep the thread (and stream) alive forever
                 loop {
                     thread::park();
                 }
@@ -281,9 +336,7 @@ pub fn ensure_audio_initialized() -> bool {
         }
     });
 
-    // Give the audio thread a moment to start
     thread::sleep(std::time::Duration::from_millis(100));
-
     let _ = AUDIO_INITIALIZED.set(true);
     true
 }
@@ -291,35 +344,27 @@ pub fn ensure_audio_initialized() -> bool {
 /// Get the current audio sample rate, or None if audio isn't initialized.
 #[allow(dead_code)]
 pub fn get_audio_sample_rate() -> Option<u32> {
-    let state = AUDIO_STATE.get()?;
-    let state = state.lock().ok()?;
-    Some(state.sample_rate)
+    Some(AUDIO_STATE.get()?.sample_rate)
 }
 
 /// Get the current audio mode, or None if audio isn't initialized.
 #[allow(dead_code)]
 pub fn get_audio_mode() -> Option<AudioMode> {
-    let state = AUDIO_STATE.get()?;
-    let state = state.lock().ok()?;
-    Some(state.mode)
+    Some(AUDIO_STATE.get()?.mode)
 }
 
-/// Create laser points from audio input using stream timebase.
+/// Create laser points from audio input.
 ///
-/// This function aligns audio samples to the stream's point timeline, providing
-/// stable, jitter-free rendering. It uses the ChunkRequest's timing info
-/// to render the audio that corresponds to each point's beam position.
+/// Renders audio with low, fixed latency. The `extra_delay_ms` config provides
+/// a safety margin for audio capture latency.
 ///
 /// - **Stereo**: XY oscilloscope (left=X, right=Y)
 /// - **Mono**: Time-domain oscilloscope (X=time sweep, Y=amplitude from timebase)
-///
-/// # Arguments
-/// * `req` - The chunk request from the stream, containing timing information
-/// * `config` - Audio rendering configuration
-///
-/// # Returns
-/// A vector of exactly `req.n_points` LaserPoints
 pub fn create_audio_points(req: &ChunkRequest, config: &AudioConfig) -> Vec<LaserPoint> {
+    if req.n_points == 0 {
+        return Vec::new();
+    }
+
     if !ensure_audio_initialized() {
         return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
     }
@@ -329,78 +374,71 @@ pub fn create_audio_points(req: &ChunkRequest, config: &AudioConfig) -> Vec<Lase
         None => return vec![LaserPoint::blanked(0.0, 0.0); req.n_points],
     };
 
-    let state = match state.lock() {
-        Ok(s) => s,
-        Err(_) => return vec![LaserPoint::blanked(0.0, 0.0); req.n_points],
-    };
-
-    let sample_rate = state.sample_rate;
+    let snap = state.snapshot();
     let pps = req.pps;
-    let mode = state.mode;
 
-    // Convert points to audio frames ratio
-    let points_to_frames_ratio = sample_rate as f64 / pps as f64;
+    // Ratio for converting points to audio frames
+    let points_to_frames = snap.sample_rate as f64 / pps as f64;
 
-    // Calculate audio start frame based on configured delay
-    // We render audio that was captured `delay_ms` ago, giving us low-latency output
-    let delay_frames = (config.delay_ms / 1000.0) * sample_rate as f32;
-    let chunk_frames = (req.n_points as f64 * points_to_frames_ratio) as u64;
-    let audio_start_frame = state.sample_clock
-        .saturating_sub(delay_frames as u64)
+    // Calculate audio start frame:
+    // - sample_clock is "now" in audio time
+    // - We go back by extra_delay_ms for safety margin
+    // - We go back by chunk duration so the chunk spans [start, start + n_points)
+    let extra_delay_frames = (config.extra_delay_ms / 1000.0 * snap.sample_rate as f32) as u64;
+    let chunk_frames = (req.n_points as f64 * points_to_frames) as u64;
+    let audio_start_frame = snap.sample_clock
+        .saturating_sub(extra_delay_frames)
         .saturating_sub(chunk_frames);
 
-    // Check for silence by sampling across the chunk
+    // Read all samples we need (this minimizes lock hold time)
+    let samples = state.read_samples(audio_start_frame, req.n_points, points_to_frames);
+
+    // Check for silence
     if config.blank_threshold > 0.0 {
         let check_count = (req.n_points / 10).max(10).min(req.n_points);
-        let mut max_amp = 0.0f32;
-        for i in 0..check_count {
-            let audio_frame_f = audio_start_frame as f64 + (i * req.n_points / check_count) as f64 * points_to_frames_ratio;
-            let (l, r) = state.read_frame_interp(audio_frame_f);
-            max_amp = max_amp.max(l.abs()).max(r.abs());
-        }
+        let max_amp = samples
+            .iter()
+            .step_by(req.n_points / check_count)
+            .map(|(l, r)| l.abs().max(r.abs()))
+            .fold(0.0f32, f32::max);
+
         if max_amp < config.blank_threshold {
             debug!("Audio: silence detected (max_amp={:.4}), blanking", max_amp);
             return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
         }
     }
 
-    let mut points = Vec::with_capacity(req.n_points);
+    // Generate points
     let (cr, cg, cb) = config.color;
-
-    match mode {
-        AudioMode::Stereo => {
-            // XY mode: left channel = X, right channel = Y
-            for i in 0..req.n_points {
-                let audio_frame_f = audio_start_frame as f64 + i as f64 * points_to_frames_ratio;
-                let (l, r) = state.read_frame_interp(audio_frame_f);
-
-                let x = l.clamp(-1.0, 1.0);
-                let y = r.clamp(-1.0, 1.0);
-
-                points.push(LaserPoint::new(x, y, cr, cg, cb, config.intensity));
-            }
-        }
-        AudioMode::Mono => {
-            // Time-domain mode: X = time sweep (-1 to +1), Y = audio amplitude
-            for i in 0..req.n_points {
+    let points: Vec<LaserPoint> = match snap.mode {
+        AudioMode::Stereo => samples
+            .iter()
+            .map(|(l, r)| {
+                LaserPoint::new(
+                    l.clamp(-1.0, 1.0),
+                    r.clamp(-1.0, 1.0),
+                    cr, cg, cb,
+                    config.intensity,
+                )
+            })
+            .collect(),
+        AudioMode::Mono => samples
+            .iter()
+            .enumerate()
+            .map(|(i, (l, _r))| {
                 let t = i as f32 / (req.n_points - 1).max(1) as f32;
-                let x = t * 2.0 - 1.0; // -1 to +1 sweep
-
-                let audio_frame_f = audio_start_frame as f64 + i as f64 * points_to_frames_ratio;
-                let (l, _r) = state.read_frame_interp(audio_frame_f);
-                let y = l.clamp(-1.0, 1.0);
-
-                points.push(LaserPoint::new(x, y, cr, cg, cb, config.intensity));
-            }
-        }
-    }
+                let x = t * 2.0 - 1.0;
+                LaserPoint::new(x, l.clamp(-1.0, 1.0), cr, cg, cb, config.intensity)
+            })
+            .collect(),
+    };
 
     debug!(
-        "Audio: rendered {} points, mode={:?}, audio_start_frame={}, delay={}ms",
+        "Audio: {} points, mode={:?}, audio_frame={}, delay={}ms",
         points.len(),
-        mode,
+        snap.mode,
         audio_start_frame,
-        config.delay_ms
+        config.extra_delay_ms
     );
 
     points
