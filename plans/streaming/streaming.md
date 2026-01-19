@@ -417,7 +417,7 @@ The expected usage is:
 **FrameAdapter behavior**
 
 - Latest-wins: `update()` sets the pending frame; multiple calls before a swap keep only the most recent.
-- Wrap-boundary swaps: the pending frame becomes current only at wrap boundaries (when the point index cycles back to 0), ensuring clean transitions without mid-cycle jumps.
+- Immediate swap on frame end: when the current frame completes (all points output), any pending frame becomes current immediately—even mid-chunk. This ensures clean frame-to-frame transitions.
 - Chunks are produced by cycling through the frame's points (integer index, no resampling).
 - Empty frames output blanked points at the last known position.
 - For time-varying animation, use the streaming API directly with a point generator instead of FrameAdapter.

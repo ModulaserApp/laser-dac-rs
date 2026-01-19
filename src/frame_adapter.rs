@@ -8,9 +8,9 @@
 //!
 //! - **Latest-wins**: `update()` sets the pending frame. Multiple calls before
 //!   a swap keep only the most recent.
-//! - **Wrap-boundary swaps**: The pending frame becomes current at the start of
-//!   the next `next_chunk()` call after the index wraps to 0 (which may happen
-//!   mid-chunk). This ensures clean transitions without mid-cycle jumps.
+//! - **Immediate swap on frame end**: When the current frame completes (all
+//!   points output), any pending frame becomes current immediately—even
+//!   mid-chunk. This ensures clean frame-to-frame transitions.
 //!
 //! The adapter does not insert blanking on frame swaps. If the new frame's first
 //! point is far from the previous frame's last point, content should include
@@ -68,8 +68,8 @@ impl From<Vec<LaserPoint>> for Frame {
 /// # Update semantics
 ///
 /// - `update()` sets the pending frame (latest-wins if called multiple times)
-/// - The pending frame becomes current at the start of the next `next_chunk()`
-///   after a wrap, ensuring clean transitions without mid-cycle jumps
+/// - When the current frame ends, any pending frame becomes current immediately
+///   (even mid-chunk), ensuring clean frame-to-frame transitions
 ///
 /// # Example
 ///
@@ -87,8 +87,6 @@ pub struct FrameAdapter {
     current: Frame,
     pending: Option<Frame>,
     point_index: usize,
-    /// True when we've wrapped and should apply pending on next chunk.
-    swap_pending: bool,
     /// For "hold last" blanking when frame is empty.
     last_position: (f32, f32),
 }
@@ -102,15 +100,14 @@ impl FrameAdapter {
             current: Frame::empty(),
             pending: None,
             point_index: 0,
-            swap_pending: true, // Apply first frame immediately
             last_position: (0.0, 0.0),
         }
     }
 
     /// Sets the pending frame.
     ///
-    /// The frame becomes current at the start of the next `next_chunk()` after
-    /// a wrap. If called multiple times before a swap, only the most recent
+    /// The frame becomes current when the current frame ends (all points
+    /// output). If called multiple times before a swap, only the most recent
     /// frame is kept (latest-wins).
     pub fn update(&mut self, frame: Frame) {
         self.pending = Some(frame);
@@ -118,40 +115,42 @@ impl FrameAdapter {
 
     /// Produces exactly `req.n_points` points.
     ///
-    /// Cycles through the current frame, applying any pending frame
-    /// only at wrap boundaries.
+    /// Cycles through the current frame. When the frame ends and a pending
+    /// frame is available, switches immediately (even mid-chunk).
     pub fn next_chunk(&mut self, req: &ChunkRequest) -> Vec<LaserPoint> {
-        if self.swap_pending {
-            if let Some(pending) = self.pending.take() {
-                self.current = pending;
-                self.point_index = 0;
-            }
-            self.swap_pending = false;
-        }
-
         self.generate_points(req.n_points)
     }
 
     fn generate_points(&mut self, n_points: usize) -> Vec<LaserPoint> {
-        let frame_points = &self.current.points;
-
-        if frame_points.is_empty() {
-            let (x, y) = self.last_position;
-            return vec![LaserPoint::blanked(x, y); n_points];
-        }
-
         let mut output = Vec::with_capacity(n_points);
-        let len = frame_points.len();
 
         for _ in 0..n_points {
-            let point = frame_points[self.point_index];
+            // Handle empty frame: try to swap, else output blanked
+            if self.current.points.is_empty() {
+                if let Some(pending) = self.pending.take() {
+                    self.current = pending;
+                    self.point_index = 0;
+                }
+
+                if self.current.points.is_empty() {
+                    let (x, y) = self.last_position;
+                    output.push(LaserPoint::blanked(x, y));
+                    continue;
+                }
+            }
+
+            let point = self.current.points[self.point_index];
             output.push(point);
             self.last_position = (point.x, point.y);
 
             self.point_index += 1;
-            if self.point_index >= len {
+            if self.point_index >= self.current.points.len() {
                 self.point_index = 0;
-                self.swap_pending = true;
+                // Immediately swap to pending frame if available
+                if let Some(pending) = self.pending.take() {
+                    self.current = pending;
+                    self.point_index = 0;
+                }
             }
         }
 
@@ -179,7 +178,7 @@ pub struct SharedFrameAdapter {
 }
 
 impl SharedFrameAdapter {
-    /// Sets the pending frame. Takes effect at the next wrap boundary.
+    /// Sets the pending frame. Takes effect when the current frame ends.
     pub fn update(&self, frame: Frame) {
         let mut adapter = self.inner.lock().unwrap();
         adapter.update(frame);
@@ -234,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_point_swaps_quickly() {
+    fn test_single_point_swaps_immediately() {
         let mut adapter = FrameAdapter::new();
         adapter.update(Frame::new(vec![LaserPoint::new(
             0.0, 0.0, 65535, 0, 0, 65535,
@@ -255,13 +254,19 @@ mod tests {
             1.0, 1.0, 0, 65535, 0, 65535,
         )]));
 
-        // Single-point frame wraps every point, so swap happens on next chunk
+        // Single-point frame wraps every point; swap happens immediately after
+        // each point, so first point is old frame, rest is new frame
         let points2 = adapter.next_chunk(&req);
-        assert_eq!(points2[0].x, 1.0);
+        assert_eq!(points2[0].x, 0.0, "First point finishes old frame");
+        assert_eq!(points2[1].x, 1.0, "Second point starts new frame");
+        assert!(
+            points2[2..].iter().all(|p| p.x == 1.0),
+            "Rest is new frame"
+        );
     }
 
     #[test]
-    fn test_swap_waits_for_wrap() {
+    fn test_swap_waits_for_frame_end() {
         let mut adapter = FrameAdapter::new();
         let frame1: Vec<LaserPoint> = (0..100)
             .map(|i| LaserPoint::new(i as f32 / 100.0, 0.0, 65535, 0, 0, 65535))
@@ -285,7 +290,7 @@ mod tests {
             .collect();
         adapter.update(Frame::new(frame2));
 
-        // Should still use frame1 (not wrapped yet)
+        // Should still use frame1 (not finished yet)
         let points2 = adapter.next_chunk(&req);
         assert!(
             (points2[0].x - 0.1).abs() < 1e-4,
@@ -298,9 +303,52 @@ mod tests {
             adapter.next_chunk(&req);
         }
 
-        // Now wrapped, uses frame2
+        // Now frame1 finished, uses frame2
         let points_after_wrap = adapter.next_chunk(&req);
         assert_eq!(points_after_wrap[0].x, 9.0);
+    }
+
+    #[test]
+    fn test_mid_chunk_stitching() {
+        // Frame with 95 points, chunk size 10: wrap happens mid-chunk
+        let mut adapter = FrameAdapter::new();
+        let frame1: Vec<LaserPoint> = (0..95)
+            .map(|i| LaserPoint::new(i as f32, 0.0, 65535, 0, 0, 65535))
+            .collect();
+        adapter.update(Frame::new(frame1));
+
+        let req = ChunkRequest {
+            start: StreamInstant(0),
+            pps: 30000,
+            n_points: 10,
+            scheduled_ahead_points: 0,
+            device_queued_points: None,
+        };
+
+        // Output 90 points (9 chunks)
+        for _ in 0..9 {
+            adapter.next_chunk(&req);
+        }
+
+        // Now at index 90, update with new frame
+        let frame2: Vec<LaserPoint> = (0..95)
+            .map(|_| LaserPoint::new(999.0, 999.0, 0, 65535, 0, 65535))
+            .collect();
+        adapter.update(Frame::new(frame2));
+
+        // Next chunk: points 90-94 from frame1, then points 0-4 from frame2
+        let stitched = adapter.next_chunk(&req);
+        assert_eq!(stitched.len(), 10);
+
+        // First 5 points are frame1 (90, 91, 92, 93, 94)
+        for (i, p) in stitched[0..5].iter().enumerate() {
+            assert_eq!(p.x, (90 + i) as f32, "Point {} should be from frame1", i);
+        }
+
+        // Last 5 points are frame2 (all 999.0)
+        for (i, p) in stitched[5..10].iter().enumerate() {
+            assert_eq!(p.x, 999.0, "Point {} should be from frame2", i + 5);
+        }
     }
 
     #[test]
@@ -321,10 +369,16 @@ mod tests {
         adapter.next_chunk(&req);
         adapter.update(Frame::empty());
 
+        // First point finishes the single-point frame, then swap to empty
         let points = adapter.next_chunk(&req);
-        assert!(points.iter().all(|p| p.intensity == 0));
-        assert_eq!(points[0].x, 0.5);
-        assert_eq!(points[0].y, -0.3);
+        assert_eq!(points[0].intensity, 65535, "First point finishes old frame");
+        assert!(
+            points[1..].iter().all(|p| p.intensity == 0),
+            "Rest is blanked"
+        );
+        // Empty frame holds the last known position
+        assert_eq!(points[1].x, 0.5);
+        assert_eq!(points[1].y, -0.3);
     }
 
     #[test]
