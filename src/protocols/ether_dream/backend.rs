@@ -4,7 +4,7 @@ use crate::backend::{StreamBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::ether_dream::dac::{stream, LightEngine, Playback, PlaybackFlags};
 use crate::protocols::ether_dream::protocol::{DacBroadcast, DacPoint};
-use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ pub struct EtherDreamBackend {
     broadcast: DacBroadcast,
     ip_addr: IpAddr,
     stream: Option<stream::Stream>,
-    caps: Caps,
+    caps: DacCapabilities,
 }
 
 impl EtherDreamBackend {
@@ -22,7 +22,7 @@ impl EtherDreamBackend {
             broadcast,
             ip_addr,
             stream: None,
-            caps: caps_for_dac_type(&DacType::EtherDream),
+            caps: super::default_capabilities(),
         }
     }
 }
@@ -32,7 +32,7 @@ impl StreamBackend for EtherDreamBackend {
         DacType::EtherDream
     }
 
-    fn caps(&self) -> &Caps {
+    fn caps(&self) -> &DacCapabilities {
         &self.caps
     }
 

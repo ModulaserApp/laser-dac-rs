@@ -36,7 +36,7 @@ This refactor is not “architecture for architecture’s sake”. It targets fa
 - Streaming-first: the primary output abstraction is a **stream of point chunks** at a fixed PPS.
 - Explicit integer timebase: `StreamInstant(u64)` meaning “points since stream start”.
 - Uniform backpressure model: “accept now” vs “would block” is consistent across backends.
-- Centralized device capabilities: chunk sizing and validation are based on `Caps`, not tribal knowledge.
+- Centralized device capabilities: chunk sizing and validation are based on `DacCapabilities`, not tribal knowledge.
 - Library-owned underrun behavior: repeat/blank/park/stop is consistent across DACs.
 - Make stream behavior observable (queue depth + basic stats) so timing issues are debuggable in real rigs.
 - Frames remain supported, but as **adapters** that feed a stream.
@@ -61,10 +61,10 @@ This refactor is not “architecture for architecture’s sake”. It targets fa
 
 ### Discovery / opening
 
-Discovery yields metadata including capabilities. Opening yields a connected `Device` that can start a streaming session.
+Discovery yields metadata including capabilities. Opening yields a connected `Dac` that can start a streaming session.
 
 ```rust
-pub struct DeviceInfo {
+pub struct DacInfo {
     /// Stable, unique identifier used for (re)selecting devices.
     ///
     /// This should be unique across same-name devices and as stable as possible across restarts.
@@ -72,11 +72,11 @@ pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub kind: DacType,
-    pub caps: Caps,
+    pub caps: DacCapabilities,
 }
 
-pub fn list_devices() -> Result<Vec<DeviceInfo>, Error>;
-pub fn open_device(id: &str) -> Result<Device, Error>;
+pub fn list_devices() -> Result<Vec<DacInfo>, Error>;
+pub fn open_device(id: &str) -> Result<Dac, Error>;
 ```
 
 ### Capabilities
@@ -85,7 +85,7 @@ Capabilities let the stream scheduler choose safe chunk sizes and behaviors.
 
 ```rust
 #[derive(Clone, Debug)]
-pub struct Caps {
+pub struct DacCapabilities {
     pub pps_min: u32,
     pub pps_max: u32,
 
@@ -136,7 +136,7 @@ pub struct StreamConfig {
     pub pps: u32,
 
     /// Exact chunk size to request/write. If `None`, the library chooses a safe default
-    /// based on `Caps` and the target queue.
+    /// based on `DacCapabilities` and the target queue.
     pub chunk_points: Option<usize>,
 
     /// Target amount of queued data expressed in points (not time).
@@ -144,12 +144,6 @@ pub struct StreamConfig {
     pub target_queue_points: usize,
 
     pub underrun: UnderrunPolicy,
-
-    /// Whether to automatically open the hardware output gate when arming.
-    /// When `false` (default), `arm()` only enables software output.
-    /// When `true`, `arm()` will also open the hardware gate.
-    /// Note: `disarm()` always closes the hardware gate for safety.
-    pub open_output_gate_on_arm: bool,
 }
 
 pub enum UnderrunPolicy {
@@ -159,9 +153,9 @@ pub enum UnderrunPolicy {
     Stop,
 }
 
-impl Device {
-    pub fn caps(&self) -> &Caps;
-    pub fn info(&self) -> &DeviceInfo;
+impl Dac {
+    pub fn caps(&self) -> &DacCapabilities;
+    pub fn info(&self) -> &DacInfo;
     pub fn id(&self) -> &str;
     pub fn name(&self) -> &str;
     pub fn kind(&self) -> &DacType;
@@ -170,22 +164,25 @@ impl Device {
 
     /// Starts a streaming session, consuming the device.
     ///
-    /// The `Device` is consumed because each device can only have one active stream
+    /// The `Dac` is consumed because each DAC can only have one active stream
     /// at a time. The backend is moved into the `Stream` to ensure exclusive access.
-    /// This prevents accidental reuse of a device that's already streaming.
+    /// This prevents accidental reuse of a DAC that's already streaming.
     ///
-    /// Returns both the `Stream` and a copy of `DeviceInfo`, so you retain access
-    /// to device metadata (id, name, capabilities) after starting.
+    /// Returns both the `Stream` and a copy of `DacInfo`, so you retain access
+    /// to DAC metadata (id, name, capabilities) after starting.
     ///
-    /// To recover the device for reuse, call `stream.into_device()`.
-    pub fn start_stream(self, cfg: StreamConfig) -> Result<(Stream, DeviceInfo), Error>;
+    /// To recover the DAC for reuse, call `stream.into_dac()`.
+    pub fn start_stream(self, cfg: StreamConfig) -> Result<(Stream, DacInfo), Error>;
 }
 ```
 
 **Safety defaults (intent)**
 
-- The default `UnderrunPolicy` should be safe (typically `Blank` or `Park`), not “repeat last bright point forever”.
-- Make an explicit armed/disarmed output gate a first-class API so reconnects don’t accidentally lase without an explicit enable step.
+- The default `UnderrunPolicy` should be safe (typically `Blank` or `Park`), not "repeat last bright point forever".
+- Binary armed/disarmed model: `arm()` opens shutter + enables output, `disarm()` closes shutter + blanks all points.
+- No separate shutter API — this keeps the mental model simple: armed = laser may emit.
+- Shutter control is best-effort: LaserCube USB/WiFi have actual hardware control; Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
+- New streams always start disarmed so reconnects don't accidentally lase.
 
 **Out-of-band control (target direction)**
 
@@ -257,7 +254,7 @@ pub struct ChunkRequest {
 }
 
 impl Stream {
-    pub fn info(&self) -> &DeviceInfo;
+    pub fn info(&self) -> &DacInfo;
     pub fn config(&self) -> &StreamConfig;
     pub fn control(&self) -> StreamControl;
     pub fn status(&self) -> Result<StreamStatus, Error>;
@@ -275,20 +272,11 @@ impl Stream {
     /// Semantics: fixed for the lifetime of the stream.
     pub fn chunk_points(&self) -> usize;
 
-    /// Manually open the hardware output gate.
-    pub fn open_output_gate(&mut self) -> Result<(), Error>;
-
-    /// Manually close the hardware output gate.
-    pub fn close_output_gate(&mut self) -> Result<(), Error>;
-
-    /// Returns whether the hardware output gate is currently open.
-    pub fn is_output_gate_open(&self) -> bool;
-
-    /// Consume the stream and recover the device for reuse.
+    /// Consume the stream and recover the DAC for reuse.
     ///
-    /// This stops the stream, closes the output gate, and returns the
-    /// underlying `Device` along with the final `StreamStats`.
-    pub fn into_device(self) -> (Device, StreamStats);
+    /// This stops the stream, closes the shutter, and returns the
+    /// underlying `Dac` along with the final `StreamStats`.
+    pub fn into_dac(self) -> (Dac, StreamStats);
 }
 
 pub struct StreamStatus {
@@ -429,7 +417,7 @@ The expected usage is:
 **FrameAdapter behavior**
 
 - Latest-wins: `update()` sets the pending frame; multiple calls before a swap keep only the most recent.
-- Wrap-boundary swaps: the pending frame becomes current only at wrap boundaries (when the point index cycles back to 0), ensuring clean transitions without mid-cycle jumps.
+- Immediate swap on frame end: when the current frame completes (all points output), any pending frame becomes current immediately—even mid-chunk. This ensures clean frame-to-frame transitions.
 - Chunks are produced by cycling through the frame's points (integer index, no resampling).
 - Empty frames output blanked points at the last known position.
 - For time-varying animation, use the streaming API directly with a point generator instead of FrameAdapter.
@@ -441,7 +429,7 @@ Keep responsibilities separated:
 1. **backends/** (per device)
    - Connect/disconnect
    - Convert `&[LaserPoint]` to on-wire/device formats
-   - Expose `Caps`
+   - Expose `DacCapabilities`
    - Implement `try_write_chunk(pps, points)` with uniform “would block”
    - Optional: best-effort status (queue estimate)
 

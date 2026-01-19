@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
 use crate::protocols::idn::error::{CommunicationError, ResponseError};
 use crate::protocols::idn::protocol::PointXyrgbi;
-use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::time::Duration;
 
 /// IDN DAC backend (ILDA Digital Network).
@@ -13,7 +13,7 @@ pub struct IdnBackend {
     server: ServerInfo,
     service: ServiceInfo,
     stream: Option<stream::Stream>,
-    caps: Caps,
+    caps: DacCapabilities,
 }
 
 impl IdnBackend {
@@ -22,7 +22,7 @@ impl IdnBackend {
             server,
             service,
             stream: None,
-            caps: caps_for_dac_type(&DacType::Idn),
+            caps: super::default_capabilities(),
         }
     }
 }
@@ -32,7 +32,7 @@ impl StreamBackend for IdnBackend {
         DacType::Idn
     }
 
-    fn caps(&self) -> &Caps {
+    fn caps(&self) -> &DacCapabilities {
         &self.caps
     }
 

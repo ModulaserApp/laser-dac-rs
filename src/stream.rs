@@ -1,8 +1,30 @@
-//! Stream and Device types for point output.
+//! Stream and Dac types for point output.
 //!
 //! This module provides the `Stream` type for streaming point chunks to a DAC,
-//! `StreamControl` for out-of-band control (arm/disarm/stop), and `Device` for
+//! `StreamControl` for out-of-band control (arm/disarm/stop), and `Dac` for
 //! connected devices that can start streaming sessions.
+//!
+//! # Armed/Disarmed Model
+//!
+//! Streams use a binary armed/disarmed safety model:
+//!
+//! - **Armed**: Content passes through to device, shutter opened (best-effort).
+//! - **Disarmed** (default): Shutter closed, intensity/RGB forced to 0.
+//!
+//! All streams start disarmed. Call `arm()` to enable output.
+//! `arm()` and `disarm()` are the only safety controls — there is no separate
+//! shutter API. This keeps the mental model simple: armed = laser may emit.
+//!
+//! # Hardware Shutter Support
+//!
+//! Shutter control is best-effort and varies by backend:
+//! - **LaserCube USB/WiFi**: Actual hardware control
+//! - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
+//!
+//! # Disconnect Behavior
+//!
+//! No automatic reconnection. On disconnect, create a new `Dac` and `Stream`.
+//! New streams always start disarmed for safety.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -11,8 +33,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    Caps, ChunkRequest, DacType, DeviceInfo, LaserPoint, RunExit, StreamConfig, StreamInstant,
-    StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit, StreamConfig,
+    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -25,9 +47,9 @@ use crate::types::{
 /// even when the stream is waiting (pacing, backpressure, etc.).
 #[derive(Debug, Clone, Copy)]
 enum ControlMsg {
-    /// Arm the output (may open gate if configured).
+    /// Arm the output (opens hardware shutter).
     Arm,
-    /// Disarm the output and close the hardware gate.
+    /// Disarm the output (closes hardware shutter).
     Disarm,
     /// Request the stream to stop.
     Stop,
@@ -68,32 +90,32 @@ impl StreamControl {
 
     /// Arm the output (allow laser to fire).
     ///
-    /// If `StreamConfig::open_output_gate_on_arm` is `true`, the hardware output
-    /// gate will be opened as soon as the stream processes this command.
+    /// When armed, content from the producer passes through unmodified
+    /// and the hardware shutter is opened (best-effort).
     pub fn arm(&self) -> Result<()> {
         self.inner.armed.store(true, Ordering::SeqCst);
-        // Send message to stream for immediate gate control
+        // Send message to stream for immediate shutter control
         if let Ok(tx) = self.inner.control_tx.lock() {
             let _ = tx.send(ControlMsg::Arm);
         }
         Ok(())
     }
 
-    /// Disarm the output (force laser off).
+    /// Disarm the output (force laser off). Designed for E-stop use.
     ///
-    /// This immediately:
-    /// 1. Sets the armed flag to false (subsequent points will be blanked in software)
-    /// 2. Sends a message to close the hardware output gate as soon as possible
+    /// Immediately sets an atomic flag (works even if stream loop is blocked),
+    /// then sends a message to close the hardware shutter. All future points
+    /// are blanked in software. The stream stays alive outputting blanks -
+    /// use `stop()` to terminate entirely.
     ///
-    /// # Safety Note
+    /// **Latency**: Points already in the device buffer will still play out.
+    /// `target_queue_points` bounds this latency.
     ///
-    /// Software cannot unschedule points that have already been sent to the device
-    /// buffer. "Immediate" means the output gate closes ASAP and all future points
-    /// will be safe (blanked). The `target_queue_points` configuration bounds the
-    /// maximum latency before the gate closes.
+    /// **Hardware shutter**: Best-effort. LaserCube has actual hardware control;
+    /// Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
     pub fn disarm(&self) -> Result<()> {
         self.inner.armed.store(false, Ordering::SeqCst);
-        // Send message to stream for immediate gate control
+        // Send message to stream for immediate shutter control
         if let Ok(tx) = self.inner.control_tx.lock() {
             let _ = tx.send(ControlMsg::Disarm);
         }
@@ -106,6 +128,9 @@ impl StreamControl {
     }
 
     /// Request the stream to stop.
+    ///
+    /// Signals termination; `run()` returns `RunExit::Stopped`.
+    /// For clean shutdown with shutter close, prefer `Stream::stop()`.
     pub fn stop(&self) -> Result<()> {
         self.inner.stop_requested.store(true, Ordering::SeqCst);
         // Send message to stream for immediate stop
@@ -136,8 +161,8 @@ struct StreamState {
     stats: StreamStats,
     /// Track the last armed state to detect transitions.
     last_armed: bool,
-    /// Whether the hardware output gate is currently open.
-    output_gate_open: bool,
+    /// Whether the hardware shutter is currently open.
+    shutter_open: bool,
 }
 
 impl StreamState {
@@ -148,7 +173,7 @@ impl StreamState {
             last_chunk: None,
             stats: StreamStats::default(),
             last_armed: false,
-            output_gate_open: false,
+            shutter_open: false,
         }
     }
 }
@@ -167,7 +192,7 @@ impl StreamState {
 /// The stream owns pacing, backpressure, and the timebase (`StreamInstant`).
 pub struct Stream {
     /// Device info for this stream.
-    info: DeviceInfo,
+    info: DacInfo,
     /// The backend.
     backend: Option<Box<dyn StreamBackend>>,
     /// Stream configuration.
@@ -185,7 +210,7 @@ pub struct Stream {
 impl Stream {
     /// Create a new stream with a backend.
     pub(crate) fn with_backend(
-        info: DeviceInfo,
+        info: DacInfo,
         backend: Box<dyn StreamBackend>,
         config: StreamConfig,
         chunk_points: usize,
@@ -203,7 +228,7 @@ impl Stream {
     }
 
     /// Returns the device info.
-    pub fn info(&self) -> &DeviceInfo {
+    pub fn info(&self) -> &DacInfo {
         &self.info
     }
 
@@ -282,12 +307,11 @@ impl Stream {
     /// - `points.len()` must equal `req.n_points`.
     /// - The request must be the most recent one from `next_request()`.
     ///
-    /// # Output Gate Control
+    /// # Shutter Control
     ///
-    /// This method manages the hardware output gate based on arm state transitions:
-    /// - When transitioning from armed to disarmed, the output gate is closed (best-effort).
-    /// - When transitioning from disarmed to armed, the output gate is opened only if
-    ///   `StreamConfig::open_output_gate_on_arm` is `true`.
+    /// This method manages the hardware shutter based on arm state transitions:
+    /// - When transitioning from armed to disarmed, the shutter is closed (best-effort).
+    /// - When transitioning from disarmed to armed, the shutter is opened (best-effort).
     pub fn write(&mut self, req: &ChunkRequest, points: &[LaserPoint]) -> Result<()> {
         // Validate point count
         if points.len() != req.n_points {
@@ -305,8 +329,8 @@ impl Stream {
 
         let is_armed = self.control.is_armed();
 
-        // Handle output gate transitions
-        self.handle_output_gate_transition(is_armed);
+        // Handle shutter transitions
+        self.handle_shutter_transition(is_armed);
 
         // Write to backend (optimized: no allocation when armed)
         let backend = self
@@ -342,103 +366,71 @@ impl Stream {
         }
     }
 
-    /// Handle hardware output gate transitions based on arm state changes.
-    fn handle_output_gate_transition(&mut self, is_armed: bool) {
+    /// Handle hardware shutter transitions based on arm state changes.
+    fn handle_shutter_transition(&mut self, is_armed: bool) {
         let was_armed = self.state.last_armed;
         self.state.last_armed = is_armed;
 
         if was_armed && !is_armed {
-            // Disarmed: close the output gate for safety (best-effort)
-            if self.state.output_gate_open {
+            // Disarmed: close the shutter for safety (best-effort)
+            if self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
                     let _ = backend.set_shutter(false); // Best-effort, ignore errors
                 }
-                self.state.output_gate_open = false;
+                self.state.shutter_open = false;
             }
-        } else if !was_armed && is_armed && self.config.open_output_gate_on_arm {
-            // Armed with auto-open enabled: open the output gate (best-effort)
-            if !self.state.output_gate_open {
+        } else if !was_armed && is_armed {
+            // Armed: open the shutter (best-effort)
+            if !self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
                     let _ = backend.set_shutter(true); // Best-effort, ignore errors
                 }
-                self.state.output_gate_open = true;
+                self.state.shutter_open = true;
             }
         }
     }
 
-    /// Stop the stream.
+    /// Stop the stream and terminate output.
+    ///
+    /// Disarms the output (software blanking + hardware shutter) before stopping
+    /// the backend to prevent the "freeze on last bright point" hazard.
+    /// Use `disarm()` instead if you want to keep the stream alive but safe.
     pub fn stop(&mut self) -> Result<()> {
+        // Disarm: sets armed flag for software blanking
+        self.control.disarm()?;
+
         self.control.stop()?;
 
+        // Directly close shutter and stop backend (defense-in-depth)
         if let Some(backend) = &mut self.backend {
+            let _ = backend.set_shutter(false);
             backend.stop()?;
         }
 
         Ok(())
     }
 
-    /// Manually open the hardware output gate.
-    ///
-    /// This provides explicit control over the hardware output gate (shutter/interlock).
-    /// Returns `Ok(())` on success, or an error if the backend doesn't support it
-    /// or the operation fails.
-    ///
-    /// Note: The output gate is automatically managed based on arm state transitions
-    /// (see `StreamConfig::open_output_gate_on_arm`). Use this method only if you
-    /// need manual control beyond the automatic behavior.
-    pub fn open_output_gate(&mut self) -> Result<()> {
-        let backend = self
-            .backend
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("no backend"))?;
-        backend.set_shutter(true)?;
-        self.state.output_gate_open = true;
-        Ok(())
-    }
-
-    /// Manually close the hardware output gate.
-    ///
-    /// This provides explicit control over the hardware output gate (shutter/interlock).
-    /// Returns `Ok(())` on success, or an error if the backend doesn't support it
-    /// or the operation fails.
-    ///
-    /// Note: The output gate is automatically closed on `disarm()` for safety.
-    /// Use this method only if you need manual control.
-    pub fn close_output_gate(&mut self) -> Result<()> {
-        let backend = self
-            .backend
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("no backend"))?;
-        backend.set_shutter(false)?;
-        self.state.output_gate_open = false;
-        Ok(())
-    }
-
-    /// Returns whether the hardware output gate is currently open.
-    pub fn is_output_gate_open(&self) -> bool {
-        self.state.output_gate_open
-    }
-
     /// Consume the stream and recover the device for reuse.
     ///
-    /// This method stops the stream, closes the output gate, and returns the
-    /// underlying `Device` along with the final `StreamStats`. The device can
-    /// then be used to start a new stream with different configuration.
+    /// This method disarms and stops the stream (software blanking + hardware shutter),
+    /// then returns the underlying `Dac` along with the final `StreamStats`.
+    /// The device can then be used to start a new stream with different configuration.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let (stream, info) = device.start_stream(config)?;
     /// // ... stream for a while ...
-    /// let (device, stats) = stream.into_device();
+    /// let (device, stats) = stream.into_dac();
     /// println!("Streamed {} points", stats.points_written);
     ///
     /// // Restart with different config
     /// let new_config = StreamConfig::new(60_000);
     /// let (stream2, _) = device.start_stream(new_config)?;
     /// ```
-    pub fn into_device(mut self) -> (Device, StreamStats) {
-        // Stop the stream and close output gate
+    pub fn into_dac(mut self) -> (Dac, StreamStats) {
+        // Disarm (software blanking) and close shutter before stopping
+        let _ = self.control.disarm();
         let _ = self.control.stop();
         if let Some(backend) = &mut self.backend {
             let _ = backend.set_shutter(false);
@@ -449,12 +441,12 @@ impl Stream {
         let backend = self.backend.take();
         let stats = self.state.stats.clone();
 
-        let device = Device {
+        let dac = Dac {
             info: self.info.clone(),
             backend,
         };
 
-        (device, stats)
+        (dac, stats)
     }
 
     /// Run the stream in callback mode.
@@ -518,7 +510,7 @@ impl Stream {
                                 // then sleep briefly if still blocked
                                 std::thread::yield_now();
 
-                                // Process control messages for immediate gate control
+                                // Process control messages for immediate shutter control
                                 if self.process_control_messages() {
                                     return Ok(RunExit::Stopped);
                                 }
@@ -567,8 +559,8 @@ impl Stream {
     /// Process any pending control messages from StreamControl.
     ///
     /// This method drains the control message queue and takes immediate action:
-    /// - `Arm`: Opens the output gate if configured
-    /// - `Disarm`: Closes the output gate immediately
+    /// - `Arm`: Opens the shutter (best-effort)
+    /// - `Disarm`: Closes the shutter immediately
     /// - `Stop`: Returns `true` to signal the caller to stop
     ///
     /// Returns `true` if stop was requested, `false` otherwise.
@@ -576,21 +568,21 @@ impl Stream {
         loop {
             match self.control_rx.try_recv() {
                 Ok(ControlMsg::Arm) => {
-                    // Open gate if configured and not already open
-                    if self.config.open_output_gate_on_arm && !self.state.output_gate_open {
+                    // Open shutter (best-effort) if not already open
+                    if !self.state.shutter_open {
                         if let Some(backend) = &mut self.backend {
                             let _ = backend.set_shutter(true);
                         }
-                        self.state.output_gate_open = true;
+                        self.state.shutter_open = true;
                     }
                 }
                 Ok(ControlMsg::Disarm) => {
-                    // Close gate immediately for safety
-                    if self.state.output_gate_open {
+                    // Close shutter immediately for safety
+                    if self.state.shutter_open {
                         if let Some(backend) = &mut self.backend {
                             let _ = backend.set_shutter(false);
                         }
-                        self.state.output_gate_open = false;
+                        self.state.shutter_open = false;
                     }
                 }
                 Ok(ControlMsg::Stop) => {
@@ -640,7 +632,7 @@ impl Stream {
             std::thread::sleep(slice);
             remaining = remaining.saturating_sub(slice);
 
-            // Process control messages - handle gate close immediately
+            // Process control messages - handle shutter close immediately
             if self.process_control_messages() {
                 return Err(Error::Stopped);
             }
@@ -665,8 +657,8 @@ impl Stream {
 
         let is_armed = self.control.is_armed();
 
-        // Handle output gate transitions (same safety behavior as write())
-        self.handle_output_gate_transition(is_armed);
+        // Handle shutter transitions (same safety behavior as write())
+        self.handle_shutter_transition(is_armed);
 
         // Determine fill points based on arm state and policy
         let fill_points: Vec<LaserPoint> = if !is_armed {
@@ -733,7 +725,7 @@ impl Drop for Stream {
 /// A connected device that can start streaming sessions.
 ///
 /// When starting a stream, the device is consumed and the backend ownership
-/// transfers to the stream. The `DeviceInfo` is returned alongside the stream
+/// transfers to the stream. The `DacInfo` is returned alongside the stream
 /// so metadata remains accessible.
 ///
 /// # Example
@@ -744,14 +736,14 @@ impl Drop for Stream {
 /// let (stream, info) = device.start_stream(config)?;
 /// println!("Streaming to: {}", info.name);
 /// ```
-pub struct Device {
-    info: DeviceInfo,
+pub struct Dac {
+    info: DacInfo,
     backend: Option<Box<dyn StreamBackend>>,
 }
 
-impl Device {
+impl Dac {
     /// Create a new device from a backend.
-    pub fn new(info: DeviceInfo, backend: Box<dyn StreamBackend>) -> Self {
+    pub fn new(info: DacInfo, backend: Box<dyn StreamBackend>) -> Self {
         Self {
             info,
             backend: Some(backend),
@@ -759,7 +751,7 @@ impl Device {
     }
 
     /// Returns the device info.
-    pub fn info(&self) -> &DeviceInfo {
+    pub fn info(&self) -> &DacInfo {
         &self.info
     }
 
@@ -779,7 +771,7 @@ impl Device {
     }
 
     /// Returns the device capabilities.
-    pub fn caps(&self) -> &Caps {
+    pub fn caps(&self) -> &DacCapabilities {
         &self.info.caps
     }
 
@@ -800,12 +792,12 @@ impl Device {
     ///
     /// # Ownership
     ///
-    /// This method consumes the `Device` because:
+    /// This method consumes the `Dac` because:
     /// - Each device can only have one active stream at a time.
     /// - The backend is moved into the `Stream` to ensure exclusive access.
     /// - This prevents accidental reuse of a device that's already streaming.
     ///
-    /// The method returns both the `Stream` and a copy of `DeviceInfo`, so you
+    /// The method returns both the `Stream` and a copy of `DacInfo`, so you
     /// retain access to device metadata (id, name, capabilities) after starting.
     ///
     /// # Connection
@@ -820,7 +812,7 @@ impl Device {
     /// - The device backend has already been used for a stream.
     /// - The configuration is invalid (PPS out of range, invalid chunk size, etc.).
     /// - The backend fails to connect.
-    pub fn start_stream(mut self, cfg: StreamConfig) -> Result<(Stream, DeviceInfo)> {
+    pub fn start_stream(mut self, cfg: StreamConfig) -> Result<(Stream, DacInfo)> {
         let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
@@ -841,7 +833,7 @@ impl Device {
         Ok((stream, self.info))
     }
 
-    fn validate_config(caps: &Caps, cfg: &StreamConfig) -> Result<()> {
+    fn validate_config(caps: &DacCapabilities, cfg: &StreamConfig) -> Result<()> {
         if cfg.pps < caps.pps_min || cfg.pps > caps.pps_max {
             return Err(Error::invalid_config(format!(
                 "PPS {} is outside device range [{}, {}]",
@@ -868,7 +860,11 @@ impl Device {
         Ok(())
     }
 
-    fn compute_default_chunk_size(caps: &Caps, pps: u32, target_queue_points: usize) -> usize {
+    fn compute_default_chunk_size(
+        caps: &DacCapabilities,
+        pps: u32,
+        target_queue_points: usize,
+    ) -> usize {
         // Target ~10ms worth of points per chunk
         let target_chunk_ms = 10;
         let time_based_points = (pps as usize * target_chunk_ms) / 1000;
@@ -885,7 +881,7 @@ impl Device {
 }
 
 /// Legacy alias for compatibility.
-pub type OwnedDevice = Device;
+pub type OwnedDac = Dac;
 
 #[cfg(test)]
 mod tests {
@@ -896,7 +892,7 @@ mod tests {
 
     /// A test backend for unit testing stream behavior.
     struct TestBackend {
-        caps: Caps,
+        caps: DacCapabilities,
         connected: bool,
         /// Count of write attempts
         write_count: Arc<AtomicUsize>,
@@ -911,7 +907,7 @@ mod tests {
     impl TestBackend {
         fn new() -> Self {
             Self {
-                caps: Caps {
+                caps: DacCapabilities {
                     pps_min: 1000,
                     pps_max: 100000,
                     max_points_per_chunk: 1000,
@@ -938,7 +934,7 @@ mod tests {
             DacType::Custom("Test".to_string())
         }
 
-        fn caps(&self) -> &Caps {
+        fn caps(&self) -> &DacCapabilities {
             &self.caps
         }
 
@@ -1023,13 +1019,13 @@ mod tests {
     #[test]
     fn test_device_start_stream_connects_backend() {
         let backend = TestBackend::new();
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Device::new(info, Box::new(backend));
+        let device = Dac::new(info, Box::new(backend));
 
         // Device should not be connected initially
         assert!(!device.is_connected());
@@ -1047,7 +1043,7 @@ mod tests {
     fn test_handle_underrun_advances_state() {
         let mut backend = TestBackend::new();
         backend.connected = true;
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1090,7 +1086,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1120,39 +1116,42 @@ mod tests {
     }
 
     #[test]
-    fn test_disarm_closes_gate_via_control_message() {
+    fn test_arm_opens_shutter_disarm_closes_shutter() {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_open_output_gate_on_arm(true);
+        let cfg = StreamConfig::new(30000);
         let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
 
-        // Manually open the gate to simulate armed state
-        stream.open_output_gate().unwrap();
-        assert!(shutter_open.load(Ordering::SeqCst));
-        assert!(stream.is_output_gate_open());
+        // Initially shutter is closed
+        assert!(!shutter_open.load(Ordering::SeqCst));
 
-        // Get control handle and disarm (this sends ControlMsg::Disarm)
+        // Arm via control (this sends ControlMsg::Arm)
         let control = stream.control();
-        control.disarm().unwrap();
+        control.arm().unwrap();
 
-        // Process control messages - this should close the gate
+        // Process control messages - this should open the shutter
         let stopped = stream.process_control_messages();
         assert!(!stopped);
+        assert!(shutter_open.load(Ordering::SeqCst));
 
-        // Gate should be closed now
+        // Disarm (this sends ControlMsg::Disarm)
+        control.disarm().unwrap();
+
+        // Process control messages - this should close the shutter
+        let stopped = stream.process_control_messages();
+        assert!(!stopped);
         assert!(!shutter_open.load(Ordering::SeqCst));
-        assert!(!stream.is_output_gate_open());
     }
 
     #[test]
@@ -1162,7 +1161,7 @@ mod tests {
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
         backend_box.connect().unwrap();
 
-        let info = DeviceInfo {
+        let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
@@ -1198,5 +1197,75 @@ mod tests {
         // because "last armed content" hasn't changed
         let last = stream.state.last_chunk.as_ref().unwrap();
         assert_eq!(last[0].r, 65535); // Still the old colored points
+    }
+
+    #[test]
+    fn test_stop_closes_shutter() {
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm first to open shutter
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        // Stop should close shutter
+        stream.stop().unwrap();
+        assert!(!shutter_open.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_arm_disarm_arm_cycle() {
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let control = stream.control();
+
+        // Initial state: disarmed
+        assert!(!control.is_armed());
+        assert!(!shutter_open.load(Ordering::SeqCst));
+
+        // Arm
+        control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(control.is_armed());
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        // Disarm
+        control.disarm().unwrap();
+        stream.process_control_messages();
+        assert!(!control.is_armed());
+        assert!(!shutter_open.load(Ordering::SeqCst));
+
+        // Arm again
+        control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(control.is_armed());
+        assert!(shutter_open.load(Ordering::SeqCst));
     }
 }

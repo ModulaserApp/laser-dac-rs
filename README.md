@@ -52,7 +52,7 @@ The examples run continuously until you press Ctrl+C.
 
 There are two discovery APIs:
 
-- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices (predicate optional), yielding ready-to-use `Device` instances.
+- `DacDiscoveryWorker` continuously scans in a background thread and auto-connects to new devices (predicate optional), yielding ready-to-use `Dac` instances.
 - `DacDiscovery` is manual: you call `scan()` and decide if/when to `connect()` each `DiscoveredDevice`.
 
 `DacDiscoveryWorker` runs a background thread that:
@@ -81,7 +81,7 @@ for device in discovery.poll_discovered_devices() {
     println!("Found: {} ({:?})", device.name(), device.dac_type);
 }
 
-// Only filtered devices become ready-to-use Device instances
+// Only filtered devices become ready-to-use Dac instances
 for device in discovery.poll_new_devices() {
     println!("Connected: {}", device.name());
     // Start streaming with device.start_stream(config)...
@@ -156,8 +156,8 @@ Each backend handles conversion to its native format internally.
 
 | Type           | Description                                      |
 | -------------- | ------------------------------------------------ |
-| `DeviceInfo`   | Device metadata (name, type, capabilities)       |
-| `Device`       | Opened device ready for streaming                |
+| `DacInfo`      | DAC metadata (name, type, capabilities)          |
+| `Dac`          | Opened DAC ready for streaming                   |
 | `Stream`       | Active streaming session                         |
 | `StreamConfig` | Stream settings (PPS, chunk size)                |
 | `ChunkRequest` | Request for points from the DAC                  |

@@ -49,6 +49,23 @@ pub use dac::{stream, Addressed, ServiceType};
 pub use error::{CommunicationError, ProtocolError, ResponseError, Result};
 pub use protocol::{AcknowledgeResponse, Point, PointExtended, PointXyrgbHighRes, PointXyrgbi};
 
+use crate::types::{DacCapabilities, OutputModel};
+
+/// Returns the default capabilities for IDN DACs.
+///
+/// These are conservative defaults for unknown devices. IDN has no protocol-defined
+/// pps_min (rate is derived from sampleCount/chunkDuration).
+pub fn default_capabilities() -> DacCapabilities {
+    DacCapabilities {
+        pps_min: 1,
+        pps_max: 100_000,
+        max_points_per_chunk: 4096,
+        prefers_constant_pps: false,
+        can_estimate_queue: false,
+        output_model: OutputModel::UdpTimed,
+    }
+}
+
 /// Default client group for IDN communication.
 pub const DEFAULT_CLIENT_GROUP: u8 = 0;
 

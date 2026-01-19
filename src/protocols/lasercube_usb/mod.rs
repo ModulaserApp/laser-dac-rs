@@ -48,6 +48,20 @@ pub use backend::LasercubeUsbBackend;
 // Re-export rusb for consumers that need the Context type
 pub use rusb;
 
+use crate::types::{DacCapabilities, OutputModel};
+
+/// Returns the default capabilities for LaserCube USB DACs.
+pub fn default_capabilities() -> DacCapabilities {
+    DacCapabilities {
+        pps_min: 1,
+        pps_max: 35_000,
+        max_points_per_chunk: 4096,
+        prefers_constant_pps: false,
+        can_estimate_queue: false,
+        output_model: OutputModel::UsbFrameSwap,
+    }
+}
+
 use protocol::{LASERDOCK_PID, LASERDOCK_VID};
 use rusb::UsbContext;
 use std::time::Duration;

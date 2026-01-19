@@ -39,7 +39,20 @@ pub use self::protocol::{
 };
 pub use backend::EtherDreamBackend;
 
+use crate::types::{DacCapabilities, OutputModel};
 use std::{io, net};
+
+/// Returns the default capabilities for Ether Dream DACs.
+pub fn default_capabilities() -> DacCapabilities {
+    DacCapabilities {
+        pps_min: 1,
+        pps_max: 100_000,
+        max_points_per_chunk: 1799,
+        prefers_constant_pps: true,
+        can_estimate_queue: true,
+        output_model: OutputModel::NetworkFifo,
+    }
+}
 
 /// An iterator that listens and waits for broadcast messages from DACs on the network and yields
 /// them as they are received on the inner UDP socket.

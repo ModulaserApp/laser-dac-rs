@@ -38,6 +38,20 @@ pub use backend::HeliosBackend;
 pub use frame::*;
 pub use native::*;
 
+use crate::types::{DacCapabilities, OutputModel};
+
+/// Returns the default capabilities for Helios DACs.
+pub fn default_capabilities() -> DacCapabilities {
+    DacCapabilities {
+        pps_min: 7,
+        pps_max: 65535,
+        max_points_per_chunk: 4095,
+        prefers_constant_pps: true,
+        can_estimate_queue: false,
+        output_model: OutputModel::UsbFrameSwap,
+    }
+}
+
 /// Device status returned by the Helios DAC.
 #[derive(Debug, Clone, Copy)]
 pub enum DeviceStatus {

@@ -5,13 +5,13 @@ use crate::error::{Error, Result};
 use crate::protocols::helios::{
     DeviceStatus, Frame, HeliosDac, HeliosDacController, Point as HeliosPoint,
 };
-use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// Helios DAC backend (USB).
 pub struct HeliosBackend {
     dac: Option<HeliosDac>,
     device_index: usize,
-    caps: Caps,
+    caps: DacCapabilities,
 }
 
 impl HeliosBackend {
@@ -20,7 +20,7 @@ impl HeliosBackend {
         Self {
             dac: None,
             device_index,
-            caps: caps_for_dac_type(&DacType::Helios),
+            caps: super::default_capabilities(),
         }
     }
 
@@ -29,7 +29,7 @@ impl HeliosBackend {
         Self {
             dac: Some(dac),
             device_index: 0,
-            caps: caps_for_dac_type(&DacType::Helios),
+            caps: super::default_capabilities(),
         }
     }
 
@@ -48,7 +48,7 @@ impl StreamBackend for HeliosBackend {
         DacType::Helios
     }
 
-    fn caps(&self) -> &Caps {
+    fn caps(&self) -> &DacCapabilities {
         &self.caps
     }
 

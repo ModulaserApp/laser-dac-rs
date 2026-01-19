@@ -5,13 +5,13 @@ use crate::error::{Error, Result};
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
 use crate::protocols::lasercube_usb::{discover_dacs, rusb};
-use crate::types::{caps_for_dac_type, Caps, DacType, LaserPoint};
+use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// LaserCube USB DAC backend (LaserDock).
 pub struct LasercubeUsbBackend {
     device: Option<rusb::Device<rusb::Context>>,
     stream: Option<Stream<rusb::Context>>,
-    caps: Caps,
+    caps: DacCapabilities,
 }
 
 impl LasercubeUsbBackend {
@@ -19,7 +19,7 @@ impl LasercubeUsbBackend {
         Self {
             device: Some(device),
             stream: None,
-            caps: caps_for_dac_type(&DacType::LasercubeUsb),
+            caps: super::default_capabilities(),
         }
     }
 
@@ -27,7 +27,7 @@ impl LasercubeUsbBackend {
         Self {
             device: None,
             stream: Some(stream),
-            caps: caps_for_dac_type(&DacType::LasercubeUsb),
+            caps: super::default_capabilities(),
         }
     }
 
@@ -41,7 +41,7 @@ impl StreamBackend for LasercubeUsbBackend {
         DacType::LasercubeUsb
     }
 
-    fn caps(&self) -> &Caps {
+    fn caps(&self) -> &DacCapabilities {
         &self.caps
     }
 
