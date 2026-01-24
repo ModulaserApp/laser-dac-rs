@@ -46,10 +46,11 @@
 //!
 //! ## Callback Mode
 //!
-//! Use `run()` with a producer closure for simpler code:
+//! Use `run()` with a producer closure for simpler code. The producer receives
+//! a pre-allocated buffer to fill, eliminating per-chunk heap allocation:
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest};
+//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest, ProducerResult};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = StreamConfig::new(30_000);
@@ -58,10 +59,14 @@
 //! stream.control().arm().unwrap();
 //!
 //! let exit = stream.run(
-//!     |req: ChunkRequest| {
-//!         // Return Some(points) to continue, None to stop
-//!         let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
-//!         Some(points)
+//!     |req: ChunkRequest, buffer: &mut [LaserPoint]| {
+//!         // Fill the buffer with points (pre-filled with blanks)
+//!         for (i, point) in buffer.iter_mut().enumerate() {
+//!             let t = (req.start.points() + i as u64) as f32 / req.pps as f32;
+//!             let angle = t * std::f32::consts::TAU;
+//!             *point = LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535);
+//!         }
+//!         ProducerResult::Continue // or ProducerResult::End to stop
 //!     },
 //!     |err| eprintln!("Stream error: {}", err),
 //! );
@@ -124,6 +129,7 @@ pub use types::{
     EnabledDacTypes,
     LaserPoint,
     OutputModel,
+    ProducerResult,
     RunExit,
     StreamConfig,
     StreamInstant,

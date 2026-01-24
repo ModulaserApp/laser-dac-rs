@@ -59,6 +59,31 @@ pub fn create_points(shape: Shape, req: &ChunkRequest) -> Vec<LaserPoint> {
     points
 }
 
+/// Fill a buffer with points for the given shape (zero-allocation streaming API).
+///
+/// This is the buffer-filling version of `create_points` for use with the
+/// new `Stream::run()` API that passes a reusable buffer.
+pub fn fill_buffer(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) {
+    // Generate points (this still allocates internally, but the buffer pattern
+    // eliminates allocation at the stream level)
+    let points = create_points(shape, req);
+
+    // Copy into buffer
+    let n = points.len().min(buffer.len());
+    buffer[..n].copy_from_slice(&points[..n]);
+
+    // Pad remainder if needed
+    if n < buffer.len() {
+        let pad = points
+            .last()
+            .copied()
+            .unwrap_or(LaserPoint::blanked(0.0, 0.0));
+        for p in &mut buffer[n..] {
+            *p = pad;
+        }
+    }
+}
+
 /// Create points for frame-based usage (no stream timing).
 ///
 /// For shapes that need stream time (OrbitingCircle, Audio), this produces

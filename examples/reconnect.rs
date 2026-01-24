@@ -1,15 +1,18 @@
-//! Reconnecting session example.
+//! Reconnecting session example with reusable buffer.
 //!
 //! This example demonstrates the ReconnectingSession which automatically
-//! reconnects to the DAC if the connection is lost.
+//! reconnects to the DAC if the connection is lost. Uses the zero-allocation
+//! buffer API.
 //!
 //! Run with: `cargo run --example reconnect -- [triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_points, Args};
-use laser_dac::{list_devices, ReconnectingSession, Result, StreamConfig};
+use common::{fill_buffer, Args};
+use laser_dac::{
+    list_devices, LaserPoint, ProducerResult, ReconnectingSession, Result, StreamConfig,
+};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -43,10 +46,13 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire) - persists across reconnects
     session.control().arm()?;
 
-    // Run the stream - reconnects automatically on disconnect
+    // Run the stream with reusable buffer - reconnects automatically on disconnect
     let shape = args.shape;
     session.run(
-        move |req| Some(create_points(shape, &req)),
+        move |req, buffer: &mut [LaserPoint]| {
+            fill_buffer(shape, &req, buffer);
+            ProducerResult::Continue
+        },
         |err| eprintln!("Stream error: {}", err),
     )?;
 

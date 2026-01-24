@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::backend::{Error, Result};
 use crate::discovery::DacDiscovery;
 use crate::stream::{Dac, StreamControl};
-use crate::types::{ChunkRequest, DacInfo, LaserPoint, RunExit, StreamConfig};
+use crate::types::{ChunkRequest, DacInfo, LaserPoint, ProducerResult, RunExit, StreamConfig};
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;
@@ -116,7 +116,7 @@ impl SessionControl {
 /// # Example
 ///
 /// ```no_run
-/// use laser_dac::{ReconnectingSession, StreamConfig};
+/// use laser_dac::{ReconnectingSession, StreamConfig, ProducerResult};
 /// use std::time::Duration;
 ///
 /// let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
@@ -128,7 +128,10 @@ impl SessionControl {
 /// session.control().arm()?;
 ///
 /// session.run(
-///     |req| Some(vec![laser_dac::LaserPoint::blanked(0.0, 0.0); req.n_points]),
+///     |req, buffer| {
+///         // Fill buffer with points (pre-filled with blanks)
+///         ProducerResult::Continue
+///     },
 ///     |err| eprintln!("Stream error: {}", err),
 /// )?;
 /// # Ok::<(), laser_dac::Error>(())
@@ -221,10 +224,13 @@ impl ReconnectingSession {
         self.control.clone()
     }
 
-    /// Run the stream, automatically reconnecting on disconnection.
+    /// Run the stream with a reusable buffer, automatically reconnecting on disconnection.
+    ///
+    /// The producer receives a `ChunkRequest` and a mutable buffer slice to fill.
+    /// The buffer is per-stream (fresh on each reconnect) and reused across calls.
     pub fn run<F, E>(&mut self, producer: F, on_error: E) -> Result<RunExit>
     where
-        F: FnMut(ChunkRequest) -> Option<Vec<LaserPoint>> + Send + 'static,
+        F: FnMut(ChunkRequest, &mut [LaserPoint]) -> ProducerResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
         let producer = Arc::new(Mutex::new(producer));
@@ -304,9 +310,9 @@ impl ReconnectingSession {
             let on_error_handle = Arc::clone(&on_error);
             let on_disconnect_handle = Arc::clone(&on_disconnect);
             let exit = match stream.run(
-                move |req| {
+                move |req, buffer| {
                     let mut handler = producer_handle.lock().unwrap();
-                    handler(req)
+                    handler(req, buffer)
                 },
                 move |err| {
                     if err.is_disconnected() {
@@ -342,6 +348,33 @@ impl ReconnectingSession {
                 other => return Ok(other),
             }
         }
+    }
+
+    /// Run the stream with legacy allocating API, automatically reconnecting.
+    ///
+    /// This is a convenience adapter that accepts the legacy signature
+    /// `FnMut(ChunkRequest) -> Option<Vec<LaserPoint>>`. Prefer `run()` for
+    /// allocation-free streaming.
+    pub fn run_alloc<F, E>(&mut self, mut producer: F, on_error: E) -> Result<RunExit>
+    where
+        F: FnMut(ChunkRequest) -> Option<Vec<LaserPoint>> + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        self.run(
+            move |req, buffer| match producer(req.clone()) {
+                Some(points) => {
+                    let n = points.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&points[..n]);
+                    if n == req.n_points {
+                        ProducerResult::Continue
+                    } else {
+                        ProducerResult::ContinuePartial { filled: n }
+                    }
+                }
+                None => ProducerResult::End,
+            },
+            on_error,
+        )
     }
 
     fn open_device(&mut self) -> Result<Dac> {

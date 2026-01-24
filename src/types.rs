@@ -519,10 +519,29 @@ pub struct StreamStats {
 pub enum RunExit {
     /// Stream was stopped via `StreamControl::stop()`.
     Stopped,
-    /// Producer returned `None` (graceful completion).
+    /// Producer returned `End` (graceful completion).
     ProducerEnded,
     /// Device disconnected. No auto-reconnect; new streams start disarmed.
     Disconnected,
+}
+
+/// Result returned by the producer callback to control stream behavior.
+///
+/// The producer fills a pre-allocated buffer passed as `&mut [LaserPoint]`.
+/// This eliminates per-chunk heap allocation in the streaming hot path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProducerResult {
+    /// Buffer was fully filled; continue streaming.
+    Continue,
+    /// Buffer was partially filled with `filled` points.
+    ///
+    /// The stream will fill the remainder `[filled..]` based on the configured
+    /// [`UnderrunPolicy`] and arm state:
+    /// - When armed: applies the underrun policy
+    /// - When disarmed: always outputs blanked points
+    ContinuePartial { filled: usize },
+    /// End the stream gracefully.
+    End,
 }
 
 /// Information about a discovered DAC before connection.

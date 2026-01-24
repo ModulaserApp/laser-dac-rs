@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit, StreamConfig,
-    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, ProducerResult, RunExit,
+    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -156,6 +156,7 @@ struct StreamState {
     /// Points scheduled ahead of current_instant.
     scheduled_ahead: u64,
     /// Last chunk that was produced (for repeat-last underrun policy).
+    /// Only populated when `UnderrunPolicy::RepeatLast` is active.
     last_chunk: Option<Vec<LaserPoint>>,
     /// Statistics.
     stats: StreamStats,
@@ -163,6 +164,10 @@ struct StreamState {
     last_armed: bool,
     /// Whether the hardware shutter is currently open.
     shutter_open: bool,
+    /// Reusable buffer for producer callbacks (eliminates per-chunk allocation).
+    producer_buffer: Vec<LaserPoint>,
+    /// Reusable buffer for blanked output when disarmed.
+    blank_buffer: Vec<LaserPoint>,
 }
 
 impl StreamState {
@@ -174,6 +179,22 @@ impl StreamState {
             stats: StreamStats::default(),
             last_armed: false,
             shutter_open: false,
+            producer_buffer: Vec::new(),
+            blank_buffer: Vec::new(),
+        }
+    }
+
+    /// Ensure the producer buffer has the required capacity and length.
+    fn ensure_producer_buffer(&mut self, n_points: usize) {
+        if self.producer_buffer.len() != n_points {
+            self.producer_buffer.resize(n_points, LaserPoint::default());
+        }
+    }
+
+    /// Ensure the blank buffer has the required capacity and length.
+    fn ensure_blank_buffer(&mut self, n_points: usize) {
+        if self.blank_buffer.len() != n_points {
+            self.blank_buffer.resize(n_points, LaserPoint::default());
         }
     }
 }
@@ -332,7 +353,7 @@ impl Stream {
         // Handle shutter transitions
         self.handle_shutter_transition(is_armed);
 
-        // Write to backend (optimized: no allocation when armed)
+        // Write to backend
         let backend = self
             .backend
             .as_mut()
@@ -342,19 +363,29 @@ impl Stream {
             // Armed: pass points directly to backend (zero-copy)
             backend.try_write_chunk(self.config.pps, points)?
         } else {
-            // Disarmed: blank all points (allocate only when needed)
-            let blanked: Vec<LaserPoint> = points
-                .iter()
-                .map(|p| LaserPoint::blanked(p.x, p.y))
-                .collect();
-            backend.try_write_chunk(self.config.pps, &blanked)?
+            // Disarmed: blank all points using reusable buffer (no allocation)
+            self.state.ensure_blank_buffer(req.n_points);
+            for (blank, src) in self.state.blank_buffer.iter_mut().zip(points.iter()) {
+                *blank = LaserPoint::blanked(src.x, src.y);
+            }
+            backend.try_write_chunk(self.config.pps, &self.state.blank_buffer)?
         };
 
         match outcome {
             WriteOutcome::Written => {
                 // Update state
-                if is_armed {
-                    self.state.last_chunk = Some(points.to_vec());
+                // Only track last_chunk when RepeatLast policy is active and armed
+                if is_armed && matches!(self.config.underrun, UnderrunPolicy::RepeatLast) {
+                    // Reuse existing Vec capacity to avoid allocation
+                    match &mut self.state.last_chunk {
+                        Some(last) => {
+                            last.clear();
+                            last.extend_from_slice(points);
+                        }
+                        None => {
+                            self.state.last_chunk = Some(points.to_vec());
+                        }
+                    }
                 }
                 self.state.current_instant += self.chunk_points as u64;
                 self.state.scheduled_ahead += self.chunk_points as u64;
@@ -449,27 +480,46 @@ impl Stream {
         (dac, stats)
     }
 
-    /// Run the stream in callback mode.
+    /// Run the stream in callback mode with a reusable buffer (zero-allocation).
     ///
-    /// The producer is called whenever the stream needs a new chunk.
-    /// Return `Some(points)` to continue, or `None` to end the stream.
+    /// The producer is called whenever the stream needs a new chunk, receiving:
+    /// - A `ChunkRequest` describing what to produce
+    /// - A mutable slice `&mut [LaserPoint]` of exactly `req.n_points` length
+    ///
+    /// The buffer is pre-filled with blanked points before each call, allowing the
+    /// producer to only set the points it needs. Return `ProducerResult::Continue` when
+    /// the buffer is fully filled, `ProducerResult::ContinuePartial { filled }` for
+    /// partial fills, or `ProducerResult::End` to stop the stream.
+    ///
+    /// # Buffer Contract
+    ///
+    /// - The stream owns the buffer; the producer must not retain references after returning.
+    /// - The buffer is reused across calls (pointer-stable in steady state).
+    /// - The slice length is always `req.n_points`.
+    ///
+    /// # Prefill Behavior
+    ///
+    /// Before each producer call, the buffer is prefilled based on `UnderrunPolicy`:
+    /// - `Blank` → `LaserPoint::blanked(0.0, 0.0)`
+    /// - `Park { x, y }` → `LaserPoint::blanked(x, y)`
+    /// - `RepeatLast` / `Stop` → `LaserPoint::blanked(0.0, 0.0)`
     ///
     /// # Error Classification
     ///
-    /// The `on_error` callback receives recoverable errors that don't terminate the stream.
     /// Terminal conditions result in returning from `run()`:
-    ///
     /// - **`RunExit::Stopped`**: Stream was stopped via `StreamControl::stop()` or underrun policy.
-    /// - **`RunExit::ProducerEnded`**: Producer returned `None`.
+    /// - **`RunExit::ProducerEnded`**: Producer returned `ProducerResult::End`.
     /// - **`RunExit::Disconnected`**: Device disconnected or became unreachable.
     ///
-    /// Recoverable errors (reported via `on_error`, stream continues):
-    /// - Transient backend errors that don't indicate disconnection.
+    /// Recoverable errors are reported via `on_error`; the stream continues.
     pub fn run<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
     where
-        F: FnMut(ChunkRequest) -> Option<Vec<LaserPoint>> + Send + 'static,
+        F: FnMut(ChunkRequest, &mut [LaserPoint]) -> ProducerResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
+        // Ensure buffer is allocated for the chunk size
+        self.state.ensure_producer_buffer(self.chunk_points);
+
         loop {
             // Check for stop request
             if self.control.is_stop_requested() {
@@ -498,57 +548,276 @@ impl Stream {
                 return Ok(RunExit::Stopped);
             }
 
-            // Call producer
-            match producer(req.clone()) {
-                Some(points) => {
-                    // Try to write, handling backpressure with retries
-                    loop {
-                        match self.write(&req, &points) {
-                            Ok(()) => break,
-                            Err(e) if e.is_would_block() => {
-                                // Backend buffer full - yield first for low-latency scenarios,
-                                // then sleep briefly if still blocked
-                                std::thread::yield_now();
+            // Prefill buffer with blanked points based on underrun policy
+            self.prefill_buffer();
 
-                                // Process control messages for immediate shutter control
-                                if self.process_control_messages() {
-                                    return Ok(RunExit::Stopped);
-                                }
+            // Call producer with mutable slice
+            let result = producer(req.clone(), &mut self.state.producer_buffer);
 
-                                std::thread::sleep(Duration::from_micros(100));
-
-                                // Check stop again after sleep
-                                if self.process_control_messages() {
-                                    return Ok(RunExit::Stopped);
-                                }
-                                continue;
-                            }
-                            Err(e) if e.is_stopped() => {
-                                return Ok(RunExit::Stopped);
-                            }
-                            Err(e) if e.is_disconnected() => {
-                                on_error(e);
-                                return Ok(RunExit::Disconnected);
-                            }
-                            Err(e) => {
-                                // Recoverable error - report and handle underrun
-                                on_error(e);
-                                if let Err(e2) = self.handle_underrun(&req) {
-                                    // Underrun handling can also hit terminal conditions
-                                    if e2.is_stopped() {
-                                        return Ok(RunExit::Stopped);
-                                    }
-                                    on_error(e2);
-                                }
-                                break;
-                            }
-                        }
+            match result {
+                ProducerResult::Continue => {
+                    // Full fill - write the buffer
+                    if let Some(exit) = self.write_buffer_with_retries(&req, &mut on_error)? {
+                        return Ok(exit);
                     }
                 }
-                None => {
+                ProducerResult::ContinuePartial { filled } => {
+                    // Partial fill - apply underrun policy to remainder, then write
+                    if filled > req.n_points {
+                        on_error(Error::invalid_config(format!(
+                            "partial fill {} exceeds n_points {}",
+                            filled, req.n_points
+                        )));
+                        continue;
+                    }
+                    // Check if Stop policy should trigger
+                    if self.should_stop_on_partial(filled) {
+                        self.control.stop()?;
+                        return Ok(RunExit::Stopped);
+                    }
+                    self.fill_remainder(filled);
+                    if let Some(exit) = self.write_buffer_with_retries(&req, &mut on_error)? {
+                        return Ok(exit);
+                    }
+                }
+                ProducerResult::End => {
                     return Ok(RunExit::ProducerEnded);
                 }
             }
+        }
+    }
+
+    /// Run the stream in callback mode with legacy allocating API.
+    ///
+    /// This is a convenience adapter that accepts the legacy signature
+    /// `FnMut(ChunkRequest) -> Option<Vec<LaserPoint>>`. It internally copies
+    /// the returned vector into the reusable buffer.
+    ///
+    /// **Contract**: The producer must return exactly `req.n_points` points.
+    /// If the count doesn't match, an error is reported via `on_error` and
+    /// the stream treats it as a partial fill (applying the underrun policy).
+    ///
+    /// Prefer `run()` for allocation-free streaming in performance-critical code.
+    pub fn run_alloc<F, E>(self, mut producer: F, on_error: E) -> Result<RunExit>
+    where
+        F: FnMut(ChunkRequest) -> Option<Vec<LaserPoint>> + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        let on_error = Arc::new(Mutex::new(on_error));
+        let on_error_producer = Arc::clone(&on_error);
+        let on_error_stream = Arc::clone(&on_error);
+
+        self.run(
+            move |req, buffer| match producer(req.clone()) {
+                Some(points) => {
+                    if points.len() != req.n_points {
+                        if let Ok(mut handler) = on_error_producer.lock() {
+                            handler(Error::invalid_config(format!(
+                                "run_alloc: producer returned {} points, expected {}",
+                                points.len(),
+                                req.n_points
+                            )));
+                        }
+                    }
+                    let n = points.len().min(buffer.len());
+                    buffer[..n].copy_from_slice(&points[..n]);
+                    if n == req.n_points {
+                        ProducerResult::Continue
+                    } else {
+                        ProducerResult::ContinuePartial { filled: n }
+                    }
+                }
+                None => ProducerResult::End,
+            },
+            move |err| {
+                if let Ok(mut handler) = on_error_stream.lock() {
+                    handler(err);
+                }
+            },
+        )
+    }
+
+    /// Prefill the producer buffer with blanked points based on underrun policy.
+    fn prefill_buffer(&mut self) {
+        let prefill_point = match &self.config.underrun {
+            UnderrunPolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+            _ => LaserPoint::blanked(0.0, 0.0),
+        };
+
+        for point in &mut self.state.producer_buffer {
+            *point = prefill_point;
+        }
+    }
+
+    /// Check if Stop policy should trigger on partial fill.
+    fn should_stop_on_partial(&self, filled: usize) -> bool {
+        let is_armed = self.control.is_armed();
+        let n_points = self.state.producer_buffer.len();
+
+        // Only stop if armed and partial fill with Stop policy
+        is_armed && filled < n_points && matches!(self.config.underrun, UnderrunPolicy::Stop)
+    }
+
+    /// Fill the remainder of the buffer after a partial fill.
+    /// Caller must check `should_stop_on_partial()` first if Stop policy handling is needed.
+    fn fill_remainder(&mut self, filled: usize) {
+        let is_armed = self.control.is_armed();
+        let n_points = self.state.producer_buffer.len();
+
+        if filled >= n_points {
+            return;
+        }
+
+        // Determine fill value based on arm state and policy
+        let fill_point = if !is_armed {
+            // When disarmed, always blank (preserve x/y from last filled or origin)
+            if filled > 0 {
+                let last = &self.state.producer_buffer[filled - 1];
+                LaserPoint::blanked(last.x, last.y)
+            } else {
+                LaserPoint::blanked(0.0, 0.0)
+            }
+        } else {
+            match &self.config.underrun {
+                UnderrunPolicy::RepeatLast => {
+                    if filled > 0 {
+                        self.state.producer_buffer[filled - 1]
+                    } else if let Some(last_chunk) = &self.state.last_chunk {
+                        // Fall back to last point of previous chunk
+                        *last_chunk.last().unwrap_or(&LaserPoint::blanked(0.0, 0.0))
+                    } else {
+                        LaserPoint::blanked(0.0, 0.0)
+                    }
+                }
+                UnderrunPolicy::Blank => {
+                    if filled > 0 {
+                        let last = &self.state.producer_buffer[filled - 1];
+                        LaserPoint::blanked(last.x, last.y)
+                    } else {
+                        LaserPoint::blanked(0.0, 0.0)
+                    }
+                }
+                UnderrunPolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+                UnderrunPolicy::Stop => {
+                    // Caller should have handled Stop via should_stop_on_partial()
+                    // If we get here, just blank (defensive)
+                    LaserPoint::blanked(0.0, 0.0)
+                }
+            }
+        };
+
+        for point in &mut self.state.producer_buffer[filled..] {
+            *point = fill_point;
+        }
+    }
+
+    /// Write the producer buffer to the backend with backpressure retry handling.
+    /// Returns `Some(RunExit)` if the stream should exit, `None` to continue.
+    fn write_buffer_with_retries<E>(
+        &mut self,
+        req: &ChunkRequest,
+        on_error: &mut E,
+    ) -> Result<Option<RunExit>>
+    where
+        E: FnMut(Error),
+    {
+        loop {
+            match self.write_from_buffer(req) {
+                Ok(()) => return Ok(None),
+                Err(e) if e.is_would_block() => {
+                    // Backend buffer full - yield first, then sleep briefly
+                    std::thread::yield_now();
+
+                    if self.process_control_messages() {
+                        return Ok(Some(RunExit::Stopped));
+                    }
+
+                    std::thread::sleep(Duration::from_micros(100));
+
+                    if self.process_control_messages() {
+                        return Ok(Some(RunExit::Stopped));
+                    }
+                    continue;
+                }
+                Err(e) if e.is_stopped() => {
+                    return Ok(Some(RunExit::Stopped));
+                }
+                Err(e) if e.is_disconnected() => {
+                    on_error(e);
+                    return Ok(Some(RunExit::Disconnected));
+                }
+                Err(e) => {
+                    // Recoverable error - report and handle underrun
+                    on_error(e);
+                    if let Err(e2) = self.handle_underrun(req) {
+                        if e2.is_stopped() {
+                            return Ok(Some(RunExit::Stopped));
+                        }
+                        on_error(e2);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Write points from the producer buffer to the backend.
+    fn write_from_buffer(&mut self, req: &ChunkRequest) -> Result<()> {
+        // Check for stop request
+        if self.control.is_stop_requested() {
+            return Err(Error::Stopped);
+        }
+
+        let is_armed = self.control.is_armed();
+
+        // Handle shutter transitions
+        self.handle_shutter_transition(is_armed);
+
+        let backend = self
+            .backend
+            .as_mut()
+            .ok_or_else(|| Error::disconnected("no backend"))?;
+
+        let outcome = if is_armed {
+            // Armed: pass buffer directly to backend (zero-copy)
+            backend.try_write_chunk(self.config.pps, &self.state.producer_buffer)?
+        } else {
+            // Disarmed: blank all points using reusable blank buffer
+            self.state.ensure_blank_buffer(req.n_points);
+            for (blank, src) in self
+                .state
+                .blank_buffer
+                .iter_mut()
+                .zip(self.state.producer_buffer.iter())
+            {
+                *blank = LaserPoint::blanked(src.x, src.y);
+            }
+            backend.try_write_chunk(self.config.pps, &self.state.blank_buffer)?
+        };
+
+        match outcome {
+            WriteOutcome::Written => {
+                // Update state
+                // Only track last_chunk when RepeatLast policy is active and armed
+                if is_armed && matches!(self.config.underrun, UnderrunPolicy::RepeatLast) {
+                    // Reuse existing Vec capacity to avoid allocation
+                    match &mut self.state.last_chunk {
+                        Some(last) => {
+                            last.clear();
+                            last.extend_from_slice(&self.state.producer_buffer);
+                        }
+                        None => {
+                            self.state.last_chunk = Some(self.state.producer_buffer.clone());
+                        }
+                    }
+                }
+                self.state.current_instant += self.chunk_points as u64;
+                self.state.scheduled_ahead += self.chunk_points as u64;
+                self.state.stats.chunks_written += 1;
+                self.state.stats.points_written += self.chunk_points as u64;
+                Ok(())
+            }
+            WriteOutcome::WouldBlock => Err(Error::WouldBlock),
         }
     }
 
@@ -660,39 +929,79 @@ impl Stream {
         // Handle shutter transitions (same safety behavior as write())
         self.handle_shutter_transition(is_armed);
 
-        // Determine fill points based on arm state and policy
-        let fill_points: Vec<LaserPoint> = if !is_armed {
+        // Handle Stop policy early
+        if is_armed && matches!(self.config.underrun, UnderrunPolicy::Stop) {
+            self.control.stop()?;
+            return Err(Error::Stopped);
+        }
+
+        // Ensure buffer is ready
+        self.state.ensure_producer_buffer(req.n_points);
+
+        // Fill buffer based on arm state and policy (no allocation)
+        if !is_armed {
             // When disarmed, always output blanked points for safety
-            // RepeatLast means "repeat last armed content" - meaningless when disarmed
-            vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
+            let fill = LaserPoint::blanked(0.0, 0.0);
+            for point in &mut self.state.producer_buffer {
+                *point = fill;
+            }
         } else {
             match &self.config.underrun {
-                UnderrunPolicy::RepeatLast => self
-                    .state
-                    .last_chunk
-                    .clone()
-                    .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points]),
+                UnderrunPolicy::RepeatLast => {
+                    if let Some(last) = &self.state.last_chunk {
+                        // Copy from last chunk (reuse existing allocation)
+                        let copy_len = last.len().min(req.n_points);
+                        self.state.producer_buffer[..copy_len].copy_from_slice(&last[..copy_len]);
+                        // Fill any remainder with last point
+                        if copy_len < req.n_points {
+                            let fill = last
+                                .last()
+                                .copied()
+                                .unwrap_or(LaserPoint::blanked(0.0, 0.0));
+                            for point in &mut self.state.producer_buffer[copy_len..] {
+                                *point = fill;
+                            }
+                        }
+                    } else {
+                        let fill = LaserPoint::blanked(0.0, 0.0);
+                        for point in &mut self.state.producer_buffer {
+                            *point = fill;
+                        }
+                    }
+                }
                 UnderrunPolicy::Blank => {
-                    vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
+                    let fill = LaserPoint::blanked(0.0, 0.0);
+                    for point in &mut self.state.producer_buffer {
+                        *point = fill;
+                    }
                 }
                 UnderrunPolicy::Park { x, y } => {
-                    vec![LaserPoint::blanked(*x, *y); req.n_points]
+                    let fill = LaserPoint::blanked(*x, *y);
+                    for point in &mut self.state.producer_buffer {
+                        *point = fill;
+                    }
                 }
-                UnderrunPolicy::Stop => {
-                    self.control.stop()?;
-                    return Err(Error::Stopped);
-                }
+                UnderrunPolicy::Stop => unreachable!(), // Handled above
             }
         };
 
         if let Some(backend) = &mut self.backend {
-            match backend.try_write_chunk(self.config.pps, &fill_points) {
+            match backend.try_write_chunk(self.config.pps, &self.state.producer_buffer) {
                 Ok(WriteOutcome::Written) => {
                     // Update stream state to keep timebase accurate
-                    let n_points = fill_points.len();
-                    // Only update last_chunk when armed (it's the "last armed content")
-                    if is_armed {
-                        self.state.last_chunk = Some(fill_points);
+                    let n_points = req.n_points;
+                    // Only update last_chunk when armed and RepeatLast (it's the "last armed content")
+                    if is_armed && matches!(self.config.underrun, UnderrunPolicy::RepeatLast) {
+                        // Reuse existing Vec capacity to avoid allocation
+                        match &mut self.state.last_chunk {
+                            Some(last) => {
+                                last.clear();
+                                last.extend_from_slice(&self.state.producer_buffer);
+                            }
+                            None => {
+                                self.state.last_chunk = Some(self.state.producer_buffer.clone());
+                            }
+                        }
                     }
                     self.state.current_instant += n_points as u64;
                     self.state.scheduled_ahead += n_points as u64;
@@ -1099,12 +1408,16 @@ mod tests {
         let produced_count = Arc::new(AtomicUsize::new(0));
         let produced_count_clone = produced_count.clone();
         let result = stream.run(
-            move |_req| {
+            move |_req, buffer| {
                 let count = produced_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count < 1 {
-                    Some(vec![LaserPoint::blanked(0.0, 0.0); 100])
+                    // Fill the buffer with blanked points
+                    for p in buffer.iter_mut() {
+                        *p = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ProducerResult::Continue
                 } else {
-                    None // End after one chunk
+                    ProducerResult::End // End after one chunk
                 }
             },
             |_e| {},
@@ -1267,5 +1580,313 @@ mod tests {
         stream.process_control_messages();
         assert!(control.is_armed());
         assert!(shutter_open.load(Ordering::SeqCst));
+    }
+
+    // =========================================================================
+    // New buffer API tests
+    // =========================================================================
+
+    #[test]
+    fn test_run_buffer_has_exactly_n_points() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let buffer_sizes = Arc::new(Mutex::new(Vec::new()));
+        let buffer_sizes_clone = buffer_sizes.clone();
+
+        let result = stream.run(
+            move |req, buffer| {
+                // Record the buffer size
+                buffer_sizes_clone.lock().unwrap().push(buffer.len());
+
+                // Verify buffer length matches request
+                assert_eq!(buffer.len(), req.n_points);
+
+                // End after 3 chunks
+                if buffer_sizes_clone.lock().unwrap().len() >= 3 {
+                    ProducerResult::End
+                } else {
+                    ProducerResult::Continue
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Verify all chunks had exactly 100 points
+        let sizes = buffer_sizes.lock().unwrap();
+        assert!(sizes.len() >= 3);
+        for size in sizes.iter() {
+            assert_eq!(*size, 100);
+        }
+    }
+
+    #[test]
+    fn test_run_buffer_pointer_stability() {
+        // Test that the buffer pointer is stable across calls (no reallocation)
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Store pointer addresses as usize (which is Send)
+        let pointers = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let pointers_clone = pointers.clone();
+
+        let result = stream.run(
+            move |_req, buffer| {
+                // Record the buffer pointer address
+                pointers_clone
+                    .lock()
+                    .unwrap()
+                    .push(buffer.as_ptr() as usize);
+
+                // End after 5 chunks
+                if pointers_clone.lock().unwrap().len() >= 5 {
+                    ProducerResult::End
+                } else {
+                    ProducerResult::Continue
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Verify all pointers are the same (no reallocation)
+        let ptrs = pointers.lock().unwrap();
+        assert!(ptrs.len() >= 5);
+        let first_ptr = ptrs[0];
+        for ptr in ptrs.iter().skip(1) {
+            assert_eq!(*ptr, first_ptr, "buffer was reallocated");
+        }
+    }
+
+    #[test]
+    fn test_run_partial_fill_fills_remainder() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use Park policy to verify fill behavior
+        let cfg = StreamConfig::new(30000)
+            .with_target_queue_points(10000)
+            .with_underrun(UnderrunPolicy::Park { x: 0.5, y: 0.5 });
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        stream.control().arm().unwrap();
+
+        let result = stream.run(
+            move |_req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                // Fill only 10 points, leaving 90 to be filled by underrun policy
+                for point in buffer.iter_mut().take(10) {
+                    *point = LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535);
+                }
+
+                // End after a few iterations
+                if count >= 2 {
+                    ProducerResult::End
+                } else {
+                    ProducerResult::ContinuePartial { filled: 10 }
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        assert!(call_count.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn test_run_alloc_adapter_works() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let chunk_count = Arc::new(AtomicUsize::new(0));
+        let chunk_count_clone = chunk_count.clone();
+
+        // Use the legacy run_alloc adapter
+        let result = stream.run_alloc(
+            move |req| {
+                let count = chunk_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 3 {
+                    Some(vec![LaserPoint::blanked(0.0, 0.0); req.n_points])
+                } else {
+                    None
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        assert!(chunk_count.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn test_run_buffer_prefilled_with_blanks() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let result = stream.run(
+            move |_req, buffer| {
+                // Verify buffer is pre-filled with blanked points
+                for point in buffer.iter() {
+                    assert_eq!(point.r, 0);
+                    assert_eq!(point.g, 0);
+                    assert_eq!(point.b, 0);
+                    assert_eq!(point.intensity, 0);
+                }
+                ProducerResult::End
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    }
+
+    #[test]
+    fn test_run_buffer_prefilled_at_park_position() {
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use Park policy - buffer should be prefilled at park position
+        let cfg = StreamConfig::new(30000)
+            .with_target_queue_points(10000)
+            .with_underrun(UnderrunPolicy::Park { x: 0.75, y: -0.25 });
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let result = stream.run(
+            move |_req, buffer| {
+                // Verify buffer is pre-filled at park position
+                for point in buffer.iter() {
+                    assert!((point.x - 0.75).abs() < 0.001);
+                    assert!((point.y - (-0.25)).abs() < 0.001);
+                    assert_eq!(point.r, 0);
+                    assert_eq!(point.g, 0);
+                    assert_eq!(point.b, 0);
+                }
+                ProducerResult::End
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    }
+
+    #[test]
+    fn test_stop_policy_with_partial_fill_stops_stream() {
+        // Regression test: UnderrunPolicy::Stop + ContinuePartial should yield RunExit::Stopped
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use Stop policy - partial fill should stop the stream
+        let cfg = StreamConfig::new(30000)
+            .with_target_queue_points(10000)
+            .with_underrun(UnderrunPolicy::Stop);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream (Stop policy only triggers when armed)
+        stream.control().arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run(
+            move |_req, buffer| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                // Fill only half the buffer
+                for point in buffer.iter_mut().take(50) {
+                    *point = LaserPoint::blanked(0.0, 0.0);
+                }
+
+                // Return partial fill - should trigger Stop policy
+                ProducerResult::ContinuePartial { filled: 50 }
+            },
+            |_e| {},
+        );
+
+        // Should have stopped due to Stop policy on partial fill
+        assert_eq!(result.unwrap(), RunExit::Stopped);
+        // Should have only been called once before stopping
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }

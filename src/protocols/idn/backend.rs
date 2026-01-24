@@ -14,6 +14,8 @@ pub struct IdnBackend {
     service: ServiceInfo,
     stream: Option<stream::Stream>,
     caps: DacCapabilities,
+    /// Reusable scratch buffer for point conversion (eliminates per-chunk allocation).
+    scratch: Vec<PointXyrgbi>,
 }
 
 impl IdnBackend {
@@ -23,6 +25,7 @@ impl IdnBackend {
             service,
             stream: None,
             caps: super::default_capabilities(),
+            scratch: Vec::new(),
         }
     }
 }
@@ -74,9 +77,12 @@ impl StreamBackend for IdnBackend {
         }
 
         stream.set_scan_speed(pps);
-        let idn_points: Vec<PointXyrgbi> = points.iter().map(|p| p.into()).collect();
 
-        stream.write_frame(&idn_points).map_err(Error::backend)?;
+        // Reuse scratch buffer to avoid per-chunk allocation
+        self.scratch.clear();
+        self.scratch.extend(points.iter().map(PointXyrgbi::from));
+
+        stream.write_frame(&self.scratch).map_err(Error::backend)?;
 
         Ok(WriteOutcome::Written)
     }
