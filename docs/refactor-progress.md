@@ -5,7 +5,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 ## Task 1: Core Types (`src/types.rs`)
 
 - [x] **1.1 Update `StreamInstant`** - Add `as_secs_f64(pps: u32) -> f64` method and update docs (commit 88ab801)
-- [ ] **1.2 Create `FillRequest` struct** - New struct with `start`, `pps`, `min_points`, `target_points`, `buffered_points`, `buffered`, `device_queued_points`
+- [x] **1.2 Create `FillRequest` struct** - New struct with `start`, `pps`, `min_points`, `target_points`, `buffered_points`, `buffered`, `device_queued_points` (commit ea36160)
 - [ ] **1.3 Create `FillResult` enum** - `Filled(usize)`, `Starved`, `End` variants
 - [ ] **1.4 Remove `ChunkRequest`** - Delete old struct and update usages
 - [ ] **1.5 Update `StreamConfig`** - Add `tick_interval`, `target_buffer`, `min_buffer` fields

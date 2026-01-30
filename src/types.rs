@@ -553,6 +553,39 @@ pub struct FillRequest {
     pub device_queued_points: Option<u64>,
 }
 
+/// Result returned by the fill callback indicating how the buffer was filled.
+///
+/// This enum allows the callback to communicate three distinct states:
+/// - Successfully filled some number of points
+/// - Temporarily unable to provide data (underrun policy applies)
+/// - Stream should end gracefully
+///
+/// # `Filled(0)` Semantics
+///
+/// - If `target_points == 0`: Buffer is full, nothing needed. This is fine.
+/// - If `target_points > 0`: We needed points but got none. Treated as `Starved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillResult {
+    /// Wrote n points to the buffer.
+    ///
+    /// `n` must be <= `buffer.len()`.
+    /// If `n < min_points`, underrun policy is applied for the deficit.
+    Filled(usize),
+
+    /// No data available right now.
+    ///
+    /// Underrun policy is applied (repeat last chunk or blank).
+    /// Stream continues; callback will be called again next tick.
+    Starved,
+
+    /// Stream is finished. Shutdown sequence:
+    /// 1. Stop calling callback
+    /// 2. Let queued points drain (play out)
+    /// 3. Blank/park the laser at last position
+    /// 4. Return from stream() with `RunExit::ProducerEnded`
+    End,
+}
+
 /// Current status of a stream.
 #[derive(Clone, Debug)]
 pub struct StreamStatus {

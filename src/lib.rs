@@ -123,6 +123,7 @@ pub use types::{
     DacType,
     EnabledDacTypes,
     FillRequest,
+    FillResult,
     LaserPoint,
     OutputModel,
     RunExit,
