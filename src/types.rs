@@ -426,8 +426,8 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 /// # Buffer-Driven Timing
 ///
 /// The streaming API uses pure buffer-driven timing:
-/// - `target_buffer`: Target buffer level to maintain (default: 40ms)
-/// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 10ms)
+/// - `target_buffer`: Target buffer level to maintain (default: 20ms)
+/// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 8ms)
 ///
 /// The callback is invoked when `buffered < target_buffer`. The callback receives
 /// a `FillRequest` with `min_points` and `target_points` calculated from these
@@ -440,14 +440,14 @@ pub struct StreamConfig {
     /// Points per second output rate.
     pub pps: u32,
 
-    /// Target buffer level to maintain (default: 40ms).
+    /// Target buffer level to maintain (default: 20ms).
     ///
     /// The callback's `target_points` is calculated to bring the buffer to this level.
     /// The callback is invoked when the buffer drops below this level.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub target_buffer: std::time::Duration,
 
-    /// Minimum buffer before requesting urgent fill (default: 10ms).
+    /// Minimum buffer before requesting urgent fill (default: 8ms).
     ///
     /// When buffer drops below this, `min_points` in `FillRequest` will be non-zero.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
@@ -494,8 +494,8 @@ impl Default for StreamConfig {
         use std::time::Duration;
         Self {
             pps: 30_000,
-            target_buffer: Duration::from_millis(40),
-            min_buffer: Duration::from_millis(10),
+            target_buffer: Duration::from_millis(20),
+            min_buffer: Duration::from_millis(8),
             underrun: UnderrunPolicy::default(),
             drain_timeout: Duration::from_secs(1),
         }
@@ -513,7 +513,7 @@ impl StreamConfig {
 
     /// Set the target buffer level to maintain (builder pattern).
     ///
-    /// Default: 40ms. Higher values provide more safety margin against underruns.
+    /// Default: 20ms. Higher values provide more safety margin against underruns.
     /// Lower values reduce perceived latency.
     pub fn with_target_buffer(mut self, duration: std::time::Duration) -> Self {
         self.target_buffer = duration;
@@ -522,7 +522,7 @@ impl StreamConfig {
 
     /// Set the minimum buffer level before urgent fill (builder pattern).
     ///
-    /// Default: 10ms. When buffer drops below this, `min_points` will be non-zero.
+    /// Default: 8ms. When buffer drops below this, `min_points` will be non-zero.
     pub fn with_min_buffer(mut self, duration: std::time::Duration) -> Self {
         self.min_buffer = duration;
         self
