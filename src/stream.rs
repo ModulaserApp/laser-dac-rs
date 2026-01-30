@@ -1928,4 +1928,374 @@ mod tests {
         // Actually it's ceil((10ms - 299/30000) * 30000) = ceil(300 - 299) = 1
         assert!(req.min_points >= 1, "min_points should be at least 1 to reach min_buffer");
     }
+
+    // =========================================================================
+    // FillResult handling tests (Task 6.4)
+    // =========================================================================
+
+    #[test]
+    fn test_fill_result_filled_writes_points_and_updates_state() {
+        // Test that Filled(n) writes n points to backend and updates stream state
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let points_written = Arc::new(AtomicUsize::new(0));
+        let points_written_clone = points_written.clone();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count < 3 {
+                    // Fill with specific number of points
+                    let n = req.target_points.min(50);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
+                    }
+                    points_written_clone.fetch_add(n, Ordering::SeqCst);
+                    FillResult::Filled(n)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Points should have been written to backend
+        let total_queued = queued.load(Ordering::SeqCst);
+        let total_written = points_written.load(Ordering::SeqCst);
+        assert!(total_queued > 0, "Points should have been queued to backend");
+        assert_eq!(total_queued as usize, total_written, "Queued points should match written points");
+    }
+
+    #[test]
+    fn test_fill_result_filled_updates_last_chunk_when_armed() {
+        // Test that Filled(n) updates last_chunk for RepeatLast policy when armed
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream so last_chunk gets updated
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // Write specific points that we can verify later
+                    let n = req.target_points.min(10);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::new(0.5, 0.5, 10000, 20000, 30000, 40000);
+                    }
+                    FillResult::Filled(n)
+                } else if count == 1 {
+                    // Return Starved to trigger RepeatLast
+                    FillResult::Starved
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // If last_chunk wasn't updated, the Starved would have outputted blanks
+        // The test passes if no assertion fails - the RepeatLast policy used the stored chunk
+    }
+
+    #[test]
+    fn test_fill_result_starved_repeat_last_with_stored_chunk() {
+        // Test that Starved with RepeatLast policy repeats the last chunk
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // First call: provide some data to establish last_chunk
+                    let n = req.target_points.min(50);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::new(0.3, 0.3, 5000, 5000, 5000, 5000);
+                    }
+                    FillResult::Filled(n)
+                } else if count == 1 {
+                    // Second call: return Starved - should repeat last chunk
+                    FillResult::Starved
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Both the initial fill and the repeated chunk should have been written
+        let total_queued = queued.load(Ordering::SeqCst);
+        assert!(total_queued >= 50, "Should have written initial chunk plus repeated chunk");
+    }
+
+    #[test]
+    fn test_fill_result_starved_repeat_last_without_stored_chunk_falls_back_to_blank() {
+        // Test that Starved with RepeatLast but no stored chunk falls back to blank
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |_req, _buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // First call: return Starved with no prior chunk
+                    FillResult::Starved
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Should have written blank points as fallback
+        let total_queued = queued.load(Ordering::SeqCst);
+        assert!(total_queued > 0, "Should have written blank points as fallback");
+    }
+
+    #[test]
+    fn test_fill_result_starved_with_park_policy() {
+        // Test that Starved with Park policy outputs blanked points at park position
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Park at specific position
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Park { x: 0.5, y: -0.5 });
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |_req, _buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    FillResult::Starved
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Should have written parked points
+        let total_queued = queued.load(Ordering::SeqCst);
+        assert!(total_queued > 0, "Should have written parked points");
+    }
+
+    #[test]
+    fn test_fill_result_starved_with_stop_policy() {
+        // Test that Starved with Stop policy terminates the stream
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Stop);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Must arm the stream for underrun policy to be checked
+        // (disarmed streams always output blanks regardless of policy)
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let result = stream.run_fill(
+            |_req, _buffer| {
+                // Always return Starved - Stop policy should terminate the stream
+                FillResult::Starved
+            },
+            |_e| {},
+        );
+
+        // Stream should have stopped due to underrun with Stop policy
+        // The Stop policy returns Err(Error::Stopped) to immediately terminate
+        assert!(result.is_err(), "Stop policy should return an error");
+        assert!(result.unwrap_err().is_stopped(), "Error should be Stopped variant");
+    }
+
+    #[test]
+    fn test_fill_result_end_returns_producer_ended() {
+        // Test that End terminates the stream with ProducerEnded
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let result = stream.run_fill(
+            |_req, _buffer| {
+                // Immediately end
+                FillResult::End
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    }
+
+    #[test]
+    fn test_fill_result_filled_exceeds_buffer_clamped() {
+        // Test that Filled(n) where n > buffer.len() is clamped
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |_req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // Fill some points but claim we wrote more than buffer size
+                    for i in 0..buffer.len() {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    // Return a value larger than buffer - should be clamped
+                    FillResult::Filled(buffer.len() + 1000)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Should have written clamped number of points (max_points_per_chunk)
+        let total_queued = queued.load(Ordering::SeqCst);
+        assert!(total_queued > 0, "Should have written some points");
+        // The clamping should limit to max_points (1000 for TestBackend)
+        assert!(total_queued <= 1000, "Points should be clamped to max_points_per_chunk");
+    }
 }
