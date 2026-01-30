@@ -34,7 +34,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::types::{ChunkRequest, LaserPoint};
+use crate::types::{ChunkRequest, FillRequest, FillResult, LaserPoint};
 
 /// A point buffer to be cycled by the adapter.
 #[derive(Clone, Debug)]
@@ -116,8 +116,62 @@ impl FrameAdapter {
     ///
     /// Cycles through the current frame. When the frame ends and a pending
     /// frame is available, switches immediately (even mid-chunk).
+    ///
+    /// **Deprecated**: Use `fill_chunk()` instead for the new zero-allocation API.
     pub fn next_chunk(&mut self, req: &ChunkRequest) -> Vec<LaserPoint> {
         self.generate_points(req.n_points)
+    }
+
+    /// Fill the provided buffer with points from the current frame.
+    ///
+    /// This is the new zero-allocation API that fills a library-owned buffer
+    /// instead of allocating a new Vec on each call.
+    ///
+    /// Cycles through the current frame. When the frame ends and a pending
+    /// frame is available, switches immediately (even mid-chunk).
+    ///
+    /// # Returns
+    ///
+    /// - `FillResult::Filled(n)` - Wrote `n` points (always `req.target_points`)
+    /// - `FillResult::Starved` - Never returned (adapter always has points to output)
+    /// - `FillResult::End` - Never returned (adapter cycles indefinitely)
+    pub fn fill_chunk(&mut self, req: &FillRequest, buffer: &mut [LaserPoint]) -> FillResult {
+        let n_points = req.target_points.min(buffer.len());
+        self.fill_points(buffer, n_points);
+        FillResult::Filled(n_points)
+    }
+
+    /// Fill buffer with n_points from the frame (zero-allocation).
+    fn fill_points(&mut self, buffer: &mut [LaserPoint], n_points: usize) {
+        for i in 0..n_points {
+            // Handle empty frame: try to swap, else output blanked
+            if self.current.points.is_empty() {
+                if let Some(pending) = self.pending.take() {
+                    self.current = pending;
+                    self.point_index = 0;
+                }
+
+                if self.current.points.is_empty() {
+                    let (x, y) = self.last_position;
+                    buffer[i] = LaserPoint::blanked(x, y);
+                    continue;
+                }
+            }
+
+            let point = self.current.points[self.point_index];
+            buffer[i] = point;
+            self.last_position = (point.x, point.y);
+
+            self.point_index += 1;
+            if self.point_index >= self.current.points.len() {
+                self.point_index = 0;
+                // Immediately swap to pending frame if available
+                if let Some(pending) = self.pending.take() {
+                    self.current = pending;
+                    self.point_index = 0;
+                }
+            }
+        }
     }
 
     fn generate_points(&mut self, n_points: usize) -> Vec<LaserPoint> {
