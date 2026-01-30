@@ -366,7 +366,12 @@ pub fn get_audio_mode() -> Option<AudioMode> {
 ///
 /// - **Stereo**: XY oscilloscope (left=X, right=Y)
 /// - **Mono**: Time-domain oscilloscope (X=time sweep, Y=amplitude from timebase)
-pub fn fill_audio_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_points: usize, config: &AudioConfig) {
+pub fn fill_audio_points(
+    req: &ChunkRequest,
+    buffer: &mut [LaserPoint],
+    n_points: usize,
+    config: &AudioConfig,
+) {
     if n_points == 0 {
         return;
     }
@@ -452,9 +457,6 @@ pub fn fill_audio_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_points
 
     debug!(
         "Audio: {} points, mode={:?}, audio_frame={}, delay={}ms",
-        n_points,
-        snap.mode,
-        audio_start_frame,
-        config.extra_delay_ms
+        n_points, snap.mode, audio_start_frame, config.extra_delay_ms
     );
 }

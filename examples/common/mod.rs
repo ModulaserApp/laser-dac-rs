@@ -53,7 +53,9 @@ pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) 
         Shape::Circle => fill_circle_points(buffer, n_points),
         Shape::OrbitingCircle => fill_orbiting_circle_points(req, buffer, n_points),
         Shape::TestPattern => fill_test_pattern_points(buffer, n_points),
-        Shape::Audio => audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default()),
+        Shape::Audio => {
+            audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default())
+        }
     }
     ChunkResult::Filled(n_points)
 }

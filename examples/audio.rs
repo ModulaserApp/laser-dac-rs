@@ -11,7 +11,9 @@
 mod common;
 
 use common::audio::{self, AudioConfig};
-use laser_dac::{list_devices, open_device, ChunkRequest, ChunkResult, LaserPoint, Result, StreamConfig};
+use laser_dac::{
+    list_devices, open_device, ChunkRequest, ChunkResult, LaserPoint, Result, StreamConfig,
+};
 
 fn main() -> Result<()> {
     env_logger::init();

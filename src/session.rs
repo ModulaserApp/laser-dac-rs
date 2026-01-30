@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::backend::{Error, Result};
 use crate::discovery::DacDiscovery;
 use crate::stream::{Dac, StreamControl};
-use crate::types::{DacInfo, ChunkRequest, ChunkResult, LaserPoint, RunExit, StreamConfig};
+use crate::types::{ChunkRequest, ChunkResult, DacInfo, LaserPoint, RunExit, StreamConfig};
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;

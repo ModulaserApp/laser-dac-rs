@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    DacCapabilities, DacInfo, DacType, ChunkRequest, ChunkResult, LaserPoint, RunExit, StreamConfig,
-    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit,
+    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -546,8 +546,7 @@ impl Stream {
                             n,
                             self.state.last_chunk.len()
                         );
-                        self.state.last_chunk[..n]
-                            .copy_from_slice(&self.state.chunk_buffer[..n]);
+                        self.state.last_chunk[..n].copy_from_slice(&self.state.chunk_buffer[..n]);
                         self.state.last_chunk_len = n;
                     }
                     self.state.current_instant += n as u64;
@@ -838,9 +837,8 @@ impl Stream {
             }
         } else {
             // No queue depth available: sleep for estimated buffer time, capped by timeout
-            let estimated_drain = Duration::from_secs_f64(
-                self.state.scheduled_ahead as f64 / pps as f64
-            );
+            let estimated_drain =
+                Duration::from_secs_f64(self.state.scheduled_ahead as f64 / pps as f64);
             let wait_time = estimated_drain.min(timeout);
 
             // Sleep in slices to allow control message processing
@@ -1522,7 +1520,10 @@ mod tests {
         );
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-        assert!(write_count.load(Ordering::SeqCst) >= 4, "Should have written multiple chunks");
+        assert!(
+            write_count.load(Ordering::SeqCst) >= 4,
+            "Should have written multiple chunks"
+        );
     }
 
     #[test]
@@ -1813,12 +1814,18 @@ mod tests {
         // Software says 500, hardware says 300 -> should use 300 (conservative)
         stream.state.scheduled_ahead = 500;
         let estimate = stream.estimate_buffer_points();
-        assert_eq!(estimate, 300, "Should use hardware (300) when it's less than software (500)");
+        assert_eq!(
+            estimate, 300,
+            "Should use hardware (300) when it's less than software (500)"
+        );
 
         // Now set hardware higher than software
         queued.store(800, Ordering::SeqCst);
         let estimate = stream.estimate_buffer_points();
-        assert_eq!(estimate, 500, "Should use software (500) when it's less than hardware (800)");
+        assert_eq!(
+            estimate, 500,
+            "Should use software (500) when it's less than hardware (800)"
+        );
     }
 
     #[test]
@@ -1848,7 +1855,10 @@ mod tests {
         let estimate = stream.estimate_buffer_points();
 
         // Should use the conservative (lower) estimate to avoid underrun
-        assert_eq!(estimate, 100, "Should use conservative estimate (100) not optimistic (1000)");
+        assert_eq!(
+            estimate, 100,
+            "Should use conservative estimate (100) not optimistic (1000)"
+        );
 
         // Now simulate the opposite: hardware reports more than software
         // This can happen due to timing/synchronization issues
@@ -1856,7 +1866,10 @@ mod tests {
         stream.state.scheduled_ahead = 500;
 
         let estimate = stream.estimate_buffer_points();
-        assert_eq!(estimate, 500, "Should use conservative estimate (500) not hardware (2000)");
+        assert_eq!(
+            estimate, 500,
+            "Should use conservative estimate (500) not hardware (2000)"
+        );
     }
 
     #[test]
@@ -1965,7 +1978,10 @@ mod tests {
 
         // min_points should be ceil(300 - 299) = ceil(1) = 1
         // Actually it's ceil((10ms - 299/30000) * 30000) = ceil(300 - 299) = 1
-        assert!(req.min_points >= 1, "min_points should be at least 1 to reach min_buffer");
+        assert!(
+            req.min_points >= 1,
+            "min_points should be at least 1 to reach min_buffer"
+        );
     }
 
     // =========================================================================
@@ -2004,7 +2020,8 @@ mod tests {
                     // Fill with specific number of points
                     let n = req.target_points.min(50);
                     for i in 0..n {
-                        buffer[i] = LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
+                        buffer[i] =
+                            LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
                     }
                     points_written_clone.fetch_add(n, Ordering::SeqCst);
                     ChunkResult::Filled(n)
@@ -2021,7 +2038,10 @@ mod tests {
         // Note: drain adds 16 blank points at shutdown
         let total_queued = queued.load(Ordering::SeqCst);
         let total_written = points_written.load(Ordering::SeqCst);
-        assert!(total_queued > 0, "Points should have been queued to backend");
+        assert!(
+            total_queued > 0,
+            "Points should have been queued to backend"
+        );
         assert!(
             total_queued as usize >= total_written,
             "Queued points ({}) should be at least written points ({})",
@@ -2132,7 +2152,10 @@ mod tests {
 
         // Both the initial fill and the repeated chunk should have been written
         let total_queued = queued.load(Ordering::SeqCst);
-        assert!(total_queued >= 50, "Should have written initial chunk plus repeated chunk");
+        assert!(
+            total_queued >= 50,
+            "Should have written initial chunk plus repeated chunk"
+        );
     }
 
     #[test]
@@ -2179,7 +2202,10 @@ mod tests {
 
         // Should have written blank points as fallback
         let total_queued = queued.load(Ordering::SeqCst);
-        assert!(total_queued > 0, "Should have written blank points as fallback");
+        assert!(
+            total_queued > 0,
+            "Should have written blank points as fallback"
+        );
     }
 
     #[test]
@@ -2263,7 +2289,10 @@ mod tests {
         // Stream should have stopped due to underrun with Stop policy
         // The Stop policy returns Err(Error::Stopped) to immediately terminate
         assert!(result.is_err(), "Stop policy should return an error");
-        assert!(result.unwrap_err().is_stopped(), "Error should be Stopped variant");
+        assert!(
+            result.unwrap_err().is_stopped(),
+            "Error should be Stopped variant"
+        );
     }
 
     #[test]
@@ -2342,7 +2371,10 @@ mod tests {
         let total_queued = queued.load(Ordering::SeqCst);
         assert!(total_queued > 0, "Should have written some points");
         // The clamping should limit to max_points (1000 for TestBackend) + 16 blank drain points
-        assert!(total_queued <= 1016, "Points should be clamped to max_points_per_chunk (+ drain)");
+        assert!(
+            total_queued <= 1016,
+            "Points should be clamped to max_points_per_chunk (+ drain)"
+        );
     }
 
     // =========================================================================
@@ -2405,8 +2437,14 @@ mod tests {
 
         // 5. Verify stream ended properly
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-        assert!(queued.load(Ordering::SeqCst) > 0, "Should have written points");
-        assert!(call_count.load(Ordering::SeqCst) >= 5, "Should have called producer multiple times");
+        assert!(
+            queued.load(Ordering::SeqCst) > 0,
+            "Should have written points"
+        );
+        assert!(
+            call_count.load(Ordering::SeqCst) >= 5,
+            "Should have called producer multiple times"
+        );
     }
 
     #[test]
@@ -2469,7 +2507,10 @@ mod tests {
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
         // Should have written: initial data + repeated chunk + recovered data
         let total = queued.load(Ordering::SeqCst);
-        assert!(total >= 100, "Should have written multiple chunks including underrun recovery");
+        assert!(
+            total >= 100,
+            "Should have written multiple chunks including underrun recovery"
+        );
     }
 
     #[test]
@@ -2780,10 +2821,7 @@ mod tests {
         queued.store(0, Ordering::SeqCst);
 
         let start = Instant::now();
-        let result = stream.run_fill(
-            |_req, _buffer| ChunkResult::End,
-            |_e| {},
-        );
+        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2818,10 +2856,7 @@ mod tests {
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(
-            |_req, _buffer| ChunkResult::End,
-            |_e| {},
-        );
+        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2856,10 +2891,7 @@ mod tests {
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(
-            |_req, _buffer| ChunkResult::End,
-            |_e| {},
-        );
+        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2892,10 +2924,7 @@ mod tests {
         let stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(
-            |_req, _buffer| ChunkResult::End,
-            |_e| {},
-        );
+        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2946,6 +2975,9 @@ mod tests {
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
         // Shutter should be closed after graceful shutdown
-        assert!(!shutter_open.load(Ordering::SeqCst), "Shutter should be closed after drain");
+        assert!(
+            !shutter_open.load(Ordering::SeqCst),
+            "Shutter should be closed after drain"
+        );
     }
 }

@@ -913,8 +913,7 @@ mod tests {
 
         // Round-trip through JSON
         let json = serde_json::to_string(&config).expect("serialize to JSON");
-        let restored: StreamConfig =
-            serde_json::from_str(&json).expect("deserialize from JSON");
+        let restored: StreamConfig = serde_json::from_str(&json).expect("deserialize from JSON");
 
         assert_eq!(restored.pps, config.pps);
         assert_eq!(restored.target_buffer, config.target_buffer);

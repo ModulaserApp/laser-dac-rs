@@ -9,7 +9,9 @@ mod common;
 
 use clap::Parser;
 use common::{fill_points, Args};
-use laser_dac::{list_devices, ChunkRequest, LaserPoint, ReconnectingSession, Result, StreamConfig};
+use laser_dac::{
+    list_devices, ChunkRequest, LaserPoint, ReconnectingSession, Result, StreamConfig,
+};
 use std::time::Duration;
 
 fn main() -> Result<()> {

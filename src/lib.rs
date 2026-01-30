@@ -81,6 +81,8 @@ pub use discovery::{
 pub use types::{
     // DAC types
     caps_for_dac_type,
+    ChunkRequest,
+    ChunkResult,
     // Streaming types
     DacCapabilities,
     DacConnectionState,
@@ -88,8 +90,6 @@ pub use types::{
     DacInfo,
     DacType,
     EnabledDacTypes,
-    ChunkRequest,
-    ChunkResult,
     LaserPoint,
     OutputModel,
     RunExit,
