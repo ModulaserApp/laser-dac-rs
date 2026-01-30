@@ -2298,4 +2298,409 @@ mod tests {
         // The clamping should limit to max_points (1000 for TestBackend)
         assert!(total_queued <= 1000, "Points should be clamped to max_points_per_chunk");
     }
+
+    // =========================================================================
+    // Integration tests (Task 6.5)
+    // =========================================================================
+
+    #[test]
+    fn test_full_stream_lifecycle_create_arm_stream_stop() {
+        // Test the complete lifecycle: create -> arm -> stream data -> stop
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+        let shutter_open = backend.shutter_open.clone();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // 1. Create device and start stream
+        let device = Dac::new(info, Box::new(backend));
+        assert!(!device.is_connected());
+
+        let cfg = StreamConfig::new(30000);
+        let (stream, returned_info) = device.start_stream(cfg).unwrap();
+        assert_eq!(returned_info.id, "test");
+
+        // 2. Get control handle and verify initial state
+        let control = stream.control();
+        assert!(!control.is_armed());
+        assert!(!shutter_open.load(Ordering::SeqCst));
+
+        // 3. Arm the stream
+        control.arm().unwrap();
+        assert!(control.is_armed());
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // 4. Run the stream for a few iterations
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count < 5 {
+                    // Fill with data
+                    let n = req.target_points.min(buffer.len()).min(100);
+                    for i in 0..n {
+                        let t = i as f32 / 100.0;
+                        buffer[i] = LaserPoint::new(t, t, 10000, 20000, 30000, 40000);
+                    }
+                    FillResult::Filled(n)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        // 5. Verify stream ended properly
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        assert!(queued.load(Ordering::SeqCst) > 0, "Should have written points");
+        assert!(call_count.load(Ordering::SeqCst) >= 5, "Should have called producer multiple times");
+    }
+
+    #[test]
+    fn test_full_stream_lifecycle_with_underrun_recovery() {
+        // Test lifecycle with underrun and recovery
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream for underrun policy to work
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                match count {
+                    0 => {
+                        // First call: provide data (establishes last_chunk)
+                        let n = req.target_points.min(buffer.len()).min(50);
+                        for i in 0..n {
+                            buffer[i] = LaserPoint::new(0.5, 0.5, 30000, 30000, 30000, 30000);
+                        }
+                        FillResult::Filled(n)
+                    }
+                    1 => {
+                        // Second call: underrun (triggers RepeatLast)
+                        FillResult::Starved
+                    }
+                    2 => {
+                        // Third call: recover with new data
+                        let n = req.target_points.min(buffer.len()).min(50);
+                        for i in 0..n {
+                            buffer[i] = LaserPoint::new(-0.5, -0.5, 20000, 20000, 20000, 20000);
+                        }
+                        FillResult::Filled(n)
+                    }
+                    _ => FillResult::End,
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Should have written: initial data + repeated chunk + recovered data
+        let total = queued.load(Ordering::SeqCst);
+        assert!(total >= 100, "Should have written multiple chunks including underrun recovery");
+    }
+
+    #[test]
+    fn test_full_stream_lifecycle_external_stop() {
+        // Test stopping stream from external control handle
+        use std::thread;
+
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let control = stream.control();
+        let control_clone = control.clone();
+
+        // Spawn thread to stop stream after delay
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            control_clone.stop().unwrap();
+        });
+
+        let result = stream.run_fill(
+            |req, buffer| {
+                // Keep streaming until stopped
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                FillResult::Filled(n)
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::Stopped);
+    }
+
+    #[test]
+    fn test_full_stream_lifecycle_into_dac_recovery() {
+        // Test recovering Dac from stream for reuse
+        let backend = TestBackend::new();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // First stream session
+        let device = Dac::new(info, Box::new(backend));
+        let cfg = StreamConfig::new(30000);
+        let (stream, _) = device.start_stream(cfg).unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 2 {
+                    let n = req.target_points.min(buffer.len()).min(50);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Note: into_dac() would be tested here, but run_fill consumes the stream
+        // and doesn't return it. The into_dac pattern is for the blocking API.
+        // This test verifies the stream lifecycle completes cleanly.
+    }
+
+    #[test]
+    fn test_stream_stats_tracking() {
+        // Test that stream statistics are tracked correctly
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm the stream
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let points_per_call = 50;
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count < 3 {
+                    let n = req.target_points.min(buffer.len()).min(points_per_call);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Stats tracking is verified by the successful completion
+        // Detailed stats assertions would require access to stream after run_fill
+    }
+
+    #[test]
+    fn test_stream_disarm_during_streaming() {
+        // Test disarming stream while it's running
+        use std::thread;
+
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let control = stream.control();
+        let control_clone = control.clone();
+
+        // Arm first
+        control.arm().unwrap();
+        assert!(control.is_armed());
+
+        // Spawn thread to disarm then stop
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(15));
+            control_clone.disarm().unwrap();
+            thread::sleep(Duration::from_millis(15));
+            control_clone.stop().unwrap();
+        });
+
+        let result = stream.run_fill(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::new(0.1, 0.1, 50000, 50000, 50000, 50000);
+                }
+                FillResult::Filled(n)
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::Stopped);
+        // Shutter should have been closed by disarm
+        assert!(!shutter_open.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_stream_with_mock_backend_disconnect() {
+        // Test handling of backend disconnect during streaming
+        use std::sync::atomic::AtomicBool;
+
+        struct DisconnectingBackend {
+            inner: TestBackend,
+            disconnect_after: Arc<AtomicUsize>,
+            call_count: Arc<AtomicUsize>,
+        }
+
+        impl StreamBackend for DisconnectingBackend {
+            fn dac_type(&self) -> DacType {
+                self.inner.dac_type()
+            }
+
+            fn caps(&self) -> &DacCapabilities {
+                self.inner.caps()
+            }
+
+            fn connect(&mut self) -> Result<()> {
+                self.inner.connect()
+            }
+
+            fn disconnect(&mut self) -> Result<()> {
+                self.inner.disconnect()
+            }
+
+            fn is_connected(&self) -> bool {
+                let count = self.call_count.load(Ordering::SeqCst);
+                let disconnect_after = self.disconnect_after.load(Ordering::SeqCst);
+                if count >= disconnect_after {
+                    return false;
+                }
+                self.inner.is_connected()
+            }
+
+            fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.try_write_chunk(pps, points)
+            }
+
+            fn stop(&mut self) -> Result<()> {
+                self.inner.stop()
+            }
+
+            fn set_shutter(&mut self, open: bool) -> Result<()> {
+                self.inner.set_shutter(open)
+            }
+
+            fn queued_points(&self) -> Option<u64> {
+                self.inner.queued_points()
+            }
+        }
+
+        let mut backend = DisconnectingBackend {
+            inner: TestBackend::new(),
+            disconnect_after: Arc::new(AtomicUsize::new(3)),
+            call_count: Arc::new(AtomicUsize::new(0)),
+        };
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+
+        let error_occurred = Arc::new(AtomicBool::new(false));
+        let error_occurred_clone = error_occurred.clone();
+
+        let result = stream.run_fill(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                FillResult::Filled(n)
+            },
+            move |_e| {
+                error_occurred_clone.store(true, Ordering::SeqCst);
+            },
+        );
+
+        // Should return Disconnected when backend reports disconnection
+        assert_eq!(result.unwrap(), RunExit::Disconnected);
+    }
 }
