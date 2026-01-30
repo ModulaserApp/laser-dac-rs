@@ -499,8 +499,8 @@ impl Stream {
                     self.handle_underrun_fill(&req)?;
                 }
                 FillResult::End => {
-                    // Graceful shutdown: let queued points drain, then return
-                    // TODO: Implement drain wait in future PR
+                    // Graceful shutdown: let queued points drain, then blank/park
+                    self.drain_and_blank();
                     return Ok(RunExit::ProducerEnded);
                 }
             }
@@ -782,6 +782,98 @@ impl Stream {
         }
     }
 
+    /// Wait for queued points to drain, then blank/park the laser.
+    ///
+    /// Called on graceful shutdown (`FillResult::End`) to let buffered content
+    /// play out before stopping. Uses `drain_timeout` from config to cap the wait.
+    ///
+    /// - If `queued_points()` is available: polls until queue empties or timeout
+    /// - If `queued_points()` is `None`: sleeps for estimated buffer duration, capped by timeout
+    ///
+    /// After drain (or timeout), closes shutter and outputs blank points.
+    fn drain_and_blank(&mut self) {
+        use std::time::Instant;
+
+        let timeout = self.config.drain_timeout;
+        if timeout.is_zero() {
+            // Skip drain entirely if timeout is zero
+            self.blank_and_close_shutter();
+            return;
+        }
+
+        let deadline = Instant::now() + timeout;
+        let pps = self.config.pps;
+
+        // Check if backend supports queue depth reporting
+        let has_queue_depth = self
+            .backend
+            .as_ref()
+            .and_then(|b| b.queued_points())
+            .is_some();
+
+        if has_queue_depth {
+            // Poll until queue empties or timeout
+            const POLL_INTERVAL: Duration = Duration::from_millis(5);
+            while Instant::now() < deadline {
+                if let Some(queued) = self.backend.as_ref().and_then(|b| b.queued_points()) {
+                    if queued == 0 {
+                        break;
+                    }
+                } else {
+                    // Backend disconnected or stopped reporting
+                    break;
+                }
+
+                // Process control messages during drain (allow stop to interrupt)
+                if self.process_control_messages() {
+                    break;
+                }
+
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        } else {
+            // No queue depth available: sleep for estimated buffer time, capped by timeout
+            let estimated_drain = Duration::from_secs_f64(
+                self.state.scheduled_ahead as f64 / pps as f64
+            );
+            let wait_time = estimated_drain.min(timeout);
+
+            // Sleep in slices to allow control message processing
+            const SLEEP_SLICE: Duration = Duration::from_millis(10);
+            let mut remaining = wait_time;
+            while remaining > Duration::ZERO && Instant::now() < deadline {
+                let slice = remaining.min(SLEEP_SLICE);
+                std::thread::sleep(slice);
+                remaining = remaining.saturating_sub(slice);
+
+                if self.process_control_messages() {
+                    break;
+                }
+            }
+        }
+
+        self.blank_and_close_shutter();
+    }
+
+    /// Output blank points and close the hardware shutter.
+    ///
+    /// Best-effort safety shutdown - errors are ignored since we're already
+    /// in shutdown path.
+    fn blank_and_close_shutter(&mut self) {
+        // Close shutter (best-effort)
+        if let Some(backend) = &mut self.backend {
+            let _ = backend.set_shutter(false);
+        }
+        self.state.shutter_open = false;
+
+        // Output a small blank chunk to ensure laser is off
+        // (some DACs may hold the last point otherwise)
+        if let Some(backend) = &mut self.backend {
+            let blank_point = LaserPoint::blanked(0.0, 0.0);
+            let blank_chunk = [blank_point; 16];
+            let _ = backend.try_write_chunk(self.config.pps, &blank_chunk);
+        }
+    }
 }
 
 impl Drop for Stream {
@@ -1464,8 +1556,11 @@ mod tests {
         };
 
         // Use very short tick interval so we can easily cause overrun
+        // Skip drain to focus on tick behavior
         let tick_interval = Duration::from_millis(2);
-        let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
+        let cfg = StreamConfig::new(30000)
+            .with_tick_interval(tick_interval)
+            .with_drain_timeout(Duration::ZERO);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -1947,10 +2042,16 @@ mod tests {
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
 
         // Points should have been written to backend
+        // Note: drain adds 16 blank points at shutdown
         let total_queued = queued.load(Ordering::SeqCst);
         let total_written = points_written.load(Ordering::SeqCst);
         assert!(total_queued > 0, "Points should have been queued to backend");
-        assert_eq!(total_queued as usize, total_written, "Queued points should match written points");
+        assert!(
+            total_queued as usize >= total_written,
+            "Queued points ({}) should be at least written points ({})",
+            total_queued,
+            total_written
+        );
     }
 
     #[test]
@@ -2261,10 +2362,11 @@ mod tests {
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
 
         // Should have written clamped number of points (max_points_per_chunk)
+        // plus 16 blank points from drain shutdown
         let total_queued = queued.load(Ordering::SeqCst);
         assert!(total_queued > 0, "Should have written some points");
-        // The clamping should limit to max_points (1000 for TestBackend)
-        assert!(total_queued <= 1000, "Points should be clamped to max_points_per_chunk");
+        // The clamping should limit to max_points (1000 for TestBackend) + 16 blank drain points
+        assert!(total_queued <= 1016, "Points should be clamped to max_points_per_chunk (+ drain)");
     }
 
     // =========================================================================
@@ -2796,5 +2898,204 @@ mod tests {
         );
 
         assert!(result.is_err(), "Zero tick_interval should be rejected");
+    }
+
+    // =========================================================================
+    // Drain wait tests
+    // =========================================================================
+
+    #[test]
+    fn test_fill_result_end_drains_with_queue_depth() {
+        // Test that FillResult::End waits for queue to drain when queue depth is available
+        use std::time::Instant;
+
+        let backend = TestBackend::new().with_initial_queue(1000);
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use short drain timeout for test
+        let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        // Simulate queue draining by setting it to 0 before the stream runs
+        queued.store(0, Ordering::SeqCst);
+
+        let start = Instant::now();
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Should return quickly since queue was empty
+        assert!(
+            elapsed.as_millis() < 50,
+            "Should return quickly when queue is empty, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fill_result_end_respects_drain_timeout() {
+        // Test that drain respects timeout and doesn't block forever
+        use std::time::Instant;
+
+        let backend = TestBackend::new().with_initial_queue(100000); // Large queue that won't drain
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Very short timeout
+        let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(50));
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        let start = Instant::now();
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Should timeout around 50ms, allow some margin
+        assert!(
+            elapsed.as_millis() >= 40 && elapsed.as_millis() < 150,
+            "Should respect drain timeout (~50ms), took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fill_result_end_skips_drain_with_zero_timeout() {
+        // Test that drain is skipped when timeout is zero
+        use std::time::Instant;
+
+        let backend = TestBackend::new().with_initial_queue(100000);
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Zero timeout = skip drain
+        let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::ZERO);
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        let start = Instant::now();
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Should return immediately
+        assert!(
+            elapsed.as_millis() < 20,
+            "Should skip drain with zero timeout, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fill_result_end_drains_without_queue_depth() {
+        // Test drain behavior when queued_points() returns None
+        use std::time::Instant;
+
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        // Short drain timeout
+        let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let start = Instant::now();
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Without queue depth, drain sleeps for estimated buffer time (0 here)
+        // So should return quickly
+        assert!(
+            elapsed.as_millis() < 50,
+            "Should return quickly with empty buffer estimate, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_fill_result_end_closes_shutter() {
+        // Test that shutter is closed after drain
+        let backend = TestBackend::new();
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(10));
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        // Arm the stream first
+        let control = stream.control();
+        control.arm().unwrap();
+
+        let result = stream.run_fill(
+            |req, buffer| {
+                // Fill some points then end
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                FillResult::End
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        // Shutter should be closed after graceful shutdown
+        assert!(!shutter_open.load(Ordering::SeqCst), "Shutter should be closed after drain");
     }
 }

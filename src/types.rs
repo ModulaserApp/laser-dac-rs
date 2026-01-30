@@ -458,6 +458,14 @@ pub struct StreamConfig {
 
     /// What to do when the producer can't keep up.
     pub underrun: UnderrunPolicy,
+
+    /// Maximum time to wait for queued points to drain on graceful shutdown (default: 1s).
+    ///
+    /// When the producer returns `FillResult::End`, the stream waits for buffered
+    /// points to play out before returning. This timeout caps that wait to prevent
+    /// blocking forever if the DAC stalls or queue depth is unknown.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub drain_timeout: std::time::Duration,
 }
 
 #[cfg(feature = "serde")]
@@ -493,6 +501,7 @@ impl Default for StreamConfig {
             target_buffer: Duration::from_millis(40),
             min_buffer: Duration::from_millis(10),
             underrun: UnderrunPolicy::default(),
+            drain_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -533,6 +542,14 @@ impl StreamConfig {
     /// Set the underrun policy (builder pattern).
     pub fn with_underrun(mut self, policy: UnderrunPolicy) -> Self {
         self.underrun = policy;
+        self
+    }
+
+    /// Set the drain timeout for graceful shutdown (builder pattern).
+    ///
+    /// Default: 1 second. Set to `Duration::ZERO` to skip drain entirely.
+    pub fn with_drain_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = timeout;
         self
     }
 }

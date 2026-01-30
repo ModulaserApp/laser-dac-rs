@@ -79,18 +79,11 @@ No longer used with the new timing model.
 
 **Location:** `src/stream.rs:494-498`
 
-The proposal specifies graceful shutdown should let queued points drain before returning. Currently it returns immediately.
+The proposal specifies graceful shutdown should let queued points drain before returning.
 
-```rust
-FillResult::End => {
-    // TODO: Implement drain wait in future PR
-    return Ok(RunExit::ProducerEnded);
-}
-```
-
-- [ ] Implement waiting for buffer to drain
-- [ ] Add configurable drain timeout
-- [ ] Park/blank laser after drain completes
+- [x] Implement waiting for buffer to drain
+- [x] Add configurable drain timeout (`StreamConfig::drain_timeout`, default 1s)
+- [x] Park/blank laser after drain completes
 
 ### 8. Update doc comment referencing deprecated field
 
