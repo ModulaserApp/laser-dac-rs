@@ -33,8 +33,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit, StreamConfig,
-    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, FillRequest, LaserPoint, RunExit,
+    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -631,6 +631,59 @@ impl Stream {
         }
 
         software
+    }
+
+    /// Build a FillRequest with calculated buffer state and point requirements.
+    ///
+    /// Calculates:
+    /// - `buffered_points`: Conservative estimate of points in buffer
+    /// - `buffered`: Buffer level as Duration
+    /// - `start`: Estimated playback time (playhead + buffered)
+    /// - `min_points`: Minimum points to avoid underrun (ceiling rounded)
+    /// - `target_points`: Ideal points to reach target buffer (clamped to max)
+    ///
+    /// # Arguments
+    ///
+    /// * `max_points` - Maximum points the callback can write (buffer length)
+    fn build_fill_request(&self, max_points: usize) -> FillRequest {
+        let pps = self.config.pps;
+
+        // Calculate buffer state using conservative estimation
+        let buffered_points = self.estimate_buffer_points();
+        let buffered = Duration::from_secs_f64(buffered_points as f64 / pps as f64);
+
+        // Calculate playhead (estimated playback position)
+        // start = playhead + buffered = current_instant (which already includes scheduled)
+        let start = self.state.current_instant;
+
+        // Calculate point requirements
+        // deficit_target = target_buffer - buffered (how much we're below target)
+        let target_buffer_secs = self.config.target_buffer.as_secs_f64();
+        let min_buffer_secs = self.config.min_buffer.as_secs_f64();
+        let buffered_secs = buffered.as_secs_f64();
+
+        // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
+        let deficit_target = (target_buffer_secs - buffered_secs).max(0.0);
+        let target_points = (deficit_target * pps as f64).ceil() as usize;
+        let target_points = target_points.min(max_points);
+
+        // min_points: ceil((min_buffer - buffered) * pps) - minimum to avoid underrun
+        let deficit_min = (min_buffer_secs - buffered_secs).max(0.0);
+        let min_points = (deficit_min * pps as f64).ceil() as usize;
+        let min_points = min_points.min(max_points);
+
+        // Get raw device queue if available
+        let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
+
+        FillRequest {
+            start,
+            pps,
+            min_points,
+            target_points,
+            buffered_points,
+            buffered,
+            device_queued_points,
+        }
     }
 
     /// Wait until we're ready for the next chunk (pacing).
