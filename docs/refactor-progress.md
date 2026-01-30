@@ -13,7 +13,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 ## Task 2: Stream Internals (`src/stream.rs`)
 
 - [ ] **2.1 Update callback signature** - Change to `FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult`
-- [ ] **2.2 Add pre-allocated buffers to `Stream`** - `chunk_buffer` and `last_chunk` sized to `caps.max_points_per_chunk`
+- [x] **2.2 Add pre-allocated buffers to `Stream`** - `chunk_buffer` and `last_chunk` sized to `caps.max_points_per_chunk` (commit bba5174)
 - [ ] **2.3 Implement fixed-tick timing loop** - Use `sleep_until(next_tick)` with tick overrun handling
 - [ ] **2.4 Implement buffer state calculation** - Calculate `buffered_points`, `buffered`, `playhead`, `min_points`, `target_points`
 - [ ] **2.5 Implement conservative buffer estimation** - Use `min(hardware, software)` estimation

@@ -612,6 +612,27 @@ impl Stream {
         false
     }
 
+    /// Estimate the current buffer level in points using conservative estimation.
+    ///
+    /// Uses `min(hardware, software)` to prevent underruns:
+    /// - If hardware reports fewer points than software estimates, hardware is truth
+    /// - Using `max` would overestimate buffer → underrequest points → underrun
+    /// - Conservative (lower) estimate is safer: we might overfill slightly, but won't underrun
+    ///
+    /// # Returns
+    ///
+    /// The estimated number of points currently buffered (points sent but not yet played).
+    fn estimate_buffer_points(&self) -> u64 {
+        let software = self.state.scheduled_ahead;
+
+        // When hardware reports queue depth, use MINIMUM of hardware and software.
+        if let Some(device_queue) = self.backend.as_ref().and_then(|b| b.queued_points()) {
+            return device_queue.min(software);
+        }
+
+        software
+    }
+
     /// Wait until we're ready for the next chunk (pacing).
     ///
     /// Sleeps in small slices to allow processing control messages promptly.
@@ -621,18 +642,8 @@ impl Stream {
 
         let target = self.config.target_queue_points as u64;
 
-        // Use the more accurate queue depth when available from the device.
-        // This handles cases where the device reports actual buffer state,
-        // which may differ from our software-tracked scheduled_ahead.
-        let effective_queue = if self.info.caps.can_estimate_queue {
-            self.backend
-                .as_ref()
-                .and_then(|b| b.queued_points())
-                .map(|device_q| device_q.max(self.state.scheduled_ahead))
-                .unwrap_or(self.state.scheduled_ahead)
-        } else {
-            self.state.scheduled_ahead
-        };
+        // Use conservative buffer estimation (min of hardware/software)
+        let effective_queue = self.estimate_buffer_points();
 
         if effective_queue < target {
             return Ok(());
