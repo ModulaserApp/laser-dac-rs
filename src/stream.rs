@@ -155,8 +155,15 @@ struct StreamState {
     current_instant: StreamInstant,
     /// Points scheduled ahead of current_instant.
     scheduled_ahead: u64,
-    /// Last chunk that was produced (for repeat-last underrun policy).
-    last_chunk: Option<Vec<LaserPoint>>,
+
+    // Pre-allocated buffers (no per-chunk allocation in hot path)
+    /// Buffer for callback to fill points into.
+    chunk_buffer: Vec<LaserPoint>,
+    /// Last chunk for RepeatLast underrun policy.
+    last_chunk: Vec<LaserPoint>,
+    /// Number of valid points in last_chunk.
+    last_chunk_len: usize,
+
     /// Statistics.
     stats: StreamStats,
     /// Track the last armed state to detect transitions.
@@ -166,11 +173,17 @@ struct StreamState {
 }
 
 impl StreamState {
-    fn new() -> Self {
+    /// Create new stream state with pre-allocated buffers.
+    ///
+    /// Buffers are sized to `max_points_per_chunk` from DAC capabilities,
+    /// ensuring we can handle any catch-up scenario without reallocation.
+    fn new(max_points_per_chunk: usize) -> Self {
         Self {
             current_instant: StreamInstant::new(0),
             scheduled_ahead: 0,
-            last_chunk: None,
+            chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
+            last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
+            last_chunk_len: 0,
             stats: StreamStats::default(),
             last_armed: false,
             shutter_open: false,
@@ -216,6 +229,7 @@ impl Stream {
         chunk_points: usize,
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
+        let max_points = info.caps.max_points_per_chunk;
         Self {
             info,
             backend: Some(backend),
@@ -223,7 +237,7 @@ impl Stream {
             chunk_points,
             control: StreamControl::new(control_tx),
             control_rx,
-            state: StreamState::new(),
+            state: StreamState::new(max_points),
         }
     }
 
@@ -354,7 +368,10 @@ impl Stream {
             WriteOutcome::Written => {
                 // Update state
                 if is_armed {
-                    self.state.last_chunk = Some(points.to_vec());
+                    // Copy to pre-allocated last_chunk buffer (no allocation)
+                    let len = points.len().min(self.state.last_chunk.len());
+                    self.state.last_chunk[..len].copy_from_slice(&points[..len]);
+                    self.state.last_chunk_len = len;
                 }
                 self.state.current_instant += self.chunk_points as u64;
                 self.state.scheduled_ahead += self.chunk_points as u64;
@@ -667,11 +684,14 @@ impl Stream {
             vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
         } else {
             match &self.config.underrun {
-                UnderrunPolicy::RepeatLast => self
-                    .state
-                    .last_chunk
-                    .clone()
-                    .unwrap_or_else(|| vec![LaserPoint::blanked(0.0, 0.0); req.n_points]),
+                UnderrunPolicy::RepeatLast => {
+                    // Use pre-allocated last_chunk if available
+                    if self.state.last_chunk_len > 0 {
+                        self.state.last_chunk[..self.state.last_chunk_len].to_vec()
+                    } else {
+                        vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
+                    }
+                }
                 UnderrunPolicy::Blank => {
                     vec![LaserPoint::blanked(0.0, 0.0); req.n_points]
                 }
@@ -692,7 +712,9 @@ impl Stream {
                     let n_points = fill_points.len();
                     // Only update last_chunk when armed (it's the "last armed content")
                     if is_armed {
-                        self.state.last_chunk = Some(fill_points);
+                        let len = n_points.min(self.state.last_chunk.len());
+                        self.state.last_chunk[..len].copy_from_slice(&fill_points[..len]);
+                        self.state.last_chunk_len = len;
                     }
                     self.state.current_instant += n_points as u64;
                     self.state.scheduled_ahead += n_points as u64;
@@ -1172,11 +1194,12 @@ mod tests {
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
         let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
 
-        // Set some last_chunk with colored points
-        stream.state.last_chunk = Some(vec![
-            LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
-            100
-        ]);
+        // Set some last_chunk with colored points using the pre-allocated buffer
+        let colored_point = LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
+        for i in 0..100 {
+            stream.state.last_chunk[i] = colored_point;
+        }
+        stream.state.last_chunk_len = 100;
 
         // Ensure disarmed (default state)
         assert!(!stream.control.is_armed());
@@ -1195,8 +1218,7 @@ mod tests {
         // last_chunk should NOT be updated (we're disarmed)
         // The actual write was blanked points, but we don't update last_chunk when disarmed
         // because "last armed content" hasn't changed
-        let last = stream.state.last_chunk.as_ref().unwrap();
-        assert_eq!(last[0].r, 65535); // Still the old colored points
+        assert_eq!(stream.state.last_chunk[0].r, 65535); // Still the old colored points
     }
 
     #[test]

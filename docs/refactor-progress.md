@@ -8,7 +8,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 - [x] **1.2 Create `FillRequest` struct** - New struct with `start`, `pps`, `min_points`, `target_points`, `buffered_points`, `buffered`, `device_queued_points` (commit ea36160)
 - [x] **1.3 Create `FillResult` enum** - `Filled(usize)`, `Starved`, `End` variants (commit 2ad8147)
 - [ ] **1.4 Remove `ChunkRequest`** - Delete old struct and update usages
-- [ ] **1.5 Update `StreamConfig`** - Add `tick_interval`, `target_buffer`, `min_buffer` fields
+- [x] **1.5 Update `StreamConfig`** - Add `tick_interval`, `target_buffer`, `min_buffer` fields (commit 124af43)
 
 ## Task 2: Stream Internals (`src/stream.rs`)
 
