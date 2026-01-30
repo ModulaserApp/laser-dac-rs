@@ -40,7 +40,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 
 - [x] **6.1 Update existing stream tests** - Convert to new callback signature (commit 3e0a353)
 - [x] **6.2 Add timing loop tests** - Test fixed-tick behavior, tick overrun handling, early wake
-- [ ] **6.3 Add buffer estimation tests** - Test conservative estimation
+- [x] **6.3 Add buffer estimation tests** - Test conservative estimation with min(hardware, software)
 - [ ] **6.4 Add `FillResult` handling tests** - Test all variants
 - [ ] **6.5 Add integration tests** - Test full stream lifecycle
 

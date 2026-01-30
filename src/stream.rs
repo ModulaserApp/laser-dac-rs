@@ -992,6 +992,65 @@ mod tests {
             self.would_block_count = Arc::new(AtomicUsize::new(count));
             self
         }
+
+        /// Set the initial queue depth for testing buffer estimation.
+        fn with_initial_queue(mut self, queue: u64) -> Self {
+            self.queued = Arc::new(AtomicU64::new(queue));
+            self
+        }
+    }
+
+    /// A test backend that does NOT report hardware queue depth.
+    /// Used to test software-only estimation.
+    struct NoQueueTestBackend {
+        inner: TestBackend,
+    }
+
+    impl NoQueueTestBackend {
+        fn new() -> Self {
+            Self {
+                inner: TestBackend::new(),
+            }
+        }
+    }
+
+    impl StreamBackend for NoQueueTestBackend {
+        fn dac_type(&self) -> DacType {
+            self.inner.dac_type()
+        }
+
+        fn caps(&self) -> &DacCapabilities {
+            self.inner.caps()
+        }
+
+        fn connect(&mut self) -> Result<()> {
+            self.inner.connect()
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            self.inner.disconnect()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+            self.inner.try_write_chunk(pps, points)
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.inner.set_shutter(open)
+        }
+
+        /// Returns None - simulates a DAC that cannot report queue depth
+        fn queued_points(&self) -> Option<u64> {
+            None
+        }
     }
 
     impl StreamBackend for TestBackend {
@@ -1663,5 +1722,210 @@ mod tests {
             queued.load(Ordering::SeqCst) > 0,
             "Filled(0) with target > 0 should trigger underrun and write blank points"
         );
+    }
+
+    // =========================================================================
+    // Buffer estimation tests (Task 6.3)
+    // =========================================================================
+
+    #[test]
+    fn test_estimate_buffer_uses_software_when_no_hardware() {
+        // When hardware doesn't report queue depth, use software estimate
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+
+        // Set software estimate to 500 points
+        stream.state.scheduled_ahead = 500;
+
+        // Should use software estimate since hardware returns None
+        let estimate = stream.estimate_buffer_points();
+        assert_eq!(estimate, 500);
+    }
+
+    #[test]
+    fn test_estimate_buffer_uses_min_of_hardware_and_software() {
+        // When hardware reports queue depth, use min(hardware, software)
+        let backend = TestBackend::new().with_initial_queue(300);
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Software says 500, hardware says 300 -> should use 300 (conservative)
+        stream.state.scheduled_ahead = 500;
+        let estimate = stream.estimate_buffer_points();
+        assert_eq!(estimate, 300, "Should use hardware (300) when it's less than software (500)");
+
+        // Now set hardware higher than software
+        queued.store(800, Ordering::SeqCst);
+        let estimate = stream.estimate_buffer_points();
+        assert_eq!(estimate, 500, "Should use software (500) when it's less than hardware (800)");
+    }
+
+    #[test]
+    fn test_estimate_buffer_conservative_prevents_underrun() {
+        // Verify that conservative estimation (using min) prevents underruns
+        // by ensuring we never overestimate the buffer
+        let backend = TestBackend::new().with_initial_queue(100);
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Simulate: software thinks 1000 points scheduled, but hardware only has 100
+        // This can happen if hardware consumed points faster than expected
+        stream.state.scheduled_ahead = 1000;
+
+        let estimate = stream.estimate_buffer_points();
+
+        // Should use the conservative (lower) estimate to avoid underrun
+        assert_eq!(estimate, 100, "Should use conservative estimate (100) not optimistic (1000)");
+
+        // Now simulate the opposite: hardware reports more than software
+        // This can happen due to timing/synchronization issues
+        queued.store(2000, Ordering::SeqCst);
+        stream.state.scheduled_ahead = 500;
+
+        let estimate = stream.estimate_buffer_points();
+        assert_eq!(estimate, 500, "Should use conservative estimate (500) not hardware (2000)");
+    }
+
+    #[test]
+    fn test_build_fill_request_uses_conservative_estimation() {
+        // Verify that build_fill_request uses conservative buffer estimation
+        let backend = TestBackend::new().with_initial_queue(200);
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000)
+            .with_target_buffer(Duration::from_millis(40))
+            .with_min_buffer(Duration::from_millis(10));
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Set software estimate higher than hardware
+        stream.state.scheduled_ahead = 500;
+
+        let req = stream.build_fill_request(1000);
+
+        // Should use conservative estimate (hardware = 200)
+        assert_eq!(req.buffered_points, 200);
+        assert_eq!(req.device_queued_points, Some(200));
+    }
+
+    #[test]
+    fn test_build_fill_request_calculates_min_and_target_points() {
+        // Verify that min_points and target_points are calculated correctly
+        // based on buffer state. Use NoQueueTestBackend so software estimate is used directly.
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        // 30000 PPS, target_buffer = 40ms, min_buffer = 10ms
+        // target_buffer = 40ms * 30000 = 1200 points
+        // min_buffer = 10ms * 30000 = 300 points
+        let cfg = StreamConfig::new(30000)
+            .with_target_buffer(Duration::from_millis(40))
+            .with_min_buffer(Duration::from_millis(10));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+
+        // Empty buffer: need full target
+        stream.state.scheduled_ahead = 0;
+        let req = stream.build_fill_request(1000);
+
+        // target_points should be clamped to max_points (1000)
+        assert_eq!(req.target_points, 1000);
+        // min_points should be 300 (10ms * 30000), clamped to 1000
+        assert_eq!(req.min_points, 300);
+
+        // Buffer at 500 points (16.67ms): below target (40ms), above min (10ms)
+        stream.state.scheduled_ahead = 500;
+        let req = stream.build_fill_request(1000);
+
+        // target_points = (1200 - 500) = 700
+        assert_eq!(req.target_points, 700);
+        // min_points = (300 - 500) = 0 (buffer above min)
+        assert_eq!(req.min_points, 0);
+
+        // Buffer full at 1200 points (40ms): at target
+        stream.state.scheduled_ahead = 1200;
+        let req = stream.build_fill_request(1000);
+
+        // target_points = 0 (at target)
+        assert_eq!(req.target_points, 0);
+        // min_points = 0 (well above min)
+        assert_eq!(req.min_points, 0);
+    }
+
+    #[test]
+    fn test_build_fill_request_ceiling_rounds_min_points() {
+        // Verify that min_points uses ceiling to prevent underrun
+        // Use NoQueueTestBackend so software estimate is used directly.
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        // min_buffer = 10ms at 30000 PPS = 300 points exactly
+        let cfg = StreamConfig::new(30000)
+            .with_target_buffer(Duration::from_millis(40))
+            .with_min_buffer(Duration::from_millis(10));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+
+        // Buffer at 299 points: 1 point below min_buffer
+        stream.state.scheduled_ahead = 299;
+        let req = stream.build_fill_request(1000);
+
+        // min_points should be ceil(300 - 299) = ceil(1) = 1
+        // Actually it's ceil((10ms - 299/30000) * 30000) = ceil(300 - 299) = 1
+        assert!(req.min_points >= 1, "min_points should be at least 1 to reach min_buffer");
     }
 }
