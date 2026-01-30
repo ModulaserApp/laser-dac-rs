@@ -26,7 +26,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 
 ## Task 4: FrameAdapter Updates (`src/frame_adapter.rs`)
 
-- [ ] **4.1 Update `FrameAdapter::fill_chunk()` method** - Rename from `next_chunk()`, change signature
+- [x] **4.1 Update `FrameAdapter::fill_chunk()` method** - Rename from `next_chunk()`, change signature (commit 54ebdfa)
 - [ ] **4.2 Update `SharedFrameAdapter`** - Update `fill_chunk()` to match new signature
 - [ ] **4.3 Update FrameAdapter tests** - Convert to use `FillRequest` and `FillResult`
 

@@ -238,9 +238,20 @@ impl SharedFrameAdapter {
     }
 
     /// Produces exactly `req.n_points` points.
+    ///
+    /// **Deprecated**: Use `fill_chunk()` instead for the new zero-allocation API.
     pub fn next_chunk(&self, req: &ChunkRequest) -> Vec<LaserPoint> {
         let mut adapter = self.inner.lock().unwrap();
         adapter.next_chunk(req)
+    }
+
+    /// Fill the provided buffer with points from the current frame.
+    ///
+    /// Thread-safe version of `FrameAdapter::fill_chunk()`.
+    /// See that method for full documentation.
+    pub fn fill_chunk(&self, req: &FillRequest, buffer: &mut [LaserPoint]) -> FillResult {
+        let mut adapter = self.inner.lock().unwrap();
+        adapter.fill_chunk(req, buffer)
     }
 }
 
