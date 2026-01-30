@@ -402,9 +402,10 @@ impl Stream {
 
         // Validate tick_interval to prevent division-by-zero and ensure sane scheduling
         if tick_interval < Duration::from_millis(1) {
-            return Err(Error::invalid_config(
-                "tick_interval must be at least 1ms to ensure proper scheduling",
-            ));
+            return Err(Error::invalid_config(format!(
+                "tick_interval {:?} is too small; must be at least 1ms to ensure proper scheduling",
+                tick_interval
+            )));
         }
 
         let max_points = self.info.caps.max_points_per_chunk;
@@ -748,8 +749,10 @@ impl Stream {
         let buffered_points = self.estimate_buffer_points();
         let buffered = Duration::from_secs_f64(buffered_points as f64 / pps as f64);
 
-        // Calculate playhead (estimated playback position)
-        // start = playhead + buffered = current_instant (which already includes scheduled)
+        // Calculate start time for this chunk (when these points will play).
+        // current_instant = total points written = playhead + buffered, so it represents
+        // the stream time at which the next generated points will be played back.
+        // This is the correct value for audio synchronization.
         let start = self.state.current_instant;
 
         // Calculate point requirements
