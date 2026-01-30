@@ -774,6 +774,7 @@ impl Stream {
         FillRequest {
             start,
             pps,
+            tick_interval: self.config.tick_interval,
             min_points,
             target_points,
             buffered_points,
@@ -1247,6 +1248,7 @@ mod tests {
         let req = FillRequest {
             start: StreamInstant::new(0),
             pps: 30000,
+            tick_interval: Duration::from_millis(10),
             min_points: 100,
             target_points: 100,
             buffered_points: 0,
@@ -1376,6 +1378,7 @@ mod tests {
         let req = FillRequest {
             start: StreamInstant::new(0),
             pps: 30000,
+            tick_interval: Duration::from_millis(10),
             min_points: 100,
             target_points: 100,
             buffered_points: 0,

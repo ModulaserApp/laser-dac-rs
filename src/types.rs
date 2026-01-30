@@ -597,6 +597,13 @@ pub struct FillRequest {
     /// Points per second (fixed for stream duration).
     pub pps: u32,
 
+    /// The tick interval (callback frequency).
+    ///
+    /// This is the fixed timing interval at which the callback is invoked.
+    /// Equivalent to `target_points / pps` when buffer is empty, but provided
+    /// explicitly to make the fixed-timing contract visible.
+    pub tick_interval: std::time::Duration,
+
     /// Minimum points needed to avoid imminent underrun.
     ///
     /// Calculated with ceiling to prevent underrun: `ceil((min_buffer - buffered) * pps)`
@@ -634,7 +641,8 @@ pub enum FillResult {
     /// Wrote n points to the buffer.
     ///
     /// `n` must be <= `buffer.len()`.
-    /// If `n < min_points`, underrun policy is applied for the deficit.
+    /// Partial fills (`n < min_points`) are accepted without padding - useful when
+    /// content is legitimately ending. Return `End` on the next call to signal completion.
     Filled(usize),
 
     /// No data available right now.

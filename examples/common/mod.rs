@@ -69,6 +69,7 @@ pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
     let dummy_req = FillRequest {
         start: StreamInstant::new(0),
         pps: 30_000,
+        tick_interval: Duration::from_millis(10),
         min_points: n_points,
         target_points: n_points,
         buffered_points: 0,
