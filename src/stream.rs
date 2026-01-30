@@ -195,12 +195,11 @@ impl StreamState {
 // Stream
 // =============================================================================
 
-/// A streaming session for outputting point chunks to a DAC.
+/// A streaming session for outputting points to a DAC.
 ///
-/// The stream provides two modes of operation:
-///
-/// - **Blocking mode**: Call `next_request()` to get what to produce, then `write()`.
-/// - **Callback mode**: Call `run()` with a producer closure.
+/// Use [`run_fill()`](Self::run_fill) to stream with buffer-driven timing.
+/// The callback is invoked when the buffer needs filling, providing automatic
+/// backpressure handling and zero allocations in the hot path.
 ///
 /// The stream owns pacing, backpressure, and the timebase (`StreamInstant`).
 pub struct Stream {

@@ -1,7 +1,7 @@
 //! Callback-based example using Stream::run_fill().
 //!
 //! This demonstrates the callback/pull approach where the stream drives timing.
-//! The callback is invoked at regular intervals to fill a buffer with points.
+//! The callback is invoked when the buffer needs filling.
 //!
 //! Run with: `cargo run --example callback -- [triangle|circle]`
 
@@ -52,7 +52,7 @@ fn main() -> Result<()> {
 
     // Run in callback mode with zero-allocation API
     let exit = stream.run_fill(
-        // Producer callback - invoked at regular intervals to fill buffer
+        // Producer callback - invoked when buffer needs filling
         move |req: &FillRequest, buffer: &mut [LaserPoint]| {
             let count = counter.fetch_add(1, Ordering::Relaxed);
 
