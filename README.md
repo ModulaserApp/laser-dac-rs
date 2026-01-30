@@ -78,10 +78,10 @@ loop {
 
 ### Callback Mode
 
-The DAC drives timing by invoking your callback whenever it's ready for more data:
+The DAC drives timing by invoking your callback at regular intervals to fill a buffer:
 
 ```rust
-use laser_dac::{list_devices, open_device, ChunkRequest, StreamConfig};
+use laser_dac::{list_devices, open_device, FillRequest, FillResult, LaserPoint, StreamConfig};
 
 let devices = list_devices()?;
 let device = open_device(&devices[0].id)?;
@@ -91,25 +91,28 @@ let (stream, info) = device.start_stream(config)?;
 
 stream.control().arm()?;
 
-let exit = stream.run(
-    // Producer callback - invoked when device needs more data
-    |req: ChunkRequest| {
-        let points = generate_points(req.n_points);
-        Some(points) // Return None to stop
+let exit = stream.run_fill(
+    // Producer callback - fills buffer with points
+    |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        let n = req.target_points;
+        for i in 0..n {
+            buffer[i] = generate_point(i);
+        }
+        FillResult::Filled(n)
     },
     // Error callback
     |err| eprintln!("Stream error: {}", err),
 )?;
 ```
 
-Return `Some(points)` to continue streaming, or `None` to signal completion.
+Return `FillResult::Filled(n)` to continue, `FillResult::End` to stop gracefully.
 
 ### Reconnecting Session (optional)
 
 If you want automatic reconnection by device ID, use `ReconnectingSession`:
 
 ```rust
-use laser_dac::{ReconnectingSession, StreamConfig};
+use laser_dac::{FillRequest, FillResult, LaserPoint, ReconnectingSession, StreamConfig};
 use std::time::Duration;
 
 let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
@@ -122,7 +125,13 @@ let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000
 session.control().arm()?;
 
 let exit = session.run(
-    |req| Some(generate_points(req.n_points)),
+    |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        let n = req.target_points;
+        for i in 0..n {
+            buffer[i] = generate_point(i);
+        }
+        FillResult::Filled(n)
+    },
     |err| eprintln!("Stream error: {}", err),
 )?;
 ```
@@ -149,7 +158,7 @@ Each backend handles conversion to its native format internally.
 | `Stream`       | Active streaming session                         |
 | `ReconnectingSession` | Stream wrapper with automatic reconnect   |
 | `StreamConfig` | Stream settings (PPS, chunk size)                |
-| `ChunkRequest` | Request for points from the DAC                  |
+| `FillRequest`  | Request info for filling point buffer            |
 | `LaserPoint`   | Single point with position (f32) and color (u16) |
 | `DacType`      | Enum of supported DAC hardware                   |
 

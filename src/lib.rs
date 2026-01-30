@@ -6,50 +6,15 @@
 //!
 //! # Getting Started
 //!
-//! The streaming API provides two modes of operation:
-//!
-//! ## Blocking Mode
-//!
-//! Use `next_request()` to get what to produce, then `write()` to send points:
-//!
-//! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint};
-//!
-//! // Discover devices
-//! let devices = list_devices().unwrap();
-//! println!("Found {} devices", devices.len());
-//!
-//! // Open and start streaming
-//! let device = open_device(&devices[0].id).unwrap();
-//! let config = StreamConfig::new(30_000); // 30k points per second
-//! let (mut stream, info) = device.start_stream(config).unwrap();
-//!
-//! // Arm the output (allow laser to fire)
-//! stream.control().arm().unwrap();
-//!
-//! // Streaming loop
-//! loop {
-//!     let req = stream.next_request().unwrap();
-//!
-//!     // Generate points for this chunk
-//!     let points: Vec<LaserPoint> = (0..req.n_points)
-//!         .map(|i| {
-//!             let t = (req.start.points() + i as u64) as f32 / req.pps as f32;
-//!             let angle = t * std::f32::consts::TAU;
-//!             LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535)
-//!         })
-//!         .collect();
-//!
-//!     stream.write(&req, &points).unwrap();
-//! }
-//! ```
+//! The streaming API uses a zero-allocation callback approach where the library
+//! manages timing and you fill buffers with points:
 //!
 //! ## Callback Mode
 //!
-//! Use `run()` with a producer closure for simpler code:
+//! Use `run_fill()` with a producer closure for simpler code:
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest};
+//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, FillRequest, FillResult};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = StreamConfig::new(30_000);
@@ -57,11 +22,13 @@
 //!
 //! stream.control().arm().unwrap();
 //!
-//! let exit = stream.run(
-//!     |req: ChunkRequest| {
-//!         // Return Some(points) to continue, None to stop
-//!         let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
-//!         Some(points)
+//! let exit = stream.run_fill(
+//!     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+//!         let n = req.target_points;
+//!         for i in 0..n {
+//!             buffer[i] = LaserPoint::blanked(0.0, 0.0);
+//!         }
+//!         FillResult::Filled(n)
 //!     },
 //!     |err| eprintln!("Stream error: {}", err),
 //! );
@@ -114,7 +81,6 @@ pub use discovery::{
 pub use types::{
     // DAC types
     caps_for_dac_type,
-    ChunkRequest,
     // Streaming types
     DacCapabilities,
     DacConnectionState,

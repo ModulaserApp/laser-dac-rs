@@ -5,7 +5,7 @@
 //! buffer for stable, drift-free output with configurable latency.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use laser_dac::{ChunkRequest, LaserPoint};
+use laser_dac::{FillRequest, LaserPoint};
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -359,25 +359,33 @@ pub fn get_audio_mode() -> Option<AudioMode> {
     Some(AUDIO_STATE.get()?.mode)
 }
 
-/// Create laser points from audio input.
+/// Fill laser points from audio input into buffer.
 ///
 /// Renders audio with low, fixed latency. The `extra_delay_ms` config provides
 /// a safety margin for audio capture latency.
 ///
 /// - **Stereo**: XY oscilloscope (left=X, right=Y)
 /// - **Mono**: Time-domain oscilloscope (X=time sweep, Y=amplitude from timebase)
-pub fn create_audio_points(req: &ChunkRequest, config: &AudioConfig) -> Vec<LaserPoint> {
-    if req.n_points == 0 {
-        return Vec::new();
+pub fn fill_audio_points(req: &FillRequest, buffer: &mut [LaserPoint], n_points: usize, config: &AudioConfig) {
+    if n_points == 0 {
+        return;
     }
 
     if !ensure_audio_initialized() {
-        return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+        for i in 0..n_points {
+            buffer[i] = LaserPoint::blanked(0.0, 0.0);
+        }
+        return;
     }
 
     let state = match AUDIO_STATE.get() {
         Some(s) => s,
-        None => return vec![LaserPoint::blanked(0.0, 0.0); req.n_points],
+        None => {
+            for i in 0..n_points {
+                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            }
+            return;
+        }
     };
 
     let snap = state.snapshot();
@@ -391,64 +399,62 @@ pub fn create_audio_points(req: &ChunkRequest, config: &AudioConfig) -> Vec<Lase
     // - We go back by extra_delay_ms for safety margin
     // - We go back by chunk duration so the chunk spans [start, start + n_points)
     let extra_delay_frames = (config.extra_delay_ms / 1000.0 * snap.sample_rate as f32) as u64;
-    let chunk_frames = (req.n_points as f64 * points_to_frames) as u64;
+    let chunk_frames = (n_points as f64 * points_to_frames) as u64;
     let audio_start_frame = snap
         .sample_clock
         .saturating_sub(extra_delay_frames)
         .saturating_sub(chunk_frames);
 
     // Read all samples we need (this minimizes lock hold time)
-    let samples = state.read_samples(audio_start_frame, req.n_points, points_to_frames);
+    let samples = state.read_samples(audio_start_frame, n_points, points_to_frames);
 
     // Check for silence
     if config.blank_threshold > 0.0 {
-        let check_count = (req.n_points / 10).max(10).min(req.n_points);
+        let check_count = (n_points / 10).max(10).min(n_points);
         let max_amp = samples
             .iter()
-            .step_by(req.n_points / check_count)
+            .step_by(n_points / check_count)
             .map(|(l, r)| l.abs().max(r.abs()))
             .fold(0.0f32, f32::max);
 
         if max_amp < config.blank_threshold {
             debug!("Audio: silence detected (max_amp={:.4}), blanking", max_amp);
-            return vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+            for i in 0..n_points {
+                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            }
+            return;
         }
     }
 
     // Generate points
     let (cr, cg, cb) = config.color;
-    let points: Vec<LaserPoint> = match snap.mode {
-        AudioMode::Stereo => samples
-            .iter()
-            .map(|(l, r)| {
-                LaserPoint::new(
+    match snap.mode {
+        AudioMode::Stereo => {
+            for (i, (l, r)) in samples.iter().enumerate().take(n_points) {
+                buffer[i] = LaserPoint::new(
                     l.clamp(-1.0, 1.0),
                     r.clamp(-1.0, 1.0),
                     cr,
                     cg,
                     cb,
                     config.intensity,
-                )
-            })
-            .collect(),
-        AudioMode::Mono => samples
-            .iter()
-            .enumerate()
-            .map(|(i, (l, _r))| {
-                let t = i as f32 / (req.n_points - 1).max(1) as f32;
+                );
+            }
+        }
+        AudioMode::Mono => {
+            for (i, (l, _r)) in samples.iter().enumerate().take(n_points) {
+                let t = i as f32 / (n_points - 1).max(1) as f32;
                 let x = t * 2.0 - 1.0;
-                LaserPoint::new(x, l.clamp(-1.0, 1.0), cr, cg, cb, config.intensity)
-            })
-            .collect(),
-    };
+                buffer[i] = LaserPoint::new(x, l.clamp(-1.0, 1.0), cr, cg, cb, config.intensity);
+            }
+        }
+    }
 
     debug!(
         "Audio: {} points, mode={:?}, audio_frame={}, delay={}ms",
-        points.len(),
+        n_points,
         snap.mode,
         audio_start_frame,
         config.extra_delay_ms
     );
-
-    points
 }

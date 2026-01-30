@@ -577,21 +577,6 @@ pub enum UnderrunPolicy {
     Stop,
 }
 
-/// A request from the stream for a chunk of points.
-#[derive(Clone, Debug)]
-pub struct ChunkRequest {
-    /// The stream instant at which this chunk starts.
-    pub start: StreamInstant,
-    /// The points-per-second rate for this chunk.
-    pub pps: u32,
-    /// Number of points requested for this chunk.
-    pub n_points: usize,
-    /// How many points are currently scheduled ahead of `start`.
-    pub scheduled_ahead_points: u64,
-    /// Best-effort: points reported by the device as queued.
-    pub device_queued_points: Option<u64>,
-}
-
 /// A request to fill a buffer with points for streaming.
 ///
 /// This is the new streaming API that uses fixed timing with variable chunk sizes.

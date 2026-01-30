@@ -11,7 +11,7 @@
 mod common;
 
 use common::audio::{self, AudioConfig};
-use laser_dac::{list_devices, open_device, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, FillRequest, FillResult, LaserPoint, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
 
     // Start streaming
     let config = StreamConfig::new(30_000);
-    let (mut stream, info) = device.start_stream(config)?;
+    let (stream, info) = device.start_stream(config)?;
 
     println!(
         "\nStreaming audio to {}... Press Ctrl+C to stop\n",
@@ -50,12 +50,18 @@ fn main() -> Result<()> {
 
     let audio_config = AudioConfig::default();
 
-    loop {
-        let req = stream.next_request()?;
+    // Run stream with zero-allocation audio callback
+    let exit = stream.run_fill(
+        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+            let n = req.target_points.min(buffer.len());
+            audio::fill_audio_points(req, buffer, n, &audio_config);
+            FillResult::Filled(n)
+        },
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
 
-        // Generate audio-reactive points
-        let points = audio::create_audio_points(&req, &audio_config);
-
-        stream.write(&req, &points)?;
-    }
+    println!("\nStream ended: {:?}", exit);
+    Ok(())
 }

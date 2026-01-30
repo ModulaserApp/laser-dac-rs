@@ -14,7 +14,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_frame_points, Args};
-use laser_dac::{list_devices, open_device, Frame, FrameAdapter, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, FillRequest, Frame, FrameAdapter, LaserPoint, Result, StreamConfig};
 use std::thread;
 use std::time::Duration;
 
@@ -49,7 +49,7 @@ fn main() -> Result<()> {
 
     // Start streaming
     let config = StreamConfig::new(30_000);
-    let (mut stream, info) = device.start_stream(config)?;
+    let (stream, info) = device.start_stream(config)?;
 
     println!(
         "\nStreaming {} via FrameAdapter to {}... Press Ctrl+C to stop\n",
@@ -67,10 +67,16 @@ fn main() -> Result<()> {
     // Arm the output
     stream.control().arm()?;
 
-    // Stream loop - the adapter cycles through the frame continuously
-    loop {
-        let req = stream.next_request()?;
-        let points = adapter.next_chunk(&req);
-        stream.write(&req, &points)?;
-    }
+    // Run stream with frame adapter using zero-allocation API
+    let exit = stream.run_fill(
+        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+            adapter.fill_chunk(req, buffer)
+        },
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
+
+    println!("\nStream ended: {:?}", exit);
+    Ok(())
 }
