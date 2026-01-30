@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::backend::{Error, Result};
 use crate::discovery::DacDiscovery;
 use crate::stream::{Dac, StreamControl};
-use crate::types::{DacInfo, FillRequest, FillResult, LaserPoint, RunExit, StreamConfig};
+use crate::types::{DacInfo, ChunkRequest, ChunkResult, LaserPoint, RunExit, StreamConfig};
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;
@@ -116,7 +116,7 @@ impl SessionControl {
 /// # Example
 ///
 /// ```no_run
-/// use laser_dac::{FillRequest, FillResult, LaserPoint, ReconnectingSession, StreamConfig};
+/// use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, ReconnectingSession, StreamConfig};
 /// use std::time::Duration;
 ///
 /// let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
@@ -128,12 +128,12 @@ impl SessionControl {
 /// session.control().arm()?;
 ///
 /// session.run(
-///     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+///     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
 ///         let n = req.target_points;
 ///         for i in 0..n {
 ///             buffer[i] = LaserPoint::blanked(0.0, 0.0);
 ///         }
-///         FillResult::Filled(n)
+///         ChunkResult::Filled(n)
 ///     },
 ///     |err| eprintln!("Stream error: {}", err),
 /// )?;
@@ -232,7 +232,7 @@ impl ReconnectingSession {
     /// Uses the zero-allocation callback API with buffer-driven timing.
     pub fn run<F, E>(&mut self, producer: F, on_error: E) -> Result<RunExit>
     where
-        F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,
+        F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
         let producer = Arc::new(Mutex::new(producer));

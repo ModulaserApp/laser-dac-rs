@@ -9,7 +9,7 @@ mod common;
 
 use clap::Parser;
 use common::{fill_points, Args};
-use laser_dac::{list_devices, open_device, FillRequest, LaserPoint, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     // Run in callback mode with zero-allocation API
     let exit = stream.run_fill(
         // Producer callback - invoked when buffer needs filling
-        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let count = counter.fetch_add(1, Ordering::Relaxed);
 
             // Print progress periodically

@@ -14,7 +14,7 @@ mod common;
 
 use clap::Parser;
 use common::{create_frame_points, Args};
-use laser_dac::{list_devices, open_device, FillRequest, Frame, FrameAdapter, LaserPoint, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, ChunkRequest, Frame, FrameAdapter, LaserPoint, Result, StreamConfig};
 use std::thread;
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 
     // Run stream with frame adapter using zero-allocation API
     let exit = stream.run_fill(
-        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             adapter.fill_chunk(req, buffer)
         },
         |err| {

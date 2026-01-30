@@ -14,7 +14,7 @@
 //! Use `run_fill()` with a producer closure for simpler code:
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, FillRequest, FillResult};
+//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = StreamConfig::new(30_000);
@@ -23,12 +23,12 @@
 //! stream.control().arm().unwrap();
 //!
 //! let exit = stream.run_fill(
-//!     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+//!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
 //!         let n = req.target_points;
 //!         for i in 0..n {
 //!             buffer[i] = LaserPoint::blanked(0.0, 0.0);
 //!         }
-//!         FillResult::Filled(n)
+//!         ChunkResult::Filled(n)
 //!     },
 //!     |err| eprintln!("Stream error: {}", err),
 //! );
@@ -88,8 +88,8 @@ pub use types::{
     DacInfo,
     DacType,
     EnabledDacTypes,
-    FillRequest,
-    FillResult,
+    ChunkRequest,
+    ChunkResult,
     LaserPoint,
     OutputModel,
     RunExit,

@@ -5,7 +5,7 @@
 //! buffer for stable, drift-free output with configurable latency.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use laser_dac::{FillRequest, LaserPoint};
+use laser_dac::{ChunkRequest, LaserPoint};
 use log::{debug, error, info};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -366,7 +366,7 @@ pub fn get_audio_mode() -> Option<AudioMode> {
 ///
 /// - **Stereo**: XY oscilloscope (left=X, right=Y)
 /// - **Mono**: Time-domain oscilloscope (X=time sweep, Y=amplitude from timebase)
-pub fn fill_audio_points(req: &FillRequest, buffer: &mut [LaserPoint], n_points: usize, config: &AudioConfig) {
+pub fn fill_audio_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_points: usize, config: &AudioConfig) {
     if n_points == 0 {
         return;
     }

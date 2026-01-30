@@ -9,7 +9,7 @@ mod common;
 
 use clap::Parser;
 use common::{fill_points, Args};
-use laser_dac::{list_devices, open_device, FillRequest, LaserPoint, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
 
     // Run stream with zero-allocation callback
     let exit = stream.run_fill(
-        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             fill_points(shape, req, buffer)
         },
         |err| {

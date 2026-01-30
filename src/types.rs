@@ -340,7 +340,7 @@ pub enum OutputModel {
 /// Represents a point in stream time, anchored to estimated playback position.
 ///
 /// `StreamInstant` represents the **estimated playback time** of points, not merely
-/// "points sent so far." When used in `FillRequest::start`, it represents:
+/// "points sent so far." When used in `ChunkRequest::start`, it represents:
 ///
 /// `start` = playhead + buffered
 ///
@@ -430,7 +430,7 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 /// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 8ms)
 ///
 /// The callback is invoked when `buffered < target_buffer`. The callback receives
-/// a `FillRequest` with `min_points` and `target_points` calculated from these
+/// a `ChunkRequest` with `min_points` and `target_points` calculated from these
 /// durations and the current buffer state.
 ///
 /// To reduce perceived latency, reduce `target_buffer`.
@@ -449,7 +449,7 @@ pub struct StreamConfig {
 
     /// Minimum buffer before requesting urgent fill (default: 8ms).
     ///
-    /// When buffer drops below this, `min_points` in `FillRequest` will be non-zero.
+    /// When buffer drops below this, `min_points` in `ChunkRequest` will be non-zero.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub min_buffer: std::time::Duration,
 
@@ -458,7 +458,7 @@ pub struct StreamConfig {
 
     /// Maximum time to wait for queued points to drain on graceful shutdown (default: 1s).
     ///
-    /// When the producer returns `FillResult::End`, the stream waits for buffered
+    /// When the producer returns `ChunkResult::End`, the stream waits for buffered
     /// points to play out before returning. This timeout caps that wait to prevent
     /// blocking forever if the DAC stalls or queue depth is unknown.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
@@ -562,7 +562,7 @@ pub enum UnderrunPolicy {
 /// A request to fill a buffer with points for streaming.
 ///
 /// This is the streaming API with pure buffer-driven timing.
-/// The callback receives a `FillRequest` describing buffer state and requirements,
+/// The callback receives a `ChunkRequest` describing buffer state and requirements,
 /// and fills points into a library-owned buffer.
 ///
 /// # Point Tiers
@@ -576,7 +576,7 @@ pub enum UnderrunPolicy {
 /// - `min_points`: Always **ceiling** (underrun prevention)
 /// - `target_points`: **ceiling**, then clamped to buffer length
 #[derive(Clone, Debug)]
-pub struct FillRequest {
+pub struct ChunkRequest {
     /// Estimated playback time when this chunk starts.
     ///
     /// Calculated as: playhead + buffered_points
@@ -619,7 +619,7 @@ pub struct FillRequest {
 /// - If `target_points == 0`: Buffer is full, nothing needed. This is fine.
 /// - If `target_points > 0`: We needed points but got none. Treated as `Starved`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FillResult {
+pub enum ChunkResult {
     /// Wrote n points to the buffer.
     ///
     /// `n` must be <= `buffer.len()`.

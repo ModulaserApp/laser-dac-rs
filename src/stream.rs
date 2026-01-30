@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    DacCapabilities, DacInfo, DacType, FillRequest, FillResult, LaserPoint, RunExit, StreamConfig,
+    DacCapabilities, DacInfo, DacType, ChunkRequest, ChunkResult, LaserPoint, RunExit, StreamConfig,
     StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
@@ -359,39 +359,39 @@ impl Stream {
     ///
     /// # Callback Contract
     ///
-    /// The callback receives a `FillRequest` describing buffer state and requirements,
+    /// The callback receives a `ChunkRequest` describing buffer state and requirements,
     /// and a mutable slice to fill with points. It returns:
     ///
-    /// - `FillResult::Filled(n)`: Wrote `n` points to the buffer
-    /// - `FillResult::Starved`: No data available (underrun policy applies)
-    /// - `FillResult::End`: Stream should end gracefully
+    /// - `ChunkResult::Filled(n)`: Wrote `n` points to the buffer
+    /// - `ChunkResult::Starved`: No data available (underrun policy applies)
+    /// - `ChunkResult::End`: Stream should end gracefully
     ///
     /// # Exit Conditions
     ///
     /// - **`RunExit::Stopped`**: Stop requested via `StreamControl::stop()`.
-    /// - **`RunExit::ProducerEnded`**: Callback returned `FillResult::End`.
+    /// - **`RunExit::ProducerEnded`**: Callback returned `ChunkResult::End`.
     /// - **`RunExit::Disconnected`**: Device disconnected.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// use laser_dac::{FillRequest, FillResult, LaserPoint};
+    /// use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
     ///
     /// stream.run_fill(
-    ///     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+    ///     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
     ///         let n = req.target_points;
     ///         for i in 0..n {
     ///             let t = req.start.as_secs_f64(req.pps) + (i as f64 / req.pps as f64);
     ///             buffer[i] = generate_point_at_time(t);
     ///         }
-    ///         FillResult::Filled(n)
+    ///         ChunkResult::Filled(n)
     ///     },
     ///     |err| eprintln!("Error: {}", err),
     /// )?;
     /// ```
     pub fn run_fill<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
     where
-        F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,
+        F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
         use std::time::Instant;
@@ -459,7 +459,7 @@ impl Stream {
 
             // 8. Handle result
             match result {
-                FillResult::Filled(n) => {
+                ChunkResult::Filled(n) => {
                     // Validate n doesn't exceed buffer
                     let n = n.min(max_points);
 
@@ -474,10 +474,10 @@ impl Stream {
                         self.write_fill_points(n, &mut on_error)?;
                     }
                 }
-                FillResult::Starved => {
+                ChunkResult::Starved => {
                     self.handle_underrun_fill(&req)?;
                 }
-                FillResult::End => {
+                ChunkResult::End => {
                     // Graceful shutdown: let queued points drain, then blank/park
                     self.drain_and_blank();
                     return Ok(RunExit::ProducerEnded);
@@ -583,7 +583,7 @@ impl Stream {
     }
 
     /// Handle underrun for the fill API by applying the underrun policy.
-    fn handle_underrun_fill(&mut self, req: &FillRequest) -> Result<()> {
+    fn handle_underrun_fill(&mut self, req: &ChunkRequest) -> Result<()> {
         self.state.stats.underrun_count += 1;
 
         let is_armed = self.control.is_armed();
@@ -732,7 +732,7 @@ impl Stream {
         software
     }
 
-    /// Build a FillRequest with calculated buffer state and point requirements.
+    /// Build a ChunkRequest with calculated buffer state and point requirements.
     ///
     /// Calculates:
     /// - `buffered_points`: Conservative estimate of points in buffer
@@ -744,7 +744,7 @@ impl Stream {
     /// # Arguments
     ///
     /// * `max_points` - Maximum points the callback can write (buffer length)
-    fn build_fill_request(&self, max_points: usize) -> FillRequest {
+    fn build_fill_request(&self, max_points: usize) -> ChunkRequest {
         let pps = self.config.pps;
 
         // Calculate buffer state using conservative estimation
@@ -776,7 +776,7 @@ impl Stream {
         // Get raw device queue if available
         let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
 
-        FillRequest {
+        ChunkRequest {
             start,
             pps,
             min_points,
@@ -789,7 +789,7 @@ impl Stream {
 
     /// Wait for queued points to drain, then blank/park the laser.
     ///
-    /// Called on graceful shutdown (`FillResult::End`) to let buffered content
+    /// Called on graceful shutdown (`ChunkResult::End`) to let buffered content
     /// play out before stopping. Uses `drain_timeout` from config to cap the wait.
     ///
     /// - If `queued_points()` is available: polls until queue empties or timeout
@@ -1256,8 +1256,8 @@ mod tests {
         let initial_chunks = stream.state.stats.chunks_written;
         let initial_points = stream.state.stats.points_written;
 
-        // Trigger underrun handling with FillRequest
-        let req = FillRequest {
+        // Trigger underrun handling with ChunkRequest
+        let req = ChunkRequest {
             start: StreamInstant::new(0),
             pps: 30000,
             min_points: 100,
@@ -1305,9 +1305,9 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -1386,7 +1386,7 @@ mod tests {
         // Ensure disarmed (default state)
         assert!(!stream.control.is_armed());
 
-        let req = FillRequest {
+        let req = ChunkRequest {
             start: StreamInstant::new(0),
             pps: 30000,
             min_points: 100,
@@ -1509,13 +1509,13 @@ mod tests {
 
                 // Run for 5 calls then end
                 if count >= 4 {
-                    FillResult::End
+                    ChunkResult::End
                 } else {
                     let n = req.target_points.min(buffer.len()).min(100);
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 }
             },
             |_e| {},
@@ -1558,14 +1558,14 @@ mod tests {
 
                 // End after 3 callbacks
                 if count >= 2 {
-                    FillResult::End
+                    ChunkResult::End
                 } else {
                     // Fill buffer to trigger sleep
                     let n = req.target_points.min(buffer.len());
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 }
             },
             |_e| {},
@@ -1618,7 +1618,7 @@ mod tests {
                 for i in 0..n {
                     buffer[i] = LaserPoint::blanked(0.0, 0.0);
                 }
-                FillResult::Filled(n)
+                ChunkResult::Filled(n)
             },
             |_e| {},
         );
@@ -1629,7 +1629,7 @@ mod tests {
 
     #[test]
     fn test_run_fill_producer_ended() {
-        // Test that FillResult::End terminates the stream gracefully
+        // Test that ChunkResult::End terminates the stream gracefully
         let backend = TestBackend::new();
 
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
@@ -1658,10 +1658,10 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
                     // Second call: end the stream
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -1673,7 +1673,7 @@ mod tests {
 
     #[test]
     fn test_run_fill_starved_applies_underrun_policy() {
-        // Test that FillResult::Starved triggers underrun policy
+        // Test that ChunkResult::Starved triggers underrun policy
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
@@ -1700,10 +1700,10 @@ mod tests {
 
                 if count == 0 {
                     // First call: return Starved to trigger underrun policy
-                    FillResult::Starved
+                    ChunkResult::Starved
                 } else {
                     // Second call: end the stream
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -1746,9 +1746,9 @@ mod tests {
 
                 if count == 0 {
                     // Return Filled(0) when buffer needs data - should be treated as Starved
-                    FillResult::Filled(0)
+                    ChunkResult::Filled(0)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -1969,7 +1969,7 @@ mod tests {
     }
 
     // =========================================================================
-    // FillResult handling tests (Task 6.4)
+    // ChunkResult handling tests (Task 6.4)
     // =========================================================================
 
     #[test]
@@ -2007,9 +2007,9 @@ mod tests {
                         buffer[i] = LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
                     }
                     points_written_clone.fetch_add(n, Ordering::SeqCst);
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2065,12 +2065,12 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::new(0.5, 0.5, 10000, 20000, 30000, 40000);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else if count == 1 {
                     // Return Starved to trigger RepeatLast
-                    FillResult::Starved
+                    ChunkResult::Starved
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2117,12 +2117,12 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::new(0.3, 0.3, 5000, 5000, 5000, 5000);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else if count == 1 {
                     // Second call: return Starved - should repeat last chunk
-                    FillResult::Starved
+                    ChunkResult::Starved
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2167,9 +2167,9 @@ mod tests {
 
                 if count == 0 {
                     // First call: return Starved with no prior chunk
-                    FillResult::Starved
+                    ChunkResult::Starved
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2214,9 +2214,9 @@ mod tests {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
                 if count == 0 {
-                    FillResult::Starved
+                    ChunkResult::Starved
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2255,7 +2255,7 @@ mod tests {
         let result = stream.run_fill(
             |_req, _buffer| {
                 // Always return Starved - Stop policy should terminate the stream
-                FillResult::Starved
+                ChunkResult::Starved
             },
             |_e| {},
         );
@@ -2287,7 +2287,7 @@ mod tests {
         let result = stream.run_fill(
             |_req, _buffer| {
                 // Immediately end
-                FillResult::End
+                ChunkResult::End
             },
             |_e| {},
         );
@@ -2327,9 +2327,9 @@ mod tests {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
                     // Return a value larger than buffer - should be clamped
-                    FillResult::Filled(buffer.len() + 1000)
+                    ChunkResult::Filled(buffer.len() + 1000)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2395,9 +2395,9 @@ mod tests {
                         let t = i as f32 / 100.0;
                         buffer[i] = LaserPoint::new(t, t, 10000, 20000, 30000, 40000);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2446,11 +2446,11 @@ mod tests {
                         for i in 0..n {
                             buffer[i] = LaserPoint::new(0.5, 0.5, 30000, 30000, 30000, 30000);
                         }
-                        FillResult::Filled(n)
+                        ChunkResult::Filled(n)
                     }
                     1 => {
                         // Second call: underrun (triggers RepeatLast)
-                        FillResult::Starved
+                        ChunkResult::Starved
                     }
                     2 => {
                         // Third call: recover with new data
@@ -2458,9 +2458,9 @@ mod tests {
                         for i in 0..n {
                             buffer[i] = LaserPoint::new(-0.5, -0.5, 20000, 20000, 20000, 20000);
                         }
-                        FillResult::Filled(n)
+                        ChunkResult::Filled(n)
                     }
-                    _ => FillResult::End,
+                    _ => ChunkResult::End,
                 }
             },
             |_e| {},
@@ -2508,7 +2508,7 @@ mod tests {
                 for i in 0..n {
                     buffer[i] = LaserPoint::blanked(0.0, 0.0);
                 }
-                FillResult::Filled(n)
+                ChunkResult::Filled(n)
             },
             |_e| {},
         );
@@ -2544,9 +2544,9 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2593,9 +2593,9 @@ mod tests {
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
-                    FillResult::Filled(n)
+                    ChunkResult::Filled(n)
                 } else {
-                    FillResult::End
+                    ChunkResult::End
                 }
             },
             |_e| {},
@@ -2648,7 +2648,7 @@ mod tests {
                 for i in 0..n {
                     buffer[i] = LaserPoint::new(0.1, 0.1, 50000, 50000, 50000, 50000);
                 }
-                FillResult::Filled(n)
+                ChunkResult::Filled(n)
             },
             |_e| {},
         );
@@ -2739,7 +2739,7 @@ mod tests {
                 for i in 0..n {
                     buffer[i] = LaserPoint::blanked(0.0, 0.0);
                 }
-                FillResult::Filled(n)
+                ChunkResult::Filled(n)
             },
             move |_e| {
                 error_occurred_clone.store(true, Ordering::SeqCst);
@@ -2756,7 +2756,7 @@ mod tests {
 
     #[test]
     fn test_fill_result_end_drains_with_queue_depth() {
-        // Test that FillResult::End waits for queue to drain when queue depth is available
+        // Test that ChunkResult::End waits for queue to drain when queue depth is available
         use std::time::Instant;
 
         let backend = TestBackend::new().with_initial_queue(1000);
@@ -2781,7 +2781,7 @@ mod tests {
 
         let start = Instant::now();
         let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
+            |_req, _buffer| ChunkResult::End,
             |_e| {},
         );
 
@@ -2819,7 +2819,7 @@ mod tests {
 
         let start = Instant::now();
         let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
+            |_req, _buffer| ChunkResult::End,
             |_e| {},
         );
 
@@ -2857,7 +2857,7 @@ mod tests {
 
         let start = Instant::now();
         let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
+            |_req, _buffer| ChunkResult::End,
             |_e| {},
         );
 
@@ -2893,7 +2893,7 @@ mod tests {
 
         let start = Instant::now();
         let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
+            |_req, _buffer| ChunkResult::End,
             |_e| {},
         );
 
@@ -2939,7 +2939,7 @@ mod tests {
                 for i in 0..n {
                     buffer[i] = LaserPoint::blanked(0.0, 0.0);
                 }
-                FillResult::End
+                ChunkResult::End
             },
             |_e| {},
         );

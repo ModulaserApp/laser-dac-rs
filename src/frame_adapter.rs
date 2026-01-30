@@ -19,14 +19,14 @@
 //! # Example
 //!
 //! ```ignore
-//! use laser_dac::{FillRequest, FillResult, LaserPoint, Frame, FrameAdapter};
+//! use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, Frame, FrameAdapter};
 //!
 //! let adapter = FrameAdapter::new();
 //! adapter.update(Frame::new(circle_points));
 //! let shared = adapter.shared(); // Thread-safe handle
 //!
 //! stream.run_fill(
-//!     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+//!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
 //!         shared.fill_chunk(req, buffer)
 //!     },
 //!     |err| eprintln!("Error: {}", err),
@@ -38,7 +38,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::types::{FillRequest, FillResult, LaserPoint};
+use crate::types::{ChunkRequest, ChunkResult, LaserPoint};
 
 /// A point buffer to be cycled by the adapter.
 #[derive(Clone, Debug)]
@@ -126,13 +126,13 @@ impl FrameAdapter {
     ///
     /// # Returns
     ///
-    /// - `FillResult::Filled(n)` - Wrote `n` points (always `req.target_points`)
-    /// - `FillResult::Starved` - Never returned (adapter always has points to output)
-    /// - `FillResult::End` - Never returned (adapter cycles indefinitely)
-    pub fn fill_chunk(&mut self, req: &FillRequest, buffer: &mut [LaserPoint]) -> FillResult {
+    /// - `ChunkResult::Filled(n)` - Wrote `n` points (always `req.target_points`)
+    /// - `ChunkResult::Starved` - Never returned (adapter always has points to output)
+    /// - `ChunkResult::End` - Never returned (adapter cycles indefinitely)
+    pub fn fill_chunk(&mut self, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
         let n_points = req.target_points.min(buffer.len());
         self.fill_points(buffer, n_points);
-        FillResult::Filled(n_points)
+        ChunkResult::Filled(n_points)
     }
 
     /// Fill buffer with n_points from the frame (zero-allocation).
@@ -200,7 +200,7 @@ impl SharedFrameAdapter {
     ///
     /// Thread-safe version of `FrameAdapter::fill_chunk()`.
     /// See that method for full documentation.
-    pub fn fill_chunk(&self, req: &FillRequest, buffer: &mut [LaserPoint]) -> FillResult {
+    pub fn fill_chunk(&self, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
         let mut adapter = self.inner.lock().unwrap();
         adapter.fill_chunk(req, buffer)
     }
@@ -212,8 +212,8 @@ mod tests {
     use crate::types::StreamInstant;
     use std::time::Duration;
 
-    fn make_fill_request(target_points: usize) -> FillRequest {
-        FillRequest {
+    fn make_fill_request(target_points: usize) -> ChunkRequest {
+        ChunkRequest {
             start: StreamInstant(0),
             pps: 30000,
             min_points: target_points,
@@ -231,7 +231,7 @@ mod tests {
         let mut buffer = vec![LaserPoint::default(); 100];
 
         let result = adapter.fill_chunk(&req, &mut buffer);
-        assert!(matches!(result, FillResult::Filled(100)));
+        assert!(matches!(result, ChunkResult::Filled(100)));
         assert!(buffer.iter().all(|p| p.intensity == 0));
     }
 
@@ -247,7 +247,7 @@ mod tests {
         let mut buffer = vec![LaserPoint::default(); 25];
 
         let result = adapter.fill_chunk(&req, &mut buffer);
-        assert!(matches!(result, FillResult::Filled(25)));
+        assert!(matches!(result, ChunkResult::Filled(25)));
     }
 
     #[test]

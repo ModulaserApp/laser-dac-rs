@@ -11,7 +11,7 @@
 mod common;
 
 use common::audio::{self, AudioConfig};
-use laser_dac::{list_devices, open_device, FillRequest, FillResult, LaserPoint, Result, StreamConfig};
+use laser_dac::{list_devices, open_device, ChunkRequest, ChunkResult, LaserPoint, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -52,10 +52,10 @@ fn main() -> Result<()> {
 
     // Run stream with zero-allocation audio callback
     let exit = stream.run_fill(
-        move |req: &FillRequest, buffer: &mut [LaserPoint]| {
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let n = req.target_points.min(buffer.len());
             audio::fill_audio_points(req, buffer, n, &audio_config);
-            FillResult::Filled(n)
+            ChunkResult::Filled(n)
         },
         |err| {
             eprintln!("Stream error: {}", err);

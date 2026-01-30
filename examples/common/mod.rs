@@ -3,7 +3,7 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{FillRequest, FillResult, LaserPoint, StreamInstant};
+use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, StreamInstant};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
 use std::time::Duration;
@@ -45,8 +45,8 @@ impl Shape {
 /// Fill points for the given shape into the buffer (streaming API).
 ///
 /// The `req` parameter provides timing info for time-based shapes.
-/// Returns `FillResult::Filled(n)` where n is the number of points written.
-pub fn fill_points(shape: Shape, req: &FillRequest, buffer: &mut [LaserPoint]) -> FillResult {
+/// Returns `ChunkResult::Filled(n)` where n is the number of points written.
+pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
     let n_points = req.target_points.min(buffer.len());
     match shape {
         Shape::Triangle => fill_triangle_points(buffer, n_points),
@@ -55,18 +55,18 @@ pub fn fill_points(shape: Shape, req: &FillRequest, buffer: &mut [LaserPoint]) -
         Shape::TestPattern => fill_test_pattern_points(buffer, n_points),
         Shape::Audio => audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default()),
     }
-    FillResult::Filled(n_points)
+    ChunkResult::Filled(n_points)
 }
 
 /// Create points for frame-based usage (no stream timing).
 ///
 /// For shapes that need stream time (OrbitingCircle, Audio), this produces
-/// a static frame at t=0. Use `fill_points` with a real FillRequest
+/// a static frame at t=0. Use `fill_points` with a real ChunkRequest
 /// for proper time-based animation.
 #[allow(dead_code)] // Used by frame_adapter example, not all examples
 pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
     // Create a dummy request for frame-based usage
-    let dummy_req = FillRequest {
+    let dummy_req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30_000,
         min_points: n_points,
@@ -171,7 +171,7 @@ fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
 /// Each point's position is calculated from its exact stream timestamp,
 /// so the orbit advances smoothly even within a single chunk.
 /// No blanking - the beam continuously traces the circle as it orbits.
-fn fill_orbiting_circle_points(req: &FillRequest, buffer: &mut [LaserPoint], n_points: usize) {
+fn fill_orbiting_circle_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_points: usize) {
     const ORBIT_RADIUS: f32 = 0.5;
     const CIRCLE_RADIUS: f32 = 0.15;
     const ORBIT_PERIOD_SECS: f32 = 4.0;

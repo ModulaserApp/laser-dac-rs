@@ -52,7 +52,7 @@ buffer needs filling. This provides automatic backpressure handling and zero
 allocations in the hot path.
 
 ```rust
-use laser_dac::{list_devices, open_device, FillRequest, FillResult, LaserPoint, StreamConfig};
+use laser_dac::{list_devices, open_device, ChunkRequest, ChunkResult, LaserPoint, StreamConfig};
 
 let devices = list_devices()?;
 let device = open_device(&devices[0].id)?;
@@ -64,26 +64,26 @@ stream.control().arm()?;
 
 let exit = stream.run_fill(
     // Producer callback - fills buffer with points
-    |req: &FillRequest, buffer: &mut [LaserPoint]| {
+    |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
         let n = req.target_points;
         for i in 0..n {
             buffer[i] = generate_point(i);
         }
-        FillResult::Filled(n)
+        ChunkResult::Filled(n)
     },
     // Error callback
     |err| eprintln!("Stream error: {}", err),
 )?;
 ```
 
-Return `FillResult::Filled(n)` to continue, `FillResult::End` to stop gracefully.
+Return `ChunkResult::Filled(n)` to continue, `ChunkResult::End` to stop gracefully.
 
 ### Reconnecting Session (optional)
 
 If you want automatic reconnection by device ID, use `ReconnectingSession`:
 
 ```rust
-use laser_dac::{FillRequest, FillResult, LaserPoint, ReconnectingSession, StreamConfig};
+use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, ReconnectingSession, StreamConfig};
 use std::time::Duration;
 
 let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
@@ -96,12 +96,12 @@ let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000
 session.control().arm()?;
 
 let exit = session.run(
-    |req: &FillRequest, buffer: &mut [LaserPoint]| {
+    |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
         let n = req.target_points;
         for i in 0..n {
             buffer[i] = generate_point(i);
         }
-        FillResult::Filled(n)
+        ChunkResult::Filled(n)
     },
     |err| eprintln!("Stream error: {}", err),
 )?;
@@ -129,7 +129,7 @@ Each backend handles conversion to its native format internally.
 | `Stream`       | Active streaming session                         |
 | `ReconnectingSession` | Stream wrapper with automatic reconnect   |
 | `StreamConfig` | Stream settings (PPS, buffer targets)            |
-| `FillRequest`  | Request info for filling point buffer            |
+| `ChunkRequest`  | Request info for filling point buffer            |
 | `LaserPoint`   | Single point with position (f32) and color (u16) |
 | `DacType`      | Enum of supported DAC hardware                   |
 
