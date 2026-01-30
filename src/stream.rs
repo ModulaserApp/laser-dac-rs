@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, DacCapabilities, DacInfo, DacType, FillRequest, LaserPoint, RunExit,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, FillRequest, FillResult, LaserPoint, RunExit,
     StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
@@ -567,6 +567,301 @@ impl Stream {
                 }
             }
         }
+    }
+
+    /// Run the stream with the new zero-allocation callback API.
+    ///
+    /// This method uses **fixed-tick timing** with **variable chunk sizes**:
+    /// - Callback is invoked at regular intervals (`tick_interval` from config)
+    /// - Points requested varies based on buffer headroom (`min_points`, `target_points`)
+    /// - Callback fills a library-owned buffer (zero allocations in hot path)
+    ///
+    /// # Callback Contract
+    ///
+    /// The callback receives a `FillRequest` describing buffer state and requirements,
+    /// and a mutable slice to fill with points. It returns:
+    ///
+    /// - `FillResult::Filled(n)`: Wrote `n` points to the buffer
+    /// - `FillResult::Starved`: No data available (underrun policy applies)
+    /// - `FillResult::End`: Stream should end gracefully
+    ///
+    /// # Exit Conditions
+    ///
+    /// - **`RunExit::Stopped`**: Stop requested via `StreamControl::stop()`.
+    /// - **`RunExit::ProducerEnded`**: Callback returned `FillResult::End`.
+    /// - **`RunExit::Disconnected`**: Device disconnected.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use laser_dac::{FillRequest, FillResult, LaserPoint};
+    ///
+    /// stream.run_fill(
+    ///     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+    ///         let n = req.target_points;
+    ///         for i in 0..n {
+    ///             let t = req.start.as_secs_f64(req.pps) + (i as f64 / req.pps as f64);
+    ///             buffer[i] = generate_point_at_time(t);
+    ///         }
+    ///         FillResult::Filled(n)
+    ///     },
+    ///     |err| eprintln!("Error: {}", err),
+    /// )?;
+    /// ```
+    pub fn run_fill<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
+    where
+        F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        use std::time::Instant;
+
+        let tick_interval = self.config.tick_interval;
+        let max_points = self.info.caps.max_points_per_chunk;
+        let mut next_tick = Instant::now();
+
+        loop {
+            // 1. Check for stop request
+            if self.control.is_stop_requested() {
+                return Ok(RunExit::Stopped);
+            }
+
+            // 2. Wait for next tick (sleep_until semantics to avoid drift)
+            let now = Instant::now();
+            if now < next_tick {
+                // Sleep in small slices to process control messages promptly
+                let mut remaining = next_tick.duration_since(now);
+                const SLEEP_SLICE: Duration = Duration::from_millis(2);
+                while remaining > Duration::ZERO {
+                    let slice = remaining.min(SLEEP_SLICE);
+                    std::thread::sleep(slice);
+                    remaining = remaining.saturating_sub(slice);
+
+                    // Process control messages for immediate response
+                    if self.process_control_messages() {
+                        return Ok(RunExit::Stopped);
+                    }
+                }
+            }
+            next_tick += tick_interval;
+
+            // 3. Handle tick overrun (callback took longer than tick_interval)
+            //    Skip missed ticks rather than running back-to-back
+            let now = Instant::now();
+            if now > next_tick {
+                let missed =
+                    (now.duration_since(next_tick).as_millis() / tick_interval.as_millis()) as u32;
+                next_tick += tick_interval * (missed + 1);
+                self.state.stats.underrun_count += missed as u64; // Track missed ticks
+            }
+
+            // 4. Check backend connection
+            if let Some(backend) = &self.backend {
+                if !backend.is_connected() {
+                    on_error(Error::disconnected("backend disconnected"));
+                    return Ok(RunExit::Disconnected);
+                }
+            } else {
+                on_error(Error::disconnected("no backend"));
+                return Ok(RunExit::Disconnected);
+            }
+
+            // 5. Process control messages before calling producer
+            if self.process_control_messages() {
+                return Ok(RunExit::Stopped);
+            }
+
+            // 6. Build fill request with buffer state
+            let req = self.build_fill_request(max_points);
+
+            // 7. Call producer with pre-allocated buffer
+            let buffer = &mut self.state.chunk_buffer[..max_points];
+            let result = producer(&req, buffer);
+
+            // 8. Handle result
+            match result {
+                FillResult::Filled(n) => {
+                    // Validate n doesn't exceed buffer
+                    let n = n.min(max_points);
+
+                    // Treat Filled(0) with target_points > 0 as Starved
+                    if n == 0 && req.target_points > 0 {
+                        self.handle_underrun_fill(&req)?;
+                        continue;
+                    }
+
+                    // Write to backend if we have points
+                    if n > 0 {
+                        self.write_fill_points(n, &mut on_error)?;
+                    }
+                }
+                FillResult::Starved => {
+                    self.handle_underrun_fill(&req)?;
+                }
+                FillResult::End => {
+                    // Graceful shutdown: let queued points drain, then return
+                    // TODO: Implement drain wait in future PR
+                    return Ok(RunExit::ProducerEnded);
+                }
+            }
+
+            // 9. Early wake check: if buffer critically low, don't wait for next tick
+            let buffered = self.estimate_buffer_points();
+            let min_buffer_points =
+                (self.config.min_buffer.as_secs_f64() * self.config.pps as f64) as u64;
+            if buffered < min_buffer_points / 2 {
+                next_tick = Instant::now(); // Wake immediately
+            }
+        }
+    }
+
+    /// Write points from chunk_buffer to the backend.
+    ///
+    /// Called by `run_fill` after the producer fills the buffer.
+    fn write_fill_points<E>(&mut self, n: usize, on_error: &mut E) -> Result<()>
+    where
+        E: FnMut(Error),
+    {
+        let is_armed = self.control.is_armed();
+        let pps = self.config.pps;
+
+        // Handle shutter transitions
+        self.handle_shutter_transition(is_armed);
+
+        // Blank points in-place when disarmed
+        if !is_armed {
+            for p in &mut self.state.chunk_buffer[..n] {
+                *p = LaserPoint::blanked(p.x, p.y);
+            }
+        }
+
+        // Try to write with backpressure handling
+        loop {
+            // Check backend exists
+            let backend = match self.backend.as_mut() {
+                Some(b) => b,
+                None => return Err(Error::disconnected("no backend")),
+            };
+
+            match backend.try_write_chunk(pps, &self.state.chunk_buffer[..n]) {
+                Ok(WriteOutcome::Written) => {
+                    // Update state
+                    if is_armed {
+                        let len = n.min(self.state.last_chunk.len());
+                        self.state.last_chunk[..len]
+                            .copy_from_slice(&self.state.chunk_buffer[..len]);
+                        self.state.last_chunk_len = len;
+                    }
+                    self.state.current_instant += n as u64;
+                    self.state.scheduled_ahead += n as u64;
+                    self.state.stats.chunks_written += 1;
+                    self.state.stats.points_written += n as u64;
+                    return Ok(());
+                }
+                Ok(WriteOutcome::WouldBlock) => {
+                    // Backend buffer full - yield and retry
+                    // Borrow of backend is dropped here, so we can call process_control_messages
+                }
+                Err(e) if e.is_stopped() => {
+                    return Err(Error::Stopped);
+                }
+                Err(e) if e.is_disconnected() => {
+                    on_error(Error::disconnected("backend disconnected"));
+                    return Err(e);
+                }
+                Err(e) => {
+                    on_error(e);
+                    return Ok(()); // Continue with next tick
+                }
+            }
+
+            // Handle WouldBlock: yield and process control messages
+            std::thread::yield_now();
+            if self.process_control_messages() {
+                return Err(Error::Stopped);
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// Handle underrun for the fill API by applying the underrun policy.
+    fn handle_underrun_fill(&mut self, req: &FillRequest) -> Result<()> {
+        self.state.stats.underrun_count += 1;
+
+        let is_armed = self.control.is_armed();
+        self.handle_shutter_transition(is_armed);
+
+        // Calculate how many points we need (use target_points as the fill amount)
+        let n_points = req.target_points.max(1);
+
+        // Fill chunk_buffer with underrun content
+        let fill_start = if !is_armed {
+            // When disarmed, always output blanked points
+            for i in 0..n_points {
+                self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            }
+            n_points
+        } else {
+            match &self.config.underrun {
+                UnderrunPolicy::RepeatLast => {
+                    if self.state.last_chunk_len > 0 {
+                        // Repeat last chunk cyclically
+                        for i in 0..n_points {
+                            self.state.chunk_buffer[i] =
+                                self.state.last_chunk[i % self.state.last_chunk_len];
+                        }
+                        n_points
+                    } else {
+                        // No last chunk, fall back to blank
+                        for i in 0..n_points {
+                            self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                        }
+                        n_points
+                    }
+                }
+                UnderrunPolicy::Blank => {
+                    for i in 0..n_points {
+                        self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    n_points
+                }
+                UnderrunPolicy::Park { x, y } => {
+                    for i in 0..n_points {
+                        self.state.chunk_buffer[i] = LaserPoint::blanked(*x, *y);
+                    }
+                    n_points
+                }
+                UnderrunPolicy::Stop => {
+                    self.control.stop()?;
+                    return Err(Error::Stopped);
+                }
+            }
+        };
+
+        // Write the fill points
+        if let Some(backend) = &mut self.backend {
+            match backend.try_write_chunk(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
+                Ok(WriteOutcome::Written) => {
+                    if is_armed {
+                        let len = fill_start.min(self.state.last_chunk.len());
+                        self.state.last_chunk[..len]
+                            .copy_from_slice(&self.state.chunk_buffer[..len]);
+                        self.state.last_chunk_len = len;
+                    }
+                    self.state.current_instant += fill_start as u64;
+                    self.state.scheduled_ahead += fill_start as u64;
+                    self.state.stats.chunks_written += 1;
+                    self.state.stats.points_written += fill_start as u64;
+                }
+                Ok(WriteOutcome::WouldBlock) => {
+                    // Backend is full - expected during underrun
+                }
+                Err(_) => {
+                    // Backend error during underrun handling - ignore
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // =========================================================================

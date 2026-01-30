@@ -12,7 +12,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 
 ## Task 2: Stream Internals (`src/stream.rs`)
 
-- [ ] **2.1 Update callback signature** - Change to `FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult`
+- [x] **2.1 Update callback signature** - Add `run_fill()` with `FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult`
 - [x] **2.2 Add pre-allocated buffers to `Stream`** - `chunk_buffer` and `last_chunk` sized to `caps.max_points_per_chunk` (commit bba5174)
 - [ ] **2.3 Implement fixed-tick timing loop** - Use `sleep_until(next_tick)` with tick overrun handling
 - [x] **2.4 Implement buffer state calculation** - Calculate `buffered_points`, `buffered`, `playhead`, `min_points`, `target_points` (commit 9040195)
@@ -27,7 +27,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 ## Task 4: FrameAdapter Updates (`src/frame_adapter.rs`)
 
 - [x] **4.1 Update `FrameAdapter::fill_chunk()` method** - Rename from `next_chunk()`, change signature (commit 54ebdfa)
-- [ ] **4.2 Update `SharedFrameAdapter`** - Update `fill_chunk()` to match new signature
+- [x] **4.2 Update `SharedFrameAdapter`** - Update `fill_chunk()` to match new signature (commit 840a509)
 - [ ] **4.3 Update FrameAdapter tests** - Convert to use `FillRequest` and `FillResult`
 
 ## Task 5: Example Updates (`examples/`)
