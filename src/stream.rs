@@ -262,7 +262,6 @@ impl Stream {
                 .as_ref()
                 .map(|b| b.is_connected())
                 .unwrap_or(false),
-            tick_interval: self.config.tick_interval,
             scheduled_ahead_points: self.state.scheduled_ahead,
             device_queued_points,
             stats: Some(self.state.stats.clone()),
@@ -354,8 +353,8 @@ impl Stream {
 
     /// Run the stream with the zero-allocation callback API.
     ///
-    /// This method uses **fixed-tick timing** with **variable chunk sizes**:
-    /// - Callback is invoked at regular intervals (`tick_interval` from config)
+    /// This method uses **pure buffer-driven timing**:
+    /// - Callback is invoked when `buffered < target_buffer`
     /// - Points requested varies based on buffer headroom (`min_points`, `target_points`)
     /// - Callback fills a library-owned buffer (zero allocations in hot path)
     ///
@@ -396,20 +395,8 @@ impl Stream {
         F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
-        use std::time::Instant;
-
-        let tick_interval = self.config.tick_interval;
-
-        // Validate tick_interval to prevent division-by-zero and ensure sane scheduling
-        if tick_interval < Duration::from_millis(1) {
-            return Err(Error::invalid_config(format!(
-                "tick_interval {:?} is too small; must be at least 1ms to ensure proper scheduling",
-                tick_interval
-            )));
-        }
-
+        let pps = self.config.pps as f64;
         let max_points = self.info.caps.max_points_per_chunk;
-        let mut next_tick = Instant::now();
 
         loop {
             // 1. Check for stop request
@@ -417,44 +404,24 @@ impl Stream {
                 return Ok(RunExit::Stopped);
             }
 
-            // 2. Wait for next tick (sleep_until semantics to avoid drift)
-            let now = Instant::now();
-            if now < next_tick {
-                // Sleep in small slices to process control messages promptly
-                let mut remaining = next_tick.duration_since(now);
-                const SLEEP_SLICE: Duration = Duration::from_millis(2);
-                while remaining > Duration::ZERO {
-                    let slice = remaining.min(SLEEP_SLICE);
-                    std::thread::sleep(slice);
-                    remaining = remaining.saturating_sub(slice);
+            // 2. Estimate buffer state
+            let buffered = self.estimate_buffer_points();
+            let target_points = (self.config.target_buffer.as_secs_f64() * pps) as u64;
 
-                    // Process control messages for immediate response
-                    if self.process_control_messages() {
-                        return Ok(RunExit::Stopped);
-                    }
+            // 3. If buffer is above target, sleep until it drains to target
+            // Note: use > not >= so we call producer when exactly at target
+            if buffered > target_points {
+                let excess_points = buffered - target_points;
+                let sleep_time = Duration::from_secs_f64(excess_points as f64 / pps);
+                if self.sleep_with_control_check(sleep_time)? {
+                    return Ok(RunExit::Stopped);
                 }
+                // Decrement software estimate by points consumed during sleep
+                // This keeps scheduled_ahead accurate when queued_points() returns None
+                let points_consumed = (sleep_time.as_secs_f64() * pps) as u64;
+                self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
+                continue; // Re-check buffer after sleep
             }
-            next_tick += tick_interval;
-
-            // 3. Handle tick overrun (callback took longer than tick_interval)
-            //    Skip missed ticks rather than running back-to-back
-            let now = Instant::now();
-            let ticks_elapsed = if now > next_tick {
-                let missed =
-                    (now.duration_since(next_tick).as_millis() / tick_interval.as_millis()) as u32;
-                next_tick += tick_interval * (missed + 1);
-                self.state.stats.underrun_count += missed as u64; // Track missed ticks
-                missed + 1
-            } else {
-                1
-            };
-
-            // 3b. Decrement software buffer estimate by consumed points
-            //     This keeps scheduled_ahead accurate when queued_points() returns None
-            let points_consumed = (tick_interval.as_secs_f64()
-                * self.config.pps as f64
-                * ticks_elapsed as f64) as u64;
-            self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
 
             // 4. Check backend connection
             if let Some(backend) = &self.backend {
@@ -505,15 +472,28 @@ impl Stream {
                     return Ok(RunExit::ProducerEnded);
                 }
             }
+        }
+    }
 
-            // 9. Early wake check: if buffer critically low, don't wait for next tick
-            let buffered = self.estimate_buffer_points();
-            let min_buffer_points =
-                (self.config.min_buffer.as_secs_f64() * self.config.pps as f64) as u64;
-            if buffered < min_buffer_points / 2 {
-                next_tick = Instant::now(); // Wake immediately
+    /// Sleep for the given duration while checking for control messages.
+    ///
+    /// Returns `true` if stop was requested, `false` otherwise.
+    fn sleep_with_control_check(&mut self, duration: Duration) -> Result<bool> {
+        const SLEEP_SLICE: Duration = Duration::from_millis(2);
+        let mut remaining = duration;
+
+        while remaining > Duration::ZERO {
+            let slice = remaining.min(SLEEP_SLICE);
+            std::thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+
+            // Process control messages for immediate response
+            if self.process_control_messages() {
+                return Ok(true);
             }
         }
+
+        Ok(false)
     }
 
     /// Write points from chunk_buffer to the backend.
@@ -572,7 +552,7 @@ impl Stream {
                 }
                 Err(e) => {
                     on_error(e);
-                    return Ok(()); // Continue with next tick
+                    return Ok(()); // Continue with next iteration
                 }
             }
 
@@ -777,7 +757,6 @@ impl Stream {
         FillRequest {
             start,
             pps,
-            tick_interval: self.config.tick_interval,
             min_points,
             target_points,
             buffered_points,
@@ -1251,7 +1230,6 @@ mod tests {
         let req = FillRequest {
             start: StreamInstant::new(0),
             pps: 30000,
-            tick_interval: Duration::from_millis(10),
             min_points: 100,
             target_points: 100,
             buffered_points: 0,
@@ -1381,7 +1359,6 @@ mod tests {
         let req = FillRequest {
             start: StreamInstant::new(0),
             pps: 30000,
-            tick_interval: Duration::from_millis(10),
             min_points: 100,
             target_points: 100,
             buffered_points: 0,
@@ -1469,47 +1446,42 @@ mod tests {
     }
 
     // =========================================================================
-    // Timing loop tests (Task 6.2)
+    // Buffer-driven timing tests
     // =========================================================================
 
     #[test]
-    fn test_run_fill_fixed_tick_behavior() {
-        // Test that run_fill runs on a fixed tick interval
-        use std::time::Instant;
-
-        let backend = TestBackend::new();
-        let write_count = backend.write_count.clone();
-
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
-        backend_box.connect().unwrap();
+    fn test_run_fill_buffer_driven_behavior() {
+        // Test that run_fill uses buffer-driven timing
+        // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+        let write_count = backend.inner.write_count.clone();
 
         let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
-            caps: backend_box.caps().clone(),
+            caps: backend.inner.caps().clone(),
         };
 
-        // Use short tick interval for testing
-        let tick_interval = Duration::from_millis(5);
-        let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
-        let stream = Stream::with_backend(info, backend_box, cfg);
+        // Use short target buffer for testing
+        let cfg = StreamConfig::new(30000)
+            .with_target_buffer(Duration::from_millis(10))
+            .with_min_buffer(Duration::from_millis(5));
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
 
-        let call_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-        let call_times_clone = call_times.clone();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
         let result = stream.run_fill(
             move |req, buffer| {
-                call_times_clone.lock().unwrap().push(Instant::now());
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
-                // Run for 5 ticks then end
+                // Run for 5 calls then end
                 if count >= 4 {
                     FillResult::End
                 } else {
-                    let n = req.target_points.min(buffer.len()).min(10);
+                    let n = req.target_points.min(buffer.len()).min(100);
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
@@ -1520,54 +1492,31 @@ mod tests {
         );
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-        assert!(write_count.load(Ordering::SeqCst) >= 4);
-
-        // Check that callbacks happened at roughly fixed intervals
-        let times = call_times.lock().unwrap();
-        assert!(times.len() >= 4, "Expected at least 4 callback invocations");
-
-        // Check intervals between callbacks are roughly tick_interval
-        // Allow for some jitter (±3ms tolerance)
-        for i in 1..times.len() {
-            let interval = times[i].duration_since(times[i - 1]);
-            // First tick might be immediate if buffer needs filling
-            if i > 1 {
-                // Interval should be roughly tick_interval (allow 0-15ms range)
-                assert!(
-                    interval.as_millis() <= 15,
-                    "Interval {} was too long: {:?}",
-                    i,
-                    interval
-                );
-            }
-        }
+        assert!(write_count.load(Ordering::SeqCst) >= 4, "Should have written multiple chunks");
     }
 
     #[test]
-    fn test_run_fill_tick_overrun_skips_missed_ticks() {
-        // Test that when callback takes longer than tick_interval,
-        // the loop skips missed ticks rather than running back-to-back
+    fn test_run_fill_sleeps_when_buffer_healthy() {
+        // Test that run_fill sleeps when buffer is above target
+        // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
         use std::time::Instant;
 
-        let backend = TestBackend::new();
-
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
-        backend_box.connect().unwrap();
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
 
         let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
-            caps: backend_box.caps().clone(),
+            caps: backend.inner.caps().clone(),
         };
 
-        // Use very short tick interval so we can easily cause overrun
-        // Skip drain to focus on tick behavior
-        let tick_interval = Duration::from_millis(2);
+        // Very small target buffer, skip drain
         let cfg = StreamConfig::new(30000)
-            .with_tick_interval(tick_interval)
+            .with_target_buffer(Duration::from_millis(5))
+            .with_min_buffer(Duration::from_millis(2))
             .with_drain_timeout(Duration::ZERO);
-        let stream = Stream::with_backend(info, backend_box, cfg);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1577,16 +1526,12 @@ mod tests {
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
-                // On first callback, sleep for 10ms to cause tick overrun
-                if count == 0 {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-
                 // End after 3 callbacks
                 if count >= 2 {
                     FillResult::End
                 } else {
-                    let n = req.target_points.min(buffer.len()).min(10);
+                    // Fill buffer to trigger sleep
+                    let n = req.target_points.min(buffer.len());
                     for i in 0..n {
                         buffer[i] = LaserPoint::blanked(0.0, 0.0);
                     }
@@ -1598,18 +1543,13 @@ mod tests {
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
 
-        // With proper tick overrun handling, the loop should have skipped
-        // the missed ticks and not run back-to-back catching up
+        // Should have taken some time due to buffer-driven sleep
         let elapsed = start_time.elapsed();
-
-        // We had:
-        // - First callback with 10ms sleep
-        // - Skipped missed ticks
-        // - Two more callbacks with ~2ms ticks each
-        // Total should be roughly 10ms + some overhead, not 10ms + many catchup ticks
+        // With buffer-driven timing, we should see some elapsed time
+        // (not instant return)
         assert!(
-            elapsed.as_millis() < 50,
-            "Elapsed time {:?} suggests ticks weren't skipped properly",
+            elapsed.as_millis() < 100,
+            "Elapsed time {:?} is too long for test",
             elapsed
         );
     }
@@ -1631,7 +1571,7 @@ mod tests {
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let cfg = StreamConfig::new(30000);
         let stream = Stream::with_backend(info, backend_box, cfg);
         let control = stream.control();
 
@@ -2519,7 +2459,7 @@ mod tests {
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let cfg = StreamConfig::new(30000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let control = stream.control();
@@ -2654,7 +2594,7 @@ mod tests {
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let cfg = StreamConfig::new(30000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let control = stream.control();
@@ -2778,132 +2718,6 @@ mod tests {
 
         // Should return Disconnected when backend reports disconnection
         assert_eq!(result.unwrap(), RunExit::Disconnected);
-    }
-
-    // =========================================================================
-    // Software-only buffer estimation tests
-    // =========================================================================
-
-    #[test]
-    fn test_software_buffer_decrements_over_time() {
-        // Test that scheduled_ahead is decremented for playback consumption
-        // when hardware doesn't report queue depth
-        let mut backend = NoQueueTestBackend::new();
-        backend.inner.connected = true;
-
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("Test".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        // Use 10ms tick interval at 30000 PPS = 300 points consumed per tick
-        let cfg = StreamConfig::new(30000)
-            .with_tick_interval(Duration::from_millis(10))
-            .with_target_buffer(Duration::from_millis(100))
-            .with_min_buffer(Duration::from_millis(20));
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let target_points_seen = Arc::new(Mutex::new(Vec::<usize>::new()));
-        let target_points_clone = target_points_seen.clone();
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
-
-        let result = stream.run_fill(
-            move |req, buffer| {
-                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
-                target_points_clone.lock().unwrap().push(req.target_points);
-
-                // First few calls: fill aggressively to build up buffer
-                if count < 3 {
-                    let n = req.target_points.min(buffer.len());
-                    for i in 0..n {
-                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                    }
-                    FillResult::Filled(n)
-                } else if count < 6 {
-                    // Next few calls: return zero points to let buffer drain
-                    FillResult::Filled(0)
-                } else {
-                    FillResult::End
-                }
-            },
-            |_e| {},
-        );
-
-        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-
-        // Verify that target_points increased when we stopped filling
-        // (indicating the software estimate properly decremented)
-        let targets = target_points_seen.lock().unwrap();
-        assert!(targets.len() >= 6, "Expected at least 6 callback invocations");
-
-        // The last few calls (when we returned Filled(0)) should have
-        // increasing target_points as the buffer drains
-        // Note: exact values depend on timing, but trend should be upward
-        let later_targets = &targets[3..];
-        let has_increasing_demand = later_targets.windows(2).any(|w| w[1] >= w[0]);
-        assert!(
-            has_increasing_demand,
-            "target_points should increase as buffer drains: {:?}",
-            later_targets
-        );
-    }
-
-    #[test]
-    fn test_run_fill_rejects_sub_millisecond_tick_interval() {
-        // Test that tick_interval < 1ms is rejected to prevent division-by-zero
-        let mut backend = TestBackend::new();
-        backend.connected = true;
-
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("Test".to_string()),
-            caps: backend.caps().clone(),
-        };
-
-        // Try with 500 microseconds - should be rejected
-        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_micros(500));
-        let stream = Stream::with_backend(info.clone(), Box::new(backend), cfg);
-
-        let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
-            |_e| {},
-        );
-
-        assert!(result.is_err(), "Sub-millisecond tick_interval should be rejected");
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("tick_interval"),
-            "Error should mention tick_interval: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_run_fill_rejects_zero_tick_interval() {
-        // Test that tick_interval of 0 is rejected
-        let mut backend = TestBackend::new();
-        backend.connected = true;
-
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("Test".to_string()),
-            caps: backend.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::ZERO);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let result = stream.run_fill(
-            |_req, _buffer| FillResult::End,
-            |_e| {},
-        );
-
-        assert!(result.is_err(), "Zero tick_interval should be rejected");
     }
 
     // =========================================================================

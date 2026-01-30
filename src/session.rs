@@ -229,7 +229,7 @@ impl ReconnectingSession {
 
     /// Run the stream, automatically reconnecting on disconnection.
     ///
-    /// Uses the zero-allocation callback API with fixed-tick timing and variable chunk sizes.
+    /// Uses the zero-allocation callback API with buffer-driven timing.
     pub fn run<F, E>(&mut self, producer: F, on_error: E) -> Result<RunExit>
     where
         F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,

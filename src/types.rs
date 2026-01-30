@@ -423,30 +423,27 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 
 /// Configuration for starting a stream.
 ///
-/// # New Timing Model
+/// # Buffer-Driven Timing
 ///
-/// The streaming API uses fixed timing with variable chunk sizes:
-/// - `tick_interval`: How often the callback is invoked (default: 10ms)
+/// The streaming API uses pure buffer-driven timing:
 /// - `target_buffer`: Target buffer level to maintain (default: 40ms)
 /// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 10ms)
 ///
-/// The callback receives a `FillRequest` with `min_points` and `target_points`
-/// calculated from these durations and the current buffer state.
+/// The callback is invoked when `buffered < target_buffer`. The callback receives
+/// a `FillRequest` with `min_points` and `target_points` calculated from these
+/// durations and the current buffer state.
+///
+/// To reduce perceived latency, reduce `target_buffer`.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamConfig {
     /// Points per second output rate.
     pub pps: u32,
 
-    /// How often to call the callback (default: 10ms).
-    ///
-    /// The stream uses fixed-interval timing to align with audio frame boundaries.
-    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
-    pub tick_interval: std::time::Duration,
-
     /// Target buffer level to maintain (default: 40ms).
     ///
     /// The callback's `target_points` is calculated to bring the buffer to this level.
+    /// The callback is invoked when the buffer drops below this level.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub target_buffer: std::time::Duration,
 
@@ -497,7 +494,6 @@ impl Default for StreamConfig {
         use std::time::Duration;
         Self {
             pps: 30_000,
-            tick_interval: Duration::from_millis(10),
             target_buffer: Duration::from_millis(40),
             min_buffer: Duration::from_millis(10),
             underrun: UnderrunPolicy::default(),
@@ -515,17 +511,10 @@ impl StreamConfig {
         }
     }
 
-    /// Set how often the callback is invoked (builder pattern).
-    ///
-    /// Default: 10ms. Shorter intervals provide lower latency but higher CPU usage.
-    pub fn with_tick_interval(mut self, interval: std::time::Duration) -> Self {
-        self.tick_interval = interval;
-        self
-    }
-
     /// Set the target buffer level to maintain (builder pattern).
     ///
     /// Default: 40ms. Higher values provide more safety margin against underruns.
+    /// Lower values reduce perceived latency.
     pub fn with_target_buffer(mut self, duration: std::time::Duration) -> Self {
         self.target_buffer = duration;
         self
@@ -572,7 +561,7 @@ pub enum UnderrunPolicy {
 
 /// A request to fill a buffer with points for streaming.
 ///
-/// This is the new streaming API that uses fixed timing with variable chunk sizes.
+/// This is the streaming API with pure buffer-driven timing.
 /// The callback receives a `FillRequest` describing buffer state and requirements,
 /// and fills points into a library-owned buffer.
 ///
@@ -596,13 +585,6 @@ pub struct FillRequest {
 
     /// Points per second (fixed for stream duration).
     pub pps: u32,
-
-    /// The tick interval (callback frequency).
-    ///
-    /// This is the fixed timing interval at which the callback is invoked.
-    /// Equivalent to `target_points / pps` when buffer is empty, but provided
-    /// explicitly to make the fixed-timing contract visible.
-    pub tick_interval: std::time::Duration,
 
     /// Minimum points needed to avoid imminent underrun.
     ///
@@ -648,7 +630,7 @@ pub enum FillResult {
     /// No data available right now.
     ///
     /// Underrun policy is applied (repeat last chunk or blank).
-    /// Stream continues; callback will be called again next tick.
+    /// Stream continues; callback will be called again when buffer needs filling.
     Starved,
 
     /// Stream is finished. Shutdown sequence:
@@ -664,8 +646,6 @@ pub enum FillResult {
 pub struct StreamStatus {
     /// Whether the device is connected.
     pub connected: bool,
-    /// The tick interval used by the stream.
-    pub tick_interval: std::time::Duration,
     /// Library-owned scheduled amount.
     pub scheduled_ahead_points: u64,
     /// Best-effort device/backend estimate.
@@ -925,10 +905,10 @@ mod tests {
 
         let config = StreamConfig {
             pps: 45000,
-            tick_interval: Duration::from_millis(15),
             target_buffer: Duration::from_millis(50),
             min_buffer: Duration::from_millis(12),
             underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
+            drain_timeout: Duration::from_secs(2),
         };
 
         // Round-trip through JSON
@@ -937,9 +917,9 @@ mod tests {
             serde_json::from_str(&json).expect("deserialize from JSON");
 
         assert_eq!(restored.pps, config.pps);
-        assert_eq!(restored.tick_interval, config.tick_interval);
         assert_eq!(restored.target_buffer, config.target_buffer);
         assert_eq!(restored.min_buffer, config.min_buffer);
+        assert_eq!(restored.drain_timeout, config.drain_timeout);
 
         // Verify underrun policy
         match restored.underrun {
@@ -968,7 +948,7 @@ mod tests {
 
         for &duration in &test_durations {
             let config = StreamConfig {
-                tick_interval: duration,
+                target_buffer: duration,
                 ..StreamConfig::default()
             };
 
@@ -976,7 +956,7 @@ mod tests {
             let restored: StreamConfig = serde_json::from_str(&json).expect("deserialize");
 
             assert_eq!(
-                restored.tick_interval, duration,
+                restored.target_buffer, duration,
                 "Duration {:?} did not round-trip correctly",
                 duration
             );

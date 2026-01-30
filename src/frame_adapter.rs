@@ -216,7 +216,6 @@ mod tests {
         FillRequest {
             start: StreamInstant(0),
             pps: 30000,
-            tick_interval: Duration::from_millis(10),
             min_points: target_points,
             target_points,
             buffered_points: 0,
