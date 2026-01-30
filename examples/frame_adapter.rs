@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     stream.control().arm()?;
 
     // Run stream with frame adapter using zero-allocation API
-    let exit = stream.run_fill(
+    let exit = stream.run(
         move |req: &ChunkRequest, buffer: &mut [LaserPoint]| adapter.fill_chunk(req, buffer),
         |err| {
             eprintln!("Stream error: {}", err);

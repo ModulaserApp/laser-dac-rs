@@ -197,7 +197,7 @@ impl StreamState {
 
 /// A streaming session for outputting points to a DAC.
 ///
-/// Use [`run_fill()`](Self::run_fill) to stream with buffer-driven timing.
+/// Use [`run()`](Self::run) to stream with buffer-driven timing.
 /// The callback is invoked when the buffer needs filling, providing automatic
 /// backpressure handling and zero allocations in the hot path.
 ///
@@ -377,7 +377,7 @@ impl Stream {
     /// ```ignore
     /// use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
     ///
-    /// stream.run_fill(
+    /// stream.run(
     ///     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
     ///         let n = req.target_points;
     ///         for i in 0..n {
@@ -389,7 +389,7 @@ impl Stream {
     ///     |err| eprintln!("Error: {}", err),
     /// )?;
     /// ```
-    pub fn run_fill<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
+    pub fn run<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
@@ -465,7 +465,7 @@ impl Stream {
 
                     // Treat Filled(0) with target_points > 0 as Starved
                     if n == 0 && req.target_points > 0 {
-                        self.handle_underrun_fill(&req)?;
+                        self.handle_underrun(&req)?;
                         continue;
                     }
 
@@ -475,7 +475,7 @@ impl Stream {
                     }
                 }
                 ChunkResult::Starved => {
-                    self.handle_underrun_fill(&req)?;
+                    self.handle_underrun(&req)?;
                 }
                 ChunkResult::End => {
                     // Graceful shutdown: let queued points drain, then blank/park
@@ -509,7 +509,7 @@ impl Stream {
 
     /// Write points from chunk_buffer to the backend.
     ///
-    /// Called by `run_fill` after the producer fills the buffer.
+    /// Called by `run` after the producer fills the buffer.
     fn write_fill_points<E>(&mut self, n: usize, on_error: &mut E) -> Result<()>
     where
         E: FnMut(Error),
@@ -582,7 +582,7 @@ impl Stream {
     }
 
     /// Handle underrun for the fill API by applying the underrun policy.
-    fn handle_underrun_fill(&mut self, req: &ChunkRequest) -> Result<()> {
+    fn handle_underrun(&mut self, req: &ChunkRequest) -> Result<()> {
         self.state.stats.underrun_count += 1;
 
         let is_armed = self.control.is_armed();
@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_underrun_fill_advances_state() {
+    fn test_handle_underrun_advances_state() {
         let mut backend = TestBackend::new();
         backend.connected = true;
         let info = DacInfo {
@@ -1264,7 +1264,7 @@ mod tests {
             buffered: Duration::ZERO,
             device_queued_points: None,
         };
-        stream.handle_underrun_fill(&req).unwrap();
+        stream.handle_underrun(&req).unwrap();
 
         // State should have advanced
         assert!(stream.state.current_instant > initial_instant);
@@ -1275,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_retries_on_would_block() {
+    fn test_run_retries_on_would_block() {
         // Create a backend that returns WouldBlock 3 times before accepting
         let backend = TestBackend::new().with_would_block_count(3);
         let write_count = backend.write_count.clone();
@@ -1295,7 +1295,7 @@ mod tests {
 
         let produced_count = Arc::new(AtomicUsize::new(0));
         let produced_count_clone = produced_count.clone();
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = produced_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count < 1 {
@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_underrun_fill_blanks_when_disarmed() {
+    fn test_handle_underrun_blanks_when_disarmed() {
         let backend = TestBackend::new();
 
         let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
@@ -1395,7 +1395,7 @@ mod tests {
         };
 
         // Handle underrun while disarmed
-        stream.handle_underrun_fill(&req).unwrap();
+        stream.handle_underrun(&req).unwrap();
 
         // last_chunk should NOT be updated (we're disarmed)
         // The actual write was blanked points, but we don't update last_chunk when disarmed
@@ -1478,8 +1478,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_run_fill_buffer_driven_behavior() {
-        // Test that run_fill uses buffer-driven timing
+    fn test_run_buffer_driven_behavior() {
+        // Test that run uses buffer-driven timing
         // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
         let mut backend = NoQueueTestBackend::new();
         backend.inner.connected = true;
@@ -1501,7 +1501,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -1527,8 +1527,8 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_sleeps_when_buffer_healthy() {
-        // Test that run_fill sleeps when buffer is above target
+    fn test_run_sleeps_when_buffer_healthy() {
+        // Test that run sleeps when buffer is above target
         // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
         use std::time::Instant;
 
@@ -1553,7 +1553,7 @@ mod tests {
         let call_count_clone = call_count.clone();
         let start_time = Instant::now();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -1586,7 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_stops_on_control_stop() {
+    fn test_run_stops_on_control_stop() {
         // Test that stop() via control handle terminates the loop promptly
         use std::thread;
 
@@ -1613,7 +1613,7 @@ mod tests {
             control_clone.stop().unwrap();
         });
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |req, buffer| {
                 let n = req.target_points.min(buffer.len()).min(10);
                 for i in 0..n {
@@ -1629,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_producer_ended() {
+    fn test_run_producer_ended() {
         // Test that ChunkResult::End terminates the stream gracefully
         let backend = TestBackend::new();
 
@@ -1649,7 +1649,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -1673,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_starved_applies_underrun_policy() {
+    fn test_run_starved_applies_underrun_policy() {
         // Test that ChunkResult::Starved triggers underrun policy
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
@@ -1695,7 +1695,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |_req, _buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -1720,7 +1720,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_fill_filled_zero_with_target_treated_as_starved() {
+    fn test_run_filled_zero_with_target_treated_as_starved() {
         // Test that Filled(0) when target_points > 0 is treated as Starved
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
@@ -1741,7 +1741,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |_req, _buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2012,7 +2012,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2075,7 +2075,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2127,7 +2127,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2184,7 +2184,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |_req, _buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2235,7 +2235,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |_req, _buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2278,7 +2278,7 @@ mod tests {
         let control = stream.control();
         control.arm().unwrap();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |_req, _buffer| {
                 // Always return Starved - Stop policy should terminate the stream
                 ChunkResult::Starved
@@ -2313,7 +2313,7 @@ mod tests {
         let cfg = StreamConfig::new(30000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |_req, _buffer| {
                 // Immediately end
                 ChunkResult::End
@@ -2346,7 +2346,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |_req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2416,7 +2416,7 @@ mod tests {
         let call_count_clone = call_count.clone();
 
         // 4. Run the stream for a few iterations
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2473,7 +2473,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
 
@@ -2542,7 +2542,7 @@ mod tests {
             control_clone.stop().unwrap();
         });
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |req, buffer| {
                 // Keep streaming until stopped
                 let n = req.target_points.min(buffer.len()).min(10);
@@ -2577,7 +2577,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count < 2 {
@@ -2595,7 +2595,7 @@ mod tests {
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
 
-        // Note: into_dac() would be tested here, but run_fill consumes the stream
+        // Note: into_dac() would be tested here, but run consumes the stream
         // and doesn't return it. The into_dac pattern is for the blocking API.
         // This test verifies the stream lifecycle completes cleanly.
     }
@@ -2626,7 +2626,7 @@ mod tests {
         let call_count_clone = call_count.clone();
         let points_per_call = 50;
 
-        let result = stream.run_fill(
+        let result = stream.run(
             move |req, buffer| {
                 let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
                 if count < 3 {
@@ -2644,7 +2644,7 @@ mod tests {
 
         assert_eq!(result.unwrap(), RunExit::ProducerEnded);
         // Stats tracking is verified by the successful completion
-        // Detailed stats assertions would require access to stream after run_fill
+        // Detailed stats assertions would require access to stream after run
     }
 
     #[test]
@@ -2683,7 +2683,7 @@ mod tests {
             control_clone.stop().unwrap();
         });
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |req, buffer| {
                 let n = req.target_points.min(buffer.len()).min(10);
                 for i in 0..n {
@@ -2774,7 +2774,7 @@ mod tests {
         let error_occurred = Arc::new(AtomicBool::new(false));
         let error_occurred_clone = error_occurred.clone();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |req, buffer| {
                 let n = req.target_points.min(buffer.len()).min(10);
                 for i in 0..n {
@@ -2821,7 +2821,7 @@ mod tests {
         queued.store(0, Ordering::SeqCst);
 
         let start = Instant::now();
-        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
+        let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2856,7 +2856,7 @@ mod tests {
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
+        let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2891,7 +2891,7 @@ mod tests {
         let stream = Stream::with_backend(info, backend_box, cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
+        let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2924,7 +2924,7 @@ mod tests {
         let stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         let start = Instant::now();
-        let result = stream.run_fill(|_req, _buffer| ChunkResult::End, |_e| {});
+        let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
 
         let elapsed = start.elapsed();
 
@@ -2961,7 +2961,7 @@ mod tests {
         let control = stream.control();
         control.arm().unwrap();
 
-        let result = stream.run_fill(
+        let result = stream.run(
             |req, buffer| {
                 // Fill some points then end
                 let n = req.target_points.min(buffer.len()).min(10);

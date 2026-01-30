@@ -311,7 +311,7 @@ impl ReconnectingSession {
             let producer_handle = Arc::clone(&producer);
             let on_error_handle = Arc::clone(&on_error);
             let on_disconnect_handle = Arc::clone(&on_disconnect);
-            let exit = match stream.run_fill(
+            let exit = match stream.run(
                 move |req, buffer| {
                     let mut handler = producer_handle.lock().unwrap();
                     handler(req, buffer)

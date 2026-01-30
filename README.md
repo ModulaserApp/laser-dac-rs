@@ -62,7 +62,7 @@ let (stream, info) = device.start_stream(config)?;
 
 stream.control().arm()?;
 
-let exit = stream.run_fill(
+let exit = stream.run(
     // Producer callback - fills buffer with points
     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
         let n = req.target_points;

@@ -1,4 +1,4 @@
-//! Callback-based example using Stream::run_fill().
+//! Callback-based example using Stream::run().
 //!
 //! This demonstrates the callback/pull approach where the stream drives timing.
 //! The callback is invoked when the buffer needs filling.
@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     let shape = args.shape;
 
     // Run in callback mode with zero-allocation API
-    let exit = stream.run_fill(
+    let exit = stream.run(
         // Producer callback - invoked when buffer needs filling
         move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let count = counter.fetch_add(1, Ordering::Relaxed);

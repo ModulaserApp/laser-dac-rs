@@ -25,7 +25,7 @@
 //! adapter.update(Frame::new(circle_points));
 //! let shared = adapter.shared(); // Thread-safe handle
 //!
-//! stream.run_fill(
+//! stream.run(
 //!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
 //!         shared.fill_chunk(req, buffer)
 //!     },
@@ -67,7 +67,7 @@ impl From<Vec<LaserPoint>> for Frame {
 /// Converts a point buffer (frame) into a continuous stream.
 ///
 /// The adapter cycles through the frame's points, filling buffers via
-/// the `fill_chunk()` method for use with `Stream::run_fill()`.
+/// the `fill_chunk()` method for use with `Stream::run()`.
 ///
 /// # Update semantics
 ///
@@ -82,7 +82,7 @@ impl From<Vec<LaserPoint>> for Frame {
 /// adapter.update(Frame::new(circle_points));
 /// let shared = adapter.shared();
 ///
-/// stream.run_fill(
+/// stream.run(
 ///     |req, buffer| shared.fill_chunk(req, buffer),
 ///     |err| eprintln!("Error: {}", err),
 /// )?;

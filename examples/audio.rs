@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let audio_config = AudioConfig::default();
 
     // Run stream with zero-allocation audio callback
-    let exit = stream.run_fill(
+    let exit = stream.run(
         move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let n = req.target_points.min(buffer.len());
             audio::fill_audio_points(req, buffer, n, &audio_config);

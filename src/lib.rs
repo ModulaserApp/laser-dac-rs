@@ -11,7 +11,7 @@
 //!
 //! ## Callback Mode
 //!
-//! Use `run_fill()` with a producer closure for simpler code:
+//! Use `run()` with a producer closure for simpler code:
 //!
 //! ```no_run
 //! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
@@ -22,7 +22,7 @@
 //!
 //! stream.control().arm().unwrap();
 //!
-//! let exit = stream.run_fill(
+//! let exit = stream.run(
 //!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
 //!         let n = req.target_points;
 //!         for i in 0..n {
