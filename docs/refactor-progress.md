@@ -54,4 +54,4 @@ This checklist tracks progress on implementing the streaming API refactor as des
 - [x] **8.1 Run all tests** - `cargo test` passes (commit 3e0a353)
 - [x] **8.2 Run all examples** - Each example compiles and runs (commit 3e0a353)
 - [x] **8.3 Run clippy** - `cargo clippy` passes (commit 3e0a353)
-- [ ] **8.4 Verify documentation** - `cargo doc` builds without warnings
+- [x] **8.4 Verify documentation** - `cargo doc` builds without warnings
