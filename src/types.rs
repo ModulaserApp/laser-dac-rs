@@ -422,26 +422,85 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 }
 
 /// Configuration for starting a stream.
+///
+/// # New Timing Model
+///
+/// The streaming API uses fixed timing with variable chunk sizes:
+/// - `tick_interval`: How often the callback is invoked (default: 10ms)
+/// - `target_buffer`: Target buffer level to maintain (default: 40ms)
+/// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 10ms)
+///
+/// The callback receives a `FillRequest` with `min_points` and `target_points`
+/// calculated from these durations and the current buffer state.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamConfig {
     /// Points per second output rate.
     pub pps: u32,
-    /// Exact chunk size to request/write. If `None`, the library chooses a default.
-    pub chunk_points: Option<usize>,
-    /// Target amount of queued data expressed in points.
-    pub target_queue_points: usize,
+
+    /// How often to call the callback (default: 10ms).
+    ///
+    /// The stream uses fixed-interval timing to align with audio frame boundaries.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub tick_interval: std::time::Duration,
+
+    /// Target buffer level to maintain (default: 40ms).
+    ///
+    /// The callback's `target_points` is calculated to bring the buffer to this level.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub target_buffer: std::time::Duration,
+
+    /// Minimum buffer before requesting urgent fill (default: 10ms).
+    ///
+    /// When buffer drops below this, `min_points` in `FillRequest` will be non-zero.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub min_buffer: std::time::Duration,
+
     /// What to do when the producer can't keep up.
     pub underrun: UnderrunPolicy,
+
+    // Legacy fields (kept for compatibility during transition)
+    /// Exact chunk size to request/write. If `None`, the library chooses a default.
+    /// Deprecated: Use the new timing model with `tick_interval` instead.
+    pub chunk_points: Option<usize>,
+    /// Target amount of queued data expressed in points.
+    /// Deprecated: Use `target_buffer` duration instead.
+    pub target_queue_points: usize,
+}
+
+#[cfg(feature = "serde")]
+mod duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        duration.as_millis().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let millis = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(millis))
+    }
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
+        use std::time::Duration;
         Self {
             pps: 30_000,
+            tick_interval: Duration::from_millis(10),
+            target_buffer: Duration::from_millis(40),
+            min_buffer: Duration::from_millis(10),
+            underrun: UnderrunPolicy::default(),
+            // Legacy fields
             chunk_points: None,
             target_queue_points: 3000,
-            underrun: UnderrunPolicy::default(),
         }
     }
 }
@@ -455,13 +514,41 @@ impl StreamConfig {
         }
     }
 
+    /// Set how often the callback is invoked (builder pattern).
+    ///
+    /// Default: 10ms. Shorter intervals provide lower latency but higher CPU usage.
+    pub fn with_tick_interval(mut self, interval: std::time::Duration) -> Self {
+        self.tick_interval = interval;
+        self
+    }
+
+    /// Set the target buffer level to maintain (builder pattern).
+    ///
+    /// Default: 40ms. Higher values provide more safety margin against underruns.
+    pub fn with_target_buffer(mut self, duration: std::time::Duration) -> Self {
+        self.target_buffer = duration;
+        self
+    }
+
+    /// Set the minimum buffer level before urgent fill (builder pattern).
+    ///
+    /// Default: 10ms. When buffer drops below this, `min_points` will be non-zero.
+    pub fn with_min_buffer(mut self, duration: std::time::Duration) -> Self {
+        self.min_buffer = duration;
+        self
+    }
+
     /// Set the chunk size (builder pattern).
+    ///
+    /// Deprecated: The new timing model calculates chunk size dynamically.
     pub fn with_chunk_points(mut self, chunk_points: usize) -> Self {
         self.chunk_points = Some(chunk_points);
         self
     }
 
     /// Set the target queue depth in points (builder pattern).
+    ///
+    /// Deprecated: Use `with_target_buffer()` instead.
     pub fn with_target_queue_points(mut self, points: usize) -> Self {
         self.target_queue_points = points;
         self
