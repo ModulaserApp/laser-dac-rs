@@ -337,7 +337,19 @@ pub enum OutputModel {
     UdpTimed,
 }
 
-/// A point in stream time, measured in points since stream start.
+/// Represents a point in stream time, anchored to estimated playback position.
+///
+/// `StreamInstant` represents the **estimated playback time** of points, not merely
+/// "points sent so far." When used in `FillRequest::start`, it represents:
+///
+/// `start` = playhead + buffered
+///
+/// Where:
+/// - `playhead` = stream_epoch + estimated_consumed_points
+/// - `buffered` = points sent but not yet played
+///
+/// This allows callbacks to generate content for the exact time it will be displayed,
+/// enabling accurate audio synchronization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamInstant(pub u64);
@@ -356,6 +368,15 @@ impl StreamInstant {
     /// Convert this instant to seconds at the given points-per-second rate.
     pub fn as_seconds(&self, pps: u32) -> f64 {
         self.0 as f64 / pps as f64
+    }
+
+    /// Convert to seconds at the given PPS.
+    ///
+    /// This is an alias for `as_seconds()` for consistency with standard Rust
+    /// duration naming conventions (e.g., `Duration::as_secs_f64()`).
+    #[inline]
+    pub fn as_secs_f64(&self, pps: u32) -> f64 {
+        self.as_seconds(pps)
     }
 
     /// Create a stream instant from a duration in seconds at the given PPS.
