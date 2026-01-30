@@ -394,14 +394,30 @@ impl Stream {
         F: FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
     {
+        use std::time::Instant;
+
         let pps = self.config.pps as f64;
         let max_points = self.info.caps.max_points_per_chunk;
+
+        // Track time between iterations to decrement scheduled_ahead for backends
+        // that don't report queued_points(). This prevents stalls when buffered
+        // equals target_points exactly.
+        let mut last_iteration = Instant::now();
 
         loop {
             // 1. Check for stop request
             if self.control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
             }
+
+            // Decrement scheduled_ahead based on elapsed time since last iteration.
+            // This is critical for backends without queued_points() - without this,
+            // scheduled_ahead would never decrease and target_points would stay 0.
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_iteration);
+            let points_consumed = (elapsed.as_secs_f64() * pps) as u64;
+            self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
+            last_iteration = now;
 
             // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
@@ -415,10 +431,6 @@ impl Stream {
                 if self.sleep_with_control_check(sleep_time)? {
                     return Ok(RunExit::Stopped);
                 }
-                // Decrement software estimate by points consumed during sleep
-                // This keeps scheduled_ahead accurate when queued_points() returns None
-                let points_consumed = (sleep_time.as_secs_f64() * pps) as u64;
-                self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
                 continue; // Re-check buffer after sleep
             }
 
@@ -527,10 +539,16 @@ impl Stream {
                 Ok(WriteOutcome::Written) => {
                     // Update state
                     if is_armed {
-                        let len = n.min(self.state.last_chunk.len());
-                        self.state.last_chunk[..len]
-                            .copy_from_slice(&self.state.chunk_buffer[..len]);
-                        self.state.last_chunk_len = len;
+                        // Both buffers are pre-allocated to max_points_per_chunk, so n always fits
+                        debug_assert!(
+                            n <= self.state.last_chunk.len(),
+                            "n ({}) exceeds last_chunk capacity ({})",
+                            n,
+                            self.state.last_chunk.len()
+                        );
+                        self.state.last_chunk[..n]
+                            .copy_from_slice(&self.state.chunk_buffer[..n]);
+                        self.state.last_chunk_len = n;
                     }
                     self.state.current_instant += n as u64;
                     self.state.scheduled_ahead += n as u64;
@@ -623,10 +641,15 @@ impl Stream {
             match backend.try_write_chunk(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
                 Ok(WriteOutcome::Written) => {
                     if is_armed {
-                        let len = fill_start.min(self.state.last_chunk.len());
-                        self.state.last_chunk[..len]
-                            .copy_from_slice(&self.state.chunk_buffer[..len]);
-                        self.state.last_chunk_len = len;
+                        debug_assert!(
+                            fill_start <= self.state.last_chunk.len(),
+                            "fill_start ({}) exceeds last_chunk capacity ({})",
+                            fill_start,
+                            self.state.last_chunk.len()
+                        );
+                        self.state.last_chunk[..fill_start]
+                            .copy_from_slice(&self.state.chunk_buffer[..fill_start]);
+                        self.state.last_chunk_len = fill_start;
                     }
                     self.state.current_instant += fill_start as u64;
                     self.state.scheduled_ahead += fill_start as u64;
@@ -1042,8 +1065,16 @@ mod tests {
         }
     }
 
-    /// A test backend that does NOT report hardware queue depth.
-    /// Used to test software-only estimation.
+    /// A test backend that does NOT report hardware queue depth (`queued_points()` returns `None`).
+    ///
+    /// Use this backend to test software-only buffer estimation, which is the fallback path
+    /// for real backends like `HeliosBackend` that don't implement `queued_points()`.
+    ///
+    /// **When to use which test backend:**
+    /// - `TestBackend`: Simulates DACs with hardware queue reporting (e.g., Ether Dream, IDN).
+    ///   Use for testing buffer estimation with hardware feedback.
+    /// - `NoQueueTestBackend`: Simulates DACs without queue reporting (e.g., Helios).
+    ///   Use for testing the time-based `scheduled_ahead` decrement logic.
     struct NoQueueTestBackend {
         inner: TestBackend,
     }
