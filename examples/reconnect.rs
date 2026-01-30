@@ -8,8 +8,10 @@
 mod common;
 
 use clap::Parser;
-use common::{create_points, Args};
-use laser_dac::{list_devices, ReconnectingSession, Result, StreamConfig};
+use common::{fill_points, Args};
+use laser_dac::{
+    list_devices, ChunkRequest, LaserPoint, ReconnectingSession, Result, StreamConfig,
+};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -46,7 +48,7 @@ fn main() -> Result<()> {
     // Run the stream - reconnects automatically on disconnect
     let shape = args.shape;
     session.run(
-        move |req| Some(create_points(shape, &req)),
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, req, buffer),
         |err| eprintln!("Stream error: {}", err),
     )?;
 
