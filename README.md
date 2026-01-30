@@ -11,7 +11,7 @@ Unified DAC backend abstraction for laser projectors.
 This crate provides a complete solution for communicating with various laser DAC hardware:
 
 - **Discovery**: Automatically find connected DAC devices (USB and network)
-- **Streaming**: Blocking and callback modes with backpressure handling
+- **Streaming**: Zero-allocation callback API with buffer-driven timing
 - **Backends**: Unified interface for all DAC types
 
 This crate does not apply any additional processing on points (like blanking), except to make it compatible with the target DAC.
@@ -36,49 +36,20 @@ Connect your laser DAC and run an example. For full API details, see the [docume
 
 ```bash
 cargo run --example stream -- circle
-# or:
 cargo run --example stream -- triangle
-# callback mode (DAC-driven timing):
-cargo run --example callback -- circle
-# frame mode (using FrameAdapter):
-cargo run --example frame_adapter -- circle
-# reconnecting session (auto-reconnect on disconnect):
-cargo run --example reconnect -- circle
-# audio-reactive (requires microphone):
-cargo run --example audio
+cargo run --example callback -- circle      # with progress counter
+cargo run --example frame_adapter -- circle # using FrameAdapter
+cargo run --example reconnect -- circle     # auto-reconnect on disconnect
+cargo run --example audio                   # audio-reactive (requires microphone)
 ```
 
 The examples run continuously until you press Ctrl+C.
 
-## Streaming Modes
+## Streaming API
 
-There are two ways to stream points to a DAC:
-
-### Blocking Mode
-
-You control timing by calling `next_request()` which blocks until the DAC needs more data:
-
-```rust
-use laser_dac::{list_devices, open_device, StreamConfig};
-
-let devices = list_devices()?;
-let device = open_device(&devices[0].id)?;
-
-let config = StreamConfig::new(30_000); // 30k points per second
-let (mut stream, info) = device.start_stream(config)?;
-
-stream.control().arm()?; // Enable laser output
-
-loop {
-    let req = stream.next_request()?; // Blocks until DAC ready
-    let points = generate_points(req.n_points);
-    stream.write(&req, &points)?;
-}
-```
-
-### Callback Mode
-
-The DAC drives timing by invoking your callback at regular intervals to fill a buffer:
+The streaming API uses buffer-driven timing: your callback is invoked when the
+buffer needs filling. This provides automatic backpressure handling and zero
+allocations in the hot path.
 
 ```rust
 use laser_dac::{list_devices, open_device, FillRequest, FillResult, LaserPoint, StreamConfig};
@@ -157,7 +128,7 @@ Each backend handles conversion to its native format internally.
 | `Dac`          | Opened DAC ready for streaming                   |
 | `Stream`       | Active streaming session                         |
 | `ReconnectingSession` | Stream wrapper with automatic reconnect   |
-| `StreamConfig` | Stream settings (PPS, chunk size)                |
+| `StreamConfig` | Stream settings (PPS, buffer targets)            |
 | `FillRequest`  | Request info for filling point buffer            |
 | `LaserPoint`   | Single point with position (f32) and color (u16) |
 | `DacType`      | Enum of supported DAC hardware                   |
