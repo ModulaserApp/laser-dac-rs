@@ -458,14 +458,6 @@ pub struct StreamConfig {
 
     /// What to do when the producer can't keep up.
     pub underrun: UnderrunPolicy,
-
-    // Legacy fields (kept for compatibility during transition)
-    /// Exact chunk size to request/write. If `None`, the library chooses a default.
-    /// Deprecated: Use the new timing model with `tick_interval` instead.
-    pub chunk_points: Option<usize>,
-    /// Target amount of queued data expressed in points.
-    /// Deprecated: Use `target_buffer` duration instead.
-    pub target_queue_points: usize,
 }
 
 #[cfg(feature = "serde")]
@@ -477,7 +469,10 @@ mod duration_millis {
     where
         S: Serializer,
     {
-        duration.as_millis().serialize(serializer)
+        // Use u64 for both serialize and deserialize to ensure round-trip compatibility.
+        // Clamp to u64::MAX for durations > ~584 million years (practically never hit).
+        let millis = duration.as_millis().min(u64::MAX as u128) as u64;
+        millis.serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
@@ -498,9 +493,6 @@ impl Default for StreamConfig {
             target_buffer: Duration::from_millis(40),
             min_buffer: Duration::from_millis(10),
             underrun: UnderrunPolicy::default(),
-            // Legacy fields
-            chunk_points: None,
-            target_queue_points: 3000,
         }
     }
 }
@@ -535,22 +527,6 @@ impl StreamConfig {
     /// Default: 10ms. When buffer drops below this, `min_points` will be non-zero.
     pub fn with_min_buffer(mut self, duration: std::time::Duration) -> Self {
         self.min_buffer = duration;
-        self
-    }
-
-    /// Set the chunk size (builder pattern).
-    ///
-    /// Deprecated: The new timing model calculates chunk size dynamically.
-    pub fn with_chunk_points(mut self, chunk_points: usize) -> Self {
-        self.chunk_points = Some(chunk_points);
-        self
-    }
-
-    /// Set the target queue depth in points (builder pattern).
-    ///
-    /// Deprecated: Use `with_target_buffer()` instead.
-    pub fn with_target_queue_points(mut self, points: usize) -> Self {
-        self.target_queue_points = points;
         self
     }
 
@@ -663,8 +639,8 @@ pub enum FillResult {
 pub struct StreamStatus {
     /// Whether the device is connected.
     pub connected: bool,
-    /// The resolved chunk size chosen for this stream.
-    pub chunk_points: usize,
+    /// The tick interval used by the stream.
+    pub tick_interval: std::time::Duration,
     /// Library-owned scheduled amount.
     pub scheduled_ahead_points: u64,
     /// Best-effort device/backend estimate.
@@ -911,5 +887,74 @@ mod tests {
         assert_eq!(s1, s2);
         assert_ne!(s1, s3); // Different name
         assert_ne!(s1, s4); // Different variant
+    }
+
+    // ==========================================================================
+    // StreamConfig Serde Tests
+    // ==========================================================================
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_stream_config_serde_roundtrip() {
+        use std::time::Duration;
+
+        let config = StreamConfig {
+            pps: 45000,
+            tick_interval: Duration::from_millis(15),
+            target_buffer: Duration::from_millis(50),
+            min_buffer: Duration::from_millis(12),
+            underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
+        };
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&config).expect("serialize to JSON");
+        let restored: StreamConfig =
+            serde_json::from_str(&json).expect("deserialize from JSON");
+
+        assert_eq!(restored.pps, config.pps);
+        assert_eq!(restored.tick_interval, config.tick_interval);
+        assert_eq!(restored.target_buffer, config.target_buffer);
+        assert_eq!(restored.min_buffer, config.min_buffer);
+
+        // Verify underrun policy
+        match restored.underrun {
+            UnderrunPolicy::Park { x, y } => {
+                assert!((x - 0.5).abs() < f32::EPSILON);
+                assert!((y - (-0.3)).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected Park policy"),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_duration_millis_roundtrip_consistency() {
+        use std::time::Duration;
+
+        // Test various duration values round-trip correctly
+        let test_durations = [
+            Duration::from_millis(0),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_millis(1000),
+            Duration::from_millis(u64::MAX / 1000), // Large but valid
+        ];
+
+        for &duration in &test_durations {
+            let config = StreamConfig {
+                tick_interval: duration,
+                ..StreamConfig::default()
+            };
+
+            let json = serde_json::to_string(&config).expect("serialize");
+            let restored: StreamConfig = serde_json::from_str(&json).expect("deserialize");
+
+            assert_eq!(
+                restored.tick_interval, duration,
+                "Duration {:?} did not round-trip correctly",
+                duration
+            );
+        }
     }
 }

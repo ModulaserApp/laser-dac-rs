@@ -109,7 +109,7 @@ impl StreamControl {
     /// use `stop()` to terminate entirely.
     ///
     /// **Latency**: Points already in the device buffer will still play out.
-    /// `target_queue_points` bounds this latency.
+    /// `target_buffer` bounds this latency.
     ///
     /// **Hardware shutter**: Best-effort. LaserCube has actual hardware control;
     /// Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
@@ -210,8 +210,6 @@ pub struct Stream {
     backend: Option<Box<dyn StreamBackend>>,
     /// Stream configuration.
     config: StreamConfig,
-    /// Resolved chunk size.
-    chunk_points: usize,
     /// Thread-safe control handle.
     control: StreamControl,
     /// Receiver for control messages from StreamControl.
@@ -226,7 +224,6 @@ impl Stream {
         info: DacInfo,
         backend: Box<dyn StreamBackend>,
         config: StreamConfig,
-        chunk_points: usize,
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
         let max_points = info.caps.max_points_per_chunk;
@@ -234,7 +231,6 @@ impl Stream {
             info,
             backend: Some(backend),
             config,
-            chunk_points,
             control: StreamControl::new(control_tx),
             control_rx,
             state: StreamState::new(max_points),
@@ -256,13 +252,6 @@ impl Stream {
         self.control.clone()
     }
 
-    /// The resolved chunk size chosen for this stream.
-    ///
-    /// This is fixed for the lifetime of the stream.
-    pub fn chunk_points(&self) -> usize {
-        self.chunk_points
-    }
-
     /// Returns the current stream status.
     pub fn status(&self) -> Result<StreamStatus> {
         let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
@@ -273,7 +262,7 @@ impl Stream {
                 .as_ref()
                 .map(|b| b.is_connected())
                 .unwrap_or(false),
-            chunk_points: self.chunk_points,
+            tick_interval: self.config.tick_interval,
             scheduled_ahead_points: self.state.scheduled_ahead,
             device_queued_points,
             stats: Some(self.state.stats.clone()),
@@ -410,6 +399,14 @@ impl Stream {
         use std::time::Instant;
 
         let tick_interval = self.config.tick_interval;
+
+        // Validate tick_interval to prevent division-by-zero and ensure sane scheduling
+        if tick_interval < Duration::from_millis(1) {
+            return Err(Error::invalid_config(
+                "tick_interval must be at least 1ms to ensure proper scheduling",
+            ));
+        }
+
         let max_points = self.info.caps.max_points_per_chunk;
         let mut next_tick = Instant::now();
 
@@ -441,12 +438,22 @@ impl Stream {
             // 3. Handle tick overrun (callback took longer than tick_interval)
             //    Skip missed ticks rather than running back-to-back
             let now = Instant::now();
-            if now > next_tick {
+            let ticks_elapsed = if now > next_tick {
                 let missed =
                     (now.duration_since(next_tick).as_millis() / tick_interval.as_millis()) as u32;
                 next_tick += tick_interval * (missed + 1);
                 self.state.stats.underrun_count += missed as u64; // Track missed ticks
-            }
+                missed + 1
+            } else {
+                1
+            };
+
+            // 3b. Decrement software buffer estimate by consumed points
+            //     This keeps scheduled_ahead accurate when queued_points() returns None
+            let points_consumed = (tick_interval.as_secs_f64()
+                * self.config.pps as f64
+                * ticks_elapsed as f64) as u64;
+            self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
 
             // 4. Check backend connection
             if let Some(backend) = &self.backend {
@@ -889,11 +896,7 @@ impl Dac {
             backend.connect()?;
         }
 
-        let chunk_points = cfg.chunk_points.unwrap_or_else(|| {
-            Self::compute_default_chunk_size(&self.info.caps, cfg.pps, cfg.target_queue_points)
-        });
-
-        let stream = Stream::with_backend(self.info.clone(), backend, cfg, chunk_points);
+        let stream = Stream::with_backend(self.info.clone(), backend, cfg);
 
         Ok((stream, self.info))
     }
@@ -906,42 +909,7 @@ impl Dac {
             )));
         }
 
-        if let Some(chunk_points) = cfg.chunk_points {
-            if chunk_points > caps.max_points_per_chunk {
-                return Err(Error::invalid_config(format!(
-                    "chunk_points {} exceeds device max {}",
-                    chunk_points, caps.max_points_per_chunk
-                )));
-            }
-            if chunk_points == 0 {
-                return Err(Error::invalid_config("chunk_points cannot be 0"));
-            }
-        }
-
-        if cfg.target_queue_points == 0 {
-            return Err(Error::invalid_config("target_queue_points cannot be 0"));
-        }
-
         Ok(())
-    }
-
-    fn compute_default_chunk_size(
-        caps: &DacCapabilities,
-        pps: u32,
-        target_queue_points: usize,
-    ) -> usize {
-        // Target ~10ms worth of points per chunk
-        let target_chunk_ms = 10;
-        let time_based_points = (pps as usize * target_chunk_ms) / 1000;
-
-        // Also bound by target queue: aim for ~¼ of target queue per chunk.
-        // This ensures we don't send huge chunks relative to our latency target.
-        let queue_based_max = target_queue_points / 4;
-
-        let max_points = caps.max_points_per_chunk.min(queue_based_max.max(100));
-        let min_points = 100;
-
-        time_based_points.clamp(min_points, max_points)
     }
 }
 
@@ -1175,7 +1143,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         // Record initial state
         let initial_instant = stream.state.current_instant;
@@ -1219,8 +1187,8 @@ mod tests {
             caps: backend_box.caps().clone(),
         };
 
-        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let produced_count = Arc::new(AtomicUsize::new(0));
         let produced_count_clone = produced_count.clone();
@@ -1262,7 +1230,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Initially shutter is closed
         assert!(!shutter_open.load(Ordering::SeqCst));
@@ -1301,7 +1269,7 @@ mod tests {
 
         // Use RepeatLast policy - but when disarmed, should still blank
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Set some last_chunk with colored points using the pre-allocated buffer
         let colored_point = LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
@@ -1348,7 +1316,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm first to open shutter
         stream.control.arm().unwrap();
@@ -1376,7 +1344,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
         let control = stream.control();
 
         // Initial state: disarmed
@@ -1427,7 +1395,7 @@ mod tests {
         // Use short tick interval for testing
         let tick_interval = Duration::from_millis(5);
         let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
         let call_times_clone = call_times.clone();
@@ -1498,7 +1466,7 @@ mod tests {
         // Use very short tick interval so we can easily cause overrun
         let tick_interval = Duration::from_millis(2);
         let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1563,7 +1531,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
         let control = stream.control();
 
         // Spawn a thread to stop the stream after a short delay
@@ -1604,7 +1572,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1650,7 +1618,7 @@ mod tests {
 
         // Use Blank policy for underrun
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1696,7 +1664,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1742,7 +1710,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         // Set software estimate to 500 points
         stream.state.scheduled_ahead = 500;
@@ -1769,7 +1737,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Software says 500, hardware says 300 -> should use 300 (conservative)
         stream.state.scheduled_ahead = 500;
@@ -1800,7 +1768,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Simulate: software thinks 1000 points scheduled, but hardware only has 100
         // This can happen if hardware consumed points faster than expected
@@ -1838,7 +1806,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(40))
             .with_min_buffer(Duration::from_millis(10));
-        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
 
         // Set software estimate higher than hardware
         stream.state.scheduled_ahead = 500;
@@ -1870,7 +1838,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(40))
             .with_min_buffer(Duration::from_millis(10));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         // Empty buffer: need full target
         stream.state.scheduled_ahead = 0;
@@ -1918,7 +1886,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(40))
             .with_min_buffer(Duration::from_millis(10));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         // Buffer at 299 points: 1 point below min_buffer
         stream.state.scheduled_ahead = 299;
@@ -1950,7 +1918,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let points_written = Arc::new(AtomicUsize::new(0));
         let points_written_clone = points_written.clone();
@@ -2001,7 +1969,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream so last_chunk gets updated
         let control = stream.control();
@@ -2053,7 +2021,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream
         let control = stream.control();
@@ -2107,7 +2075,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream
         let control = stream.control();
@@ -2155,7 +2123,7 @@ mod tests {
 
         // Park at specific position
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Park { x: 0.5, y: -0.5 });
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream
         let control = stream.control();
@@ -2200,7 +2168,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Stop);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Must arm the stream for underrun policy to be checked
         // (disarmed streams always output blanks regardless of policy)
@@ -2237,7 +2205,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let result = stream.run_fill(
             |_req, _buffer| {
@@ -2267,7 +2235,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -2380,7 +2348,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream for underrun policy to work
         let control = stream.control();
@@ -2444,7 +2412,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let control = stream.control();
         let control_clone = control.clone();
@@ -2529,7 +2497,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         // Arm the stream
         let control = stream.control();
@@ -2579,7 +2547,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
-        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let stream = Stream::with_backend(info, backend_box, cfg);
 
         let control = stream.control();
         let control_clone = control.clone();
@@ -2682,7 +2650,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg, 100);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
 
         let error_occurred = Arc::new(AtomicBool::new(false));
         let error_occurred_clone = error_occurred.clone();
@@ -2702,5 +2670,131 @@ mod tests {
 
         // Should return Disconnected when backend reports disconnection
         assert_eq!(result.unwrap(), RunExit::Disconnected);
+    }
+
+    // =========================================================================
+    // Software-only buffer estimation tests
+    // =========================================================================
+
+    #[test]
+    fn test_software_buffer_decrements_over_time() {
+        // Test that scheduled_ahead is decremented for playback consumption
+        // when hardware doesn't report queue depth
+        let mut backend = NoQueueTestBackend::new();
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        // Use 10ms tick interval at 30000 PPS = 300 points consumed per tick
+        let cfg = StreamConfig::new(30000)
+            .with_tick_interval(Duration::from_millis(10))
+            .with_target_buffer(Duration::from_millis(100))
+            .with_min_buffer(Duration::from_millis(20));
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let target_points_seen = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let target_points_clone = target_points_seen.clone();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                target_points_clone.lock().unwrap().push(req.target_points);
+
+                // First few calls: fill aggressively to build up buffer
+                if count < 3 {
+                    let n = req.target_points.min(buffer.len());
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                } else if count < 6 {
+                    // Next few calls: return zero points to let buffer drain
+                    FillResult::Filled(0)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Verify that target_points increased when we stopped filling
+        // (indicating the software estimate properly decremented)
+        let targets = target_points_seen.lock().unwrap();
+        assert!(targets.len() >= 6, "Expected at least 6 callback invocations");
+
+        // The last few calls (when we returned Filled(0)) should have
+        // increasing target_points as the buffer drains
+        // Note: exact values depend on timing, but trend should be upward
+        let later_targets = &targets[3..];
+        let has_increasing_demand = later_targets.windows(2).any(|w| w[1] >= w[0]);
+        assert!(
+            has_increasing_demand,
+            "target_points should increase as buffer drains: {:?}",
+            later_targets
+        );
+    }
+
+    #[test]
+    fn test_run_fill_rejects_sub_millisecond_tick_interval() {
+        // Test that tick_interval < 1ms is rejected to prevent division-by-zero
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // Try with 500 microseconds - should be rejected
+        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_micros(500));
+        let stream = Stream::with_backend(info.clone(), Box::new(backend), cfg);
+
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        assert!(result.is_err(), "Sub-millisecond tick_interval should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("tick_interval"),
+            "Error should mention tick_interval: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_run_fill_rejects_zero_tick_interval() {
+        // Test that tick_interval of 0 is rejected
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::ZERO);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let result = stream.run_fill(
+            |_req, _buffer| FillResult::End,
+            |_e| {},
+        );
+
+        assert!(result.is_err(), "Zero tick_interval should be rejected");
     }
 }

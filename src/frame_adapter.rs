@@ -19,14 +19,18 @@
 //! # Example
 //!
 //! ```ignore
-//! let mut adapter = FrameAdapter::new();
-//! adapter.update(Frame::new(points));
+//! use laser_dac::{FillRequest, FillResult, LaserPoint, Frame, FrameAdapter};
 //!
-//! loop {
-//!     let req = stream.next_request()?;
-//!     let points = adapter.next_chunk(&req);
-//!     stream.write(&req, &points)?;
-//! }
+//! let adapter = FrameAdapter::new();
+//! adapter.update(Frame::new(circle_points));
+//! let shared = adapter.shared(); // Thread-safe handle
+//!
+//! stream.run_fill(
+//!     |req: &FillRequest, buffer: &mut [LaserPoint]| {
+//!         shared.fill_chunk(req, buffer)
+//!     },
+//!     |err| eprintln!("Error: {}", err),
+//! )?;
 //! ```
 //!
 //! For time-varying animation, use the streaming API directly with a point
@@ -62,8 +66,8 @@ impl From<Vec<LaserPoint>> for Frame {
 
 /// Converts a point buffer (frame) into a continuous stream.
 ///
-/// The adapter cycles through the frame's points, producing exactly
-/// `req.n_points` on each `next_chunk()` call.
+/// The adapter cycles through the frame's points, filling buffers via
+/// the `fill_chunk()` method for use with `Stream::run_fill()`.
 ///
 /// # Update semantics
 ///
@@ -74,14 +78,14 @@ impl From<Vec<LaserPoint>> for Frame {
 /// # Example
 ///
 /// ```ignore
-/// let mut adapter = FrameAdapter::new();
+/// let adapter = FrameAdapter::new();
 /// adapter.update(Frame::new(circle_points));
+/// let shared = adapter.shared();
 ///
-/// loop {
-///     let req = stream.next_request()?;
-///     let points = adapter.next_chunk(&req);
-///     stream.write(&req, &points)?;
-/// }
+/// stream.run_fill(
+///     |req, buffer| shared.fill_chunk(req, buffer),
+///     |err| eprintln!("Error: {}", err),
+/// )?;
 /// ```
 pub struct FrameAdapter {
     current: Frame,
