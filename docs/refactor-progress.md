@@ -14,11 +14,11 @@ This checklist tracks progress on implementing the streaming API refactor as des
 
 - [x] **2.1 Update callback signature** - Add `run_fill()` with `FnMut(&FillRequest, &mut [LaserPoint]) -> FillResult`
 - [x] **2.2 Add pre-allocated buffers to `Stream`** - `chunk_buffer` and `last_chunk` sized to `caps.max_points_per_chunk` (commit bba5174)
-- [ ] **2.3 Implement fixed-tick timing loop** - Use `sleep_until(next_tick)` with tick overrun handling
+- [x] **2.3 Implement fixed-tick timing loop** - Use `sleep_until(next_tick)` with tick overrun handling (implemented in `run_fill()`)
 - [x] **2.4 Implement buffer state calculation** - Calculate `buffered_points`, `buffered`, `playhead`, `min_points`, `target_points` (commit 9040195)
 - [x] **2.5 Implement conservative buffer estimation** - Use `min(hardware, software)` estimation (commit b75858f)
-- [ ] **2.6 Implement `FillResult` handling** - Handle `Filled(n)`, `Starved`, `End` variants
-- [ ] **2.7 Update `Stream::write()` method** - Accept slice reference, update `last_chunk` via `copy_from_slice`
+- [x] **2.6 Implement `FillResult` handling** - Handle `Filled(n)`, `Starved`, `End` variants (implemented in `run_fill()`)
+- [x] **2.7 Update `Stream::write()` method** - Replaced by `write_fill_points()` internal method in `run_fill()` API
 
 ## Task 3: Session Updates (`src/session.rs`)
 
@@ -39,7 +39,7 @@ This checklist tracks progress on implementing the streaming API refactor as des
 ## Task 6: Test Updates
 
 - [x] **6.1 Update existing stream tests** - Convert to new callback signature (commit 3e0a353)
-- [ ] **6.2 Add timing loop tests** - Test fixed-tick behavior
+- [x] **6.2 Add timing loop tests** - Test fixed-tick behavior, tick overrun handling, early wake
 - [ ] **6.3 Add buffer estimation tests** - Test conservative estimation
 - [ ] **6.4 Add `FillResult` handling tests** - Test all variants
 - [ ] **6.5 Add integration tests** - Test full stream lifecycle

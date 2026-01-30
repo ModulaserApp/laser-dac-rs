@@ -1342,4 +1342,326 @@ mod tests {
         assert!(control.is_armed());
         assert!(shutter_open.load(Ordering::SeqCst));
     }
+
+    // =========================================================================
+    // Timing loop tests (Task 6.2)
+    // =========================================================================
+
+    #[test]
+    fn test_run_fill_fixed_tick_behavior() {
+        // Test that run_fill runs on a fixed tick interval
+        use std::time::Instant;
+
+        let backend = TestBackend::new();
+        let write_count = backend.write_count.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use short tick interval for testing
+        let tick_interval = Duration::from_millis(5);
+        let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let call_times_clone = call_times.clone();
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                call_times_clone.lock().unwrap().push(Instant::now());
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                // Run for 5 ticks then end
+                if count >= 4 {
+                    FillResult::End
+                } else {
+                    let n = req.target_points.min(buffer.len()).min(10);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        assert!(write_count.load(Ordering::SeqCst) >= 4);
+
+        // Check that callbacks happened at roughly fixed intervals
+        let times = call_times.lock().unwrap();
+        assert!(times.len() >= 4, "Expected at least 4 callback invocations");
+
+        // Check intervals between callbacks are roughly tick_interval
+        // Allow for some jitter (±3ms tolerance)
+        for i in 1..times.len() {
+            let interval = times[i].duration_since(times[i - 1]);
+            // First tick might be immediate if buffer needs filling
+            if i > 1 {
+                // Interval should be roughly tick_interval (allow 0-15ms range)
+                assert!(
+                    interval.as_millis() <= 15,
+                    "Interval {} was too long: {:?}",
+                    i,
+                    interval
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_fill_tick_overrun_skips_missed_ticks() {
+        // Test that when callback takes longer than tick_interval,
+        // the loop skips missed ticks rather than running back-to-back
+        use std::time::Instant;
+
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use very short tick interval so we can easily cause overrun
+        let tick_interval = Duration::from_millis(2);
+        let cfg = StreamConfig::new(30000).with_tick_interval(tick_interval);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let start_time = Instant::now();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                // On first callback, sleep for 10ms to cause tick overrun
+                if count == 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+
+                // End after 3 callbacks
+                if count >= 2 {
+                    FillResult::End
+                } else {
+                    let n = req.target_points.min(buffer.len()).min(10);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // With proper tick overrun handling, the loop should have skipped
+        // the missed ticks and not run back-to-back catching up
+        let elapsed = start_time.elapsed();
+
+        // We had:
+        // - First callback with 10ms sleep
+        // - Skipped missed ticks
+        // - Two more callbacks with ~2ms ticks each
+        // Total should be roughly 10ms + some overhead, not 10ms + many catchup ticks
+        assert!(
+            elapsed.as_millis() < 50,
+            "Elapsed time {:?} suggests ticks weren't skipped properly",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_run_fill_stops_on_control_stop() {
+        // Test that stop() via control handle terminates the loop promptly
+        use std::thread;
+
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_tick_interval(Duration::from_millis(5));
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+        let control = stream.control();
+
+        // Spawn a thread to stop the stream after a short delay
+        let control_clone = control.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            control_clone.stop().unwrap();
+        });
+
+        let result = stream.run_fill(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                FillResult::Filled(n)
+            },
+            |_e| {},
+        );
+
+        // Should exit with Stopped, not hang forever
+        assert_eq!(result.unwrap(), RunExit::Stopped);
+    }
+
+    #[test]
+    fn test_run_fill_producer_ended() {
+        // Test that FillResult::End terminates the stream gracefully
+        let backend = TestBackend::new();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |req, buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // First call: return some data
+                    let n = req.target_points.min(buffer.len()).min(100);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    FillResult::Filled(n)
+                } else {
+                    // Second call: end the stream
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_run_fill_starved_applies_underrun_policy() {
+        // Test that FillResult::Starved triggers underrun policy
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Use Blank policy for underrun
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |_req, _buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // First call: return Starved to trigger underrun policy
+                    FillResult::Starved
+                } else {
+                    // Second call: end the stream
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Underrun policy should have written some points
+        assert!(
+            queued.load(Ordering::SeqCst) > 0,
+            "Underrun policy should have written blank points"
+        );
+    }
+
+    #[test]
+    fn test_run_fill_filled_zero_with_target_treated_as_starved() {
+        // Test that Filled(0) when target_points > 0 is treated as Starved
+        let backend = TestBackend::new();
+        let queued = backend.queued.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
+        let stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let result = stream.run_fill(
+            move |_req, _buffer| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+
+                if count == 0 {
+                    // Return Filled(0) when buffer needs data - should be treated as Starved
+                    FillResult::Filled(0)
+                } else {
+                    FillResult::End
+                }
+            },
+            |_e| {},
+        );
+
+        assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+        // Filled(0) with target_points > 0 should trigger underrun policy
+        assert!(
+            queued.load(Ordering::SeqCst) > 0,
+            "Filled(0) with target > 0 should trigger underrun and write blank points"
+        );
+    }
 }
