@@ -505,6 +505,54 @@ pub struct ChunkRequest {
     pub device_queued_points: Option<u64>,
 }
 
+/// A request to fill a buffer with points for streaming.
+///
+/// This is the new streaming API that uses fixed timing with variable chunk sizes.
+/// The callback receives a `FillRequest` describing buffer state and requirements,
+/// and fills points into a library-owned buffer.
+///
+/// # Point Tiers
+///
+/// - `min_points`: Minimum points needed to avoid imminent underrun (ceiling rounded)
+/// - `target_points`: Ideal number of points to reach target buffer level (clamped to buffer length)
+/// - `buffer.len()` (passed separately): Maximum points the callback may write
+///
+/// # Rounding Rules
+///
+/// - `min_points`: Always **ceiling** (underrun prevention)
+/// - `target_points`: **ceiling**, then clamped to buffer length
+#[derive(Clone, Debug)]
+pub struct FillRequest {
+    /// Estimated playback time when this chunk starts.
+    ///
+    /// Calculated as: playhead + buffered_points
+    /// Use this for audio synchronization.
+    pub start: StreamInstant,
+
+    /// Points per second (fixed for stream duration).
+    pub pps: u32,
+
+    /// Minimum points needed to avoid imminent underrun.
+    ///
+    /// Calculated with ceiling to prevent underrun: `ceil((min_buffer - buffered) * pps)`
+    /// If 0, buffer is healthy.
+    pub min_points: usize,
+
+    /// Ideal number of points to reach target buffer level.
+    ///
+    /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
+    pub target_points: usize,
+
+    /// Current buffer level in points (for diagnostics/adaptive content).
+    pub buffered_points: u64,
+
+    /// Current buffer level as duration (for audio sync convenience).
+    pub buffered: std::time::Duration,
+
+    /// Raw device queue if available (best-effort, may differ from buffered_points).
+    pub device_queued_points: Option<u64>,
+}
+
 /// Current status of a stream.
 #[derive(Clone, Debug)]
 pub struct StreamStatus {
