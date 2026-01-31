@@ -302,6 +302,10 @@ impl Stream {
 
     /// Writes exactly `req.n_points` points for the given request.
     ///
+    /// If the device cannot accept data immediately (backpressure), this method
+    /// retries automatically with brief sleeps until the write succeeds or the
+    /// stream is stopped.
+    ///
     /// # Contract
     ///
     /// - `points.len()` must equal `req.n_points`.
@@ -322,47 +326,62 @@ impl Stream {
             )));
         }
 
-        // Check for stop request
-        if self.control.is_stop_requested() {
-            return Err(Error::Stopped);
-        }
-
-        let is_armed = self.control.is_armed();
-
-        // Handle shutter transitions
-        self.handle_shutter_transition(is_armed);
-
-        // Write to backend (optimized: no allocation when armed)
-        let backend = self
-            .backend
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("no backend"))?;
-
-        let outcome = if is_armed {
-            // Armed: pass points directly to backend (zero-copy)
-            backend.try_write_chunk(self.config.pps, points)?
-        } else {
-            // Disarmed: blank all points (allocate only when needed)
-            let blanked: Vec<LaserPoint> = points
-                .iter()
-                .map(|p| LaserPoint::blanked(p.x, p.y))
-                .collect();
-            backend.try_write_chunk(self.config.pps, &blanked)?
-        };
-
-        match outcome {
-            WriteOutcome::Written => {
-                // Update state
-                if is_armed {
-                    self.state.last_chunk = Some(points.to_vec());
-                }
-                self.state.current_instant += self.chunk_points as u64;
-                self.state.scheduled_ahead += self.chunk_points as u64;
-                self.state.stats.chunks_written += 1;
-                self.state.stats.points_written += self.chunk_points as u64;
-                Ok(())
+        loop {
+            // Check for stop request
+            if self.control.is_stop_requested() {
+                return Err(Error::Stopped);
             }
-            WriteOutcome::WouldBlock => Err(Error::WouldBlock),
+
+            let is_armed = self.control.is_armed();
+
+            // Handle shutter transitions
+            self.handle_shutter_transition(is_armed);
+
+            // Write to backend (optimized: no allocation when armed)
+            let backend = self
+                .backend
+                .as_mut()
+                .ok_or_else(|| Error::disconnected("no backend"))?;
+
+            let outcome = if is_armed {
+                // Armed: pass points directly to backend (zero-copy)
+                backend.try_write_chunk(self.config.pps, points)?
+            } else {
+                // Disarmed: blank all points (allocate only when needed)
+                let blanked: Vec<LaserPoint> = points
+                    .iter()
+                    .map(|p| LaserPoint::blanked(p.x, p.y))
+                    .collect();
+                backend.try_write_chunk(self.config.pps, &blanked)?
+            };
+
+            match outcome {
+                WriteOutcome::Written => {
+                    // Update state
+                    if is_armed {
+                        self.state.last_chunk = Some(points.to_vec());
+                    }
+                    self.state.current_instant += self.chunk_points as u64;
+                    self.state.scheduled_ahead += self.chunk_points as u64;
+                    self.state.stats.chunks_written += 1;
+                    self.state.stats.points_written += self.chunk_points as u64;
+                    return Ok(());
+                }
+                WriteOutcome::WouldBlock => {
+                    // Backend buffer full - yield and retry
+                    std::thread::yield_now();
+
+                    if self.process_control_messages() {
+                        return Err(Error::Stopped);
+                    }
+
+                    std::thread::sleep(Duration::from_micros(100));
+
+                    if self.process_control_messages() {
+                        return Err(Error::Stopped);
+                    }
+                }
+            }
         }
     }
 
@@ -501,46 +520,24 @@ impl Stream {
             // Call producer
             match producer(req.clone()) {
                 Some(points) => {
-                    // Try to write, handling backpressure with retries
-                    loop {
-                        match self.write(&req, &points) {
-                            Ok(()) => break,
-                            Err(e) if e.is_would_block() => {
-                                // Backend buffer full - yield first for low-latency scenarios,
-                                // then sleep briefly if still blocked
-                                std::thread::yield_now();
-
-                                // Process control messages for immediate shutter control
-                                if self.process_control_messages() {
+                    match self.write(&req, &points) {
+                        Ok(()) => {}
+                        Err(e) if e.is_stopped() => {
+                            return Ok(RunExit::Stopped);
+                        }
+                        Err(e) if e.is_disconnected() => {
+                            on_error(e);
+                            return Ok(RunExit::Disconnected);
+                        }
+                        Err(e) => {
+                            // Recoverable error - report and handle underrun
+                            on_error(e);
+                            if let Err(e2) = self.handle_underrun(&req) {
+                                // Underrun handling can also hit terminal conditions
+                                if e2.is_stopped() {
                                     return Ok(RunExit::Stopped);
                                 }
-
-                                std::thread::sleep(Duration::from_micros(100));
-
-                                // Check stop again after sleep
-                                if self.process_control_messages() {
-                                    return Ok(RunExit::Stopped);
-                                }
-                                continue;
-                            }
-                            Err(e) if e.is_stopped() => {
-                                return Ok(RunExit::Stopped);
-                            }
-                            Err(e) if e.is_disconnected() => {
-                                on_error(e);
-                                return Ok(RunExit::Disconnected);
-                            }
-                            Err(e) => {
-                                // Recoverable error - report and handle underrun
-                                on_error(e);
-                                if let Err(e2) = self.handle_underrun(&req) {
-                                    // Underrun handling can also hit terminal conditions
-                                    if e2.is_stopped() {
-                                        return Ok(RunExit::Stopped);
-                                    }
-                                    on_error(e2);
-                                }
-                                break;
+                                on_error(e2);
                             }
                         }
                     }
@@ -1267,5 +1264,175 @@ mod tests {
         stream.process_control_messages();
         assert!(control.is_armed());
         assert!(shutter_open.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_blocking_write_retries_on_would_block() {
+        // Simulates the Helios scenario: device returns WouldBlock on first
+        // attempts (e.g., still busy from a previous session), then accepts.
+        // The blocking write() must retry internally instead of propagating
+        // WouldBlock as an error to the caller.
+        let backend = TestBackend::new().with_would_block_count(3);
+        let write_count = backend.write_count.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let req = stream.next_request().unwrap();
+        let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+
+        // write() must succeed despite the backend returning WouldBlock 3 times
+        stream.write(&req, &points).unwrap();
+
+        // Should have attempted 4 times (3 WouldBlock + 1 Written)
+        assert_eq!(write_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_write_stops_during_would_block_retry() {
+        // If the backend never accepts writes, write() must not loop forever.
+        // A stop() from another thread must break out of the retry loop.
+        let backend = TestBackend::new().with_would_block_count(usize::MAX);
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let req = stream.next_request().unwrap();
+        let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+
+        // Stop from another thread while write() is stuck retrying
+        let control = stream.control();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            control.stop().unwrap();
+        });
+
+        let result = stream.write(&req, &points);
+        assert!(result.unwrap_err().is_stopped());
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_write_processes_disarm_during_would_block_retry() {
+        // If disarm() is called while write() is retrying on WouldBlock,
+        // the shutter must be closed during the retry loop — not deferred
+        // until the next write() call.
+        let backend = TestBackend::new().with_would_block_count(100);
+        let shutter_open = backend.shutter_open.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        // Arm first so shutter is open
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        assert!(shutter_open.load(Ordering::SeqCst));
+
+        let req = stream.next_request().unwrap();
+        let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+
+        // Disarm from another thread while write() is retrying
+        let control = stream.control();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1));
+            control.disarm().unwrap();
+        });
+
+        // write() eventually succeeds after 100 WouldBlocks
+        stream.write(&req, &points).unwrap();
+        handle.join().unwrap();
+
+        // Shutter must have been closed during the retry loop
+        assert!(!shutter_open.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_write_stats_correct_after_would_block_retries() {
+        // WouldBlock retries are internal — only the final successful write
+        // should be counted in stats (1 chunk, N points).
+        let backend = TestBackend::new().with_would_block_count(3);
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let req = stream.next_request().unwrap();
+        let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
+
+        stream.write(&req, &points).unwrap();
+
+        // Despite 3 retries, only 1 successful chunk should be recorded
+        assert_eq!(stream.state.stats.chunks_written, 1);
+        assert_eq!(stream.state.stats.points_written, 100);
+    }
+
+    #[test]
+    fn test_write_rejects_wrong_point_count_without_retrying() {
+        // Point count validation must happen before the retry loop.
+        // A wrong count should fail immediately without touching the backend.
+        let backend = TestBackend::new();
+        let write_count = backend.write_count.clone();
+
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_target_queue_points(10000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg, 100);
+
+        let req = stream.next_request().unwrap();
+        // Wrong number of points (one extra)
+        let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points + 1];
+
+        let result = stream.write(&req, &points);
+        assert!(result.is_err());
+
+        // Backend should never have been called
+        assert_eq!(write_count.load(Ordering::SeqCst), 0);
     }
 }
