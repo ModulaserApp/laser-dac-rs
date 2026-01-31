@@ -200,7 +200,7 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
                 id: info.stable_id(),
                 name: info.name(),
                 kind: device.dac_type(),
-                caps: caps_for_dac_type(&device.dac_type()),
+                caps: device.caps(),
             }
         })
         .collect();

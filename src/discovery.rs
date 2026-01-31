@@ -139,6 +139,9 @@ use crate::protocols::lasercube_usb::rusb;
 #[cfg(feature = "lasercube-usb")]
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
+#[cfg(feature = "audio-out")]
+use crate::protocols::audio_out::{AudioDeviceInfo, AudioOutDiscovery};
+
 // =============================================================================
 // DiscoveredDevice
 // =============================================================================
@@ -171,6 +174,21 @@ impl DiscoveredDevice {
     /// Returns the DAC type.
     pub fn dac_type(&self) -> DacType {
         self.dac_type.clone()
+    }
+
+    /// Returns device-specific capabilities.
+    ///
+    /// For most DAC types this delegates to `caps_for_dac_type`. For audio
+    /// devices, the capabilities are derived from the actual sample rate
+    /// discovered during scanning (since audio caps depend on the device).
+    pub fn caps(&self) -> crate::types::DacCapabilities {
+        match &self.inner {
+            #[cfg(feature = "audio-out")]
+            DiscoveredDeviceInner::Audio { info } => {
+                crate::protocols::audio_out::default_capabilities(info.sample_rate)
+            }
+            _ => crate::types::caps_for_dac_type(&self.dac_type),
+        }
     }
 
     /// Returns a lightweight, cloneable info struct for this device.
@@ -270,6 +288,12 @@ impl DiscoveredDeviceInfo {
                     return format!("lasercube-wifi:{}", ip);
                 }
             }
+            #[cfg(feature = "audio-out")]
+            DacType::Audio => {
+                if let Some(ref hw_name) = self.hardware_name {
+                    return format!("audio:{}", hw_name);
+                }
+            }
             DacType::Custom(name) => {
                 // For custom types, use the custom name as prefix
                 if let Some(ip) = self.ip_address {
@@ -307,6 +331,10 @@ enum DiscoveredDeviceInner {
     },
     #[cfg(feature = "lasercube-usb")]
     LasercubeUsb(rusb::Device<rusb::Context>),
+    #[cfg(feature = "audio-out")]
+    Audio {
+        info: AudioDeviceInfo,
+    },
     /// External discoverer device.
     External {
         /// Index into `DacDiscovery.external` for the discoverer that found this device.
@@ -320,7 +348,8 @@ enum DiscoveredDeviceInner {
         feature = "ether-dream",
         feature = "idn",
         feature = "lasercube-wifi",
-        feature = "lasercube-usb"
+        feature = "lasercube-usb",
+        feature = "audio-out"
     )))]
     _Placeholder,
 }
@@ -709,6 +738,8 @@ pub struct DacDiscovery {
     lasercube_wifi: LasercubeWifiDiscovery,
     #[cfg(feature = "lasercube-usb")]
     lasercube_usb: Option<LasercubeUsbDiscovery>,
+    #[cfg(feature = "audio-out")]
+    audio_out: AudioOutDiscovery,
     enabled: EnabledDacTypes,
     /// External discoverers registered by external crates.
     external: Vec<Box<dyn ExternalDiscoverer>>,
@@ -734,6 +765,8 @@ impl DacDiscovery {
             lasercube_wifi: LasercubeWifiDiscovery::new(),
             #[cfg(feature = "lasercube-usb")]
             lasercube_usb: LasercubeUsbDiscovery::new(),
+            #[cfg(feature = "audio-out")]
+            audio_out: AudioOutDiscovery::new(),
             enabled,
             external: Vec::new(),
         }
@@ -835,6 +868,22 @@ impl DacDiscovery {
             }
         }
 
+        // Audio output
+        #[cfg(feature = "audio-out")]
+        if self.enabled.is_enabled(DacType::Audio) {
+            for info in self.audio_out.scan() {
+                devices.push(DiscoveredDevice {
+                    dac_type: DacType::Audio,
+                    ip_address: None,
+                    mac_address: None,
+                    hostname: None,
+                    usb_address: None,
+                    hardware_name: Some(info.name.clone()),
+                    inner: DiscoveredDeviceInner::Audio { info },
+                });
+            }
+        }
+
         // External discoverers
         for (index, discoverer) in self.external.iter_mut().enumerate() {
             let dac_type = discoverer.dac_type();
@@ -893,6 +942,13 @@ impl DacDiscovery {
                 .as_ref()
                 .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
                 .connect(device),
+            #[cfg(feature = "audio-out")]
+            DacType::Audio => {
+                let DiscoveredDeviceInner::Audio { info } = device.inner else {
+                    return Err(Error::invalid_config("Invalid device type for Audio"));
+                };
+                self.audio_out.connect(&info.name)
+            }
             _ => Err(Error::invalid_config(format!(
                 "DAC type {:?} not supported in this build",
                 device.dac_type

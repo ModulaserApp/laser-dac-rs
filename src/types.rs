@@ -74,12 +74,17 @@ pub enum DacType {
     LasercubeWifi,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
     LasercubeUsb,
+    /// Audio output for oscilloscope XY mode.
+    /// Maps LaserPoint.x → Left channel, LaserPoint.y → Right channel.
+    #[cfg(feature = "audio-out")]
+    Audio,
     /// Custom DAC implementation (for external/third-party backends).
     Custom(String),
 }
 
 impl DacType {
     /// Returns all available DAC types.
+    #[cfg(not(feature = "audio-out"))]
     pub fn all() -> &'static [DacType] {
         &[
             DacType::Helios,
@@ -87,6 +92,19 @@ impl DacType {
             DacType::Idn,
             DacType::LasercubeWifi,
             DacType::LasercubeUsb,
+        ]
+    }
+
+    /// Returns all available DAC types.
+    #[cfg(feature = "audio-out")]
+    pub fn all() -> &'static [DacType] {
+        &[
+            DacType::Helios,
+            DacType::EtherDream,
+            DacType::Idn,
+            DacType::LasercubeWifi,
+            DacType::LasercubeUsb,
+            DacType::Audio,
         ]
     }
 
@@ -98,6 +116,8 @@ impl DacType {
             DacType::Idn => "IDN",
             DacType::LasercubeWifi => "LaserCube WiFi",
             DacType::LasercubeUsb => "LaserCube USB (Laserdock)",
+            #[cfg(feature = "audio-out")]
+            DacType::Audio => "Audio Output",
             DacType::Custom(name) => name,
         }
     }
@@ -110,6 +130,8 @@ impl DacType {
             DacType::Idn => "ILDA Digital Network laser DAC",
             DacType::LasercubeWifi => "WiFi laser DAC",
             DacType::LasercubeUsb => "USB laser DAC",
+            #[cfg(feature = "audio-out")]
+            DacType::Audio => "Audio output for oscilloscope XY mode",
             DacType::Custom(_) => "Custom DAC",
         }
     }
@@ -320,6 +342,9 @@ pub fn caps_for_dac_type(dac_type: &DacType) -> DacCapabilities {
         DacType::LasercubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
         #[cfg(not(feature = "lasercube-usb"))]
         DacType::LasercubeUsb => DacCapabilities::default(),
+
+        #[cfg(feature = "audio-out")]
+        DacType::Audio => DacCapabilities::default(), // Audio caps depend on sample rate, use backend's actual caps
 
         DacType::Custom(_) => DacCapabilities::default(),
     }
@@ -581,14 +606,19 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn test_dac_type_all_returns_all_five_types() {
+    fn test_dac_type_all_returns_all_types() {
         let all_types = DacType::all();
+        #[cfg(not(feature = "audio-out"))]
         assert_eq!(all_types.len(), 5);
+        #[cfg(feature = "audio-out")]
+        assert_eq!(all_types.len(), 6);
         assert!(all_types.contains(&DacType::Helios));
         assert!(all_types.contains(&DacType::EtherDream));
         assert!(all_types.contains(&DacType::Idn));
         assert!(all_types.contains(&DacType::LasercubeWifi));
         assert!(all_types.contains(&DacType::LasercubeUsb));
+        #[cfg(feature = "audio-out")]
+        assert!(all_types.contains(&DacType::Audio));
     }
 
     #[test]
