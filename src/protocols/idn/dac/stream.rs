@@ -6,14 +6,13 @@ use crate::protocols::idn::protocol::{
     AcknowledgeResponse, ChannelConfigHeader, ChannelMessageHeader, GroupRequest, GroupResponse,
     PacketHeader, ParameterGetRequest, ParameterResponse, ParameterSetRequest, Point, ReadBytes,
     SampleChunkHeader, SizeBytes, WriteBytes, EXTENDED_SAMPLE_SIZE, IDNCMD_GROUP_REQUEST,
-    IDNCMD_GROUP_RESPONSE, IDNCMD_PING_REQUEST, IDNCMD_PING_RESPONSE,
-    IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_SERVICE_PARAMS_RESPONSE,
-    IDNCMD_UNIT_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_RESPONSE,
-    IDNCMD_RT_ACKNOWLEDGE, IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_ACKREQ, IDNCMD_RT_CNLMSG_CLOSE,
-    IDNCMD_RT_CNLMSG_CLOSE_ACKREQ,
-    IDNFLG_CHNCFG_CLOSE, IDNFLG_CHNCFG_ROUTING, IDNFLG_CONTENTID_CHANNELMSG,
-    IDNFLG_CONTENTID_CONFIG_LSTFRG, IDNVAL_CNKTYPE_LPGRF_WAVE, IDNVAL_CNKTYPE_VOID,
-    IDNVAL_SMOD_LPGRF_CONTINUOUS, MAX_UDP_PAYLOAD, XYRGBI_SAMPLE_SIZE, XYRGB_HIGHRES_SAMPLE_SIZE,
+    IDNCMD_GROUP_RESPONSE, IDNCMD_PING_REQUEST, IDNCMD_PING_RESPONSE, IDNCMD_RT_ACKNOWLEDGE,
+    IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_ACKREQ, IDNCMD_RT_CNLMSG_CLOSE,
+    IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_SERVICE_PARAMS_RESPONSE,
+    IDNCMD_UNIT_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_RESPONSE, IDNFLG_CHNCFG_CLOSE,
+    IDNFLG_CHNCFG_ROUTING, IDNFLG_CONTENTID_CHANNELMSG, IDNFLG_CONTENTID_CONFIG_LSTFRG,
+    IDNVAL_CNKTYPE_LPGRF_WAVE, IDNVAL_CNKTYPE_VOID, IDNVAL_SMOD_LPGRF_CONTINUOUS, MAX_UDP_PAYLOAD,
+    XYRGBI_SAMPLE_SIZE, XYRGB_HIGHRES_SAMPLE_SIZE,
 };
 use std::io;
 use std::net::UdpSocket;
@@ -230,8 +229,7 @@ impl Stream {
     pub fn send_keepalive(&mut self) -> Result<()> {
         let service_id = self.dac.service_id();
         let channel_id = ((service_id.saturating_sub(1)) as u16 & 0x3F) << 8;
-        let content_id =
-            IDNFLG_CONTENTID_CHANNELMSG | channel_id | IDNVAL_CNKTYPE_VOID as u16;
+        let content_id = IDNFLG_CONTENTID_CHANNELMSG | channel_id | IDNVAL_CNKTYPE_VOID as u16;
 
         self.packet_buffer.clear();
 
@@ -871,7 +869,10 @@ impl Stream {
         let (request_cmd, response_cmd) = if service_id == 0 {
             (IDNCMD_UNIT_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_RESPONSE)
         } else {
-            (IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_SERVICE_PARAMS_RESPONSE)
+            (
+                IDNCMD_SERVICE_PARAMS_REQUEST,
+                IDNCMD_SERVICE_PARAMS_RESPONSE,
+            )
         };
 
         self.packet_buffer.clear();
@@ -951,7 +952,10 @@ impl Stream {
         let (request_cmd, response_cmd) = if service_id == 0 {
             (IDNCMD_UNIT_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_RESPONSE)
         } else {
-            (IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_SERVICE_PARAMS_RESPONSE)
+            (
+                IDNCMD_SERVICE_PARAMS_REQUEST,
+                IDNCMD_SERVICE_PARAMS_RESPONSE,
+            )
         };
 
         self.packet_buffer.clear();

@@ -200,10 +200,7 @@ mod tests {
             expected: 42,
             actual: 99,
         };
-        assert_eq!(
-            err.to_string(),
-            "sequence mismatch: expected 42, got 99"
-        );
+        assert_eq!(err.to_string(), "sequence mismatch: expected 42, got 99");
     }
 
     #[test]

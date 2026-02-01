@@ -228,11 +228,8 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
                 IDNCMD_RT_CNLMSG_CLOSE_ACKREQ => {
                     log::debug!("Received RT_CNLMSG_CLOSE_ACKREQ from {}", src);
-                    let response = build_ack_response(
-                        flags,
-                        sequence,
-                        self.behavior.get_ack_result_code(),
-                    );
+                    let response =
+                        build_ack_response(flags, sequence, self.behavior.get_ack_result_code());
                     let _ = self.socket.send_to(&response, src);
                 }
                 IDNCMD_UNIT_PARAMS_REQUEST => {

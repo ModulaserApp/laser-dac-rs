@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use idn_mock_server::{
     MockIdnServer, MockRelay, MockService, ServerBehavior, ServerConfig, ServerHandle,
-    IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_UNIT_PARAMS_REQUEST,
-    IDNCMD_SERVICE_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
+    IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST,
+    IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
 };
 
 use laser_dac::types::{DacType, EnabledDacTypes, LaserPoint, StreamConfig};
@@ -955,9 +955,7 @@ impl ParsedPacket {
 // =============================================================================
 
 /// Connect to a mock server using the low-level stream API.
-fn connect_stream(
-    handle: &TestServerHandle,
-) -> laser_dac::protocols::idn::dac::stream::Stream {
+fn connect_stream(handle: &TestServerHandle) -> laser_dac::protocols::idn::dac::stream::Stream {
     let addr = handle.addr();
 
     // Discover the server first to get real ServerInfo

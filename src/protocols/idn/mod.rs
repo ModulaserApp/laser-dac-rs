@@ -141,10 +141,7 @@ impl ServerScanner {
                     Ok(socket) => {
                         endpoints.push(BroadcastEndpoint {
                             socket,
-                            broadcast_addr: SocketAddrV4::new(
-                                iface.broadcast_address(),
-                                IDN_PORT,
-                            ),
+                            broadcast_addr: SocketAddrV4::new(iface.broadcast_address(), IDN_PORT),
                         });
                     }
                     Err(e) => {
@@ -301,7 +298,10 @@ impl ServerScanner {
     }
 
     /// Parse a scan response from a raw packet buffer.
-    fn process_scan_response(data: &[u8], src_addr: &SocketAddr) -> Option<(ScanResponse, Ipv4Addr)> {
+    fn process_scan_response(
+        data: &[u8],
+        src_addr: &SocketAddr,
+    ) -> Option<(ScanResponse, Ipv4Addr)> {
         if data.len() < PacketHeader::SIZE_BYTES + ScanResponse::SIZE_BYTES {
             return None;
         }

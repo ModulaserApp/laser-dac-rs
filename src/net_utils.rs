@@ -64,8 +64,7 @@ fn get_local_interfaces_impl() -> io::Result<Vec<NetworkInterface>> {
 
             let mask_addr = ifa.ifa_netmask as *const libc::sockaddr_in;
             let mask_bytes = (*mask_addr).sin_addr.s_addr.to_ne_bytes();
-            let netmask =
-                Ipv4Addr::new(mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]);
+            let netmask = Ipv4Addr::new(mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]);
 
             interfaces.push(NetworkInterface { ip, netmask });
         }
