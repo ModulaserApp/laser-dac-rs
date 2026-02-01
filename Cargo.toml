@@ -28,7 +28,7 @@ network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
 ether-dream = []
-idn = []
+idn = ["dep:socket2", "dep:libc"]
 lasercube-wifi = ["dep:socket2", "dep:libc"]
 
 # Optional serialization

@@ -3,8 +3,9 @@
 pub mod stream;
 
 use crate::protocols::idn::protocol::{
-    ServiceMapEntry, IDNFLG_SCAN_STATUS_MALFUNCTION, IDNFLG_SCAN_STATUS_OCCUPIED,
-    IDNFLG_SCAN_STATUS_OFFLINE, IDNFLG_SCAN_STATUS_REALTIME, IDNFLG_SERVICEMAP_DSID,
+    ServiceMapEntry, IDNFLG_SCAN_STATUS_EXCLUDED, IDNFLG_SCAN_STATUS_MALFUNCTION,
+    IDNFLG_SCAN_STATUS_OCCUPIED, IDNFLG_SCAN_STATUS_OFFLINE, IDNFLG_SCAN_STATUS_REALTIME,
+    IDNFLG_SERVICEMAP_DSID,
     IDNVAL_STYPE_DMX512, IDNVAL_STYPE_LAPRO, IDNVAL_STYPE_UART,
 };
 use std::net::SocketAddr;
@@ -192,6 +193,11 @@ impl ServerInfo {
         self.status & IDNFLG_SCAN_STATUS_OCCUPIED != 0
     }
 
+    /// Check if the server is excluded from scanning.
+    pub fn is_excluded(&self) -> bool {
+        self.status & IDNFLG_SCAN_STATUS_EXCLUDED != 0
+    }
+
     /// Check if the server supports realtime streaming.
     pub fn supports_realtime(&self) -> bool {
         self.status & IDNFLG_SCAN_STATUS_REALTIME != 0
@@ -231,5 +237,29 @@ impl Addressed {
     /// Get the server hostname.
     pub fn hostname(&self) -> &str {
         &self.server.hostname
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_server(status: u8) -> ServerInfo {
+        ServerInfo::new([0u8; 16], "test".to_string(), (1, 0), status)
+    }
+
+    #[test]
+    fn test_is_excluded() {
+        // EXCLUDED flag set → true
+        let server = make_server(IDNFLG_SCAN_STATUS_EXCLUDED);
+        assert!(server.is_excluded());
+
+        // No flags → false
+        let server = make_server(0);
+        assert!(!server.is_excluded());
+
+        // All flags set (0xFF includes EXCLUDED) → true
+        let server = make_server(0xFF);
+        assert!(server.is_excluded());
     }
 }

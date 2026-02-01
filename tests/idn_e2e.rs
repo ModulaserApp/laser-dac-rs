@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use idn_mock_server::{
     MockIdnServer, MockRelay, MockService, ServerBehavior, ServerConfig, ServerHandle,
-    IDNCMD_RT_CNLMSG, IDNFLG_STATUS_REALTIME,
+    IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_UNIT_PARAMS_REQUEST,
+    IDNCMD_SERVICE_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
 };
 
 use laser_dac::types::{DacType, EnabledDacTypes, LaserPoint, StreamConfig};
@@ -398,45 +399,33 @@ fn test_connection_loss_detection() {
 
     // Simulate server disconnect
     handle.simulate_disconnect();
-
-    // Wait for connection loss to be detected
-    // The IDN backend should detect loss when it can't send data or get acks
     thread::sleep(Duration::from_millis(800));
 
-    // Try to get next request - should eventually fail
-    // Note: The exact behavior depends on the IDN backend implementation
-    // We may get a few more requests before the connection loss is detected
-    let mut lost_detected = false;
-    for _ in 0..10 {
+    // IDN uses fire-and-forget UDP, so writes succeed even when the server
+    // stops responding. The stream remains "connected" from its perspective.
+    // Verify that writes continue to succeed (no false errors).
+    for _ in 0..5 {
         match stream.next_request() {
             Ok(req) => {
                 let points: Vec<LaserPoint> = (0..req.n_points)
                     .map(|_| LaserPoint::blanked(0.0, 0.0))
                     .collect();
-                if stream.write(&req, &points).is_err() {
-                    lost_detected = true;
-                    break;
-                }
+                stream
+                    .write(&req, &points)
+                    .expect("UDP writes should succeed even without server");
             }
-            Err(_) => {
-                lost_detected = true;
-                break;
+            Err(e) => {
+                panic!("next_request should not fail for UDP stream: {e}");
             }
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    // Check status shows disconnected
-    let final_status = stream.status();
-    if let Ok(status) = final_status {
-        if !status.connected {
-            lost_detected = true;
-        }
-    }
-
+    // Stream still reports connected since UDP has no delivery confirmation
+    let final_status = stream.status().expect("Should get status");
     assert!(
-        lost_detected,
-        "Stream should detect connection loss after server stops responding"
+        final_status.connected,
+        "UDP stream should still report connected (fire-and-forget)"
     );
 }
 
@@ -851,4 +840,349 @@ fn test_connection_to_nonexistent_server() {
         discovered.is_empty(),
         "IdnDiscovery should return empty for nonexistent server"
     );
+}
+
+// =============================================================================
+// Packet parsing helper for low-level E2E tests
+// =============================================================================
+
+/// Parsed fields from a raw IDN packet for test assertions.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ParsedPacket {
+    command: u8,
+    flags: u8,
+    sequence: u16,
+    /// Timestamp from ChannelMessageHeader (offset 8..12), if present
+    timestamp: Option<u32>,
+    /// Content ID from ChannelMessageHeader (offset 6..8), if present
+    content_id: Option<u16>,
+    /// Number of sample bytes after all headers
+    sample_byte_count: Option<usize>,
+}
+
+impl ParsedPacket {
+    /// Parse a raw IDN packet captured by the mock server.
+    fn from_bytes(data: &[u8]) -> Self {
+        let command = data[0];
+        let flags = data[1];
+        let sequence = u16::from_be_bytes([data[2], data[3]]);
+
+        let mut timestamp = None;
+        let mut content_id = None;
+        let mut sample_byte_count = None;
+
+        // If this is a channel message, parse the ChannelMessageHeader
+        if (command == 0x40 || command == 0x41 || command == 0x45) && data.len() >= 12 {
+            // ChannelMessageHeader starts at offset 4:
+            //   total_size: u16 (BE) at [4..6]
+            //   content_id: u16 (BE) at [6..8]
+            //   timestamp:  u32 (BE) at [8..12]
+            content_id = Some(u16::from_be_bytes([data[6], data[7]]));
+            timestamp = Some(u32::from_be_bytes([data[8], data[9], data[10], data[11]]));
+
+            // Calculate sample bytes: total packet length minus all headers.
+            // The total_size field in ChannelMessageHeader tells us everything
+            // from the ChannelMessageHeader start to end of payload.
+            let total_size = u16::from_be_bytes([data[4], data[5]]) as usize;
+            // Packet is: PacketHeader(4) + ChannelMsg payload(total_size)
+            // ChannelMsg payload includes: ChannelMessageHeader(8) + config (optional) + chunk header + samples
+            // We can compute sample bytes from the raw data length minus the 4-byte packet header
+            // and the total_size tells us the channel message size
+            if data.len() >= 4 + total_size {
+                // The data after PacketHeader(4) is total_size bytes
+                // Within that: ChannelMessageHeader is 8 bytes, then config+chunk+samples
+                // For simplicity, count everything after PacketHeader + ChannelMessageHeader
+                // that could be samples by scanning for the SampleChunkHeader
+                sample_byte_count = Some(data.len() - 4); // approximate: everything after packet header
+            }
+        }
+
+        Self {
+            command,
+            flags,
+            sequence,
+            timestamp,
+            content_id,
+            sample_byte_count,
+        }
+    }
+
+    /// Count the number of sample points of a given size in the packet.
+    /// Searches for data after all headers by using the known header sizes.
+    fn count_samples(data: &[u8], bytes_per_sample: usize) -> usize {
+        if data.len() < 12 {
+            return 0;
+        }
+
+        let total_size = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let channel_msg_payload = &data[4..4 + total_size.min(data.len() - 4)];
+
+        // ChannelMessageHeader is 8 bytes within the payload
+        if channel_msg_payload.len() <= 8 {
+            return 0;
+        }
+
+        let content_id = u16::from_be_bytes([data[6], data[7]]);
+        let has_config = content_id & 0x4000 != 0; // IDNFLG_CONTENTID_CONFIG_LSTFRG
+
+        let mut offset = 8; // past ChannelMessageHeader
+
+        if has_config {
+            // ChannelConfigHeader is 4 bytes + descriptors
+            if channel_msg_payload.len() <= offset {
+                return 0;
+            }
+            let word_count = channel_msg_payload[offset] as usize;
+            let config_size = 4 + word_count * 4; // 4 header bytes + word_count * 4 descriptor bytes
+            offset += config_size;
+        }
+
+        // SampleChunkHeader is 4 bytes
+        offset += 4;
+
+        if offset > channel_msg_payload.len() {
+            return 0;
+        }
+
+        let sample_data_len = channel_msg_payload.len() - offset;
+        sample_data_len / bytes_per_sample
+    }
+}
+
+// =============================================================================
+// Helper: Create a stream connected to a mock server (low-level API)
+// =============================================================================
+
+/// Connect to a mock server using the low-level stream API.
+fn connect_stream(
+    handle: &TestServerHandle,
+) -> laser_dac::protocols::idn::dac::stream::Stream {
+    let addr = handle.addr();
+
+    // Discover the server first to get real ServerInfo
+    let mut scanner =
+        laser_dac::protocols::idn::ServerScanner::new(0).expect("Failed to create scanner");
+    let servers = scanner
+        .scan_address(addr, Duration::from_millis(500))
+        .expect("Scan failed");
+    assert!(!servers.is_empty(), "Should find mock server");
+
+    let server = &servers[0];
+    let service_id = server.services.first().map(|s| s.service_id).unwrap_or(1);
+
+    laser_dac::protocols::idn::dac::stream::connect(server, service_id)
+        .expect("Should connect stream")
+}
+
+// =============================================================================
+// Low-level E2E tests
+// =============================================================================
+
+#[test]
+fn test_keepalive_sends_void_channel_message() {
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("KeepaliveTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+
+    // Send one frame to establish session
+    let points: Vec<PointXyrgbi> = (0..20)
+        .map(|_| PointXyrgbi::new(0, 0, 255, 0, 0, 255))
+        .collect();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    // Clear packets and send keepalive
+    handle.clear_received_packets();
+    thread::sleep(Duration::from_millis(600)); // exceed KEEPALIVE_INTERVAL
+    stream.send_keepalive().expect("Should send keepalive");
+    thread::sleep(Duration::from_millis(50));
+
+    // Inspect the keepalive packet
+    let packets = handle.received_packets.lock().unwrap();
+    assert!(!packets.is_empty(), "Should have captured keepalive packet");
+
+    let last = packets.last().unwrap();
+    let parsed = ParsedPacket::from_bytes(last);
+
+    // Should be RT_CNLMSG (0x40), NOT PING_REQUEST (0x08)
+    assert_eq!(
+        parsed.command, 0x40,
+        "keepalive should use RT_CNLMSG (0x40), not PING_REQUEST"
+    );
+
+    // Content ID lower bits should be VOID (0x00)
+    let cid = parsed.content_id.expect("Should have content_id");
+    assert_eq!(
+        cid & 0x00FF,
+        0x00,
+        "keepalive content_id chunk type should be VOID (0x00)"
+    );
+
+    // Prevent Drop from sending close on the test socket
+    std::mem::forget(stream);
+}
+
+#[test]
+fn test_small_frame_padded_to_minimum() {
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("PaddingTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+
+    // Send a frame with only 5 points
+    let points: Vec<PointXyrgbi> = (0..5)
+        .map(|i| PointXyrgbi::new(i as i16 * 100, 0, 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_packets();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    // Find the frame packet (command 0x40)
+    let packets = handle.received_packets.lock().unwrap();
+    let frame_packet = packets
+        .iter()
+        .find(|p| !p.is_empty() && p[0] == IDNCMD_RT_CNLMSG)
+        .expect("Should find frame packet");
+
+    // Count samples in the packet (PointXyrgbi = 8 bytes per sample)
+    let sample_count = ParsedPacket::count_samples(frame_packet, 8);
+    assert!(
+        sample_count >= 20,
+        "Frame should be padded to at least 20 samples, got {}",
+        sample_count
+    );
+
+    std::mem::forget(stream);
+}
+
+#[test]
+fn test_first_frame_has_nonzero_timestamp() {
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("TimestampTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+
+    // Wait a bit so connect_time.elapsed() is non-trivial
+    thread::sleep(Duration::from_millis(50));
+
+    let points: Vec<PointXyrgbi> = (0..20)
+        .map(|_| PointXyrgbi::new(0, 0, 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_packets();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    let packets = handle.received_packets.lock().unwrap();
+    let frame_packet = packets
+        .iter()
+        .find(|p| !p.is_empty() && p[0] == IDNCMD_RT_CNLMSG)
+        .expect("Should find frame packet");
+
+    let parsed = ParsedPacket::from_bytes(frame_packet);
+    let ts = parsed.timestamp.expect("Should have timestamp");
+    assert!(
+        ts > 0,
+        "First frame timestamp should be non-zero (connect_time based), got {}",
+        ts
+    );
+
+    std::mem::forget(stream);
+}
+
+#[test]
+fn test_close_with_ack() {
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("CloseAckTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+
+    // Send one frame to establish the session
+    let points: Vec<PointXyrgbi> = (0..20)
+        .map(|_| PointXyrgbi::new(0, 0, 255, 0, 0, 255))
+        .collect();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    handle.clear_received_packets();
+
+    // Close with ack
+    let result = stream.close_with_ack(Duration::from_millis(500));
+    assert!(result.is_ok(), "close_with_ack should succeed");
+
+    thread::sleep(Duration::from_millis(50));
+
+    // Verify that the server received a CLOSE_ACKREQ packet (0x45)
+    let packets = handle.received_packets.lock().unwrap();
+    let has_close_ackreq = packets
+        .iter()
+        .any(|p| !p.is_empty() && p[0] == IDNCMD_RT_CNLMSG_CLOSE_ACKREQ);
+    assert!(
+        has_close_ackreq,
+        "Server should have received CLOSE_ACKREQ (0x45) packet"
+    );
+
+    std::mem::forget(stream);
+}
+
+#[test]
+fn test_get_parameter_uses_correct_command() {
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("ParamTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+
+    // Send one frame first to establish session
+    let points: Vec<PointXyrgbi> = (0..20)
+        .map(|_| PointXyrgbi::new(0, 0, 255, 0, 0, 255))
+        .collect();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    // Test 1: service_id=0 should use UNIT_PARAMS_REQUEST (0x22)
+    handle.clear_received_packets();
+    let _ = stream.get_parameter(0, 0x0001, Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(50));
+
+    {
+        let packets = handle.received_packets.lock().unwrap();
+        let unit_param_packet = packets
+            .iter()
+            .find(|p| !p.is_empty() && p[0] == IDNCMD_UNIT_PARAMS_REQUEST);
+        assert!(
+            unit_param_packet.is_some(),
+            "service_id=0 should send UNIT_PARAMS_REQUEST (0x22)"
+        );
+    }
+
+    // Test 2: service_id=1 should use SERVICE_PARAMS_REQUEST (0x20)
+    handle.clear_received_packets();
+    let _ = stream.get_parameter(1, 0x0001, Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(50));
+
+    {
+        let packets = handle.received_packets.lock().unwrap();
+        let service_param_packet = packets
+            .iter()
+            .find(|p| !p.is_empty() && p[0] == IDNCMD_SERVICE_PARAMS_REQUEST);
+        assert!(
+            service_param_packet.is_some(),
+            "service_id=1 should send SERVICE_PARAMS_REQUEST (0x20)"
+        );
+    }
+
+    std::mem::forget(stream);
 }

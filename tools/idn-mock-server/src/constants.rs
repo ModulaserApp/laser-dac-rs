@@ -9,7 +9,15 @@ pub const IDNCMD_SERVICEMAP_REQUEST: u8 = 0x12;
 pub const IDNCMD_SERVICEMAP_RESPONSE: u8 = 0x13;
 pub const IDNCMD_RT_CNLMSG: u8 = 0x40;
 pub const IDNCMD_RT_CNLMSG_ACKREQ: u8 = 0x41;
+pub const IDNCMD_RT_CNLMSG_CLOSE: u8 = 0x44;
+pub const IDNCMD_RT_CNLMSG_CLOSE_ACKREQ: u8 = 0x45;
 pub const IDNCMD_RT_ACK: u8 = 0x47;
+
+// Parameter commands
+pub const IDNCMD_UNIT_PARAMS_REQUEST: u8 = 0x22;
+pub const IDNCMD_UNIT_PARAMS_RESPONSE: u8 = 0x23;
+pub const IDNCMD_SERVICE_PARAMS_REQUEST: u8 = 0x20;
+pub const IDNCMD_SERVICE_PARAMS_RESPONSE: u8 = 0x21;
 
 // Service types
 pub const IDNVAL_STYPE_LAPRO: u8 = 0x80;
