@@ -1,6 +1,6 @@
 [package]
 name = "laser-dac"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 authors = ["Kees Kluskens <kees@kees.im>"]
 description = "Unified laser DAC abstraction supporting multiple protocols"
