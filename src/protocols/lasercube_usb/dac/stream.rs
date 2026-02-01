@@ -6,9 +6,10 @@ use crate::protocols::lasercube_usb::protocol::{
     Sample, CMD_CLEAR_RINGBUFFER, CMD_GET_BULK_PACKET_SAMPLE_COUNT, CMD_GET_DAC_RATE,
     CMD_GET_MAX_DAC_RATE, CMD_GET_MAX_DAC_VALUE, CMD_GET_MIN_DAC_VALUE, CMD_GET_OUTPUT,
     CMD_GET_RINGBUFFER_EMPTY_SAMPLE_COUNT, CMD_GET_RINGBUFFER_SAMPLE_COUNT,
-    CMD_GET_SAMPLE_ELEMENT_COUNT, CMD_GET_VERSION_MAJOR, CMD_GET_VERSION_MINOR, CMD_SET_DAC_RATE,
-    CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, DATA_ALT_SETTING, DATA_INTERFACE,
-    ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
+    CMD_GET_SAMPLE_ELEMENT_COUNT, CMD_GET_VERSION_MAJOR, CMD_GET_VERSION_MINOR, CMD_RUNNER_MODE,
+    CMD_SET_DAC_RATE, CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, DATA_ALT_SETTING,
+    DATA_INTERFACE, ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
+    RUNNER_MODE_SUB_ENABLE, RUNNER_MODE_SUB_RUN, SAMPLE_SIZE_BYTES,
 };
 use rusb::{DeviceHandle, UsbContext};
 use std::time::Duration;
@@ -34,6 +35,22 @@ pub struct Stream<T: UsbContext> {
 }
 
 impl<T: UsbContext> Stream<T> {
+    /// Clear any stuck runner mode state from a previous session.
+    ///
+    /// Sends the toggle sequence: enable(1), enable(0), run(1), run(0).
+    /// Errors are ignored since older firmware may not support this command.
+    fn clear_runner_mode(handle: &DeviceHandle<T>) {
+        let packets: [[u8; 3]; 4] = [
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 0],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 0],
+        ];
+        for packet in &packets {
+            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, DEFAULT_TIMEOUT);
+        }
+    }
+
     /// Open a stream to a LaserCube/LaserDock USB device.
     ///
     /// This claims the necessary interfaces and initializes the device.
@@ -46,6 +63,9 @@ impl<T: UsbContext> Stream<T> {
         // Claim data interface with alternate setting
         handle.claim_interface(DATA_INTERFACE)?;
         handle.set_alternate_setting(DATA_INTERFACE, DATA_ALT_SETTING)?;
+
+        // Clear any stuck runner mode from a previous session
+        Self::clear_runner_mode(&handle);
 
         let mut stream = Stream {
             handle,
@@ -149,7 +169,8 @@ impl<T: UsbContext> Stream<T> {
 
     /// Send samples to the DAC.
     ///
-    /// This sends the samples to the device's ring buffer for playback.
+    /// Samples are sent in chunks of `bulk_packet_sample_count` to match
+    /// the device's expected USB bulk transfer size.
     pub fn send_samples(&mut self, samples: &[Sample]) -> Result<()> {
         if self.status != DeviceStatus::Initialized {
             return Err(Error::DeviceNotOpened);
@@ -169,13 +190,26 @@ impl<T: UsbContext> Stream<T> {
             })
             .collect();
 
-        self.send_data(&buffer)
+        let chunk_bytes = self.info.bulk_packet_sample_count as usize * SAMPLE_SIZE_BYTES;
+        if chunk_bytes == 0 {
+            return self.send_data(&buffer);
+        }
+
+        for chunk in buffer.chunks(chunk_bytes) {
+            self.send_data(chunk)?;
+        }
+        Ok(())
     }
 
     /// Write a frame of samples at the specified rate.
     ///
-    /// This is a convenience method that sets the rate and sends the samples.
+    /// The rate is clamped to the device's maximum DAC rate.
     pub fn write_frame(&mut self, samples: &[Sample], rate: u32) -> Result<()> {
+        let rate = if self.info.max_dac_rate > 0 {
+            rate.min(self.info.max_dac_rate)
+        } else {
+            rate
+        };
         if self.info.current_rate != rate {
             self.set_rate(rate)?;
         }
