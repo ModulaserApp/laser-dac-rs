@@ -19,7 +19,8 @@
 //!
 //! Shutter control is best-effort and varies by backend:
 //! - **LaserCube USB/WiFi**: Actual hardware control
-//! - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
+//! - **Helios**: Hardware shutter control via USB interrupt
+//! - **Ether Dream, IDN**: No-op (safety relies on software blanking)
 //!
 //! # Disconnect Behavior
 //!
@@ -33,8 +34,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit, StreamConfig,
-    StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
+    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -111,8 +112,8 @@ impl StreamControl {
     /// **Latency**: Points already in the device buffer will still play out.
     /// `target_queue_points` bounds this latency.
     ///
-    /// **Hardware shutter**: Best-effort. LaserCube has actual hardware control;
-    /// Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
+    /// **Hardware shutter**: Best-effort. LaserCube and Helios have actual hardware
+    /// control; Ether Dream, IDN are no-ops (safety relies on software blanking).
     pub fn disarm(&self) -> Result<()> {
         self.inner.armed.store(false, Ordering::SeqCst);
         // Send message to stream for immediate shutter control
@@ -362,7 +363,11 @@ impl Stream {
                         self.state.last_chunk = Some(points.to_vec());
                     }
                     self.state.current_instant += self.chunk_points as u64;
-                    self.state.scheduled_ahead += self.chunk_points as u64;
+                    if self.info.caps.output_model == OutputModel::UsbFrameSwap {
+                        self.state.scheduled_ahead = self.chunk_points as u64;
+                    } else {
+                        self.state.scheduled_ahead += self.chunk_points as u64;
+                    }
                     self.state.stats.chunks_written += 1;
                     self.state.stats.points_written += self.chunk_points as u64;
                     return Ok(());
@@ -692,7 +697,11 @@ impl Stream {
                         self.state.last_chunk = Some(fill_points);
                     }
                     self.state.current_instant += n_points as u64;
-                    self.state.scheduled_ahead += n_points as u64;
+                    if self.info.caps.output_model == OutputModel::UsbFrameSwap {
+                        self.state.scheduled_ahead = n_points as u64;
+                    } else {
+                        self.state.scheduled_ahead += n_points as u64;
+                    }
                     self.state.stats.chunks_written += 1;
                     self.state.stats.points_written += n_points as u64;
                 }

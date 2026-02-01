@@ -27,7 +27,7 @@ const ENDPOINT_INT_IN: u8 = 0x83;
 
 // Interrupt control bytes
 const CONTROL_STOP: u8 = 0x01;
-const _CONTROL_SET_SHUTTER: u8 = 0x02;
+const CONTROL_SET_SHUTTER: u8 = 0x02;
 const CONTROL_GET_STATUS: u8 = 0x03;
 const CONTROL_GET_FIRMWARE_VERSION: u8 = 0x04;
 const CONTROL_GET_NAME: u8 = 0x05;
@@ -98,7 +98,7 @@ impl HeliosDac {
     /// Writes and outputs a frame to the DAC.
     pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
         if let HeliosDac::Open { handle, .. } = self {
-            let mut frame_buffer = Vec::new();
+            let mut frame_buffer = Vec::with_capacity(frame.points.len() * 7 + 5);
 
             // this is a bug workaround, the mcu won't correctly receive transfers with these sizes
             let mut pps_actual = frame.pps;
@@ -125,13 +125,12 @@ impl HeliosDac {
             frame_buffer.push((pps_actual >> 8) as u8);
             frame_buffer.push((num_of_points_actual & 0xFF) as u8);
             frame_buffer.push((num_of_points_actual >> 8) as u8);
-            frame_buffer.push(0); // flags
+            frame_buffer.push(frame.flags.bits());
 
-            let timeout = ((8 + frame_buffer.len()) >> 5) as u64;
             handle.write_bulk(
                 ENDPOINT_BULK_OUT,
                 &frame_buffer,
-                Duration::from_millis(timeout),
+                bulk_transfer_timeout(frame_buffer.len()),
             )?;
 
             Ok(())
@@ -191,6 +190,12 @@ impl HeliosDac {
         self.send_control(&ctrl_buffer)
     }
 
+    /// Opens or closes the hardware shutter.
+    pub fn set_shutter(&self, open: bool) -> Result<()> {
+        let ctrl_buffer = [CONTROL_SET_SHUTTER, open as u8];
+        self.send_control(&ctrl_buffer)
+    }
+
     fn call_control(&self, buffer: &[u8]) -> Result<([u8; 32], usize)> {
         self.send_control(buffer)?;
         self.read_response()
@@ -227,6 +232,14 @@ impl From<rusb::Device<rusb::Context>> for HeliosDac {
     }
 }
 
+/// Compute the USB bulk transfer timeout for a frame buffer.
+///
+/// Matches the Helios C++ SDK formula: `8 + (bufferSize >> 5)` ms.
+/// The constant 8ms base ensures a minimum timeout even for tiny frames.
+fn bulk_transfer_timeout(buffer_len: usize) -> Duration {
+    Duration::from_millis((8 + (buffer_len >> 5)) as u64)
+}
+
 /// Errors that can occur when communicating with a Helios DAC.
 #[derive(Error, Debug)]
 pub enum HeliosDacError {
@@ -238,4 +251,30 @@ pub enum HeliosDacError {
     InvalidDeviceResult,
     #[error("could not parse string: {0}")]
     Utf8Error(#[from] std::string::FromUtf8Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bulk_transfer_timeout_matches_sdk() {
+        // C++ SDK: 8 + (frameBufferSize >> 5) ms
+        // Must have an 8ms minimum floor for any buffer size.
+
+        // 1 point = 12 bytes → 8 + 0 = 8ms
+        assert_eq!(bulk_transfer_timeout(12), Duration::from_millis(8));
+
+        // 10 points = 75 bytes → 8 + 2 = 10ms
+        assert_eq!(bulk_transfer_timeout(75), Duration::from_millis(10));
+
+        // 100 points = 710 bytes → 8 + 22 = 30ms
+        assert_eq!(bulk_transfer_timeout(710), Duration::from_millis(30));
+
+        // 4095 points = 28670 bytes → 8 + 895 = 903ms
+        assert_eq!(bulk_transfer_timeout(28670), Duration::from_millis(903));
+
+        // Empty buffer → still 8ms minimum
+        assert_eq!(bulk_transfer_timeout(0), Duration::from_millis(8));
+    }
 }
