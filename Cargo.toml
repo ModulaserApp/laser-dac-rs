@@ -1,6 +1,6 @@
 [package]
 name = "laser-dac"
-version = "0.7.0"
+version = "0.7.4"
 edition = "2021"
 authors = ["Kees Kluskens <kees@kees.im>"]
 description = "Unified laser DAC abstraction supporting multiple protocols"
@@ -28,7 +28,7 @@ network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
 ether-dream = []
-idn = []
+idn = ["dep:socket2", "dep:libc"]
 lasercube-wifi = ["dep:socket2", "dep:libc"]
 
 # Optional serialization

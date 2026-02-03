@@ -118,8 +118,11 @@ impl StreamBackend for HeliosBackend {
         Ok(())
     }
 
-    fn set_shutter(&mut self, _open: bool) -> Result<()> {
-        // Helios doesn't have explicit shutter control
+    fn set_shutter(&mut self, open: bool) -> Result<()> {
+        if let Some(dac) = &self.dac {
+            dac.set_shutter(open)
+                .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))?;
+        }
         Ok(())
     }
 }

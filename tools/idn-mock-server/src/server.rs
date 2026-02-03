@@ -222,6 +222,55 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                         let _ = self.socket.send_to(&response, src);
                     }
                 }
+                IDNCMD_RT_CNLMSG_CLOSE => {
+                    log::debug!("Received RT_CNLMSG_CLOSE from {}", src);
+                    // No response needed for close without ack
+                }
+                IDNCMD_RT_CNLMSG_CLOSE_ACKREQ => {
+                    log::debug!("Received RT_CNLMSG_CLOSE_ACKREQ from {}", src);
+                    let response =
+                        build_ack_response(flags, sequence, self.behavior.get_ack_result_code());
+                    let _ = self.socket.send_to(&response, src);
+                }
+                IDNCMD_UNIT_PARAMS_REQUEST => {
+                    log::debug!("Received UNIT_PARAMS_REQUEST from {}", src);
+                    // Parse service_id and param_id from the request
+                    let service_id = if len > 4 { buf[4] } else { 0 };
+                    let param_id = if len > 7 {
+                        u16::from_be_bytes([buf[6], buf[7]])
+                    } else {
+                        0
+                    };
+                    let response = build_parameter_response(
+                        flags,
+                        sequence,
+                        IDNCMD_UNIT_PARAMS_RESPONSE,
+                        0, // success
+                        service_id,
+                        param_id,
+                        0x12345678, // dummy value
+                    );
+                    let _ = self.socket.send_to(&response, src);
+                }
+                IDNCMD_SERVICE_PARAMS_REQUEST => {
+                    log::debug!("Received SERVICE_PARAMS_REQUEST from {}", src);
+                    let service_id = if len > 4 { buf[4] } else { 0 };
+                    let param_id = if len > 7 {
+                        u16::from_be_bytes([buf[6], buf[7]])
+                    } else {
+                        0
+                    };
+                    let response = build_parameter_response(
+                        flags,
+                        sequence,
+                        IDNCMD_SERVICE_PARAMS_RESPONSE,
+                        0, // success
+                        service_id,
+                        param_id,
+                        0x12345678, // dummy value
+                    );
+                    let _ = self.socket.send_to(&response, src);
+                }
                 _ => {
                     log::trace!("Unknown command: 0x{:02X} from {}", command, src);
                 }

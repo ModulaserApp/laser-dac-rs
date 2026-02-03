@@ -61,6 +61,8 @@ pub mod backend;
 pub mod discovery;
 mod error;
 mod frame_adapter;
+#[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
+mod net_utils;
 pub mod protocols;
 pub mod session;
 pub mod stream;

@@ -3,10 +3,8 @@
 use crate::backend::{StreamBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
-use crate::protocols::idn::error::{CommunicationError, ResponseError};
 use crate::protocols::idn::protocol::PointXyrgbi;
 use crate::types::{DacCapabilities, DacType, LaserPoint};
-use std::time::Duration;
 
 /// IDN DAC backend (ILDA Digital Network).
 pub struct IdnBackend {
@@ -63,14 +61,7 @@ impl StreamBackend for IdnBackend {
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
         if stream.needs_keepalive() {
-            stream
-                .ping(Duration::from_millis(200))
-                .map_err(|e| match e {
-                    CommunicationError::Response(ResponseError::Timeout) => {
-                        Error::disconnected("Connection lost: ping timeout")
-                    }
-                    e => Error::backend(e),
-                })?;
+            stream.send_keepalive().map_err(Error::backend)?;
         }
 
         stream.set_scan_speed(pps);

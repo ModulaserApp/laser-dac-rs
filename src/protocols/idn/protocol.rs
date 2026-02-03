@@ -30,12 +30,12 @@ pub const IDNCMD_SERVICEMAP_REQUEST: u8 = 0x12;
 pub const IDNCMD_SERVICEMAP_RESPONSE: u8 = 0x13;
 
 // Parameter commands
-pub const IDNCMD_PARAM_GET_REQUEST: u8 = 0x20;
-pub const IDNCMD_PARAM_GET_RESPONSE: u8 = 0x21;
-pub const IDNCMD_PARAM_SET_REQUEST: u8 = 0x22;
-pub const IDNCMD_PARAM_SET_RESPONSE: u8 = 0x23;
-pub const IDNCMD_PARAM_LIST_REQUEST: u8 = 0x24;
-pub const IDNCMD_PARAM_LIST_RESPONSE: u8 = 0x25;
+pub const IDNCMD_SERVICE_PARAMS_REQUEST: u8 = 0x20;
+pub const IDNCMD_SERVICE_PARAMS_RESPONSE: u8 = 0x21;
+pub const IDNCMD_UNIT_PARAMS_REQUEST: u8 = 0x22;
+pub const IDNCMD_UNIT_PARAMS_RESPONSE: u8 = 0x23;
+pub const IDNCMD_LINK_PARAMS_REQUEST: u8 = 0x28;
+pub const IDNCMD_LINK_PARAMS_RESPONSE: u8 = 0x29;
 
 // Realtime stream commands
 pub const IDNCMD_RT_CNLMSG: u8 = 0x40;
@@ -417,7 +417,7 @@ impl SizeBytes for ChannelMessageHeader {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChannelConfigHeader {
-    /// Number of 16-bit words in the descriptor array
+    /// Number of descriptor pairs (32-bit words) in the descriptor array
     pub word_count: u8,
     /// Upper 4 bits: Decoder flags; Lower 4 bits: Config flags
     pub flags: u8,

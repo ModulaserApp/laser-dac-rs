@@ -61,6 +61,13 @@ pub const CMD_CLEAR_RINGBUFFER: u8 = 0x8D;
 /// Get bulk packet sample count.
 pub const CMD_GET_BULK_PACKET_SAMPLE_COUNT: u8 = 0x8E;
 
+/// Runner mode command.
+pub const CMD_RUNNER_MODE: u8 = 0xC0;
+/// Runner mode sub-command: enable.
+pub const RUNNER_MODE_SUB_ENABLE: u8 = 0x01;
+/// Runner mode sub-command: run.
+pub const RUNNER_MODE_SUB_RUN: u8 = 0x09;
+
 /// Maximum coordinate value (12-bit).
 pub const MAX_COORDINATE_VALUE: u16 = 4095;
 

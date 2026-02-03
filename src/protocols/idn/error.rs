@@ -85,6 +85,8 @@ pub enum ProtocolError {
     BufferTooSmall,
     /// Invalid point format
     InvalidPointFormat,
+    /// Response sequence number does not match request
+    SequenceMismatch { expected: u16, actual: u16 },
 }
 
 impl fmt::Display for ProtocolError {
@@ -98,6 +100,13 @@ impl fmt::Display for ProtocolError {
             ProtocolError::InvalidServiceMapResponse => write!(f, "invalid service map response"),
             ProtocolError::BufferTooSmall => write!(f, "buffer too small for operation"),
             ProtocolError::InvalidPointFormat => write!(f, "invalid point format"),
+            ProtocolError::SequenceMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "sequence mismatch: expected {}, got {}",
+                    expected, actual
+                )
+            }
         }
     }
 }
@@ -180,3 +189,35 @@ impl ResponseError {
 
 /// Result type alias for IDN operations.
 pub type Result<T> = std::result::Result<T, CommunicationError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sequence_mismatch_display() {
+        let err = ProtocolError::SequenceMismatch {
+            expected: 42,
+            actual: 99,
+        };
+        assert_eq!(err.to_string(), "sequence mismatch: expected 42, got 99");
+    }
+
+    #[test]
+    fn test_sequence_mismatch_equality() {
+        let a = ProtocolError::SequenceMismatch {
+            expected: 1,
+            actual: 2,
+        };
+        let b = ProtocolError::SequenceMismatch {
+            expected: 1,
+            actual: 2,
+        };
+        let c = ProtocolError::SequenceMismatch {
+            expected: 1,
+            actual: 3,
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+}

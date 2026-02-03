@@ -17,11 +17,15 @@ pub struct Frame {
 
 impl Frame {
     /// Create a new frame with the given point rate and points.
+    ///
+    /// Defaults to `SINGLE_MODE` (play once, don't repeat), matching the
+    /// official Helios SDK's `HELIOS_FLAGS_DEFAULT`. This prevents the DAC
+    /// from repeating the last frame indefinitely if the host stops sending.
     pub fn new(pps: u32, points: Vec<Point>) -> Self {
         Frame {
             pps,
             points,
-            flags: WriteFrameFlags::empty(),
+            flags: WriteFrameFlags::SINGLE_MODE,
         }
     }
 

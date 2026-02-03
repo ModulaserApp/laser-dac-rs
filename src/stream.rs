@@ -19,7 +19,8 @@
 //!
 //! Shutter control is best-effort and varies by backend:
 //! - **LaserCube USB/WiFi**: Actual hardware control
-//! - **Ether Dream, Helios, IDN**: No-op (safety relies on software blanking)
+//! - **Helios**: Hardware shutter control via USB interrupt
+//! - **Ether Dream, IDN**: No-op (safety relies on software blanking)
 //!
 //! # Disconnect Behavior
 //!
@@ -111,8 +112,8 @@ impl StreamControl {
     /// **Latency**: Points already in the device buffer will still play out.
     /// `target_buffer` bounds this latency.
     ///
-    /// **Hardware shutter**: Best-effort. LaserCube has actual hardware control;
-    /// Ether Dream, Helios, IDN are no-ops (safety relies on software blanking).
+    /// **Hardware shutter**: Best-effort. LaserCube and Helios have actual hardware
+    /// control; Ether Dream, IDN are no-ops (safety relies on software blanking).
     pub fn disarm(&self) -> Result<()> {
         self.inner.armed.store(false, Ordering::SeqCst);
         // Send message to stream for immediate shutter control

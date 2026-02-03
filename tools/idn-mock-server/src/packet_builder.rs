@@ -146,6 +146,34 @@ pub fn build_ack_response_full(
     response
 }
 
+/// Build a parameter response packet.
+///
+/// Used for responding to UNIT_PARAMS_REQUEST and SERVICE_PARAMS_REQUEST.
+pub fn build_parameter_response(
+    flags: u8,
+    sequence: u16,
+    response_cmd: u8,
+    result_code: i8,
+    service_id: u8,
+    param_id: u16,
+    value: u32,
+) -> Vec<u8> {
+    let mut response = Vec::with_capacity(12);
+
+    // Packet header (4 bytes)
+    response.push(response_cmd);
+    response.push(flags);
+    response.extend_from_slice(&sequence.to_be_bytes());
+
+    // ParameterResponse (8 bytes): service_id, result_code, param_id (BE), value (BE)
+    response.push(service_id);
+    response.push(result_code as u8);
+    response.extend_from_slice(&param_id.to_be_bytes());
+    response.extend_from_slice(&value.to_be_bytes());
+
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
