@@ -13,10 +13,6 @@ pub struct LasercubeUsbBackend {
     device: Option<rusb::Device<rusb::Context>>,
     stream: Option<Stream<rusb::Context>>,
     caps: DacCapabilities,
-    /// Cached ring buffer capacity from device info.
-    ringbuffer_capacity: u32,
-    /// Last known ring buffer free space.
-    last_free_space: u32,
 }
 
 impl LasercubeUsbBackend {
@@ -25,21 +21,14 @@ impl LasercubeUsbBackend {
             device: Some(device),
             stream: None,
             caps: super::default_capabilities(),
-            ringbuffer_capacity: 0,
-            last_free_space: 0,
         }
     }
 
     pub fn from_stream(stream: Stream<rusb::Context>) -> Self {
-        let info = stream.info();
-        let ringbuffer_capacity = info.ringbuffer_capacity;
-        let last_free_space = info.ringbuffer_free_space;
         Self {
             device: None,
             stream: Some(stream),
             caps: super::default_capabilities(),
-            ringbuffer_capacity,
-            last_free_space,
         }
     }
 
@@ -94,8 +83,6 @@ impl StreamBackend for LasercubeUsbBackend {
         stream.enable_output().map_err(Error::backend)?;
 
         let info = stream.info();
-        self.ringbuffer_capacity = info.ringbuffer_capacity;
-        self.last_free_space = info.ringbuffer_free_space;
         if info.max_dac_rate > 0 {
             self.caps.pps_max = info.max_dac_rate;
         }
@@ -122,21 +109,8 @@ impl StreamBackend for LasercubeUsbBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        // Query ring buffer free space for backpressure
-        let free_space = match stream.ringbuffer_free_space() {
-            Ok(space) => space,
-            Err(e) => return self.handle_stream_error(e),
-        };
-        self.last_free_space = free_space;
-
-        if (free_space as usize) < points.len() {
-            return Ok(WriteOutcome::WouldBlock);
-        }
-
         let samples: Vec<LasercubeUsbSample> = points.iter().map(|p| p.into()).collect();
 
-        // Re-borrow stream after the free space check
-        let stream = self.stream.as_mut().unwrap();
         match stream.write_frame(&samples, pps) {
             Ok(()) => Ok(WriteOutcome::Written),
             Err(e) => self.handle_stream_error(e),
@@ -169,9 +143,6 @@ impl StreamBackend for LasercubeUsbBackend {
     }
 
     fn queued_points(&self) -> Option<u64> {
-        if self.ringbuffer_capacity == 0 {
-            return None;
-        }
-        Some((self.ringbuffer_capacity - self.last_free_space) as u64)
+        None
     }
 }
