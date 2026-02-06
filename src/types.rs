@@ -267,10 +267,6 @@ pub struct DacCapabilities {
     pub pps_max: u32,
     /// Maximum number of points allowed per chunk submission.
     pub max_points_per_chunk: usize,
-    /// Some DACs dislike per-chunk PPS changes.
-    pub prefers_constant_pps: bool,
-    /// Best-effort: can we estimate device queue depth/latency?
-    pub can_estimate_queue: bool,
     /// The scheduler-relevant output model.
     pub output_model: OutputModel,
 }
@@ -281,8 +277,6 @@ impl Default for DacCapabilities {
             pps_min: 1,
             pps_max: 100_000,
             max_points_per_chunk: 4096,
-            prefers_constant_pps: false,
-            can_estimate_queue: false,
             output_model: OutputModel::NetworkFifo,
         }
     }
@@ -337,7 +331,19 @@ pub enum OutputModel {
     UdpTimed,
 }
 
-/// A point in stream time, measured in points since stream start.
+/// Represents a point in stream time, anchored to estimated playback position.
+///
+/// `StreamInstant` represents the **estimated playback time** of points, not merely
+/// "points sent so far." When used in `ChunkRequest::start`, it represents:
+///
+/// `start` = playhead + buffered
+///
+/// Where:
+/// - `playhead` = stream_epoch + estimated_consumed_points
+/// - `buffered` = points sent but not yet played
+///
+/// This allows callbacks to generate content for the exact time it will be displayed,
+/// enabling accurate audio synchronization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamInstant(pub u64);
@@ -356,6 +362,15 @@ impl StreamInstant {
     /// Convert this instant to seconds at the given points-per-second rate.
     pub fn as_seconds(&self, pps: u32) -> f64 {
         self.0 as f64 / pps as f64
+    }
+
+    /// Convert to seconds at the given PPS.
+    ///
+    /// This is an alias for `as_seconds()` for consistency with standard Rust
+    /// duration naming conventions (e.g., `Duration::as_secs_f64()`).
+    #[inline]
+    pub fn as_secs_f64(&self, pps: u32) -> f64 {
+        self.as_seconds(pps)
     }
 
     /// Create a stream instant from a duration in seconds at the given PPS.
@@ -401,26 +416,82 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 }
 
 /// Configuration for starting a stream.
+///
+/// # Buffer-Driven Timing
+///
+/// The streaming API uses pure buffer-driven timing:
+/// - `target_buffer`: Target buffer level to maintain (default: 20ms)
+/// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 8ms)
+///
+/// The callback is invoked when `buffered < target_buffer`. The callback receives
+/// a `ChunkRequest` with `min_points` and `target_points` calculated from these
+/// durations and the current buffer state.
+///
+/// To reduce perceived latency, reduce `target_buffer`.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamConfig {
     /// Points per second output rate.
     pub pps: u32,
-    /// Exact chunk size to request/write. If `None`, the library chooses a default.
-    pub chunk_points: Option<usize>,
-    /// Target amount of queued data expressed in points.
-    pub target_queue_points: usize,
+
+    /// Target buffer level to maintain (default: 20ms).
+    ///
+    /// The callback's `target_points` is calculated to bring the buffer to this level.
+    /// The callback is invoked when the buffer drops below this level.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub target_buffer: std::time::Duration,
+
+    /// Minimum buffer before requesting urgent fill (default: 8ms).
+    ///
+    /// When buffer drops below this, `min_points` in `ChunkRequest` will be non-zero.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub min_buffer: std::time::Duration,
+
     /// What to do when the producer can't keep up.
     pub underrun: UnderrunPolicy,
+
+    /// Maximum time to wait for queued points to drain on graceful shutdown (default: 1s).
+    ///
+    /// When the producer returns `ChunkResult::End`, the stream waits for buffered
+    /// points to play out before returning. This timeout caps that wait to prevent
+    /// blocking forever if the DAC stalls or queue depth is unknown.
+    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
+    pub drain_timeout: std::time::Duration,
+}
+
+#[cfg(feature = "serde")]
+mod duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Use u64 for both serialize and deserialize to ensure round-trip compatibility.
+        // Clamp to u64::MAX for durations > ~584 million years (practically never hit).
+        let millis = duration.as_millis().min(u64::MAX as u128) as u64;
+        millis.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let millis = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(millis))
+    }
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
+        use std::time::Duration;
         Self {
             pps: 30_000,
-            chunk_points: None,
-            target_queue_points: 3000,
+            target_buffer: Duration::from_millis(20),
+            min_buffer: Duration::from_millis(8),
             underrun: UnderrunPolicy::default(),
+            drain_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -434,21 +505,34 @@ impl StreamConfig {
         }
     }
 
-    /// Set the chunk size (builder pattern).
-    pub fn with_chunk_points(mut self, chunk_points: usize) -> Self {
-        self.chunk_points = Some(chunk_points);
+    /// Set the target buffer level to maintain (builder pattern).
+    ///
+    /// Default: 20ms. Higher values provide more safety margin against underruns.
+    /// Lower values reduce perceived latency.
+    pub fn with_target_buffer(mut self, duration: std::time::Duration) -> Self {
+        self.target_buffer = duration;
         self
     }
 
-    /// Set the target queue depth in points (builder pattern).
-    pub fn with_target_queue_points(mut self, points: usize) -> Self {
-        self.target_queue_points = points;
+    /// Set the minimum buffer level before urgent fill (builder pattern).
+    ///
+    /// Default: 8ms. When buffer drops below this, `min_points` will be non-zero.
+    pub fn with_min_buffer(mut self, duration: std::time::Duration) -> Self {
+        self.min_buffer = duration;
         self
     }
 
     /// Set the underrun policy (builder pattern).
     pub fn with_underrun(mut self, policy: UnderrunPolicy) -> Self {
         self.underrun = policy;
+        self
+    }
+
+    /// Set the drain timeout for graceful shutdown (builder pattern).
+    ///
+    /// Default: 1 second. Set to `Duration::ZERO` to skip drain entirely.
+    pub fn with_drain_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.drain_timeout = timeout;
         self
     }
 }
@@ -469,19 +553,86 @@ pub enum UnderrunPolicy {
     Stop,
 }
 
-/// A request from the stream for a chunk of points.
+/// A request to fill a buffer with points for streaming.
+///
+/// This is the streaming API with pure buffer-driven timing.
+/// The callback receives a `ChunkRequest` describing buffer state and requirements,
+/// and fills points into a library-owned buffer.
+///
+/// # Point Tiers
+///
+/// - `min_points`: Minimum points needed to avoid imminent underrun (ceiling rounded)
+/// - `target_points`: Ideal number of points to reach target buffer level (clamped to buffer length)
+/// - `buffer.len()` (passed separately): Maximum points the callback may write
+///
+/// # Rounding Rules
+///
+/// - `min_points`: Always **ceiling** (underrun prevention)
+/// - `target_points`: **ceiling**, then clamped to buffer length
 #[derive(Clone, Debug)]
 pub struct ChunkRequest {
-    /// The stream instant at which this chunk starts.
+    /// Estimated playback time when this chunk starts.
+    ///
+    /// Calculated as: playhead + buffered_points
+    /// Use this for audio synchronization.
     pub start: StreamInstant,
-    /// The points-per-second rate for this chunk.
+
+    /// Points per second (fixed for stream duration).
     pub pps: u32,
-    /// Number of points requested for this chunk.
-    pub n_points: usize,
-    /// How many points are currently scheduled ahead of `start`.
-    pub scheduled_ahead_points: u64,
-    /// Best-effort: points reported by the device as queued.
+
+    /// Minimum points needed to avoid imminent underrun.
+    ///
+    /// Calculated with ceiling to prevent underrun: `ceil((min_buffer - buffered) * pps)`
+    /// If 0, buffer is healthy.
+    pub min_points: usize,
+
+    /// Ideal number of points to reach target buffer level.
+    ///
+    /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
+    pub target_points: usize,
+
+    /// Current buffer level in points (for diagnostics/adaptive content).
+    pub buffered_points: u64,
+
+    /// Current buffer level as duration (for audio sync convenience).
+    pub buffered: std::time::Duration,
+
+    /// Raw device queue if available (best-effort, may differ from buffered_points).
     pub device_queued_points: Option<u64>,
+}
+
+/// Result returned by the fill callback indicating how the buffer was filled.
+///
+/// This enum allows the callback to communicate three distinct states:
+/// - Successfully filled some number of points
+/// - Temporarily unable to provide data (underrun policy applies)
+/// - Stream should end gracefully
+///
+/// # `Filled(0)` Semantics
+///
+/// - If `target_points == 0`: Buffer is full, nothing needed. This is fine.
+/// - If `target_points > 0`: We needed points but got none. Treated as `Starved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkResult {
+    /// Wrote n points to the buffer.
+    ///
+    /// `n` must be <= `buffer.len()`.
+    /// Partial fills (`n < min_points`) are accepted without padding - useful when
+    /// content is legitimately ending. Return `End` on the next call to signal completion.
+    Filled(usize),
+
+    /// No data available right now.
+    ///
+    /// Underrun policy is applied (repeat last chunk or blank).
+    /// Stream continues; callback will be called again when buffer needs filling.
+    Starved,
+
+    /// Stream is finished. Shutdown sequence:
+    /// 1. Stop calling callback
+    /// 2. Let queued points drain (play out)
+    /// 3. Blank/park the laser at last position
+    /// 4. Return from stream() with `RunExit::ProducerEnded`
+    End,
 }
 
 /// Current status of a stream.
@@ -489,8 +640,6 @@ pub struct ChunkRequest {
 pub struct StreamStatus {
     /// Whether the device is connected.
     pub connected: bool,
-    /// The resolved chunk size chosen for this stream.
-    pub chunk_points: usize,
     /// Library-owned scheduled amount.
     pub scheduled_ahead_points: u64,
     /// Best-effort device/backend estimate.
@@ -737,5 +886,73 @@ mod tests {
         assert_eq!(s1, s2);
         assert_ne!(s1, s3); // Different name
         assert_ne!(s1, s4); // Different variant
+    }
+
+    // ==========================================================================
+    // StreamConfig Serde Tests
+    // ==========================================================================
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_stream_config_serde_roundtrip() {
+        use std::time::Duration;
+
+        let config = StreamConfig {
+            pps: 45000,
+            target_buffer: Duration::from_millis(50),
+            min_buffer: Duration::from_millis(12),
+            underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
+            drain_timeout: Duration::from_secs(2),
+        };
+
+        // Round-trip through JSON
+        let json = serde_json::to_string(&config).expect("serialize to JSON");
+        let restored: StreamConfig = serde_json::from_str(&json).expect("deserialize from JSON");
+
+        assert_eq!(restored.pps, config.pps);
+        assert_eq!(restored.target_buffer, config.target_buffer);
+        assert_eq!(restored.min_buffer, config.min_buffer);
+        assert_eq!(restored.drain_timeout, config.drain_timeout);
+
+        // Verify underrun policy
+        match restored.underrun {
+            UnderrunPolicy::Park { x, y } => {
+                assert!((x - 0.5).abs() < f32::EPSILON);
+                assert!((y - (-0.3)).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected Park policy"),
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_duration_millis_roundtrip_consistency() {
+        use std::time::Duration;
+
+        // Test various duration values round-trip correctly
+        let test_durations = [
+            Duration::from_millis(0),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            Duration::from_millis(1000),
+            Duration::from_millis(u64::MAX / 1000), // Large but valid
+        ];
+
+        for &duration in &test_durations {
+            let config = StreamConfig {
+                target_buffer: duration,
+                ..StreamConfig::default()
+            };
+
+            let json = serde_json::to_string(&config).expect("serialize");
+            let restored: StreamConfig = serde_json::from_str(&json).expect("deserialize");
+
+            assert_eq!(
+                restored.target_buffer, duration,
+                "Duration {:?} did not round-trip correctly",
+                duration
+            );
+        }
     }
 }

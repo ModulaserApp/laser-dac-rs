@@ -19,14 +19,21 @@
 //! # Example
 //!
 //! ```ignore
-//! let mut adapter = FrameAdapter::new();
-//! adapter.update(Frame::new(points));
+//! use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, Frame, FrameAdapter};
 //!
-//! loop {
-//!     let req = stream.next_request()?;
-//!     let points = adapter.next_chunk(&req);
-//!     stream.write(&req, &points)?;
-//! }
+//! let mut adapter = FrameAdapter::new();
+//! adapter.update(Frame::new(vec![
+//!     LaserPoint::new(0.5, 0.0, 65535, 0, 0, 65535),
+//!     LaserPoint::new(0.0, 0.5, 0, 65535, 0, 65535),
+//! ]));
+//! let shared = adapter.shared(); // Thread-safe handle
+//!
+//! stream.run(
+//!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+//!         shared.fill_chunk(req, buffer)
+//!     },
+//!     |err| eprintln!("Error: {}", err),
+//! )?;
 //! ```
 //!
 //! For time-varying animation, use the streaming API directly with a point
@@ -34,7 +41,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::types::{ChunkRequest, LaserPoint};
+use crate::types::{ChunkRequest, ChunkResult, LaserPoint};
 
 /// A point buffer to be cycled by the adapter.
 #[derive(Clone, Debug)]
@@ -62,8 +69,8 @@ impl From<Vec<LaserPoint>> for Frame {
 
 /// Converts a point buffer (frame) into a continuous stream.
 ///
-/// The adapter cycles through the frame's points, producing exactly
-/// `req.n_points` on each `next_chunk()` call.
+/// The adapter cycles through the frame's points, filling buffers via
+/// the `fill_chunk()` method for use with `Stream::run()`.
 ///
 /// # Update semantics
 ///
@@ -74,14 +81,18 @@ impl From<Vec<LaserPoint>> for Frame {
 /// # Example
 ///
 /// ```ignore
-/// let mut adapter = FrameAdapter::new();
-/// adapter.update(Frame::new(circle_points));
+/// use laser_dac::{Frame, FrameAdapter, LaserPoint};
 ///
-/// loop {
-///     let req = stream.next_request()?;
-///     let points = adapter.next_chunk(&req);
-///     stream.write(&req, &points)?;
-/// }
+/// let mut adapter = FrameAdapter::new();
+/// adapter.update(Frame::new(vec![
+///     LaserPoint::new(0.5, 0.0, 65535, 0, 0, 65535),
+/// ]));
+/// let shared = adapter.shared();
+///
+/// stream.run(
+///     |req, buffer| shared.fill_chunk(req, buffer),
+///     |err| eprintln!("Error: {}", err),
+/// )?;
 /// ```
 pub struct FrameAdapter {
     current: Frame,
@@ -112,18 +123,29 @@ impl FrameAdapter {
         self.pending = Some(frame);
     }
 
-    /// Produces exactly `req.n_points` points.
+    /// Fill the provided buffer with points from the current frame.
+    ///
+    /// This is the new zero-allocation API that fills a library-owned buffer
+    /// instead of allocating a new Vec on each call.
     ///
     /// Cycles through the current frame. When the frame ends and a pending
     /// frame is available, switches immediately (even mid-chunk).
-    pub fn next_chunk(&mut self, req: &ChunkRequest) -> Vec<LaserPoint> {
-        self.generate_points(req.n_points)
+    ///
+    /// # Returns
+    ///
+    /// - `ChunkResult::Filled(n)` - Wrote `n` points (always `req.target_points`)
+    /// - `ChunkResult::Starved` - Never returned (adapter always has points to output)
+    /// - `ChunkResult::End` - Never returned (adapter cycles indefinitely)
+    pub fn fill_chunk(&mut self, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
+        let n_points = req.target_points.min(buffer.len());
+        self.fill_points(buffer, n_points);
+        ChunkResult::Filled(n_points)
     }
 
-    fn generate_points(&mut self, n_points: usize) -> Vec<LaserPoint> {
-        let mut output = Vec::with_capacity(n_points);
-
-        for _ in 0..n_points {
+    /// Fill buffer with n_points from the frame (zero-allocation).
+    #[allow(clippy::needless_range_loop)] // Index used with continue
+    fn fill_points(&mut self, buffer: &mut [LaserPoint], n_points: usize) {
+        for i in 0..n_points {
             // Handle empty frame: try to swap, else output blanked
             if self.current.points.is_empty() {
                 if let Some(pending) = self.pending.take() {
@@ -133,13 +155,13 @@ impl FrameAdapter {
 
                 if self.current.points.is_empty() {
                     let (x, y) = self.last_position;
-                    output.push(LaserPoint::blanked(x, y));
+                    buffer[i] = LaserPoint::blanked(x, y);
                     continue;
                 }
             }
 
             let point = self.current.points[self.point_index];
-            output.push(point);
+            buffer[i] = point;
             self.last_position = (point.x, point.y);
 
             self.point_index += 1;
@@ -152,8 +174,6 @@ impl FrameAdapter {
                 }
             }
         }
-
-        output
     }
 
     /// Returns a thread-safe handle for updating frames from another thread.
@@ -183,10 +203,13 @@ impl SharedFrameAdapter {
         adapter.update(frame);
     }
 
-    /// Produces exactly `req.n_points` points.
-    pub fn next_chunk(&self, req: &ChunkRequest) -> Vec<LaserPoint> {
+    /// Fill the provided buffer with points from the current frame.
+    ///
+    /// Thread-safe version of `FrameAdapter::fill_chunk()`.
+    /// See that method for full documentation.
+    pub fn fill_chunk(&self, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
         let mut adapter = self.inner.lock().unwrap();
-        adapter.next_chunk(req)
+        adapter.fill_chunk(req, buffer)
     }
 }
 
@@ -194,21 +217,29 @@ impl SharedFrameAdapter {
 mod tests {
     use super::*;
     use crate::types::StreamInstant;
+    use std::time::Duration;
+
+    fn make_fill_request(target_points: usize) -> ChunkRequest {
+        ChunkRequest {
+            start: StreamInstant(0),
+            pps: 30000,
+            min_points: target_points,
+            target_points,
+            buffered_points: 0,
+            buffered: Duration::ZERO,
+            device_queued_points: None,
+        }
+    }
 
     #[test]
     fn test_empty_frame() {
         let mut adapter = FrameAdapter::new();
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 100,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(100);
+        let mut buffer = vec![LaserPoint::default(); 100];
 
-        let points = adapter.next_chunk(&req);
-        assert_eq!(points.len(), 100);
-        assert!(points.iter().all(|p| p.intensity == 0));
+        let result = adapter.fill_chunk(&req, &mut buffer);
+        assert!(matches!(result, ChunkResult::Filled(100)));
+        assert!(buffer.iter().all(|p| p.intensity == 0));
     }
 
     #[test]
@@ -219,16 +250,11 @@ mod tests {
             .collect();
         adapter.update(Frame::new(frame_points));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 25,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(25);
+        let mut buffer = vec![LaserPoint::default(); 25];
 
-        let points = adapter.next_chunk(&req);
-        assert_eq!(points.len(), 25);
+        let result = adapter.fill_chunk(&req, &mut buffer);
+        assert!(matches!(result, ChunkResult::Filled(25)));
     }
 
     #[test]
@@ -238,16 +264,11 @@ mod tests {
             0.0, 0.0, 65535, 0, 0, 65535,
         )]));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 10,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(10);
+        let mut buffer = vec![LaserPoint::default(); 10];
 
-        let points1 = adapter.next_chunk(&req);
-        assert_eq!(points1[0].x, 0.0);
+        adapter.fill_chunk(&req, &mut buffer);
+        assert_eq!(buffer[0].x, 0.0);
 
         adapter.update(Frame::new(vec![LaserPoint::new(
             1.0, 1.0, 0, 65535, 0, 65535,
@@ -255,10 +276,10 @@ mod tests {
 
         // Single-point frame wraps every point; swap happens immediately after
         // each point, so first point is old frame, rest is new frame
-        let points2 = adapter.next_chunk(&req);
-        assert_eq!(points2[0].x, 0.0, "First point finishes old frame");
-        assert_eq!(points2[1].x, 1.0, "Second point starts new frame");
-        assert!(points2[2..].iter().all(|p| p.x == 1.0), "Rest is new frame");
+        adapter.fill_chunk(&req, &mut buffer);
+        assert_eq!(buffer[0].x, 0.0, "First point finishes old frame");
+        assert_eq!(buffer[1].x, 1.0, "Second point starts new frame");
+        assert!(buffer[2..].iter().all(|p| p.x == 1.0), "Rest is new frame");
     }
 
     #[test]
@@ -269,16 +290,11 @@ mod tests {
             .collect();
         adapter.update(Frame::new(frame1));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 10,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(10);
+        let mut buffer = vec![LaserPoint::default(); 10];
 
-        let points1 = adapter.next_chunk(&req);
-        assert_eq!(points1[0].x, 0.0);
+        adapter.fill_chunk(&req, &mut buffer);
+        assert_eq!(buffer[0].x, 0.0);
 
         // Update mid-cycle with different frame
         let frame2: Vec<LaserPoint> = (0..100)
@@ -287,21 +303,21 @@ mod tests {
         adapter.update(Frame::new(frame2));
 
         // Should still use frame1 (not finished yet)
-        let points2 = adapter.next_chunk(&req);
+        adapter.fill_chunk(&req, &mut buffer);
         assert!(
-            (points2[0].x - 0.1).abs() < 1e-4,
+            (buffer[0].x - 0.1).abs() < 1e-4,
             "Expected ~0.1, got {}",
-            points2[0].x
+            buffer[0].x
         );
 
         // Output remaining 80 points to complete frame1
         for _ in 0..8 {
-            adapter.next_chunk(&req);
+            adapter.fill_chunk(&req, &mut buffer);
         }
 
         // Now frame1 finished, uses frame2
-        let points_after_wrap = adapter.next_chunk(&req);
-        assert_eq!(points_after_wrap[0].x, 9.0);
+        adapter.fill_chunk(&req, &mut buffer);
+        assert_eq!(buffer[0].x, 9.0);
     }
 
     #[test]
@@ -313,17 +329,12 @@ mod tests {
             .collect();
         adapter.update(Frame::new(frame1));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 10,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(10);
+        let mut buffer = vec![LaserPoint::default(); 10];
 
         // Output 90 points (9 chunks)
         for _ in 0..9 {
-            adapter.next_chunk(&req);
+            adapter.fill_chunk(&req, &mut buffer);
         }
 
         // Now at index 90, update with new frame
@@ -333,16 +344,15 @@ mod tests {
         adapter.update(Frame::new(frame2));
 
         // Next chunk: points 90-94 from frame1, then points 0-4 from frame2
-        let stitched = adapter.next_chunk(&req);
-        assert_eq!(stitched.len(), 10);
+        adapter.fill_chunk(&req, &mut buffer);
 
         // First 5 points are frame1 (90, 91, 92, 93, 94)
-        for (i, p) in stitched[0..5].iter().enumerate() {
+        for (i, p) in buffer[0..5].iter().enumerate() {
             assert_eq!(p.x, (90 + i) as f32, "Point {} should be from frame1", i);
         }
 
         // Last 5 points are frame2 (all 999.0)
-        for (i, p) in stitched[5..10].iter().enumerate() {
+        for (i, p) in buffer[5..10].iter().enumerate() {
             assert_eq!(p.x, 999.0, "Point {} should be from frame2", i + 5);
         }
     }
@@ -354,27 +364,22 @@ mod tests {
             0.5, -0.3, 65535, 0, 0, 65535,
         )]));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 5,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(5);
+        let mut buffer = vec![LaserPoint::default(); 5];
 
-        adapter.next_chunk(&req);
+        adapter.fill_chunk(&req, &mut buffer);
         adapter.update(Frame::empty());
 
         // First point finishes the single-point frame, then swap to empty
-        let points = adapter.next_chunk(&req);
-        assert_eq!(points[0].intensity, 65535, "First point finishes old frame");
+        adapter.fill_chunk(&req, &mut buffer);
+        assert_eq!(buffer[0].intensity, 65535, "First point finishes old frame");
         assert!(
-            points[1..].iter().all(|p| p.intensity == 0),
+            buffer[1..].iter().all(|p| p.intensity == 0),
             "Rest is blanked"
         );
         // Empty frame holds the last known position
-        assert_eq!(points[1].x, 0.5);
-        assert_eq!(points[1].y, -0.3);
+        assert_eq!(buffer[1].x, 0.5);
+        assert_eq!(buffer[1].y, -0.3);
     }
 
     #[test]
@@ -385,18 +390,13 @@ mod tests {
             .collect();
         adapter.update(Frame::new(frame));
 
-        let req = ChunkRequest {
-            start: StreamInstant(0),
-            pps: 30000,
-            n_points: 7,
-            scheduled_ahead_points: 0,
-            device_queued_points: None,
-        };
+        let req = make_fill_request(7);
+        let mut buffer = vec![LaserPoint::default(); 7];
 
         // No drift over 1000 cycles
         for cycle in 0..1000 {
-            let points = adapter.next_chunk(&req);
-            for (i, p) in points.iter().enumerate() {
+            adapter.fill_chunk(&req, &mut buffer);
+            for (i, p) in buffer.iter().enumerate() {
                 assert_eq!(p.x, i as f32, "Cycle {}: drift detected", cycle);
             }
         }

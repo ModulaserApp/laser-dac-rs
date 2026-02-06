@@ -46,8 +46,6 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_min: 7,
         pps_max: 65535,
         max_points_per_chunk: 4095,
-        prefers_constant_pps: true,
-        can_estimate_queue: false,
         output_model: OutputModel::UsbFrameSwap,
     }
 }
