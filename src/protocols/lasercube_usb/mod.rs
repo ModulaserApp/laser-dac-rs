@@ -57,7 +57,7 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_max: 35_000,
         max_points_per_chunk: 4096,
         prefers_constant_pps: false,
-        can_estimate_queue: true,
+        can_estimate_queue: false,
         output_model: OutputModel::NetworkFifo,
     }
 }
@@ -67,7 +67,7 @@ use rusb::UsbContext;
 use std::time::Duration;
 
 /// Timeout for USB control transfers.
-const TIMEOUT: Duration = Duration::from_millis(100);
+const TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// A controller for managing LaserCube/LaserDock USB DAC discovery.
 pub struct DacController {

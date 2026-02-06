@@ -14,11 +14,12 @@ use crate::protocols::lasercube_usb::protocol::{
 use rusb::{DeviceHandle, UsbContext};
 use std::time::Duration;
 
-/// Default USB timeout for control operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
+/// Timeout for control endpoint transfers.
+const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Number of retry attempts for failed transfers.
-const MAX_RETRY_ATTEMPTS: usize = 3;
+/// Timeout for data endpoint transfers. Zero means infinite/blocking,
+/// matching the reference C implementation for natural backpressure.
+const DATA_TIMEOUT: Duration = Duration::ZERO;
 
 /// A bidirectional USB communication stream with a LaserCube/LaserDock DAC.
 pub struct Stream<T: UsbContext> {
@@ -46,8 +47,10 @@ impl<T: UsbContext> Stream<T> {
             [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 1],
             [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 0],
         ];
+        let mut discard = [0u8; CONTROL_PACKET_SIZE];
         for packet in &packets {
-            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, DEFAULT_TIMEOUT);
+            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, CONTROL_TIMEOUT);
+            let _ = handle.read_bulk(ENDPOINT_CONTROL_IN, &mut discard, CONTROL_TIMEOUT);
         }
     }
 
@@ -287,7 +290,7 @@ impl<T: UsbContext> Stream<T> {
     fn send_control(&self, data: &[u8]) -> Result<usize> {
         let transferred = self
             .handle
-            .write_bulk(ENDPOINT_CONTROL_OUT, data, DEFAULT_TIMEOUT)?;
+            .write_bulk(ENDPOINT_CONTROL_OUT, data, CONTROL_TIMEOUT)?;
 
         if transferred != data.len() {
             return Err(Error::Usb(rusb::Error::Io));
@@ -301,7 +304,7 @@ impl<T: UsbContext> Stream<T> {
         let mut buffer = [0u8; CONTROL_PACKET_SIZE];
         let transferred =
             self.handle
-                .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, DEFAULT_TIMEOUT)?;
+                .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, CONTROL_TIMEOUT)?;
 
         if transferred != CONTROL_PACKET_SIZE {
             return Err(Error::InvalidResponse);
@@ -311,23 +314,19 @@ impl<T: UsbContext> Stream<T> {
     }
 
     /// Send data to the data endpoint.
+    ///
+    /// Uses an infinite timeout so the transfer blocks until the device accepts
+    /// the data, providing natural backpressure (matching the reference implementation).
     fn send_data(&self, data: &[u8]) -> Result<()> {
-        let mut attempts = MAX_RETRY_ATTEMPTS;
+        let transferred = self
+            .handle
+            .write_bulk(ENDPOINT_DATA_OUT, data, DATA_TIMEOUT)?;
 
-        loop {
-            match self
-                .handle
-                .write_bulk(ENDPOINT_DATA_OUT, data, DEFAULT_TIMEOUT)
-            {
-                Ok(transferred) if transferred == data.len() => return Ok(()),
-                Ok(_) => return Err(Error::Usb(rusb::Error::Io)),
-                Err(rusb::Error::Timeout) if attempts > 0 => {
-                    attempts -= 1;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
+        if transferred != data.len() {
+            return Err(Error::Usb(rusb::Error::Io));
         }
+
+        Ok(())
     }
 }
 
