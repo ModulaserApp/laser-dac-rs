@@ -21,8 +21,11 @@
 //! ```ignore
 //! use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, Frame, FrameAdapter};
 //!
-//! let adapter = FrameAdapter::new();
-//! adapter.update(Frame::new(circle_points));
+//! let mut adapter = FrameAdapter::new();
+//! adapter.update(Frame::new(vec![
+//!     LaserPoint::new(0.5, 0.0, 65535, 0, 0, 65535),
+//!     LaserPoint::new(0.0, 0.5, 0, 65535, 0, 65535),
+//! ]));
 //! let shared = adapter.shared(); // Thread-safe handle
 //!
 //! stream.run(
@@ -78,8 +81,12 @@ impl From<Vec<LaserPoint>> for Frame {
 /// # Example
 ///
 /// ```ignore
-/// let adapter = FrameAdapter::new();
-/// adapter.update(Frame::new(circle_points));
+/// use laser_dac::{Frame, FrameAdapter, LaserPoint};
+///
+/// let mut adapter = FrameAdapter::new();
+/// adapter.update(Frame::new(vec![
+///     LaserPoint::new(0.5, 0.0, 65535, 0, 0, 65535),
+/// ]));
 /// let shared = adapter.shared();
 ///
 /// stream.run(

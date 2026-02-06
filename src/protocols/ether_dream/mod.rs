@@ -48,8 +48,6 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_min: 1,
         pps_max: 100_000,
         max_points_per_chunk: 1799,
-        prefers_constant_pps: true,
-        can_estimate_queue: true,
         output_model: OutputModel::NetworkFifo,
     }
 }

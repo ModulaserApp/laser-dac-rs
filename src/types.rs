@@ -267,10 +267,6 @@ pub struct DacCapabilities {
     pub pps_max: u32,
     /// Maximum number of points allowed per chunk submission.
     pub max_points_per_chunk: usize,
-    /// Some DACs dislike per-chunk PPS changes.
-    pub prefers_constant_pps: bool,
-    /// Best-effort: can we estimate device queue depth/latency?
-    pub can_estimate_queue: bool,
     /// The scheduler-relevant output model.
     pub output_model: OutputModel,
 }
@@ -281,8 +277,6 @@ impl Default for DacCapabilities {
             pps_min: 1,
             pps_max: 100_000,
             max_points_per_chunk: 4096,
-            prefers_constant_pps: false,
-            can_estimate_queue: false,
             output_model: OutputModel::NetworkFifo,
         }
     }

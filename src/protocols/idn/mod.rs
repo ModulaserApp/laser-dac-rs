@@ -61,8 +61,6 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_min: 1,
         pps_max: 100_000,
         max_points_per_chunk: 4096,
-        prefers_constant_pps: false,
-        can_estimate_queue: false,
         output_model: OutputModel::UdpTimed,
     }
 }

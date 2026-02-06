@@ -17,8 +17,8 @@ use idn_mock_server::{
     IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
 };
 
-use laser_dac::types::{DacType, EnabledDacTypes, LaserPoint, StreamConfig};
-use laser_dac::{caps_for_dac_type, Dac, DacInfo};
+use laser_dac::types::{ChunkRequest, ChunkResult, DacType, EnabledDacTypes, LaserPoint, StreamConfig};
+use laser_dac::{caps_for_dac_type, Dac, DacInfo, RunExit};
 
 /// Create an EnabledDacTypes with only IDN enabled.
 fn idn_only() -> EnabledDacTypes {
@@ -322,6 +322,7 @@ fn test_discover_and_connect() {
 #[test]
 fn test_send_frame() {
     use laser_dac::discovery::DacDiscovery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
@@ -341,19 +342,34 @@ fn test_send_frame() {
     // Clear any discovery packets
     handle.clear_received_packets();
 
-    // Start a stream and send points
+    // Start a stream and send points via callback API
     let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
+    let (stream, _info) = device.start_stream(config).expect("Should start stream");
 
-    // Get a request and write points
-    let req = stream.next_request().expect("Should get request");
-    let points: Vec<LaserPoint> = (0..req.n_points)
-        .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-        .collect();
-    stream.write(&req, &points).expect("Should write points");
+    let control = stream.control();
+    control.arm().unwrap();
 
-    // Give time for processing
-    thread::sleep(Duration::from_millis(100));
+    // Producer that sends a few chunks then ends
+    let chunks_sent = Arc::new(AtomicUsize::new(0));
+    let chunks_sent_clone = chunks_sent.clone();
+
+    let result = stream.run(
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+            let n = req.target_points;
+            for i in 0..n {
+                buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535);
+            }
+            let count = chunks_sent_clone.fetch_add(1, Ordering::SeqCst);
+            if count >= 5 {
+                ChunkResult::End
+            } else {
+                ChunkResult::Filled(n)
+            }
+        },
+        |err| eprintln!("Stream error: {}", err),
+    );
+
+    assert!(result.is_ok(), "Stream should complete without error");
 
     // Verify server received frame data
     assert!(
@@ -365,6 +381,7 @@ fn test_send_frame() {
 #[test]
 fn test_connection_loss_detection() {
     use laser_dac::discovery::DacDiscovery;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
@@ -381,51 +398,50 @@ fn test_connection_loss_detection() {
         .map(|d| connect_dac(&mut discovery, d))
         .expect("Should get a device");
 
-    // Start a stream and send some data
+    // Start a stream
     let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device.start_stream(config).expect("Should start stream");
+    let (stream, _info) = device.start_stream(config).expect("Should start stream");
 
-    // Send data successfully
-    let req = stream.next_request().expect("Should get request");
-    let points: Vec<LaserPoint> = (0..req.n_points)
-        .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-        .collect();
-    stream.write(&req, &points).expect("Should write points");
-    thread::sleep(Duration::from_millis(50));
+    let control = stream.control();
+    control.arm().unwrap();
 
-    // Verify stream is connected
-    let status = stream.status().expect("Should get status");
-    assert!(status.connected, "Stream should be connected initially");
+    let error_count = Arc::new(AtomicUsize::new(0));
+    let error_count_clone = error_count.clone();
+
+    // Run stream in background thread - produces points indefinitely
+    let stream_thread = thread::spawn(move || {
+        stream.run(
+            |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+                let n = req.target_points;
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                ChunkResult::Filled(n)
+            },
+            move |_err| {
+                error_count_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+    });
+
+    // Let it stream for a bit
+    thread::sleep(Duration::from_millis(200));
 
     // Simulate server disconnect
     handle.simulate_disconnect();
     thread::sleep(Duration::from_millis(800));
 
-    // IDN uses fire-and-forget UDP, so writes succeed even when the server
-    // stops responding. The stream remains "connected" from its perspective.
-    // Verify that writes continue to succeed (no false errors).
-    for _ in 0..5 {
-        match stream.next_request() {
-            Ok(req) => {
-                let points: Vec<LaserPoint> = (0..req.n_points)
-                    .map(|_| LaserPoint::blanked(0.0, 0.0))
-                    .collect();
-                stream
-                    .write(&req, &points)
-                    .expect("UDP writes should succeed even without server");
-            }
-            Err(e) => {
-                panic!("next_request should not fail for UDP stream: {e}");
-            }
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    // IDN uses fire-and-forget UDP, so the stream should still be running.
+    // Stop it via control.
+    control.stop().unwrap();
 
-    // Stream still reports connected since UDP has no delivery confirmation
-    let final_status = stream.status().expect("Should get status");
+    let result = stream_thread.join().expect("Stream thread should not panic");
+
+    // Stream should have stopped cleanly (not disconnected, since UDP is fire-and-forget)
+    assert!(result.is_ok(), "Stream should complete without error");
     assert!(
-        final_status.connected,
-        "UDP stream should still report connected (fire-and-forget)"
+        matches!(result.unwrap(), RunExit::Stopped),
+        "UDP stream should stop cleanly via control (fire-and-forget)"
     );
 }
 
@@ -450,21 +466,30 @@ fn test_full_lifecycle() {
         .expect("Phase 1: Should get device");
 
     let config = StreamConfig::new(30000);
-    let (mut stream, _info) = device
+    let (stream, _info) = device
         .start_stream(config)
         .expect("Phase 1: Should start stream");
     handle.clear_received_packets();
 
-    // Phase 2: Send frames successfully
-    for _ in 0..3 {
-        let req = stream.next_request().expect("Should get request");
-        let points: Vec<LaserPoint> = (0..req.n_points)
-            .map(|_| LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535))
-            .collect();
-        stream.write(&req, &points).expect("Should write points");
-        thread::sleep(Duration::from_millis(30));
-    }
-    thread::sleep(Duration::from_millis(100));
+    let control = stream.control();
+    control.arm().unwrap();
+
+    // Phase 2: Send frames via callback in background thread
+    let stream_thread = thread::spawn(move || {
+        stream.run(
+            |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+                let n = req.target_points;
+                for i in 0..n {
+                    buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535);
+                }
+                ChunkResult::Filled(n)
+            },
+            |err| eprintln!("Stream error: {}", err),
+        )
+    });
+
+    // Let it stream for a bit
+    thread::sleep(Duration::from_millis(200));
     assert!(
         handle.received_frame_data(),
         "Phase 2: Server should receive frame data"
@@ -474,40 +499,9 @@ fn test_full_lifecycle() {
     handle.simulate_disconnect();
     thread::sleep(Duration::from_millis(800));
 
-    // Check for connection loss
-    let status = stream.status().unwrap();
-    let initially_connected = status.connected;
-
-    // Try to write - may fail if connection is detected as lost
-    let loss_detected = if !initially_connected {
-        true
-    } else {
-        // Try to continue writing to trigger loss detection
-        let mut detected = false;
-        for _ in 0..5 {
-            match stream.next_request() {
-                Ok(req) => {
-                    let points: Vec<LaserPoint> = (0..req.n_points)
-                        .map(|_| LaserPoint::blanked(0.0, 0.0))
-                        .collect();
-                    if stream.write(&req, &points).is_err() {
-                        detected = true;
-                        break;
-                    }
-                }
-                Err(_) => {
-                    detected = true;
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        detected
-    };
-
-    // Stop the old stream
-    let _ = stream.stop();
-    drop(stream);
+    // Stop the stream
+    control.stop().unwrap();
+    let _ = stream_thread.join().expect("Stream thread should not panic");
 
     // Phase 4: Reconnect - verify server is back
     handle.resume();
@@ -522,11 +516,6 @@ fn test_full_lifecycle() {
     assert!(
         !servers.is_empty(),
         "Phase 4: Server should be discoverable after resume"
-    );
-
-    eprintln!(
-        "Full lifecycle test completed. Loss detected: {}",
-        loss_detected
     );
 }
 

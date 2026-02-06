@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, RunExit,
-    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel,
+    RunExit, StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================
@@ -321,6 +321,9 @@ impl Stream {
     /// # Example
     ///
     /// ```ignore
+    /// use laser_dac::StreamConfig;
+    ///
+    /// // device: Dac, config: StreamConfig (from prior setup)
     /// let (stream, info) = device.start_stream(config)?;
     /// // ... stream for a while ...
     /// let (device, stats) = stream.into_dac();
@@ -383,7 +386,8 @@ impl Stream {
     ///         let n = req.target_points;
     ///         for i in 0..n {
     ///             let t = req.start.as_secs_f64(req.pps) + (i as f64 / req.pps as f64);
-    ///             buffer[i] = generate_point_at_time(t);
+    ///             let angle = (t * std::f64::consts::TAU) as f32;
+    ///             buffer[i] = LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535);
     ///         }
     ///         ChunkResult::Filled(n)
     ///     },
@@ -538,22 +542,7 @@ impl Stream {
 
             match backend.try_write_chunk(pps, &self.state.chunk_buffer[..n]) {
                 Ok(WriteOutcome::Written) => {
-                    // Update state
-                    if is_armed {
-                        // Both buffers are pre-allocated to max_points_per_chunk, so n always fits
-                        debug_assert!(
-                            n <= self.state.last_chunk.len(),
-                            "n ({}) exceeds last_chunk capacity ({})",
-                            n,
-                            self.state.last_chunk.len()
-                        );
-                        self.state.last_chunk[..n].copy_from_slice(&self.state.chunk_buffer[..n]);
-                        self.state.last_chunk_len = n;
-                    }
-                    self.state.current_instant += n as u64;
-                    self.state.scheduled_ahead += n as u64;
-                    self.state.stats.chunks_written += 1;
-                    self.state.stats.points_written += n as u64;
+                    self.record_write(n, is_armed);
                     return Ok(());
                 }
                 Ok(WriteOutcome::WouldBlock) => {
@@ -640,21 +629,7 @@ impl Stream {
         if let Some(backend) = &mut self.backend {
             match backend.try_write_chunk(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
                 Ok(WriteOutcome::Written) => {
-                    if is_armed {
-                        debug_assert!(
-                            fill_start <= self.state.last_chunk.len(),
-                            "fill_start ({}) exceeds last_chunk capacity ({})",
-                            fill_start,
-                            self.state.last_chunk.len()
-                        );
-                        self.state.last_chunk[..fill_start]
-                            .copy_from_slice(&self.state.chunk_buffer[..fill_start]);
-                        self.state.last_chunk_len = fill_start;
-                    }
-                    self.state.current_instant += fill_start as u64;
-                    self.state.scheduled_ahead += fill_start as u64;
-                    self.state.stats.chunks_written += 1;
-                    self.state.stats.points_written += fill_start as u64;
+                    self.record_write(fill_start, is_armed);
                 }
                 Ok(WriteOutcome::WouldBlock) => {
                     // Backend is full - expected during underrun
@@ -666,6 +641,34 @@ impl Stream {
         }
 
         Ok(())
+    }
+
+    /// Record a successful write: update last_chunk, timebase, and stats.
+    ///
+    /// Handles `UsbFrameSwap` output model (Helios-style double-buffering) by
+    /// **replacing** `scheduled_ahead` instead of accumulating, since the device
+    /// holds at most one frame at a time.
+    fn record_write(&mut self, n: usize, is_armed: bool) {
+        if is_armed {
+            debug_assert!(
+                n <= self.state.last_chunk.len(),
+                "n ({}) exceeds last_chunk capacity ({})",
+                n,
+                self.state.last_chunk.len()
+            );
+            self.state.last_chunk[..n].copy_from_slice(&self.state.chunk_buffer[..n]);
+            self.state.last_chunk_len = n;
+        }
+        self.state.current_instant += n as u64;
+        if self.info.caps.output_model == OutputModel::UsbFrameSwap {
+            // Double-buffered devices (e.g. Helios) hold at most one frame.
+            // Replace rather than accumulate to reflect the actual queue depth.
+            self.state.scheduled_ahead = n as u64;
+        } else {
+            self.state.scheduled_ahead += n as u64;
+        }
+        self.state.stats.chunks_written += 1;
+        self.state.stats.points_written += n as u64;
     }
 
     // =========================================================================
@@ -899,6 +902,8 @@ impl Drop for Stream {
 /// # Example
 ///
 /// ```ignore
+/// use laser_dac::{open_device, StreamConfig};
+///
 /// let device = open_device("my-device")?;
 /// let config = StreamConfig::new(30_000);
 /// let (stream, info) = device.start_stream(config)?;
@@ -1009,9 +1014,6 @@ impl Dac {
     }
 }
 
-/// Legacy alias for compatibility.
-pub type OwnedDac = Dac;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1040,8 +1042,6 @@ mod tests {
                     pps_min: 1000,
                     pps_max: 100000,
                     max_points_per_chunk: 1000,
-                    prefers_constant_pps: false,
-                    can_estimate_queue: true,
                     output_model: crate::types::OutputModel::NetworkFifo,
                 },
                 connected: false,
