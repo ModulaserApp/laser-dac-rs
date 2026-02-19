@@ -1,5 +1,6 @@
 //! UDP streaming interface for LaserCube WiFi DAC communication.
 
+use crate::protocols::lasercube_wifi::dac::buffer_estimator::BufferEstimator;
 use crate::protocols::lasercube_wifi::dac::Addressed;
 use crate::protocols::lasercube_wifi::error::CommunicationError;
 use crate::protocols::lasercube_wifi::protocol::{
@@ -7,7 +8,7 @@ use crate::protocols::lasercube_wifi::protocol::{
     MAX_POINTS_PER_PACKET, POINT_SIZE_BYTES,
 };
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default command socket receive timeout.
 const CMD_TIMEOUT: Duration = Duration::from_millis(500);
@@ -41,6 +42,8 @@ pub struct Stream {
     send_buffer: Vec<u8>,
     /// Reusable buffer for receiving responses.
     recv_buffer: [u8; 1500],
+    /// Dual-estimate buffer tracker.
+    buffer_estimator: BufferEstimator,
 }
 
 impl Stream {
@@ -69,6 +72,7 @@ impl Stream {
         data_socket.connect(data_addr)?;
 
         let mut stream = Stream {
+            buffer_estimator: BufferEstimator::new(dac.max_buffer_space, 0),
             dac: dac.clone(),
             cmd_socket,
             data_socket,
@@ -135,12 +139,17 @@ impl Stream {
 
     /// Receive and process a buffer status response from the data socket.
     ///
-    /// Updates `free_buffer_space` directly from device response (C++ approach).
+    /// Updates the buffer estimator with ACK data for dual-estimate tracking.
     fn receive_buffer_status(&mut self) -> Result<Option<BufferStatus>, CommunicationError> {
         match self.data_socket.recv(&mut self.recv_buffer) {
             Ok(len) if len >= 4 => {
                 if let Ok(status) = BufferStatus::from_response(&self.recv_buffer[..len]) {
-                    // Update free_buffer_space directly from device response
+                    let now = Instant::now();
+                    self.buffer_estimator.record_ack(
+                        status.message_number,
+                        status.free_space,
+                        now,
+                    );
                     self.dac.status.free_buffer_space = status.free_space;
                     return Ok(Some(status));
                 }
@@ -182,13 +191,13 @@ impl Stream {
             // Send the packet
             self.data_socket.send(&self.send_buffer)?;
 
-            // Update counters and decrement free buffer space (C++ approach)
+            // Record the send in the buffer estimator
+            let now = Instant::now();
+            self.buffer_estimator
+                .record_send(self.message_number, chunk.len() as u16, now);
+
+            // Update counters
             self.message_number = self.message_number.wrapping_add(1);
-            self.dac.status.free_buffer_space = self
-                .dac
-                .status
-                .free_buffer_space
-                .saturating_sub(chunk.len() as u16);
 
             // Small delay between chunks
             if points.len() > MAX_POINTS_PER_PACKET {
@@ -212,6 +221,11 @@ impl Stream {
         self.dac.status.free_buffer_space
     }
 
+    /// Get the estimated number of points currently in the device buffer.
+    pub fn estimated_buffer_fullness(&self) -> u16 {
+        self.buffer_estimator.estimated_buffer_fullness(Instant::now())
+    }
+
     /// Get the current playback rate in Hz.
     pub fn point_rate(&self) -> u32 {
         self.current_rate
@@ -225,6 +239,7 @@ impl Stream {
             self.send_command_repeated(&command::set_rate(rate))?;
             self.current_rate = rate;
             self.dac.status.point_rate = rate;
+            self.buffer_estimator.set_point_rate(rate);
         }
         Ok(())
     }
@@ -252,16 +267,7 @@ impl Stream {
         // Update rate if needed
         self.set_rate(rate)?;
 
-        // Calculate buffer usage: (max - free) = points currently in device buffer
-        let buffer_used = self
-            .dac
-            .max_buffer_space
-            .saturating_sub(self.dac.status.free_buffer_space);
-
-        // Buffer threshold: ~70ms worth of data (matches C++ impl)
-        let buffer_threshold = (self.current_rate as f32 * 0.07) as u16;
-
-        if buffer_used > buffer_threshold {
+        if !self.buffer_estimator.can_send(Instant::now()) {
             // Try to receive status updates to get fresh buffer info
             self.try_receive_buffer_status();
         }
@@ -280,8 +286,8 @@ impl Stream {
         self.send_command_repeated(&command::set_output(false))?;
         self.dac.status.output_enabled = false;
         self.send_command_repeated(&command::clear_ringbuffer())?;
-        // Reset free_buffer_space to max since we cleared the buffer
         self.dac.status.free_buffer_space = self.dac.max_buffer_space;
+        self.buffer_estimator.reset();
         Ok(())
     }
 
