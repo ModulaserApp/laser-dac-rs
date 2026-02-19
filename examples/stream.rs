@@ -1,15 +1,15 @@
 //! Streaming example.
 //!
 //! This example demonstrates the basic streaming workflow: discover devices,
-//! open a connection, and stream points in a loop.
+//! open a connection, and stream points using the zero-allocation callback API.
 //!
 //! Run with: `cargo run --example stream -- [triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_points, Args};
-use laser_dac::{list_devices, open_device, Result, StreamConfig};
+use common::{fill_points, Args};
+use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 
     // Start streaming
     let config = StreamConfig::new(30_000);
-    let (mut stream, info) = device.start_stream(config)?;
+    let (stream, info) = device.start_stream(config)?;
 
     println!(
         "\nStreaming {} to {}... Press Ctrl+C to stop\n",
@@ -42,12 +42,16 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire)
     stream.control().arm()?;
 
-    loop {
-        let req = stream.next_request()?;
+    let shape = args.shape;
 
-        // Generate points for this chunk
-        let points = create_points(args.shape, &req);
+    // Run stream with zero-allocation callback
+    let exit = stream.run(
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, req, buffer),
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
 
-        stream.write(&req, &points)?;
-    }
+    println!("\nStream ended: {:?}", exit);
+    Ok(())
 }

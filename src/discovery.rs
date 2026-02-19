@@ -25,7 +25,7 @@ use crate::types::{DacType, EnabledDacTypes};
 /// ```ignore
 /// use laser_dac::{
 ///     DacDiscovery, ExternalDiscoverer, ExternalDevice,
-///     StreamBackend, DacType, EnabledDacTypes,
+///     StreamBackend, DacType, EnabledDacTypes, Result,
 /// };
 /// use std::any::Any;
 ///
@@ -769,6 +769,8 @@ impl DacDiscovery {
     /// # Example
     ///
     /// ```ignore
+    /// use laser_dac::{DacDiscovery, EnabledDacTypes};
+    ///
     /// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
     /// discovery.register(Box::new(MyClosedDacDiscoverer::new()));
     ///
@@ -1027,8 +1029,6 @@ mod tests {
                 pps_min: 1,
                 pps_max: 100_000,
                 max_points_per_chunk: 4096,
-                prefers_constant_pps: false,
-                can_estimate_queue: false,
                 output_model: crate::types::OutputModel::NetworkFifo,
             };
             &CAPS

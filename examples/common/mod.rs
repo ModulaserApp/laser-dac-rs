@@ -3,9 +3,10 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, LaserPoint, StreamInstant};
+use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, StreamInstant};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(about = "Send test patterns to connected laser DACs")]
@@ -41,28 +42,28 @@ impl Shape {
     }
 }
 
-/// Create points for the given shape (streaming API).
+/// Fill points for the given shape into the buffer (streaming API).
 ///
 /// The `req` parameter provides timing info for time-based shapes.
-pub fn create_points(shape: Shape, req: &ChunkRequest) -> Vec<LaserPoint> {
-    let n_points = req.n_points;
-    let mut points = match shape {
-        Shape::Triangle => create_triangle_points(n_points),
-        Shape::Circle => create_circle_points(n_points),
-        Shape::OrbitingCircle => create_orbiting_circle_points(req),
-        Shape::TestPattern => create_test_pattern_points(n_points),
-        Shape::Audio => audio::create_audio_points(req, &audio::AudioConfig::default()),
-    };
-
-    // Ensure exactly n_points are returned (pad or truncate as needed)
-    normalize_point_count(&mut points, n_points);
-    points
+/// Returns `ChunkResult::Filled(n)` where n is the number of points written.
+pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
+    let n_points = req.target_points.min(buffer.len());
+    match shape {
+        Shape::Triangle => fill_triangle_points(buffer, n_points),
+        Shape::Circle => fill_circle_points(buffer, n_points),
+        Shape::OrbitingCircle => fill_orbiting_circle_points(req, buffer, n_points),
+        Shape::TestPattern => fill_test_pattern_points(buffer, n_points),
+        Shape::Audio => {
+            audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default())
+        }
+    }
+    ChunkResult::Filled(n_points)
 }
 
 /// Create points for frame-based usage (no stream timing).
 ///
 /// For shapes that need stream time (OrbitingCircle, Audio), this produces
-/// a static frame at t=0. Use `create_points` with a real ChunkRequest
+/// a static frame at t=0. Use `fill_points` with a real ChunkRequest
 /// for proper time-based animation.
 #[allow(dead_code)] // Used by frame_adapter example, not all examples
 pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
@@ -70,27 +71,19 @@ pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
     let dummy_req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30_000,
-        n_points,
-        scheduled_ahead_points: 0,
+        min_points: n_points,
+        target_points: n_points,
+        buffered_points: 0,
+        buffered: Duration::ZERO,
         device_queued_points: None,
     };
-    create_points(shape, &dummy_req)
+    let mut buffer = vec![LaserPoint::default(); n_points];
+    fill_points(shape, &dummy_req, &mut buffer);
+    buffer
 }
 
-/// Normalize a point vector to exactly `target` points.
-///
-/// If there are too few points, pads with the last point (or blanked origin).
-/// If there are too many points, truncates.
-fn normalize_point_count(points: &mut Vec<LaserPoint>, target: usize) {
-    let pad_point = points
-        .last()
-        .copied()
-        .unwrap_or(LaserPoint::blanked(0.0, 0.0));
-    points.resize(target, pad_point);
-}
-
-/// Create an RGB triangle with proper blanking and interpolation.
-fn create_triangle_points(min_points: usize) -> Vec<LaserPoint> {
+/// Fill an RGB triangle with proper blanking and interpolation into buffer.
+fn fill_triangle_points(buffer: &mut [LaserPoint], n_points: usize) {
     let vertices = [
         (-0.5_f32, -0.5_f32, 65535_u16, 0_u16, 0_u16),
         (0.5_f32, -0.5_f32, 0_u16, 65535_u16, 0_u16),
@@ -101,80 +94,94 @@ fn create_triangle_points(min_points: usize) -> Vec<LaserPoint> {
     const DWELL_COUNT: usize = 3;
 
     let fixed_points = BLANK_COUNT + 3 * DWELL_COUNT + DWELL_COUNT;
-    let points_per_edge = ((min_points.saturating_sub(fixed_points)) / 3).max(20);
+    let points_per_edge = ((n_points.saturating_sub(fixed_points)) / 3).max(20);
 
-    let mut points = Vec::with_capacity(min_points);
+    let mut idx = 0;
 
-    for _ in 0..BLANK_COUNT {
-        points.push(LaserPoint::blanked(vertices[0].0, vertices[0].1));
+    // Blank points
+    for _ in 0..BLANK_COUNT.min(n_points - idx) {
+        buffer[idx] = LaserPoint::blanked(vertices[0].0, vertices[0].1);
+        idx += 1;
+        if idx >= n_points {
+            return;
+        }
     }
 
+    // Draw edges
     for edge in 0..3 {
         let (x1, y1, r1, g1, b1) = vertices[edge];
         let (x2, y2, r2, g2, b2) = vertices[(edge + 1) % 3];
 
         for _ in 0..DWELL_COUNT {
-            points.push(LaserPoint::new(x1, y1, r1, g1, b1, 65535));
+            if idx >= n_points {
+                return;
+            }
+            buffer[idx] = LaserPoint::new(x1, y1, r1, g1, b1, 65535);
+            idx += 1;
         }
 
         for i in 1..=points_per_edge {
+            if idx >= n_points {
+                return;
+            }
             let t = i as f32 / points_per_edge as f32;
             let x = x1 + (x2 - x1) * t;
             let y = y1 + (y2 - y1) * t;
             let r = (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u16;
             let g = (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u16;
             let b = (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u16;
-            points.push(LaserPoint::new(x, y, r, g, b, 65535));
+            buffer[idx] = LaserPoint::new(x, y, r, g, b, 65535);
+            idx += 1;
         }
     }
 
+    // Final dwell
     let (x, y, r, g, b) = vertices[0];
-    for _ in 0..DWELL_COUNT {
-        points.push(LaserPoint::new(x, y, r, g, b, 65535));
+    while idx < n_points {
+        buffer[idx] = LaserPoint::new(x, y, r, g, b, 65535);
+        idx += 1;
     }
-
-    points
 }
 
-/// Create a rainbow circle.
-fn create_circle_points(num_points: usize) -> Vec<LaserPoint> {
-    let mut points = Vec::with_capacity(num_points + 10);
-
+/// Fill a rainbow circle into buffer.
+fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
     const BLANK_COUNT: usize = 5;
 
-    for _ in 0..BLANK_COUNT {
-        points.push(LaserPoint::blanked(0.5, 0.0));
+    let mut idx = 0;
+
+    for _ in 0..BLANK_COUNT.min(n_points) {
+        buffer[idx] = LaserPoint::blanked(0.5, 0.0);
+        idx += 1;
     }
 
-    for i in 0..=num_points {
-        let angle = (i as f32 / num_points as f32) * 2.0 * PI;
+    let circle_points = n_points.saturating_sub(BLANK_COUNT);
+    for i in 0..circle_points {
+        let angle = (i as f32 / circle_points as f32) * 2.0 * PI;
         let x = 0.5 * angle.cos();
         let y = 0.5 * angle.sin();
 
-        let hue = i as f32 / num_points as f32;
+        let hue = i as f32 / circle_points as f32;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        points.push(LaserPoint::new(x, y, r, g, b, 65535));
+        buffer[idx] = LaserPoint::new(x, y, r, g, b, 65535);
+        idx += 1;
     }
-
-    points
 }
 
-/// Create a time-based orbiting circle with smooth continuous motion.
+/// Fill a time-based orbiting circle with smooth continuous motion into buffer.
 ///
 /// Each point's position is calculated from its exact stream timestamp,
 /// so the orbit advances smoothly even within a single chunk.
 /// No blanking - the beam continuously traces the circle as it orbits.
-fn create_orbiting_circle_points(req: &ChunkRequest) -> Vec<LaserPoint> {
+fn fill_orbiting_circle_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_points: usize) {
     const ORBIT_RADIUS: f32 = 0.5;
     const CIRCLE_RADIUS: f32 = 0.15;
     const ORBIT_PERIOD_SECS: f32 = 4.0;
     const POINTS_PER_CIRCLE: usize = 200;
 
-    let mut points = Vec::with_capacity(req.n_points);
     let pps = req.pps as f64;
 
-    for i in 0..req.n_points {
+    for i in 0..n_points {
         let point_index = req.start.0 + i as u64;
         let t_secs = point_index as f64 / pps;
 
@@ -193,10 +200,8 @@ fn create_orbiting_circle_points(req: &ChunkRequest) -> Vec<LaserPoint> {
         let hue = (t_secs as f32 / 3.0) % 1.0;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        points.push(LaserPoint::new(x, y, r, g, b, 65535));
+        buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
     }
-
-    points
 }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u16, u16, u16) {
@@ -232,7 +237,7 @@ struct PatternPoint {
     b: u8,
 }
 
-fn create_test_pattern_points(n_points: usize) -> Vec<LaserPoint> {
+fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
     let json_str = include_str!("test-pattern.json");
     let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
 
@@ -250,5 +255,7 @@ fn create_test_pattern_points(n_points: usize) -> Vec<LaserPoint> {
         })
         .collect();
 
-    points.iter().cycle().take(n_points).copied().collect()
+    for (i, point) in points.iter().cycle().take(n_points).enumerate() {
+        buffer[i] = *point;
+    }
 }

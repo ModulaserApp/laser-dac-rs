@@ -1,15 +1,15 @@
 //! Callback-based example using Stream::run().
 //!
 //! This demonstrates the callback/pull approach where the stream drives timing.
-//! The callback is invoked whenever the device is ready for more data.
+//! The callback is invoked when the buffer needs filling.
 //!
 //! Run with: `cargo run --example callback -- [triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_points, Args};
-use laser_dac::{list_devices, open_device, ChunkRequest, Result, StreamConfig};
+use common::{fill_points, Args};
+use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -50,19 +50,18 @@ fn main() -> Result<()> {
 
     let shape = args.shape;
 
-    // Run in callback mode
+    // Run in callback mode with zero-allocation API
     let exit = stream.run(
-        // Producer callback - invoked when device needs more data
-        move |req: ChunkRequest| {
+        // Producer callback - invoked when buffer needs filling
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let count = counter.fetch_add(1, Ordering::Relaxed);
-            let points = create_points(shape, &req);
 
             // Print progress periodically
             if count.is_multiple_of(100) {
                 println!("Chunks sent: {}", count);
             }
 
-            Some(points)
+            fill_points(shape, req, buffer)
         },
         // Error callback
         |err| {
