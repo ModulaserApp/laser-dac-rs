@@ -224,6 +224,8 @@ impl DeviceInfo {
 /// Buffer status response received on the data port.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BufferStatus {
+    /// The message number this ACK corresponds to.
+    pub message_number: u8,
     /// Number of free sample slots in the device buffer.
     pub free_space: u16,
 }
@@ -233,6 +235,7 @@ impl BufferStatus {
     ///
     /// Expected layout:
     /// - Offset 0: Command (0x8A)
+    /// - Offset 1: Message number (echo of the sent message number)
     /// - Offset 2-4: free_space (u16 LE)
     pub fn from_response(buffer: &[u8]) -> io::Result<Self> {
         if buffer.len() < 4 {
@@ -252,8 +255,12 @@ impl BufferStatus {
             ));
         }
 
+        let message_number = buffer[1];
         let free_space = LittleEndian::read_u16(&buffer[2..4]);
-        Ok(BufferStatus { free_space })
+        Ok(BufferStatus {
+            message_number,
+            free_space,
+        })
     }
 }
 

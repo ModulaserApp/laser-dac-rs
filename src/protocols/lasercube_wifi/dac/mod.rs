@@ -1,7 +1,9 @@
 //! High-level abstractions around a LaserCube WiFi DAC.
 
+pub mod buffer_estimator;
 pub mod stream;
 
+pub use self::buffer_estimator::BufferEstimator;
 pub use self::stream::Stream;
 
 use crate::protocols::lasercube_wifi::protocol::{self, DeviceInfo};

@@ -84,4 +84,10 @@ impl StreamBackend for LasercubeWifiBackend {
         }
         Ok(())
     }
+
+    fn queued_points(&self) -> Option<u64> {
+        self.stream
+            .as_ref()
+            .map(|s| s.estimated_buffer_fullness() as u64)
+    }
 }
