@@ -34,8 +34,8 @@ use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
 use crate::types::{
-    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel,
-    RunExit, StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
+    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
 };
 
 // =============================================================================

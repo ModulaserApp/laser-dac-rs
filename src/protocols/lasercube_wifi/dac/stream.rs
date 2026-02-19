@@ -145,11 +145,8 @@ impl Stream {
             Ok(len) if len >= 4 => {
                 if let Ok(status) = BufferStatus::from_response(&self.recv_buffer[..len]) {
                     let now = Instant::now();
-                    self.buffer_estimator.record_ack(
-                        status.message_number,
-                        status.free_space,
-                        now,
-                    );
+                    self.buffer_estimator
+                        .record_ack(status.message_number, status.free_space, now);
                     self.dac.status.free_buffer_space = status.free_space;
                     return Ok(Some(status));
                 }
@@ -223,7 +220,8 @@ impl Stream {
 
     /// Get the estimated number of points currently in the device buffer.
     pub fn estimated_buffer_fullness(&self) -> u16 {
-        self.buffer_estimator.estimated_buffer_fullness(Instant::now())
+        self.buffer_estimator
+            .estimated_buffer_fullness(Instant::now())
     }
 
     /// Get the current playback rate in Hz.

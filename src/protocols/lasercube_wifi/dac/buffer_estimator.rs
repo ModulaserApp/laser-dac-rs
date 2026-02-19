@@ -120,10 +120,7 @@ impl BufferEstimator {
         // Try to correlate this ACK to a specific send time
         if let Some(&send_time) = self.message_times.get(&message_number) {
             // Only update sent-track if this is newer than our current anchor
-            if self
-                .last_data_sent_time
-                .is_none_or(|t| send_time >= t)
-            {
+            if self.last_data_sent_time.is_none_or(|t| send_time >= t) {
                 self.last_data_sent_time = Some(send_time);
                 self.last_data_sent_buffer_size = reported_fullness;
             }
@@ -234,7 +231,7 @@ mod tests {
         let t = now();
 
         est.record_ack(0, 1000, t); // fullness = 5000
-        // After 100ms at 30000 pps: consumed = 3000
+                                    // After 100ms at 30000 pps: consumed = 3000
         let later = t + Duration::from_millis(100);
         assert_eq!(est.estimated_buffer_fullness(later), 2000);
     }

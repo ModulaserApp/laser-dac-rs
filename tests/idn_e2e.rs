@@ -17,7 +17,9 @@ use idn_mock_server::{
     IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
 };
 
-use laser_dac::types::{ChunkRequest, ChunkResult, DacType, EnabledDacTypes, LaserPoint, StreamConfig};
+use laser_dac::types::{
+    ChunkRequest, ChunkResult, DacType, EnabledDacTypes, LaserPoint, StreamConfig,
+};
 use laser_dac::{caps_for_dac_type, Dac, DacInfo, RunExit};
 
 /// Create an EnabledDacTypes with only IDN enabled.
@@ -435,7 +437,9 @@ fn test_connection_loss_detection() {
     // Stop it via control.
     control.stop().unwrap();
 
-    let result = stream_thread.join().expect("Stream thread should not panic");
+    let result = stream_thread
+        .join()
+        .expect("Stream thread should not panic");
 
     // Stream should have stopped cleanly (not disconnected, since UDP is fire-and-forget)
     assert!(result.is_ok(), "Stream should complete without error");
@@ -501,7 +505,9 @@ fn test_full_lifecycle() {
 
     // Stop the stream
     control.stop().unwrap();
-    let _ = stream_thread.join().expect("Stream thread should not panic");
+    let _ = stream_thread
+        .join()
+        .expect("Stream thread should not panic");
 
     // Phase 4: Reconnect - verify server is back
     handle.resume();
