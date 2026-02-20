@@ -27,7 +27,8 @@
 //! No automatic reconnection. On disconnect, create a new `Dac` and `Stream`.
 //! New streams always start disarmed for safety.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -76,15 +77,18 @@ struct StreamControlInner {
     /// Channel for sending control messages to the stream loop.
     /// Wrapped in Mutex because Sender is Send but not Sync.
     control_tx: Mutex<Sender<ControlMsg>>,
+    /// Color delay in microseconds (readable per-chunk without locking).
+    color_delay_micros: AtomicU64,
 }
 
 impl StreamControl {
-    fn new(control_tx: Sender<ControlMsg>) -> Self {
+    fn new(control_tx: Sender<ControlMsg>, color_delay: Duration) -> Self {
         Self {
             inner: Arc::new(StreamControlInner {
                 armed: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
                 control_tx: Mutex::new(control_tx),
+                color_delay_micros: AtomicU64::new(color_delay.as_micros() as u64),
             }),
         }
     }
@@ -128,6 +132,21 @@ impl StreamControl {
         self.inner.armed.load(Ordering::SeqCst)
     }
 
+    /// Set the color delay for scanner sync compensation.
+    ///
+    /// Takes effect within one chunk period. The delay is quantized to
+    /// whole points: `ceil(delay * pps)`.
+    pub fn set_color_delay(&self, delay: Duration) {
+        self.inner
+            .color_delay_micros
+            .store(delay.as_micros() as u64, Ordering::SeqCst);
+    }
+
+    /// Get the current color delay.
+    pub fn color_delay(&self) -> Duration {
+        Duration::from_micros(self.inner.color_delay_micros.load(Ordering::SeqCst))
+    }
+
     /// Request the stream to stop.
     ///
     /// Signals termination; `run()` returns `RunExit::Stopped`.
@@ -165,6 +184,9 @@ struct StreamState {
     /// Number of valid points in last_chunk.
     last_chunk_len: usize,
 
+    /// FIFO for color delay (r, g, b, intensity per point).
+    color_delay_line: VecDeque<(u16, u16, u16, u16)>,
+
     /// Statistics.
     stats: StreamStats,
     /// Track the last armed state to detect transitions.
@@ -185,6 +207,7 @@ impl StreamState {
             chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk_len: 0,
+            color_delay_line: VecDeque::new(),
             stats: StreamStats::default(),
             last_armed: false,
             shutter_open: false,
@@ -230,8 +253,8 @@ impl Stream {
         Self {
             info,
             backend: Some(backend),
-            config,
-            control: StreamControl::new(control_tx),
+            config: config.clone(),
+            control: StreamControl::new(control_tx, config.color_delay),
             control_rx,
             state: StreamState::new(max_points),
         }
@@ -275,6 +298,7 @@ impl Stream {
 
         if was_armed && !is_armed {
             // Disarmed: close the shutter for safety (best-effort)
+            self.state.color_delay_line.clear();
             if self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
                     let _ = backend.set_shutter(false); // Best-effort, ignore errors
@@ -283,6 +307,24 @@ impl Stream {
             }
         } else if !was_armed && is_armed {
             // Armed: open the shutter (best-effort)
+            // Pre-fill color delay line with blanked colors so early points
+            // come out dark while galvos settle.
+            let delay_micros = self
+                .control
+                .inner
+                .color_delay_micros
+                .load(Ordering::SeqCst);
+            let delay_points = if delay_micros == 0 {
+                0
+            } else {
+                (Duration::from_micros(delay_micros).as_secs_f64() * self.config.pps as f64).ceil()
+                    as usize
+            };
+            self.state.color_delay_line.clear();
+            for _ in 0..delay_points {
+                self.state.color_delay_line.push_back((0, 0, 0, 0));
+            }
+
             if !self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
                     let _ = backend.set_shutter(true); // Best-effort, ignore errors
@@ -530,6 +572,39 @@ impl Stream {
             for p in &mut self.state.chunk_buffer[..n] {
                 *p = LaserPoint::blanked(p.x, p.y);
             }
+        }
+
+        // Apply color delay: read current setting, resize deque, shift colors
+        let delay_micros = self
+            .control
+            .inner
+            .color_delay_micros
+            .load(Ordering::SeqCst);
+        let color_delay_points = if delay_micros == 0 {
+            0
+        } else {
+            (Duration::from_micros(delay_micros).as_secs_f64() * self.config.pps as f64).ceil()
+                as usize
+        };
+
+        if color_delay_points > 0 {
+            // Resize deque to match current delay (handles dynamic changes)
+            self.state
+                .color_delay_line
+                .resize(color_delay_points, (0, 0, 0, 0));
+            for p in &mut self.state.chunk_buffer[..n] {
+                self.state
+                    .color_delay_line
+                    .push_back((p.r, p.g, p.b, p.intensity));
+                let (r, g, b, i) = self.state.color_delay_line.pop_front().unwrap();
+                p.r = r;
+                p.g = g;
+                p.b = b;
+                p.intensity = i;
+            }
+        } else if !self.state.color_delay_line.is_empty() {
+            // Delay was disabled at runtime — flush the line
+            self.state.color_delay_line.clear();
         }
 
         // Try to write with backpressure handling
@@ -1179,7 +1254,7 @@ mod tests {
     #[test]
     fn test_stream_control_arm_disarm() {
         let (tx, _rx) = mpsc::channel();
-        let control = StreamControl::new(tx);
+        let control = StreamControl::new(tx, Duration::ZERO);
         assert!(!control.is_armed());
 
         control.arm().unwrap();
@@ -1192,7 +1267,7 @@ mod tests {
     #[test]
     fn test_stream_control_stop() {
         let (tx, _rx) = mpsc::channel();
-        let control = StreamControl::new(tx);
+        let control = StreamControl::new(tx, Duration::ZERO);
         assert!(!control.is_stop_requested());
 
         control.stop().unwrap();
@@ -1202,7 +1277,7 @@ mod tests {
     #[test]
     fn test_stream_control_clone_shares_state() {
         let (tx, _rx) = mpsc::channel();
-        let control1 = StreamControl::new(tx);
+        let control1 = StreamControl::new(tx, Duration::ZERO);
         let control2 = control1.clone();
 
         control1.arm().unwrap();
@@ -2980,5 +3055,204 @@ mod tests {
             !shutter_open.load(Ordering::SeqCst),
             "Shutter should be closed after drain"
         );
+    }
+
+    // =========================================================================
+    // Color delay tests
+    // =========================================================================
+
+    #[test]
+    fn test_color_delay_zero_is_passthrough() {
+        // With delay=0, colors should pass through unchanged
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000); // color_delay defaults to ZERO
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        // Arm the stream so points aren't blanked
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        stream.state.last_armed = true;
+
+        // Fill chunk_buffer with colored points
+        let n = 5;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, (i as u16 + 1) * 1000, 0, 0, 65535);
+        }
+
+        // write_fill_points applies color delay internally
+        let mut on_error = |_: Error| {};
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Delay line should remain empty
+        assert!(stream.state.color_delay_line.is_empty());
+    }
+
+    #[test]
+    fn test_color_delay_shifts_colors() {
+        // With delay=3 points, first 3 outputs should be blanked, rest shifted
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // 10000 PPS, delay = 300µs → ceil(0.0003 * 10000) = 3 points
+        let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(300));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        // Arm the stream
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        // handle_shutter_transition pre-fills the delay line on arm
+        stream.state.last_armed = true;
+
+        // Pre-fill delay line as handle_shutter_transition would on arm
+        stream.state.color_delay_line.clear();
+        for _ in 0..3 {
+            stream.state.color_delay_line.push_back((0, 0, 0, 0));
+        }
+
+        // Fill 5 points with distinct colors
+        let n = 5;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] = LaserPoint::new(
+                i as f32 * 0.1,
+                0.0,
+                (i as u16 + 1) * 10000,
+                (i as u16 + 1) * 5000,
+                (i as u16 + 1) * 2000,
+                65535,
+            );
+        }
+
+        let mut on_error = |_: Error| {};
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // After write, check the chunk_buffer was modified:
+        // We can't inspect what was written to the backend directly,
+        // but we can verify the delay line state.
+        // After processing 5 points through a 3-point delay,
+        // the delay line should still have 3 entries (the last 3 input colors).
+        assert_eq!(stream.state.color_delay_line.len(), 3);
+
+        // The delay line should contain colors from inputs 3, 4, 5 (0-indexed: 2, 3, 4)
+        let expected: Vec<(u16, u16, u16, u16)> = (3..=5)
+            .map(|i| (i * 10000u16, i * 5000, i * 2000, 65535))
+            .collect();
+        let actual: Vec<(u16, u16, u16, u16)> =
+            stream.state.color_delay_line.iter().copied().collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_color_delay_resets_on_disarm_arm() {
+        // Disarm should clear the delay line, arm should re-fill it
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // 10000 PPS, delay = 200µs → ceil(0.0002 * 10000) = 2 points
+        let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        // Arm: should pre-fill delay line
+        stream.handle_shutter_transition(true);
+        assert_eq!(stream.state.color_delay_line.len(), 2);
+        assert_eq!(
+            stream.state.color_delay_line.front(),
+            Some(&(0, 0, 0, 0))
+        );
+
+        // Disarm: should clear delay line
+        stream.handle_shutter_transition(false);
+        assert!(stream.state.color_delay_line.is_empty());
+
+        // Arm again: should re-fill
+        stream.handle_shutter_transition(true);
+        assert_eq!(stream.state.color_delay_line.len(), 2);
+    }
+
+    #[test]
+    fn test_color_delay_dynamic_change() {
+        // Changing delay at runtime via atomic should resize the deque
+        let mut backend = TestBackend::new();
+        backend.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+
+        // Start with 200µs delay at 10000 PPS → 2 points
+        let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        // Arm
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        stream.state.last_armed = true;
+
+        // Pre-fill as handle_shutter_transition would
+        stream.state.color_delay_line.clear();
+        for _ in 0..2 {
+            stream.state.color_delay_line.push_back((0, 0, 0, 0));
+        }
+
+        // Fill and write a chunk
+        let n = 3;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, (i as u16 + 1) * 10000, 0, 0, 65535);
+        }
+        let mut on_error = |_: Error| {};
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Now change delay to 500µs → ceil(0.0005 * 10000) = 5 points
+        stream
+            .control
+            .set_color_delay(Duration::from_micros(500));
+
+        // Write another chunk — delay line should resize to 5
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, (i as u16 + 4) * 10000, 0, 0, 65535);
+        }
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        assert_eq!(stream.state.color_delay_line.len(), 5);
+
+        // Now disable delay entirely
+        stream.control.set_color_delay(Duration::ZERO);
+
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, 50000, 0, 0, 65535);
+        }
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Delay line should be cleared
+        assert!(stream.state.color_delay_line.is_empty());
     }
 }

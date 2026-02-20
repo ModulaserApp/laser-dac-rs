@@ -1,6 +1,6 @@
 //! Reconnecting session wrapper for automatic reconnection.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +29,7 @@ pub struct SessionControl {
 struct SessionControlInner {
     armed: AtomicBool,
     stop_requested: AtomicBool,
+    color_delay_micros: AtomicU64,
     current: Mutex<Option<StreamControl>>,
 }
 
@@ -38,6 +39,7 @@ impl SessionControl {
             inner: Arc::new(SessionControlInner {
                 armed: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
+                color_delay_micros: AtomicU64::new(0),
                 current: Mutex::new(None),
             }),
         }
@@ -56,6 +58,9 @@ impl SessionControl {
         } else {
             let _ = control.disarm();
         }
+
+        let delay = self.inner.color_delay_micros.load(Ordering::SeqCst);
+        control.set_color_delay(Duration::from_micros(delay));
     }
 
     fn detach(&self) {
@@ -83,6 +88,23 @@ impl SessionControl {
     /// Check if the output is armed.
     pub fn is_armed(&self) -> bool {
         self.inner.armed.load(Ordering::SeqCst)
+    }
+
+    /// Set the color delay for scanner sync compensation.
+    ///
+    /// Persists across reconnections — each new stream receives this value.
+    pub fn set_color_delay(&self, delay: Duration) {
+        self.inner
+            .color_delay_micros
+            .store(delay.as_micros() as u64, Ordering::SeqCst);
+        if let Some(control) = self.inner.current.lock().unwrap().as_ref() {
+            control.set_color_delay(delay);
+        }
+    }
+
+    /// Get the current color delay.
+    pub fn color_delay(&self) -> Duration {
+        Duration::from_micros(self.inner.color_delay_micros.load(Ordering::SeqCst))
     }
 
     /// Request the session to stop.

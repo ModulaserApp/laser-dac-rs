@@ -457,6 +457,20 @@ pub struct StreamConfig {
     /// blocking forever if the DAC stalls or queue depth is unknown.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub drain_timeout: std::time::Duration,
+
+    /// Initial color delay for scanner sync compensation (default: disabled).
+    ///
+    /// Delays RGB+intensity channels relative to XY coordinates by this duration,
+    /// allowing galvo mirrors time to settle before the laser fires. The delay is
+    /// implemented as a FIFO: output colors lag input colors by `ceil(color_delay * pps)` points.
+    ///
+    /// Can be changed at runtime via [`StreamControl::set_color_delay`] /
+    /// [`SessionControl::set_color_delay`].
+    ///
+    /// Typical values: 50–200µs depending on scanner speed.
+    /// `Duration::ZERO` disables the delay (default).
+    #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
+    pub color_delay: std::time::Duration,
 }
 
 #[cfg(feature = "serde")]
@@ -483,6 +497,28 @@ mod duration_millis {
     }
 }
 
+#[cfg(feature = "serde")]
+mod duration_micros {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
+        micros.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let micros = u64::deserialize(deserializer)?;
+        Ok(Duration::from_micros(micros))
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         use std::time::Duration;
@@ -492,6 +528,7 @@ impl Default for StreamConfig {
             min_buffer: Duration::from_millis(8),
             underrun: UnderrunPolicy::default(),
             drain_timeout: Duration::from_secs(1),
+            color_delay: Duration::ZERO,
         }
     }
 }
@@ -533,6 +570,14 @@ impl StreamConfig {
     /// Default: 1 second. Set to `Duration::ZERO` to skip drain entirely.
     pub fn with_drain_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.drain_timeout = timeout;
+        self
+    }
+
+    /// Set the color delay for scanner sync compensation (builder pattern).
+    ///
+    /// Default: `Duration::ZERO` (disabled). Typical values: 50–200µs.
+    pub fn with_color_delay(mut self, delay: std::time::Duration) -> Self {
+        self.color_delay = delay;
         self
     }
 }
@@ -903,6 +948,7 @@ mod tests {
             min_buffer: Duration::from_millis(12),
             underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
             drain_timeout: Duration::from_secs(2),
+            color_delay: Duration::from_micros(150),
         };
 
         // Round-trip through JSON
@@ -913,6 +959,7 @@ mod tests {
         assert_eq!(restored.target_buffer, config.target_buffer);
         assert_eq!(restored.min_buffer, config.min_buffer);
         assert_eq!(restored.drain_timeout, config.drain_timeout);
+        assert_eq!(restored.color_delay, config.color_delay);
 
         // Verify underrun policy
         match restored.underrun {
