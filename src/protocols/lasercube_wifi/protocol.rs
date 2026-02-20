@@ -159,8 +159,8 @@ impl From<&LaserPoint> for Point {
     /// LaserCube WiFi uses 12-bit coordinates (0-4095) with inverted axes, and 12-bit colors.
     fn from(p: &LaserPoint) -> Self {
         // Map [-1..1] -> [0..1] -> invert -> [0..4095]
-        let x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
-        let y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
+        let x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
+        let y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
 
         Point {
             x,

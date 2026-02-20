@@ -924,8 +924,8 @@ impl From<&LaserPoint> for PointXyrgbi {
     /// IDN PointXyrgbi uses i16 signed coordinates (-32768 to 32767) and u8 colors.
     /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * -32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * -32767.0) as i16;
+        let x = (p.x.clamp(-1.0, 1.0) * -32767.0).round() as i16;
+        let y = (p.y.clamp(-1.0, 1.0) * -32767.0).round() as i16;
         PointXyrgbi::new(
             x,
             y,
@@ -1259,9 +1259,9 @@ mod tests {
         let laser_point = LaserPoint::new(0.5, -0.5, 100 * 257, 100 * 257, 100 * 257, 100 * 257);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
-        // 0.5 * -32767 = -16383.5 -> -16383 (axis inverted)
-        assert_eq!(idn_point.x, -16383);
-        assert_eq!(idn_point.y, 16383);
+        // 0.5 * -32767 = -16383.5 -> -16384 (axis inverted)
+        assert_eq!(idn_point.x, -16384);
+        assert_eq!(idn_point.y, 16384);
     }
 
     #[test]

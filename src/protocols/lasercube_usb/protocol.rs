@@ -182,15 +182,15 @@ impl From<&LaserPoint> for Sample {
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// LaserCube USB uses 12-bit unsigned coordinates (0-4095) and u8 colors.
     fn from(p: &LaserPoint) -> Self {
-        let x = (((p.x.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0) as u16;
-        let y = (((p.y.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0) as u16;
+        let x = (((p.x.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0).round() as u16;
+        let y = (((p.y.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0).round() as u16;
         Sample::new(x, y, (p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8)
     }
 }
 
 /// Convert a float in range [-1.0, 1.0] to a LaserDock coordinate (0-4095).
 pub fn float_to_coordinate(value: f32) -> u16 {
-    ((MAX_COORDINATE_VALUE as f32) * (value + 1.0) / 2.0) as u16
+    ((MAX_COORDINATE_VALUE as f32) * (value + 1.0) / 2.0).round() as u16
 }
 
 #[cfg(test)]
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn test_float_to_coordinate() {
         assert_eq!(float_to_coordinate(-1.0), 0);
-        assert_eq!(float_to_coordinate(0.0), 2047);
+        assert_eq!(float_to_coordinate(0.0), 2048);
         assert_eq!(float_to_coordinate(1.0), 4095);
     }
 

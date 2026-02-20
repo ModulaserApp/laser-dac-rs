@@ -98,8 +98,8 @@ impl From<&LaserPoint> for Point {
     /// [`LaserPoint`] uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// Helios uses u16 12-bit coordinates (0-4095) with inverted axes and u8 colors.
     fn from(p: &LaserPoint) -> Self {
-        let dac_x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
-        let dac_y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
+        let dac_x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
+        let dac_y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
 
         Point {
             coordinate: Coordinate { x: dac_x, y: dac_y },
@@ -128,9 +128,9 @@ mod tests {
         let laser_point = LaserPoint::new(0.0, 0.0, 128 * 257, 64 * 257, 32 * 257, 200 * 257);
         let helios_point: Point = (&laser_point).into();
 
-        // (1.0 - (0.0 + 1.0) / 2.0) * 4095 = (1.0 - 0.5) * 4095 = 2047.5 -> 2047
-        assert_eq!(helios_point.coordinate.x, 2047);
-        assert_eq!(helios_point.coordinate.y, 2047);
+        // (1.0 - (0.0 + 1.0) / 2.0) * 4095 = (1.0 - 0.5) * 4095 = 2047.5 -> 2048
+        assert_eq!(helios_point.coordinate.x, 2048);
+        assert_eq!(helios_point.coordinate.y, 2048);
         // Colors should downscale from u16 to u8 (>> 8)
         assert_eq!(helios_point.color.r, 128);
         assert_eq!(helios_point.color.g, 64);
@@ -159,10 +159,10 @@ mod tests {
         let laser_point = LaserPoint::new(-0.5, 0.5, 0, 0, 0, 0);
         let helios_point: Point = (&laser_point).into();
 
-        // x: (1.0 - (-0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.25) * 4095 = 3071
-        // y: (1.0 - (0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.75) * 4095 = 1023
+        // x: (1.0 - (-0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.25) * 4095 = 3071.25 -> 3071
+        // y: (1.0 - (0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.75) * 4095 = 1023.75 -> 1024
         assert_eq!(helios_point.coordinate.x, 3071);
-        assert_eq!(helios_point.coordinate.y, 1023);
+        assert_eq!(helios_point.coordinate.y, 1024);
     }
 
     #[test]

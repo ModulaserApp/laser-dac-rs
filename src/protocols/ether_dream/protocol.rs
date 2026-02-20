@@ -249,8 +249,8 @@ impl From<&LaserPoint> for DacPoint {
     /// Ether Dream uses i16 signed coordinates and u16 colors (direct mapping).
     /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * -32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * -32767.0) as i16;
+        let x = (p.x.clamp(-1.0, 1.0) * -32767.0).round() as i16;
+        let y = (p.y.clamp(-1.0, 1.0) * -32767.0).round() as i16;
 
         DacPoint {
             control: 0,
