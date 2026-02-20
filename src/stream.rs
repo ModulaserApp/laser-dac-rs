@@ -321,11 +321,7 @@ impl Stream {
             // Armed: open the shutter (best-effort)
             // Pre-fill color delay line with blanked colors so early points
             // come out dark while galvos settle.
-            let delay_micros = self
-                .control
-                .inner
-                .color_delay_micros
-                .load(Ordering::SeqCst);
+            let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
             let delay_points = if delay_micros == 0 {
                 0
             } else {
@@ -601,11 +597,7 @@ impl Stream {
         }
 
         // Apply color delay: read current setting, resize deque, shift colors
-        let delay_micros = self
-            .control
-            .inner
-            .color_delay_micros
-            .load(Ordering::SeqCst);
+        let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
         let color_delay_points = if delay_micros == 0 {
             0
         } else {
@@ -1158,6 +1150,11 @@ mod tests {
             self
         }
 
+        fn with_output_model(mut self, model: OutputModel) -> Self {
+            self.caps.output_model = model;
+            self
+        }
+
         /// Set the initial queue depth for testing buffer estimation.
         fn with_initial_queue(mut self, queue: u64) -> Self {
             self.queued = Arc::new(AtomicU64::new(queue));
@@ -1184,6 +1181,11 @@ mod tests {
             Self {
                 inner: TestBackend::new(),
             }
+        }
+
+        fn with_output_model(mut self, model: OutputModel) -> Self {
+            self.inner = self.inner.with_output_model(model);
+            self
         }
     }
 
@@ -3204,10 +3206,7 @@ mod tests {
         // Arm: should pre-fill delay line
         stream.handle_shutter_transition(true);
         assert_eq!(stream.state.color_delay_line.len(), 2);
-        assert_eq!(
-            stream.state.color_delay_line.front(),
-            Some(&(0, 0, 0, 0))
-        );
+        assert_eq!(stream.state.color_delay_line.front(), Some(&(0, 0, 0, 0)));
 
         // Disarm: should clear delay line
         stream.handle_shutter_transition(false);
@@ -3256,9 +3255,7 @@ mod tests {
         stream.write_fill_points(n, &mut on_error).unwrap();
 
         // Now change delay to 500µs → ceil(0.0005 * 10000) = 5 points
-        stream
-            .control
-            .set_color_delay(Duration::from_micros(500));
+        stream.control.set_color_delay(Duration::from_micros(500));
 
         // Write another chunk — delay line should resize to 5
         for i in 0..n {
@@ -3273,8 +3270,7 @@ mod tests {
         stream.control.set_color_delay(Duration::ZERO);
 
         for i in 0..n {
-            stream.state.chunk_buffer[i] =
-                LaserPoint::new(0.0, 0.0, 50000, 0, 0, 65535);
+            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 50000, 0, 0, 65535);
         }
         stream.write_fill_points(n, &mut on_error).unwrap();
 
@@ -3332,8 +3328,7 @@ mod tests {
         // Write another chunk — should NOT be blanked (counter exhausted)
         stream.state.last_armed = true; // No transition this time
         for i in 0..n {
-            stream.state.chunk_buffer[i] =
-                LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
+            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
         }
         stream.write_fill_points(n, &mut on_error).unwrap();
 
@@ -3370,8 +3365,7 @@ mod tests {
 
         let n = 10;
         for i in 0..n {
-            stream.state.chunk_buffer[i] =
-                LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
+            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
         }
         let mut on_error = |_: Error| {};
         // This triggers disarmed→armed transition, which resets counter
@@ -3389,8 +3383,7 @@ mod tests {
         // Write again — should trigger new arm transition and reset counter
         stream.state.last_armed = false;
         for i in 0..n {
-            stream.state.chunk_buffer[i] =
-                LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
+            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
         }
         stream.write_fill_points(n, &mut on_error).unwrap();
 
@@ -3426,8 +3419,7 @@ mod tests {
 
         let n = 5;
         for i in 0..n {
-            stream.state.chunk_buffer[i] =
-                LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
+            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
         }
         let mut on_error = |_: Error| {};
         stream.write_fill_points(n, &mut on_error).unwrap();
@@ -3438,5 +3430,118 @@ mod tests {
         assert_eq!(stream.state.chunk_buffer[0].b, 16000);
         assert_eq!(stream.state.chunk_buffer[0].intensity, 65535);
         assert_eq!(stream.state.startup_blank_remaining, 0);
+    }
+
+    // =========================================================================
+    // OutputModel coverage: UsbFrameSwap vs NetworkFifo scheduled_ahead
+    // =========================================================================
+
+    #[test]
+    fn test_usb_frame_swap_replaces_scheduled_ahead() {
+        let backend = TestBackend::new().with_output_model(OutputModel::UsbFrameSwap);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        // Arm and write two chunks of 50 points each
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        let n = 50;
+        for _ in 0..2 {
+            for i in 0..n {
+                stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
+            }
+            let mut on_error = |_: Error| {};
+            stream.write_fill_points(n, &mut on_error).unwrap();
+        }
+
+        // UsbFrameSwap: scheduled_ahead should be SET to n, not accumulated to 2n
+        assert_eq!(stream.state.scheduled_ahead, n as u64);
+        assert_eq!(stream.state.stats.chunks_written, 2);
+        assert_eq!(stream.state.stats.points_written, 2 * n as u64);
+    }
+
+    #[test]
+    fn test_usb_frame_swap_no_queue_reporting() {
+        let backend = NoQueueTestBackend::new().with_output_model(OutputModel::UsbFrameSwap);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        // Arm and write two chunks
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        let n = 50;
+        for _ in 0..2 {
+            for i in 0..n {
+                stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
+            }
+            let mut on_error = |_: Error| {};
+            stream.write_fill_points(n, &mut on_error).unwrap();
+        }
+
+        // UsbFrameSwap + no queue reporting (like real Helios):
+        // scheduled_ahead should be SET, not accumulated
+        assert_eq!(stream.state.scheduled_ahead, n as u64);
+
+        // Buffer estimation should use software-only path (queued_points returns None)
+        let est = stream.estimate_buffer_points();
+        // Software estimate equals scheduled_ahead = n (SET, not accumulated)
+        assert_eq!(est, n as u64);
+    }
+
+    #[test]
+    fn test_network_fifo_accumulates_scheduled_ahead() {
+        let backend = TestBackend::new(); // default: NetworkFifo
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        // Arm and write two chunks of 50 points each
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        let n = 50;
+        for _ in 0..2 {
+            for i in 0..n {
+                stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
+            }
+            let mut on_error = |_: Error| {};
+            stream.write_fill_points(n, &mut on_error).unwrap();
+        }
+
+        // NetworkFifo: scheduled_ahead should ACCUMULATE to 2n
+        assert_eq!(stream.state.scheduled_ahead, 2 * n as u64);
+        assert_eq!(stream.state.stats.chunks_written, 2);
+        assert_eq!(stream.state.stats.points_written, 2 * n as u64);
     }
 }
