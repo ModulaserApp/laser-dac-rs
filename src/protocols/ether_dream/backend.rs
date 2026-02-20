@@ -6,7 +6,7 @@ use crate::protocols::ether_dream::dac::{stream, LightEngine, Playback, Playback
 use crate::protocols::ether_dream::protocol::{DacBroadcast, DacPoint};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Ether Dream DAC backend (network).
 pub struct EtherDreamBackend {
@@ -14,6 +14,10 @@ pub struct EtherDreamBackend {
     ip_addr: IpAddr,
     stream: Option<stream::Stream>,
     caps: DacCapabilities,
+    /// When we last received a fresh status from the DAC.
+    last_status_time: Option<Instant>,
+    /// The point rate from the last write (for decay calculation).
+    last_point_rate: u32,
 }
 
 impl EtherDreamBackend {
@@ -23,6 +27,8 @@ impl EtherDreamBackend {
             ip_addr,
             stream: None,
             caps: super::default_capabilities(),
+            last_status_time: None,
+            last_point_rate: 0,
         }
     }
 }
@@ -86,6 +92,8 @@ impl StreamBackend for EtherDreamBackend {
                         "DAC stuck in emergency stop - check hardware interlock",
                     ));
                 }
+                // Status is now fresh from the ping response.
+                self.last_status_time = Some(Instant::now());
             }
             LightEngine::Warmup | LightEngine::Cooldown => {
                 return Ok(WriteOutcome::WouldBlock);
@@ -94,8 +102,19 @@ impl StreamBackend for EtherDreamBackend {
         }
 
         let buffer_capacity = stream.dac().buffer_capacity;
-        let buffer_fullness = stream.dac().status.buffer_fullness;
-        let available = buffer_capacity as usize - buffer_fullness as usize - 1;
+        let raw_fullness = stream.dac().status.buffer_fullness;
+
+        // Decay fullness based on elapsed time since last status update.
+        // Between polls, the DAC consumes points at the current point rate.
+        let fullness = if let Some(last_time) = self.last_status_time {
+            let elapsed_secs = last_time.elapsed().as_secs_f64();
+            let consumed = (elapsed_secs * self.last_point_rate as f64) as u16;
+            raw_fullness.saturating_sub(consumed).min(buffer_capacity)
+        } else {
+            raw_fullness
+        };
+
+        let available = buffer_capacity.saturating_sub(fullness).saturating_sub(1) as usize;
 
         if available == 0 {
             return Ok(WriteOutcome::WouldBlock);
@@ -107,18 +126,13 @@ impl StreamBackend for EtherDreamBackend {
             stream.dac().max_point_rate / 16
         };
 
-        const MIN_POINTS_BEFORE_BEGIN: u16 = 500;
-        let target_buffer_points = (point_rate / 20).max(MIN_POINTS_BEFORE_BEGIN as u32) as usize;
-        let target_len = target_buffer_points
-            .min(available)
-            .max(dac_points.len().min(available));
+        const MIN_POINTS_BEFORE_BEGIN: u16 = 256;
 
+        // Send exactly what the stream scheduler provides, truncated to available space.
+        // No padding — the stream scheduler handles buffer fill-up over multiple iterations.
         let mut points_to_send = dac_points;
         if points_to_send.len() > available {
             points_to_send.truncate(available);
-        } else if points_to_send.len() < target_len {
-            let seed = points_to_send.clone();
-            points_to_send.extend(seed.iter().cycle().take(target_len - points_to_send.len()));
         }
 
         let playback_flags = stream.dac().status.playback_flags;
@@ -178,6 +192,8 @@ impl StreamBackend for EtherDreamBackend {
                 .map_err(Error::backend)?;
         }
 
+        self.last_status_time = Some(Instant::now());
+        self.last_point_rate = point_rate;
         Ok(WriteOutcome::Written)
     }
 
@@ -197,8 +213,16 @@ impl StreamBackend for EtherDreamBackend {
     }
 
     fn queued_points(&self) -> Option<u64> {
-        self.stream
-            .as_ref()
-            .map(|s| s.dac().status.buffer_fullness as u64)
+        self.stream.as_ref().map(|s| {
+            let raw = s.dac().status.buffer_fullness as u64;
+            let cap = s.dac().buffer_capacity as u64;
+            if let Some(last_time) = self.last_status_time {
+                let elapsed_secs = last_time.elapsed().as_secs_f64();
+                let consumed = (elapsed_secs * self.last_point_rate as f64) as u64;
+                raw.saturating_sub(consumed).min(cap)
+            } else {
+                raw
+            }
+        })
     }
 }

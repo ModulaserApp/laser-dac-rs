@@ -377,6 +377,9 @@ fn connect_inner(
 
     tcp_stream.set_nodelay(true)?;
 
+    // Read timeout prevents blocking forever on a dead DAC.
+    tcp_stream.set_read_timeout(Some(time::Duration::from_millis(500)))?;
+
     let tcp_writer = tcp_stream.try_clone()?;
     let mut tcp_reader = BufReader::new(tcp_stream);
 
@@ -419,13 +422,44 @@ fn recv_response_buffered(
     dac: &mut Addressed,
     expected_command: u8,
 ) -> Result<(), CommunicationError> {
-    bytes.resize(protocol::DacResponse::SIZE_BYTES, 0);
-    tcp_reader.read_exact(bytes)?;
-    let response = (&bytes[..]).read_bytes::<protocol::DacResponse>()?;
+    const MAX_RETRIES: usize = 5;
 
-    // Update status before returning errors so callers can react to DAC state
-    // changes even when the response is a NAK.
-    dac.update_status(&response.dac_status)?;
-    response.check_errors(expected_command)?;
-    Ok(())
+    for _ in 0..=MAX_RETRIES {
+        bytes.resize(protocol::DacResponse::SIZE_BYTES, 0);
+        tcp_reader.read_exact(bytes)?;
+        let response = (&bytes[..]).read_bytes::<protocol::DacResponse>()?;
+
+        // Always update status from every response, even mismatched ones.
+        dac.update_status(&response.dac_status)?;
+
+        if response.command == expected_command {
+            response.check_errors(expected_command)?;
+            return Ok(());
+        }
+
+        // Command mismatch — check if it's a stale/unsolicited frame we can skip.
+        // ACK mismatch: stale pipeline response from a previous command batch.
+        // NAK_INVALID ('I') mismatch: unsolicited status frame from the DAC.
+        if response.response == protocol::DacResponse::ACK
+            || response.response == protocol::DacResponse::NAK_INVALID
+        {
+            log::debug!(
+                "ignoring unsolicited response (got command 0x{:02X}, expected 0x{:02X}, response 0x{:02X})",
+                response.command,
+                expected_command,
+                response.response,
+            );
+            continue;
+        }
+
+        // Non-ACK, non-status mismatch — real error.
+        return Err(CommunicationError::Response(ResponseError {
+            response,
+            kind: ResponseErrorKind::UnexpectedCommand(response.command),
+        }));
+    }
+
+    Err(CommunicationError::Io(io::Error::other(
+        "too many unsolicited responses",
+    )))
 }
