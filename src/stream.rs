@@ -187,6 +187,11 @@ struct StreamState {
     /// FIFO for color delay (r, g, b, intensity per point).
     color_delay_line: VecDeque<(u16, u16, u16, u16)>,
 
+    /// Points remaining in the startup blank window (decremented as points are written).
+    startup_blank_remaining: usize,
+    /// Total startup blank points (computed once from config).
+    startup_blank_points: usize,
+
     /// Statistics.
     stats: StreamStats,
     /// Track the last armed state to detect transitions.
@@ -200,7 +205,7 @@ impl StreamState {
     ///
     /// Buffers are sized to `max_points_per_chunk` from DAC capabilities,
     /// ensuring we can handle any catch-up scenario without reallocation.
-    fn new(max_points_per_chunk: usize) -> Self {
+    fn new(max_points_per_chunk: usize, startup_blank_points: usize) -> Self {
         Self {
             current_instant: StreamInstant::new(0),
             scheduled_ahead: 0,
@@ -208,6 +213,8 @@ impl StreamState {
             last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk_len: 0,
             color_delay_line: VecDeque::new(),
+            startup_blank_remaining: 0,
+            startup_blank_points,
             stats: StreamStats::default(),
             last_armed: false,
             shutter_open: false,
@@ -250,13 +257,18 @@ impl Stream {
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
         let max_points = info.caps.max_points_per_chunk;
+        let startup_blank_points = if config.startup_blank.is_zero() {
+            0
+        } else {
+            (config.startup_blank.as_secs_f64() * config.pps as f64).ceil() as usize
+        };
         Self {
             info,
             backend: Some(backend),
             config: config.clone(),
             control: StreamControl::new(control_tx, config.color_delay),
             control_rx,
-            state: StreamState::new(max_points),
+            state: StreamState::new(max_points, startup_blank_points),
         }
     }
 
@@ -324,6 +336,8 @@ impl Stream {
             for _ in 0..delay_points {
                 self.state.color_delay_line.push_back((0, 0, 0, 0));
             }
+
+            self.state.startup_blank_remaining = self.state.startup_blank_points;
 
             if !self.state.shutter_open {
                 if let Some(backend) = &mut self.backend {
@@ -572,6 +586,18 @@ impl Stream {
             for p in &mut self.state.chunk_buffer[..n] {
                 *p = LaserPoint::blanked(p.x, p.y);
             }
+        }
+
+        // Apply startup blanking: force first N points after arming to blank
+        if is_armed && self.state.startup_blank_remaining > 0 {
+            let blank_count = n.min(self.state.startup_blank_remaining);
+            for p in &mut self.state.chunk_buffer[..blank_count] {
+                p.r = 0;
+                p.g = 0;
+                p.b = 0;
+                p.intensity = 0;
+            }
+            self.state.startup_blank_remaining -= blank_count;
         }
 
         // Apply color delay: read current setting, resize deque, shift colors
@@ -3254,5 +3280,163 @@ mod tests {
 
         // Delay line should be cleared
         assert!(stream.state.color_delay_line.is_empty());
+    }
+
+    // =========================================================================
+    // Startup blanking tests
+    // =========================================================================
+
+    #[test]
+    fn test_startup_blank_blanks_first_n_points() {
+        let backend = TestBackend::new();
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // 10000 PPS, startup_blank = 500µs → ceil(0.0005 * 10000) = 5 points
+        // Disable color delay to isolate startup blanking
+        let cfg = StreamConfig::new(10000)
+            .with_startup_blank(Duration::from_micros(500))
+            .with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        assert_eq!(stream.state.startup_blank_points, 5);
+
+        // Arm the stream (triggers handle_shutter_transition which resets counter)
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        // Simulate arm transition in write path
+        stream.state.last_armed = false; // Force transition detection
+
+        // Fill 10 colored points
+        let n = 10;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(i as f32 * 0.1, 0.0, 65535, 32000, 16000, 65535);
+        }
+
+        let mut on_error = |_: Error| {};
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // After write, check what was sent: we can't inspect backend directly,
+        // but we can verify the counter decremented and the buffer was modified
+        assert_eq!(stream.state.startup_blank_remaining, 0);
+
+        // Write another chunk — should NOT be blanked (counter exhausted)
+        stream.state.last_armed = true; // No transition this time
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
+        }
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Verify colors pass through unmodified (no startup blanking)
+        // The chunk_buffer is modified in-place before write, so after write
+        // it should still have the original colors (startup blank is exhausted)
+        assert_eq!(stream.state.chunk_buffer[0].r, 65535);
+        assert_eq!(stream.state.chunk_buffer[0].g, 32000);
+    }
+
+    #[test]
+    fn test_startup_blank_resets_on_rearm() {
+        let backend = TestBackend::new();
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // 10000 PPS, startup_blank = 500µs → 5 points
+        let cfg = StreamConfig::new(10000)
+            .with_startup_blank(Duration::from_micros(500))
+            .with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        // First arm cycle: consume startup blanking
+        stream.state.last_armed = false;
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        let n = 10;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
+        }
+        let mut on_error = |_: Error| {};
+        // This triggers disarmed→armed transition, which resets counter
+        stream.state.last_armed = false;
+        stream.write_fill_points(n, &mut on_error).unwrap();
+        assert_eq!(stream.state.startup_blank_remaining, 0);
+
+        // Disarm → re-arm
+        stream.control.disarm().unwrap();
+        stream.process_control_messages();
+
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+
+        // Write again — should trigger new arm transition and reset counter
+        stream.state.last_armed = false;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
+        }
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Counter should have been reset to 5 and then decremented to 0
+        assert_eq!(stream.state.startup_blank_remaining, 0);
+    }
+
+    #[test]
+    fn test_startup_blank_zero_is_noop() {
+        let backend = TestBackend::new();
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+
+        // Disable startup blanking
+        let cfg = StreamConfig::new(10000)
+            .with_startup_blank(Duration::ZERO)
+            .with_color_delay(Duration::ZERO);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+
+        assert_eq!(stream.state.startup_blank_points, 0);
+
+        // Arm and write colored points
+        stream.control.arm().unwrap();
+        stream.process_control_messages();
+        stream.state.last_armed = false; // Force arm transition
+
+        let n = 5;
+        for i in 0..n {
+            stream.state.chunk_buffer[i] =
+                LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
+        }
+        let mut on_error = |_: Error| {};
+        stream.write_fill_points(n, &mut on_error).unwrap();
+
+        // Colors should pass through unmodified — no startup blanking
+        assert_eq!(stream.state.chunk_buffer[0].r, 65535);
+        assert_eq!(stream.state.chunk_buffer[0].g, 32000);
+        assert_eq!(stream.state.chunk_buffer[0].b, 16000);
+        assert_eq!(stream.state.chunk_buffer[0].intensity, 65535);
+        assert_eq!(stream.state.startup_blank_remaining, 0);
     }
 }

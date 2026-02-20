@@ -471,6 +471,21 @@ pub struct StreamConfig {
     /// `Duration::ZERO` disables the delay (default).
     #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
     pub color_delay: std::time::Duration,
+
+    /// Duration of forced blanking after arming (default: 1ms).
+    ///
+    /// After the stream is armed, the first `ceil(startup_blank * pps)` points
+    /// will have their color channels forced to zero, regardless of what the
+    /// producer writes. This prevents the "flash on start" artifact where
+    /// the laser fires before mirrors reach position.
+    ///
+    /// Note: when `color_delay` is also active, the delay line provides
+    /// `color_delay` worth of natural startup blanking. This `startup_blank`
+    /// setting adds blanking *beyond* that duration.
+    ///
+    /// Set to `Duration::ZERO` to disable explicit startup blanking.
+    #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
+    pub startup_blank: std::time::Duration,
 }
 
 #[cfg(feature = "serde")]
@@ -529,6 +544,7 @@ impl Default for StreamConfig {
             underrun: UnderrunPolicy::default(),
             drain_timeout: Duration::from_secs(1),
             color_delay: Duration::ZERO,
+            startup_blank: Duration::from_millis(1),
         }
     }
 }
@@ -578,6 +594,14 @@ impl StreamConfig {
     /// Default: `Duration::ZERO` (disabled). Typical values: 50–200µs.
     pub fn with_color_delay(mut self, delay: std::time::Duration) -> Self {
         self.color_delay = delay;
+        self
+    }
+
+    /// Set the startup blanking duration after arming (builder pattern).
+    ///
+    /// Default: 1ms. Set to `Duration::ZERO` to disable.
+    pub fn with_startup_blank(mut self, duration: std::time::Duration) -> Self {
+        self.startup_blank = duration;
         self
     }
 }
@@ -949,6 +973,7 @@ mod tests {
             underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
             drain_timeout: Duration::from_secs(2),
             color_delay: Duration::from_micros(150),
+            startup_blank: Duration::from_micros(800),
         };
 
         // Round-trip through JSON
@@ -960,6 +985,7 @@ mod tests {
         assert_eq!(restored.min_buffer, config.min_buffer);
         assert_eq!(restored.drain_timeout, config.drain_timeout);
         assert_eq!(restored.color_delay, config.color_delay);
+        assert_eq!(restored.startup_blank, config.startup_blank);
 
         // Verify underrun policy
         match restored.underrun {
