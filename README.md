@@ -128,10 +128,43 @@ Each backend handles conversion to its native format internally.
 | `Dac`          | Opened DAC ready for streaming                   |
 | `Stream`       | Active streaming session                         |
 | `ReconnectingSession` | Stream wrapper with automatic reconnect   |
-| `StreamConfig` | Stream settings (PPS, buffer targets)            |
+| `StreamConfig` | Stream settings (PPS, buffering, color delay, blanking) |
 | `ChunkRequest`  | Request info for filling point buffer            |
 | `LaserPoint`   | Single point with position (f32) and color (u16) |
 | `DacType`      | Enum of supported DAC hardware                   |
+
+## Advanced Configuration
+
+### Color Delay (Scanner Sync Compensation)
+
+Galvo mirrors need time to settle before the laser fires. `color_delay` shifts
+RGB+intensity channels relative to XY coordinates so colors arrive after the
+mirrors are in position.
+
+```rust
+use std::time::Duration;
+
+let config = StreamConfig::new(30_000)
+    .with_color_delay(Duration::from_micros(100));
+```
+
+Can also be changed at runtime via `stream.control().set_color_delay(...)`.
+
+Typical values: 50–200µs depending on scanner speed. Disabled by default.
+
+### Startup Blanking
+
+Prevents the "flash on start" artifact by forcing the first points after arming
+to blank, giving mirrors time to reach their initial position.
+
+```rust
+use std::time::Duration;
+
+let config = StreamConfig::new(30_000)
+    .with_startup_blank(Duration::from_millis(2)); // default: 1ms
+```
+
+Set to `Duration::ZERO` to disable.
 
 ## Features
 
