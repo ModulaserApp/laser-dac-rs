@@ -464,8 +464,8 @@ pub struct StreamConfig {
     /// allowing galvo mirrors time to settle before the laser fires. The delay is
     /// implemented as a FIFO: output colors lag input colors by `ceil(color_delay * pps)` points.
     ///
-    /// Can be changed at runtime via [`StreamControl::set_color_delay`] /
-    /// [`SessionControl::set_color_delay`].
+    /// Can be changed at runtime via [`crate::StreamControl::set_color_delay`] /
+    /// [`crate::SessionControl::set_color_delay`].
     ///
     /// Typical values: 50–200µs depending on scanner speed.
     /// `Duration::ZERO` disables the delay (default).
