@@ -58,14 +58,102 @@ impl<T: UsbContext> Stream<T> {
     ///
     /// This claims the necessary interfaces and initializes the device.
     pub fn open(device: rusb::Device<T>) -> Result<Self> {
-        let handle = device.open()?;
+        log::debug!(
+            "LaserCube USB: opening device at bus {} address {}",
+            device.bus_number(),
+            device.address()
+        );
+
+        // Log device descriptor info (available without opening)
+        match device.device_descriptor() {
+            Ok(desc) => {
+                log::debug!(
+                    "  device descriptor: VID={:#06x} PID={:#06x} class={} subclass={} protocol={} configs={}",
+                    desc.vendor_id(),
+                    desc.product_id(),
+                    desc.class_code(),
+                    desc.sub_class_code(),
+                    desc.protocol_code(),
+                    desc.num_configurations(),
+                );
+            }
+            Err(e) => log::warn!("  failed to read device descriptor: {e}"),
+        }
+
+        // Log configuration and interface info
+        if let Ok(config) = device.active_config_descriptor() {
+            log::debug!(
+                "  active config #{}: {} interface(s)",
+                config.number(),
+                config.num_interfaces()
+            );
+            for iface in config.interfaces() {
+                for desc in iface.descriptors() {
+                    log::debug!(
+                        "    interface {} alt {} class={} subclass={} protocol={} endpoints={}",
+                        desc.interface_number(),
+                        desc.setting_number(),
+                        desc.class_code(),
+                        desc.sub_class_code(),
+                        desc.protocol_code(),
+                        desc.num_endpoints(),
+                    );
+                    for ep in desc.endpoint_descriptors() {
+                        log::debug!(
+                            "      endpoint {:#04x} {:?} {:?} max_packet={}",
+                            ep.address(),
+                            ep.direction(),
+                            ep.transfer_type(),
+                            ep.max_packet_size(),
+                        );
+                    }
+                }
+            }
+        } else {
+            log::debug!("  could not read active config descriptor");
+        }
+
+        let handle = match device.open() {
+            Ok(h) => {
+                log::debug!("  device.open() succeeded");
+                h
+            }
+            Err(e) => {
+                log::error!("  device.open() failed: {e}");
+                return Err(e.into());
+            }
+        };
+
+        // Try to auto-detach kernel drivers (helps on Linux, no-op/error on other platforms)
+        match handle.set_auto_detach_kernel_driver(true) {
+            Ok(()) => log::debug!("  set_auto_detach_kernel_driver(true) succeeded"),
+            Err(e) => log::debug!("  set_auto_detach_kernel_driver(true): {e} (expected on Windows)"),
+        }
 
         // Claim control interface
-        handle.claim_interface(CONTROL_INTERFACE)?;
+        match handle.claim_interface(CONTROL_INTERFACE) {
+            Ok(()) => log::debug!("  claim_interface({CONTROL_INTERFACE}) succeeded"),
+            Err(e) => {
+                log::error!("  claim_interface({CONTROL_INTERFACE}) failed: {e}");
+                return Err(e.into());
+            }
+        }
 
         // Claim data interface with alternate setting
-        handle.claim_interface(DATA_INTERFACE)?;
-        handle.set_alternate_setting(DATA_INTERFACE, DATA_ALT_SETTING)?;
+        match handle.claim_interface(DATA_INTERFACE) {
+            Ok(()) => log::debug!("  claim_interface({DATA_INTERFACE}) succeeded"),
+            Err(e) => {
+                log::error!("  claim_interface({DATA_INTERFACE}) failed: {e}");
+                return Err(e.into());
+            }
+        }
+        match handle.set_alternate_setting(DATA_INTERFACE, DATA_ALT_SETTING) {
+            Ok(()) => log::debug!("  set_alternate_setting({DATA_INTERFACE}, {DATA_ALT_SETTING}) succeeded"),
+            Err(e) => {
+                log::error!("  set_alternate_setting({DATA_INTERFACE}, {DATA_ALT_SETTING}) failed: {e}");
+                return Err(e.into());
+            }
+        }
 
         // Clear any stuck runner mode from a previous session
         Self::clear_runner_mode(&handle);
