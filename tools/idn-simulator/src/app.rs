@@ -54,6 +54,7 @@ pub struct SimulatorApp {
 
     chunks_received: u64,
     client_address: Option<SocketAddr>,
+    hostname: String,
     /// Local copy of ACK error selection for UI
     ack_error_selection: AckErrorOption,
 
@@ -80,6 +81,7 @@ impl SimulatorApp {
         event_rx: mpsc::Receiver<ServerEvent>,
         running: Arc<AtomicBool>,
         settings: Arc<RwLock<SimulatorSettings>>,
+        hostname: String,
     ) -> Self {
         Self {
             event_rx,
@@ -97,6 +99,7 @@ impl SimulatorApp {
             texture_handle: None,
             chunks_received: 0,
             client_address: None,
+            hostname,
             ack_error_selection: AckErrorOption::Success,
             points_in_window: 0,
             chunks_in_window: 0,
@@ -154,6 +157,12 @@ impl eframe::App for SimulatorApp {
         // Process incoming events
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
+                ServerEvent::Started(port) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
+                        "IDN Simulator - {} (port {})",
+                        self.hostname, port
+                    )));
+                }
                 ServerEvent::Chunk(chunk) => {
                     self.chunks_received += 1;
                     self.chunks_in_window += 1;

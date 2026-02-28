@@ -135,6 +135,7 @@ fn main() -> eframe::Result<()> {
     // Start UDP server thread
     let server_running = Arc::clone(&running);
     let server_settings = Arc::clone(&settings);
+    let hostname = args.hostname.clone();
     let server_config = SimulatorServerConfig {
         hostname: args.hostname.clone(),
         service_name: args.service_name.clone(),
@@ -158,7 +159,11 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "IDN Simulator",
         options,
-        Box::new(|_cc| Ok(Box::new(SimulatorApp::new(event_rx, running, settings)))),
+        Box::new(|_cc| {
+            Ok(Box::new(SimulatorApp::new(
+                event_rx, running, settings, hostname,
+            )))
+        }),
     );
 
     // Wait for server thread to finish

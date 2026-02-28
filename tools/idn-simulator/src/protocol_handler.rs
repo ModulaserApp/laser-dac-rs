@@ -27,6 +27,8 @@ pub struct ParsedChunk {
 
 /// Content ID flags from protocol
 const IDNFLG_CONTENTID_CONFIG_LSTFRG: u16 = 0x4000;
+const IDNMSK_CONTENTID_CNKTYPE: u16 = 0x00FF;
+const IDNVAL_CNKTYPE_VOID: u8 = 0x00;
 
 /// Sample sizes for different point formats
 const XYRGBI_SAMPLE_SIZE: usize = 8;
@@ -35,6 +37,20 @@ const XYRGBI_SAMPLE_SIZE: usize = 8;
 ///
 /// Returns the parsed chunk with timing info or None if parsing failed.
 pub fn parse_frame_data(data: &[u8]) -> Option<ParsedChunk> {
+    if data.len() < 12 {
+        log::warn!("Packet too small: {} bytes", data.len());
+        return None;
+    }
+
+    // Check for void/keepalive packets (4-byte header + 8-byte channel msg, no sample data).
+    // The chunk type is in the lower 8 bits of content_id (bytes 6-7).
+    let content_id = u16::from_be_bytes([data[6], data[7]]);
+    let chunk_type = (content_id & IDNMSK_CONTENTID_CNKTYPE) as u8;
+    if chunk_type == IDNVAL_CNKTYPE_VOID {
+        log::trace!("Void/keepalive packet, ignoring");
+        return None;
+    }
+
     if data.len() < 16 {
         log::warn!("Packet too small: {} bytes", data.len());
         return None;

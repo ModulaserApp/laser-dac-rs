@@ -25,6 +25,8 @@ pub struct SimulatorServerConfig {
 
 /// Events sent from the server to the main thread.
 pub enum ServerEvent {
+    /// Server successfully started on the given port.
+    Started(u16),
     /// A chunk of points with timing information.
     Chunk(ParsedChunk),
     ClientConnected(SocketAddr),
@@ -107,6 +109,9 @@ impl ServerBehavior for SimulatorBehavior {
     }
 }
 
+/// Maximum number of ports to try when the default is already in use.
+const MAX_PORT_ATTEMPTS: u16 = 100;
+
 /// Create and run the IDN server with simulator behavior.
 pub fn run_server(
     config: SimulatorServerConfig,
@@ -116,16 +121,45 @@ pub fn run_server(
 ) -> io::Result<()> {
     let link_timeout = Duration::from_millis(settings.read().unwrap().link_timeout_ms as u64);
 
-    let server_config = ServerConfig::new(&config.hostname)
+    let base_config = ServerConfig::new(&config.hostname)
         .with_services(vec![
             MockService::laser_projector(1, &config.service_name).with_dsid()
         ])
-        .with_bind_address(format!("0.0.0.0:{}", config.port).parse().unwrap())
         .with_link_timeout(link_timeout);
 
-    let behavior = SimulatorBehavior::new(settings, event_tx);
+    // Try binding to the requested port, then increment if already in use.
+    let server = {
+        let mut last_err = None;
+        let mut result = None;
+        for offset in 0..MAX_PORT_ATTEMPTS {
+            let port = config.port + offset;
+            // Generate a unique unit_id per port so discovery doesn't merge instances.
+            let mut unit_id = base_config.unit_id;
+            unit_id[14] = (port >> 8) as u8;
+            unit_id[15] = port as u8;
+            let server_config = base_config
+                .clone()
+                .with_unit_id(unit_id)
+                .with_bind_address(format!("0.0.0.0:{}", port).parse().unwrap());
+            let behavior = SimulatorBehavior::new(Arc::clone(&settings), event_tx.clone());
+            match MockIdnServer::new(server_config, behavior) {
+                Ok(server) => {
+                    result = Some(server);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                    if offset == 0 {
+                        log::info!("Port {} in use, trying next available port...", port);
+                    }
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        result.ok_or_else(|| last_err.unwrap())?
+    };
 
-    let server = MockIdnServer::new(server_config, behavior)?;
+    let _ = event_tx.send(ServerEvent::Started(server.addr().port()));
 
     // Copy the running flag to the server
     let server_running = server.running_handle();
