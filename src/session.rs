@@ -274,9 +274,25 @@ impl ReconnectingSession {
                 }
             }
 
+            log::info!(
+                "'{}' attempting open_device (retry {})",
+                self.device_id,
+                retries
+            );
             let device = match self.open_device() {
-                Ok(device) => device,
+                Ok(device) => {
+                    log::info!(
+                        "'{}' open_device succeeded",
+                        self.device_id
+                    );
+                    device
+                }
                 Err(err) => {
+                    log::warn!(
+                        "'{}' open_device failed: {}",
+                        self.device_id,
+                        err
+                    );
                     if !Self::is_retriable_connect_error(&err) {
                         return Err(err);
                     }
@@ -298,8 +314,19 @@ impl ReconnectingSession {
             };
 
             let (stream, info) = match device.start_stream(self.config.clone()) {
-                Ok(result) => result,
+                Ok(result) => {
+                    log::info!(
+                        "'{}' start_stream succeeded",
+                        self.device_id
+                    );
+                    result
+                }
                 Err(err) => {
+                    log::warn!(
+                        "'{}' start_stream failed: {}",
+                        self.device_id,
+                        err
+                    );
                     if !Self::is_retriable_connect_error(&err) {
                         return Err(err);
                     }
@@ -321,9 +348,18 @@ impl ReconnectingSession {
             };
 
             if connected_once {
+                log::info!(
+                    "'{}' reconnected, firing on_reconnect",
+                    self.device_id
+                );
                 if let Some(cb) = self.on_reconnect.as_mut() {
                     cb(&info);
                 }
+            } else {
+                log::info!(
+                    "'{}' first connection established",
+                    self.device_id
+                );
             }
             connected_once = true;
             retries = 0;
@@ -333,12 +369,17 @@ impl ReconnectingSession {
             let producer_handle = Arc::clone(&producer);
             let on_error_handle = Arc::clone(&on_error);
             let on_disconnect_handle = Arc::clone(&on_disconnect);
+            let mut error_count: u64 = 0;
             let exit = match stream.run(
                 move |req, buffer| {
                     let mut handler = producer_handle.lock().unwrap();
                     handler(req, buffer)
                 },
                 move |err| {
+                    error_count += 1;
+                    if error_count == 1 || error_count % 10000 == 0 {
+                        log::warn!("error callback (#{error_count}): {} (is_disconnected={})", err, err.is_disconnected());
+                    }
                     if err.is_disconnected() {
                         if let Some(cb) = on_disconnect_handle.lock().unwrap().as_mut() {
                             cb(&err);
@@ -348,8 +389,12 @@ impl ReconnectingSession {
                     handler(err)
                 },
             ) {
-                Ok(exit) => exit,
+                Ok(exit) => {
+                    log::info!("'{}' stream.run() exited with: {:?}", self.device_id, exit);
+                    exit
+                }
                 Err(err) => {
+                    log::error!("'{}' stream.run() returned error: {}", self.device_id, err);
                     self.control.detach();
                     return Err(err);
                 }
@@ -359,6 +404,10 @@ impl ReconnectingSession {
 
             match exit {
                 RunExit::Disconnected => {
+                    log::info!(
+                        "'{}' stream disconnected, will retry",
+                        self.device_id
+                    );
                     if let Some(max) = self.max_retries {
                         if retries >= max {
                             return Ok(RunExit::Disconnected);

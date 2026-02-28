@@ -494,10 +494,12 @@ impl Stream {
             // 4. Check backend connection
             if let Some(backend) = &self.backend {
                 if !backend.is_connected() {
+                    log::warn!("backend.is_connected() = false, exiting with Disconnected");
                     on_error(Error::disconnected("backend disconnected"));
                     return Ok(RunExit::Disconnected);
                 }
             } else {
+                log::warn!("no backend, exiting with Disconnected");
                 on_error(Error::disconnected("no backend"));
                 return Ok(RunExit::Disconnected);
             }
@@ -646,12 +648,17 @@ impl Stream {
                     return Err(Error::Stopped);
                 }
                 Err(e) if e.is_disconnected() => {
+                    log::warn!(
+                        "write got Disconnected error, exiting stream: {e}"
+                    );
                     on_error(Error::disconnected("backend disconnected"));
                     return Err(e);
                 }
                 Err(e) => {
+                    log::warn!("write error, disconnecting backend: {e}");
+                    let _ = backend.disconnect();
                     on_error(e);
-                    return Ok(()); // Continue with next iteration
+                    return Ok(());
                 }
             }
 
@@ -1112,7 +1119,7 @@ mod tests {
     use super::*;
     use crate::backend::{StreamBackend, WriteOutcome};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// A test backend for unit testing stream behavior.
     struct TestBackend {
@@ -2893,6 +2900,450 @@ mod tests {
 
         // Should return Disconnected when backend reports disconnection
         assert_eq!(result.unwrap(), RunExit::Disconnected);
+    }
+
+    // =========================================================================
+    // Write error → disconnect tests
+    //
+    // These verify that a non-disconnected write error (Error::Backend) causes
+    // the backend to be disconnected, so the stream exits with
+    // RunExit::Disconnected and the device can be reconnected.
+    //
+    // Without the fix (backend.disconnect() call in the Err(e) branch of
+    // write_fill_points), the backend stays "connected" and the stream loops
+    // forever retrying writes that keep failing.
+    // =========================================================================
+
+    /// A backend that returns Error::backend() after N successful writes.
+    /// Simulates the IDN scenario where write_frame() fails with an IO error
+    /// that maps to Error::Backend (not Error::Disconnected).
+    struct FailingWriteBackend {
+        inner: TestBackend,
+        fail_after: usize,
+        write_count: Arc<AtomicUsize>,
+        disconnect_called: Arc<AtomicBool>,
+    }
+
+    impl FailingWriteBackend {
+        fn new(fail_after: usize) -> Self {
+            Self {
+                inner: TestBackend::new(),
+                fail_after,
+                write_count: Arc::new(AtomicUsize::new(0)),
+                disconnect_called: Arc::new(AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl StreamBackend for FailingWriteBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("FailingTest".to_string())
+        }
+
+        fn caps(&self) -> &DacCapabilities {
+            self.inner.caps()
+        }
+
+        fn connect(&mut self) -> Result<()> {
+            self.inner.connect()
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            self.disconnect_called.store(true, Ordering::SeqCst);
+            self.inner.disconnect()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+            let count = self.write_count.fetch_add(1, Ordering::SeqCst);
+            if count >= self.fail_after {
+                // Return a backend error (non-disconnected), like IDN's
+                // write_frame().map_err(Error::backend) would produce.
+                Err(Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated write failure",
+                )))
+            } else {
+                self.inner.try_write_chunk(pps, points)
+            }
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.inner.set_shutter(open)
+        }
+
+        fn queued_points(&self) -> Option<u64> {
+            self.inner.queued_points()
+        }
+    }
+
+    #[test]
+    fn test_backend_write_error_exits_with_disconnected() {
+        // When try_write_chunk returns a non-disconnected error (Error::Backend),
+        // the stream should disconnect the backend and exit with RunExit::Disconnected.
+        //
+        // Without the fix, the stream loops forever because is_connected() stays
+        // true. This test would hang/timeout without the backend.disconnect() call.
+        use std::thread;
+
+        let mut backend = FailingWriteBackend::new(2); // fail after 2 successful writes
+        backend.inner.connected = true;
+        let disconnect_called = backend.disconnect_called.clone();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("FailingTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        // Run in a thread so the "loops forever" case (without the fix) would
+        // be caught by the test harness timeout rather than blocking forever.
+        let handle = thread::spawn(move || {
+            stream.run(
+                |req, buffer| {
+                    let n = req.target_points.min(buffer.len()).min(10);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ChunkResult::Filled(n)
+                },
+                |_err| {},
+            )
+        });
+
+        // If the fix is missing, the stream loops forever. Give it a generous timeout.
+        let result = handle.join().expect("stream thread panicked");
+
+        // With the fix: backend.disconnect() is called, stream exits Disconnected
+        assert_eq!(
+            result.unwrap(),
+            RunExit::Disconnected,
+            "Write error should cause stream to exit with Disconnected"
+        );
+        assert!(
+            disconnect_called.load(Ordering::SeqCst),
+            "backend.disconnect() should have been called after write error"
+        );
+    }
+
+    #[test]
+    fn test_backend_write_error_fires_on_error() {
+        // Verify the on_error callback is invoked with the backend error.
+        let mut backend = FailingWriteBackend::new(1); // fail after 1 write
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("FailingTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let got_backend_error = Arc::new(AtomicBool::new(false));
+        let error_count_clone = error_count.clone();
+        let got_backend_error_clone = got_backend_error.clone();
+
+        let result = stream.run(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                ChunkResult::Filled(n)
+            },
+            move |err| {
+                error_count_clone.fetch_add(1, Ordering::SeqCst);
+                if matches!(err, Error::Backend(_)) {
+                    got_backend_error_clone.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        assert_eq!(result.unwrap(), RunExit::Disconnected);
+        assert!(
+            got_backend_error.load(Ordering::SeqCst),
+            "on_error should have received the Backend error"
+        );
+    }
+
+    #[test]
+    fn test_backend_write_error_immediate_fail() {
+        // Backend that fails on the very first write should still exit cleanly.
+        let mut backend = FailingWriteBackend::new(0); // fail immediately
+        backend.inner.connected = true;
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("FailingTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let result = stream.run(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                ChunkResult::Filled(n)
+            },
+            |_err| {},
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            RunExit::Disconnected,
+            "Immediate write failure should exit with Disconnected"
+        );
+    }
+
+    // =========================================================================
+    // Helios-style disconnect tests
+    //
+    // The Helios DAC disconnects via a USB timeout on the status() poll
+    // (inside try_write_chunk), producing Error::Backend with a TimedOut
+    // error — not Error::Disconnected. This backend simulates that exact
+    // behavior: N successful writes, then status() times out.
+    // =========================================================================
+
+    /// A backend that simulates Helios USB disconnect behavior.
+    ///
+    /// The Helios DAC performs a status() poll (USB interrupt read) before
+    /// every write_frame(). On physical disconnect, the interrupt read times
+    /// out, producing `Error::Backend("Operation timed out")`. This backend
+    /// replicates that pattern: after `fail_after` successful writes, the
+    /// next try_write_chunk returns a TimedOut backend error.
+    struct HeliosLikeBackend {
+        inner: TestBackend,
+        fail_after: usize,
+        write_count: Arc<AtomicUsize>,
+        disconnect_called: Arc<AtomicBool>,
+        error_received: Arc<Mutex<Option<String>>>,
+    }
+
+    impl HeliosLikeBackend {
+        fn new(fail_after: usize) -> Self {
+            Self {
+                inner: TestBackend::new(),
+                fail_after,
+                write_count: Arc::new(AtomicUsize::new(0)),
+                disconnect_called: Arc::new(AtomicBool::new(false)),
+                error_received: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl StreamBackend for HeliosLikeBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("HeliosLikeTest".to_string())
+        }
+
+        fn caps(&self) -> &DacCapabilities {
+            self.inner.caps()
+        }
+
+        fn connect(&mut self) -> Result<()> {
+            self.inner.connect()
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            self.disconnect_called.store(true, Ordering::SeqCst);
+            self.inner.disconnect()
+        }
+
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+
+        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+            let count = self.write_count.fetch_add(1, Ordering::SeqCst);
+            if count >= self.fail_after {
+                // Simulate Helios: status() interrupt read times out on USB disconnect.
+                // Real error chain: rusb::Error::Timeout → HeliosDacError::UsbError
+                //   → Error::backend("usb connection error: Operation timed out")
+                Err(Error::backend(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "usb connection error: Operation timed out",
+                )))
+            } else {
+                self.inner.try_write_chunk(pps, points)
+            }
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.inner.set_shutter(open)
+        }
+
+        fn queued_points(&self) -> Option<u64> {
+            // Helios does not report queue depth
+            None
+        }
+    }
+
+    #[test]
+    fn test_helios_status_timeout_exits_with_disconnected() {
+        // Simulates a Helios DAC being unplugged mid-stream.
+        //
+        // Real-world sequence observed via USB logging:
+        //   1. status() → read_response FAILED: Timeout (32ms interrupt read)
+        //   2. Error mapped to Error::Backend (not Disconnected)
+        //   3. Stream calls backend.disconnect() → dac = None
+        //   4. Next loop: is_connected() = false → RunExit::Disconnected
+        use std::thread;
+
+        let mut backend = HeliosLikeBackend::new(3);
+        backend.inner.connected = true;
+        let disconnect_called = backend.disconnect_called.clone();
+
+        let info = DacInfo {
+            id: "test-helios".to_string(),
+            name: "Test Helios".to_string(),
+            kind: DacType::Custom("HeliosLikeTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let handle = thread::spawn(move || {
+            stream.run(
+                |req, buffer| {
+                    let n = req.target_points.min(buffer.len()).min(10);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ChunkResult::Filled(n)
+                },
+                |_err| {},
+            )
+        });
+
+        let result = handle.join().expect("stream thread panicked");
+
+        assert_eq!(
+            result.unwrap(),
+            RunExit::Disconnected,
+            "Helios status timeout should cause stream to exit with Disconnected"
+        );
+        assert!(
+            disconnect_called.load(Ordering::SeqCst),
+            "backend.disconnect() should have been called on status timeout"
+        );
+    }
+
+    #[test]
+    fn test_helios_status_timeout_fires_on_error_with_backend_variant() {
+        // Verify the on_error callback receives an Error::Backend (not Disconnected).
+        // This matches real Helios behavior: the USB timeout is wrapped as Backend error.
+        let mut backend = HeliosLikeBackend::new(1);
+        backend.inner.connected = true;
+        let error_received = backend.error_received.clone();
+
+        let info = DacInfo {
+            id: "test-helios".to_string(),
+            name: "Test Helios".to_string(),
+            kind: DacType::Custom("HeliosLikeTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let got_backend_error = Arc::new(AtomicBool::new(false));
+        let got_backend_error_clone = got_backend_error.clone();
+        let error_received_clone = error_received.clone();
+
+        let result = stream.run(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                ChunkResult::Filled(n)
+            },
+            move |err| {
+                if matches!(err, Error::Backend(_)) {
+                    got_backend_error_clone.store(true, Ordering::SeqCst);
+                    *error_received_clone.lock().unwrap() = Some(err.to_string());
+                }
+            },
+        );
+
+        assert_eq!(result.unwrap(), RunExit::Disconnected);
+        assert!(
+            got_backend_error.load(Ordering::SeqCst),
+            "on_error should receive Error::Backend for Helios timeout"
+        );
+        let msg = error_received.lock().unwrap();
+        assert!(
+            msg.as_ref()
+                .unwrap()
+                .contains("Operation timed out"),
+            "Error message should mention timeout, got: {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_helios_immediate_status_timeout() {
+        // Helios that fails on the very first status check (device was already
+        // disconnected when stream started, or USB enumeration was stale).
+        let mut backend = HeliosLikeBackend::new(0);
+        backend.inner.connected = true;
+        let disconnect_called = backend.disconnect_called.clone();
+
+        let info = DacInfo {
+            id: "test-helios".to_string(),
+            name: "Test Helios".to_string(),
+            kind: DacType::Custom("HeliosLikeTest".to_string()),
+            caps: backend.inner.caps().clone(),
+        };
+
+        let cfg = StreamConfig::new(30000);
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let result = stream.run(
+            |req, buffer| {
+                let n = req.target_points.min(buffer.len()).min(10);
+                for i in 0..n {
+                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                }
+                ChunkResult::Filled(n)
+            },
+            |_err| {},
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            RunExit::Disconnected,
+            "Immediate status timeout should exit with Disconnected"
+        );
+        assert!(
+            disconnect_called.load(Ordering::SeqCst),
+            "backend.disconnect() should be called even on first-write failure"
+        );
     }
 
     // =========================================================================
