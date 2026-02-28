@@ -661,6 +661,7 @@ mod tests {
 
     struct FakeAudioEngine {
         fail_open: AtomicBool,
+        paused: Arc<AtomicBool>,
         captured_frames: Arc<Mutex<Vec<Vec<f32>>>>,
         frame_count: Arc<std::sync::atomic::AtomicUsize>,
         channels: usize,
@@ -670,6 +671,7 @@ mod tests {
         fn new(channels: usize) -> Self {
             Self {
                 fail_open: AtomicBool::new(false),
+                paused: Arc::new(AtomicBool::new(false)),
                 captured_frames: Arc::new(Mutex::new(Vec::new())),
                 frame_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 channels,
@@ -703,6 +705,7 @@ mod tests {
             let (stop_tx, stop_rx) = mpsc::channel();
             let captured_frames = Arc::clone(&self.captured_frames);
             let frame_count = Arc::clone(&self.frame_count);
+            let paused = Arc::clone(&self.paused);
             let channels = self.channels;
 
             let handle = thread::spawn(move || loop {
@@ -710,6 +713,9 @@ mod tests {
                     Ok(_) => break,
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
+                        if paused.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let mut frame = vec![0.0; channels];
                         fill_output_buffer(&mut frame, channels, &runtime);
                         if let Ok(mut captured) = captured_frames.lock() {
@@ -926,6 +932,7 @@ mod tests {
     #[test]
     fn wouldblock_then_recover_after_callback_drains() {
         let fake_engine = Arc::new(FakeAudioEngine::new(MAPPED_CHANNELS));
+        fake_engine.paused.store(true, Ordering::Release);
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
 
@@ -941,6 +948,7 @@ mod tests {
             .unwrap();
         assert_eq!(blocked, WriteOutcome::WouldBlock);
 
+        fake_engine.paused.store(false, Ordering::Release);
         thread::sleep(Duration::from_millis(25));
 
         let recovered = backend
