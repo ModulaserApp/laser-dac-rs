@@ -1,7 +1,7 @@
 //! Core mock IDN server implementation.
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -18,11 +18,13 @@ pub struct MockIdnServer<B: ServerBehavior> {
     config: ServerConfig,
     behavior: B,
     running: Arc<AtomicBool>,
-    // Client tracking
-    last_client: Option<SocketAddr>,
+    // Client tracking (by IP address, not port — multiple sockets from the same
+    // host are the same logical client)
+    last_client_ip: Option<IpAddr>,
+    last_client_addr: Option<SocketAddr>,
     last_activity: Option<Instant>,
     /// Client that was force-disconnected (ignore packets from them temporarily)
-    disconnected_client: Option<(SocketAddr, Instant)>,
+    disconnected_client: Option<(IpAddr, Instant)>,
 }
 
 impl<B: ServerBehavior> MockIdnServer<B> {
@@ -38,7 +40,8 @@ impl<B: ServerBehavior> MockIdnServer<B> {
             config,
             behavior,
             running: Arc::new(AtomicBool::new(true)),
-            last_client: None,
+            last_client_ip: None,
+            last_client_addr: None,
             last_activity: None,
             disconnected_client: None,
         })
@@ -77,9 +80,14 @@ impl<B: ServerBehavior> MockIdnServer<B> {
         while self.running.load(Ordering::SeqCst) {
             // Check for force disconnect
             if self.behavior.should_force_disconnect() {
-                if let Some(client) = self.last_client.take() {
-                    log::info!("Force disconnecting client: {}", client);
-                    self.disconnected_client = Some((client, Instant::now()));
+                if let Some(client_ip) = self.last_client_ip.take() {
+                    log::info!(
+                        "Force disconnecting client: {}",
+                        self.last_client_addr
+                            .take()
+                            .map_or(client_ip.to_string(), |a| a.to_string())
+                    );
+                    self.disconnected_client = Some((client_ip, Instant::now()));
                     self.last_activity = None;
                     self.behavior.on_client_disconnected();
                 }
@@ -94,9 +102,12 @@ impl<B: ServerBehavior> MockIdnServer<B> {
 
             // Check for link timeout
             if let Some(last_time) = self.last_activity {
-                if last_time.elapsed() > self.config.link_timeout && self.last_client.is_some() {
+                if last_time.elapsed() > self.config.link_timeout
+                    && self.last_client_ip.is_some()
+                {
                     log::info!("Client timed out");
-                    self.last_client = None;
+                    self.last_client_ip = None;
+                    self.last_client_addr = None;
                     self.last_activity = None;
                     self.behavior.on_client_disconnected();
                 }
@@ -129,9 +140,9 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 thread::sleep(latency);
             }
 
-            // Ignore packets from force-disconnected client
-            if let Some((disconnected_addr, _)) = self.disconnected_client {
-                if src == disconnected_addr {
+            // Ignore packets from force-disconnected client (match by IP)
+            if let Some((disconnected_ip, _)) = self.disconnected_client {
+                if src.ip() == disconnected_ip {
                     continue;
                 }
             }
@@ -142,6 +153,15 @@ impl<B: ServerBehavior> MockIdnServer<B> {
             let command = buf[0];
             let flags = buf[1];
             let sequence = u16::from_be_bytes([buf[2], buf[3]]);
+
+            log::debug!(
+                "Received packet: cmd=0x{:02X} flags=0x{:02X} seq={} len={} from {}",
+                command,
+                flags,
+                sequence,
+                len,
+                src
+            );
 
             // Check if we should respond
             if !self.behavior.should_respond(command) {
@@ -189,10 +209,10 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                         continue;
                     }
 
-                    // Check if occupied by another client
+                    // Check if occupied by another client (compare by IP)
                     if self.behavior.is_occupied()
-                        && self.last_client.is_some()
-                        && self.last_client != Some(src)
+                        && self.last_client_ip.is_some()
+                        && self.last_client_ip != Some(src.ip())
                     {
                         if command == IDNCMD_RT_CNLMSG_ACKREQ {
                             let response = build_ack_response(flags, sequence, 0xEC);
@@ -201,12 +221,14 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                         continue;
                     }
 
-                    // Track client connection
-                    if self.last_client != Some(src) {
+                    // Track client connection by IP — different ports from the
+                    // same host are the same logical client.
+                    if self.last_client_ip != Some(src.ip()) {
                         log::info!("Client connected: {}", src);
-                        self.last_client = Some(src);
+                        self.last_client_ip = Some(src.ip());
                         self.behavior.on_client_connected(src);
                     }
+                    self.last_client_addr = Some(src);
                     self.last_activity = Some(Instant::now());
 
                     // Forward frame data to behavior
@@ -223,11 +245,22 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                     }
                 }
                 IDNCMD_RT_CNLMSG_CLOSE => {
-                    log::debug!("Received RT_CNLMSG_CLOSE from {}", src);
-                    // No response needed for close without ack
+                    log::info!("Received RT_CNLMSG_CLOSE from {}", src);
+                    if self.last_client_ip == Some(src.ip()) {
+                        self.last_client_ip = None;
+                        self.last_client_addr = None;
+                        self.last_activity = None;
+                        self.behavior.on_client_disconnected();
+                    }
                 }
                 IDNCMD_RT_CNLMSG_CLOSE_ACKREQ => {
-                    log::debug!("Received RT_CNLMSG_CLOSE_ACKREQ from {}", src);
+                    log::info!("Received RT_CNLMSG_CLOSE_ACKREQ from {}", src);
+                    if self.last_client_ip == Some(src.ip()) {
+                        self.last_client_ip = None;
+                        self.last_client_addr = None;
+                        self.last_activity = None;
+                        self.behavior.on_client_disconnected();
+                    }
                     let response =
                         build_ack_response(flags, sequence, self.behavior.get_ack_result_code());
                     let _ = self.socket.send_to(&response, src);

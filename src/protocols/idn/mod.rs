@@ -205,10 +205,15 @@ impl ServerScanner {
                 let mut buf = [0u8; 1500];
                 match self.endpoints[i].socket.recv_from(&mut buf) {
                     Ok((len, src_addr)) => {
-                        if let Some((response, src_ip)) =
+                        if let Some((response, src_addr)) =
                             Self::process_scan_response(&buf[..len], &src_addr)
                         {
-                            Self::record_server(&mut servers, &mut addr_to_unit, response, src_ip);
+                            Self::record_server(
+                                &mut servers,
+                                &mut addr_to_unit,
+                                response,
+                                src_addr,
+                            );
                         }
                         received_any = true;
                     }
@@ -225,10 +230,15 @@ impl ServerScanner {
             // Poll unicast/fallback socket
             match self.unicast_socket.recv_from(&mut self.buffer) {
                 Ok((len, src_addr)) => {
-                    if let Some((response, src_ip)) =
+                    if let Some((response, src_addr)) =
                         Self::process_scan_response(&self.buffer[..len], &src_addr)
                     {
-                        Self::record_server(&mut servers, &mut addr_to_unit, response, src_ip);
+                        Self::record_server(
+                            &mut servers,
+                            &mut addr_to_unit,
+                            response,
+                            src_addr,
+                        );
                     }
                     received_any = true;
                 }
@@ -261,18 +271,20 @@ impl ServerScanner {
     }
 
     /// Record a scan response into the servers map.
+    ///
+    /// Uses the actual source address (IP + port) from the response packet,
+    /// so servers running on non-standard ports (e.g. multiple simulators on
+    /// the same host) are discovered correctly.
     fn record_server(
         servers: &mut HashMap<[u8; 16], ServerInfo>,
         addr_to_unit: &mut HashMap<SocketAddr, [u8; 16]>,
         response: ScanResponse,
-        src_ip: Ipv4Addr,
+        src_addr: SocketAddr,
     ) {
-        let addr = SocketAddr::V4(SocketAddrV4::new(src_ip, IDN_PORT));
-
-        if let Some(unit_id) = addr_to_unit.get(&addr) {
+        if let Some(unit_id) = addr_to_unit.get(&src_addr) {
             if let Some(server) = servers.get_mut(unit_id) {
-                if !server.addresses.contains(&addr) {
-                    server.addresses.push(addr);
+                if !server.addresses.contains(&src_addr) {
+                    server.addresses.push(src_addr);
                 }
             }
         } else {
@@ -288,10 +300,10 @@ impl ServerScanner {
                 )
             });
 
-            if !entry.addresses.contains(&addr) {
-                entry.addresses.push(addr);
+            if !entry.addresses.contains(&src_addr) {
+                entry.addresses.push(src_addr);
             }
-            addr_to_unit.insert(addr, response.unit_id);
+            addr_to_unit.insert(src_addr, response.unit_id);
         }
     }
 
@@ -299,7 +311,7 @@ impl ServerScanner {
     fn process_scan_response(
         data: &[u8],
         src_addr: &SocketAddr,
-    ) -> Option<(ScanResponse, Ipv4Addr)> {
+    ) -> Option<(ScanResponse, SocketAddr)> {
         if data.len() < PacketHeader::SIZE_BYTES + ScanResponse::SIZE_BYTES {
             return None;
         }
@@ -313,12 +325,12 @@ impl ServerScanner {
 
         let response: ScanResponse = cursor.read_bytes().ok()?;
 
-        let src_ip = match src_addr {
-            SocketAddr::V4(v4) => *v4.ip(),
-            SocketAddr::V6(_) => return None,
-        };
+        // Only support IPv4
+        if !src_addr.is_ipv4() {
+            return None;
+        }
 
-        Some((response, src_ip))
+        Some((response, *src_addr))
     }
 
     /// Send broadcast scan request on all interfaces + fallback.
