@@ -74,6 +74,8 @@ pub enum DacType {
     LasercubeWifi,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
     LasercubeUsb,
+    /// AVB audio device backend.
+    Avb,
     /// Custom DAC implementation (for external/third-party backends).
     Custom(String),
 }
@@ -87,6 +89,7 @@ impl DacType {
             DacType::Idn,
             DacType::LasercubeWifi,
             DacType::LasercubeUsb,
+            DacType::Avb,
         ]
     }
 
@@ -98,6 +101,7 @@ impl DacType {
             DacType::Idn => "IDN",
             DacType::LasercubeWifi => "LaserCube WiFi",
             DacType::LasercubeUsb => "LaserCube USB (Laserdock)",
+            DacType::Avb => "AVB Audio Device",
             DacType::Custom(name) => name,
         }
     }
@@ -110,6 +114,7 @@ impl DacType {
             DacType::Idn => "ILDA Digital Network laser DAC",
             DacType::LasercubeWifi => "WiFi laser DAC",
             DacType::LasercubeUsb => "USB laser DAC",
+            DacType::Avb => "AVB audio network output",
             DacType::Custom(_) => "Custom DAC",
         }
     }
@@ -314,6 +319,11 @@ pub fn caps_for_dac_type(dac_type: &DacType) -> DacCapabilities {
         DacType::LasercubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
         #[cfg(not(feature = "lasercube-usb"))]
         DacType::LasercubeUsb => DacCapabilities::default(),
+
+        #[cfg(feature = "avb")]
+        DacType::Avb => crate::protocols::avb::default_capabilities(),
+        #[cfg(not(feature = "avb"))]
+        DacType::Avb => DacCapabilities::default(),
 
         DacType::Custom(_) => DacCapabilities::default(),
     }
@@ -799,14 +809,15 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn test_dac_type_all_returns_all_five_types() {
+    fn test_dac_type_all_returns_all_builtin_types() {
         let all_types = DacType::all();
-        assert_eq!(all_types.len(), 5);
+        assert_eq!(all_types.len(), 6);
         assert!(all_types.contains(&DacType::Helios));
         assert!(all_types.contains(&DacType::EtherDream));
         assert!(all_types.contains(&DacType::Idn));
         assert!(all_types.contains(&DacType::LasercubeWifi));
         assert!(all_types.contains(&DacType::LasercubeUsb));
+        assert!(all_types.contains(&DacType::Avb));
     }
 
     #[test]

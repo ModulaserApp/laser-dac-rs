@@ -17,3 +17,6 @@ pub mod lasercube_wifi;
 
 #[cfg(feature = "lasercube-usb")]
 pub mod lasercube_usb;
+
+#[cfg(feature = "avb")]
+pub mod avb;

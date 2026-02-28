@@ -4,8 +4,10 @@
 //! from multiple manufacturers.
 
 use std::any::Any;
+#[cfg(feature = "lasercube-wifi")]
 use std::io;
 use std::net::IpAddr;
+#[cfg(any(feature = "ether-dream", feature = "idn", feature = "lasercube-wifi"))]
 use std::time::Duration;
 
 use crate::backend::{Error, Result, StreamBackend};
@@ -75,6 +77,8 @@ pub struct ExternalDevice {
     pub usb_address: Option<String>,
     /// Hardware/device name if available.
     pub hardware_name: Option<String>,
+    /// Disambiguation index when multiple identical devices are present.
+    pub device_index: Option<u16>,
     /// Opaque data passed back to `connect()`.
     /// Store whatever your protocol needs to establish a connection.
     pub opaque_data: Box<dyn Any + Send>,
@@ -91,6 +95,7 @@ impl ExternalDevice {
             hostname: None,
             usb_address: None,
             hardware_name: None,
+            device_index: None,
             opaque_data: Box::new(opaque_data),
         }
     }
@@ -139,6 +144,11 @@ use crate::protocols::lasercube_usb::rusb;
 #[cfg(feature = "lasercube-usb")]
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
+#[cfg(feature = "avb")]
+use crate::backend::AvbBackend;
+#[cfg(feature = "avb")]
+use crate::protocols::avb::{discover_device_selectors as discover_avb_selectors, AvbSelector};
+
 // =============================================================================
 // DiscoveredDevice
 // =============================================================================
@@ -153,6 +163,7 @@ pub struct DiscoveredDevice {
     hostname: Option<String>,
     usb_address: Option<String>,
     hardware_name: Option<String>,
+    device_index: Option<u16>,
     inner: DiscoveredDeviceInner,
 }
 
@@ -182,6 +193,7 @@ impl DiscoveredDevice {
             hostname: self.hostname.clone(),
             usb_address: self.usb_address.clone(),
             hardware_name: self.hardware_name.clone(),
+            device_index: self.device_index,
         }
     }
 }
@@ -204,6 +216,8 @@ pub struct DiscoveredDeviceInfo {
     pub usb_address: Option<String>,
     /// Device name from hardware (Helios only).
     pub hardware_name: Option<String>,
+    /// Disambiguation index when multiple identical devices are present.
+    pub device_index: Option<u16>,
 }
 
 impl DiscoveredDeviceInfo {
@@ -226,6 +240,7 @@ impl DiscoveredDeviceInfo {
     /// - Helios: `helios:<hardware_name>` (USB serial if available)
     /// - LaserCube USB: `lasercube-usb:<serial|bus:addr>`
     /// - LaserCube WiFi: `lasercube-wifi:<ip>` (best available)
+    /// - AVB: `avb:<device-slug>:<n>` (slugged audio device name + duplicate index)
     ///
     /// This is used for device tracking/deduplication.
     pub fn stable_id(&self) -> String {
@@ -270,6 +285,15 @@ impl DiscoveredDeviceInfo {
                     return format!("lasercube-wifi:{}", ip);
                 }
             }
+            DacType::Avb => {
+                if let Some(ref hw_name) = self.hardware_name {
+                    let slug = slugify_device_id(hw_name);
+                    if let Some(index) = self.device_index {
+                        return format!("avb:{}:{}", slug, index);
+                    }
+                    return format!("avb:{}", slug);
+                }
+            }
             DacType::Custom(name) => {
                 // For custom types, use the custom name as prefix
                 if let Some(ip) = self.ip_address {
@@ -284,6 +308,29 @@ impl DiscoveredDeviceInfo {
         // Fallback for unknown configurations
         format!("unknown:{:?}", self.dac_type)
     }
+}
+
+fn slugify_device_id(name: &str) -> String {
+    let normalized = name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_ascii_lowercase();
+    let mut slug = String::with_capacity(normalized.len());
+    let mut prev_dash = false;
+
+    for ch in normalized.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+
+    slug.trim_matches('-').to_string()
 }
 
 /// Internal data needed for connection (opaque to callers).
@@ -307,6 +354,8 @@ enum DiscoveredDeviceInner {
     },
     #[cfg(feature = "lasercube-usb")]
     LasercubeUsb(rusb::Device<rusb::Context>),
+    #[cfg(feature = "avb")]
+    Avb(AvbSelector),
     /// External discoverer device.
     External {
         /// Index into `DacDiscovery.external` for the discoverer that found this device.
@@ -320,7 +369,8 @@ enum DiscoveredDeviceInner {
         feature = "ether-dream",
         feature = "idn",
         feature = "lasercube-wifi",
-        feature = "lasercube-usb"
+        feature = "lasercube-usb",
+        feature = "avb"
     )))]
     _Placeholder,
 }
@@ -373,6 +423,7 @@ impl HeliosDiscovery {
                 hostname: None,
                 usb_address: None,
                 hardware_name: Some(hardware_name),
+                device_index: None,
                 inner: DiscoveredDeviceInner::Helios(opened),
             });
         }
@@ -440,6 +491,7 @@ impl EtherDreamDiscovery {
                 hostname: None,
                 usb_address: None,
                 hardware_name: None,
+                device_index: None,
                 inner: DiscoveredDeviceInner::EtherDream { broadcast, ip },
             });
         }
@@ -501,6 +553,7 @@ impl IdnDiscovery {
                 hostname: Some(hostname),
                 usb_address: None,
                 hardware_name: None,
+                device_index: None,
                 inner: DiscoveredDeviceInner::Idn { server, service },
             });
         }
@@ -548,6 +601,7 @@ impl IdnDiscovery {
                 hostname: Some(hostname),
                 usb_address: None,
                 hardware_name: None,
+                device_index: None,
                 inner: DiscoveredDeviceInner::Idn { server, service },
             });
         }
@@ -605,6 +659,7 @@ impl LasercubeWifiDiscovery {
                 hostname: None,
                 usb_address: None,
                 hardware_name: None,
+                device_index: None,
                 inner: DiscoveredDeviceInner::LasercubeWifi {
                     info: device_info,
                     source_addr,
@@ -669,6 +724,7 @@ impl LasercubeUsbDiscovery {
                 hostname: None,
                 usb_address: Some(usb_address),
                 hardware_name: serial,
+                device_index: None,
                 inner: DiscoveredDeviceInner::LasercubeUsb(device),
             });
         }
@@ -685,6 +741,59 @@ impl LasercubeUsbDiscovery {
 
         let backend = LasercubeUsbBackend::new(usb_device);
         Ok(Box::new(backend))
+    }
+}
+
+/// Discovery for AVB audio-output DACs.
+#[cfg(feature = "avb")]
+pub struct AvbDiscovery;
+
+#[cfg(feature = "avb")]
+impl AvbDiscovery {
+    /// Create a new AVB discovery instance.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Scan for available AVB output devices.
+    pub fn scan(&self) -> Vec<DiscoveredDevice> {
+        let Ok(selectors) = discover_avb_selectors() else {
+            return Vec::new();
+        };
+
+        selectors
+            .into_iter()
+            .map(|selector| {
+                let hardware_name = selector.name.clone();
+                let index = selector.duplicate_index;
+                DiscoveredDevice {
+                    dac_type: DacType::Avb,
+                    ip_address: None,
+                    mac_address: None,
+                    hostname: None,
+                    usb_address: None,
+                    hardware_name: Some(hardware_name),
+                    device_index: Some(index),
+                    inner: DiscoveredDeviceInner::Avb(selector),
+                }
+            })
+            .collect()
+    }
+
+    /// Connect to a discovered AVB output device.
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+        let DiscoveredDeviceInner::Avb(selector) = device.inner else {
+            return Err(Error::invalid_config("Invalid device type for AVB"));
+        };
+
+        Ok(Box::new(AvbBackend::from_selector(selector)))
+    }
+}
+
+#[cfg(feature = "avb")]
+impl Default for AvbDiscovery {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -709,6 +818,8 @@ pub struct DacDiscovery {
     lasercube_wifi: LasercubeWifiDiscovery,
     #[cfg(feature = "lasercube-usb")]
     lasercube_usb: Option<LasercubeUsbDiscovery>,
+    #[cfg(feature = "avb")]
+    avb: AvbDiscovery,
     enabled: EnabledDacTypes,
     /// External discoverers registered by external crates.
     external: Vec<Box<dyn ExternalDiscoverer>>,
@@ -734,6 +845,8 @@ impl DacDiscovery {
             lasercube_wifi: LasercubeWifiDiscovery::new(),
             #[cfg(feature = "lasercube-usb")]
             lasercube_usb: LasercubeUsbDiscovery::new(),
+            #[cfg(feature = "avb")]
+            avb: AvbDiscovery::new(),
             enabled,
             external: Vec::new(),
         }
@@ -837,6 +950,12 @@ impl DacDiscovery {
             }
         }
 
+        // AVB
+        #[cfg(feature = "avb")]
+        if self.enabled.is_enabled(DacType::Avb) {
+            devices.extend(self.avb.scan());
+        }
+
         // External discoverers
         for (index, discoverer) in self.external.iter_mut().enumerate() {
             let dac_type = discoverer.dac_type();
@@ -848,6 +967,7 @@ impl DacDiscovery {
                     hostname: ext_device.hostname,
                     usb_address: ext_device.usb_address,
                     hardware_name: ext_device.hardware_name,
+                    device_index: ext_device.device_index,
                     inner: DiscoveredDeviceInner::External {
                         discoverer_index: index,
                         opaque_data: ext_device.opaque_data,
@@ -895,6 +1015,8 @@ impl DacDiscovery {
                 .as_ref()
                 .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
                 .connect(device),
+            #[cfg(feature = "avb")]
+            DacType::Avb => self.avb.connect(device),
             _ => Err(Error::invalid_config(format!(
                 "DAC type {:?} not supported in this build",
                 device.dac_type
@@ -916,6 +1038,7 @@ mod tests {
             hostname: None,
             usb_address: None,
             hardware_name: None,
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "etherdream:01:23:45:67:89:ab");
     }
@@ -929,6 +1052,7 @@ mod tests {
             hostname: Some("laser-projector.local".to_string()),
             usb_address: None,
             hardware_name: None,
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "idn:laser-projector.local");
     }
@@ -942,6 +1066,7 @@ mod tests {
             hostname: None,
             usb_address: Some("1:5".to_string()),
             hardware_name: Some("Helios DAC".to_string()),
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "helios:Helios DAC");
     }
@@ -955,6 +1080,7 @@ mod tests {
             hostname: None,
             usb_address: Some("2:3".to_string()),
             hardware_name: None,
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "lasercube-usb:2:3");
     }
@@ -968,8 +1094,23 @@ mod tests {
             hostname: None,
             usb_address: None,
             hardware_name: None,
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "lasercube-wifi:192.168.1.50");
+    }
+
+    #[test]
+    fn test_stable_id_avb_with_index() {
+        let info = DiscoveredDeviceInfo {
+            dac_type: DacType::Avb,
+            ip_address: None,
+            mac_address: None,
+            hostname: None,
+            usb_address: None,
+            hardware_name: Some("MOTU AVB Main".to_string()),
+            device_index: Some(1),
+        };
+        assert_eq!(info.stable_id(), "avb:motu-avb-main:1");
     }
 
     #[test]
@@ -981,6 +1122,7 @@ mod tests {
             hostname: None,
             usb_address: None,
             hardware_name: None,
+            device_index: None,
         };
         // Custom with no identifiers falls back to unknown format
         assert_eq!(info.stable_id(), "unknown:Custom(\"MyDAC\")");
@@ -995,6 +1137,7 @@ mod tests {
             hostname: None,
             usb_address: None,
             hardware_name: None,
+            device_index: None,
         };
         assert_eq!(info.stable_id(), "mydac:10.0.0.1");
     }

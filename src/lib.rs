@@ -41,12 +41,14 @@
 //! - **IDN** - ILDA Digital Network protocol (feature: `idn`)
 //! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)
 //! - **LaserCube USB** - USB laser DAC / LaserDock (feature: `lasercube-usb`)
+//! - **AVB Audio Devices** - AVB audio output via CoreAudio/ASIO (feature: `avb`, macOS/Windows)
 //!
 //! # Features
 //!
 //! - `all-dacs` (default): Enable all DAC protocols
 //! - `usb-dacs`: Enable USB DACs (Helios, LaserCube USB)
 //! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube WiFi)
+//! - `audio-dacs`: Enable audio DACs (AVB)
 //!
 //! # Coordinate System
 //!
@@ -141,6 +143,12 @@ pub use backend::LasercubeUsbBackend;
 #[cfg(feature = "lasercube-usb")]
 pub use protocols::lasercube_usb;
 
+// AVB
+#[cfg(feature = "avb")]
+pub use backend::AvbBackend;
+#[cfg(feature = "avb")]
+pub use protocols::avb;
+
 // Re-export rusb for consumers that need the Context type (for LaserCube USB)
 #[cfg(feature = "lasercube-usb")]
 pub use protocols::lasercube_usb::rusb;
@@ -182,7 +190,7 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 ///
 /// The ID should match the `id` field returned by [`list_devices`].
 /// IDs are namespaced by protocol (e.g., `etherdream:aa:bb:cc:dd:ee:ff`,
-/// `idn:hostname.local`, `helios:serial`).
+/// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
     let discovered = discovery.scan();

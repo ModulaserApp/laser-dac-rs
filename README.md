@@ -27,6 +27,7 @@ This crate does not apply any additional processing on points (like blanking), e
 | IDN (ILDA Digital Network) | Network    | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
 | LaserCube WiFi             | Network    | ✅       | Recommend to not use through WiFi mode; use LAN only                                                       |
 | LaserCube USB / Laserdock  | USB        | ✅       |
+| AVB Audio Device           | Network    | ⚠️       | Experimental; audio output backend using CoreAudio (macOS), ASIO (Windows), ALSA (Linux)                    |
 
 All DACs have been manually verified to work.
 
@@ -41,6 +42,7 @@ cargo run --example callback -- circle      # with progress counter
 cargo run --example frame_adapter -- circle # using FrameAdapter
 cargo run --example reconnect -- circle     # auto-reconnect on disconnect
 cargo run --example audio                   # audio-reactive (requires microphone)
+cargo run --example avb_file -- circle      # write 6ch AVB-mapped WAV for validation
 ```
 
 The examples run continuously until you press Ctrl+C.
@@ -177,11 +179,13 @@ By default, all DAC protocols are enabled via the `all-dacs` feature.
 | `all-dacs`       | Enable all DAC protocols (default)                          |
 | `usb-dacs`       | Enable USB DACs: `helios`, `lasercube-usb`                  |
 | `network-dacs`   | Enable network DACs: `ether-dream`, `idn`, `lasercube-wifi` |
+| `audio-dacs`     | Enable audio DACs: `avb`                                    |
 | `helios`         | Helios USB DAC                                              |
 | `lasercube-usb`  | LaserCube USB (LaserDock) DAC                               |
 | `ether-dream`    | Ether Dream network DAC                                     |
 | `idn`            | ILDA Digital Network DAC                                    |
 | `lasercube-wifi` | LaserCube WiFi DAC                                          |
+| `avb`            | AVB audio-device backend (experimental)                     |
 
 For example, to enable only network DACs:
 

@@ -77,8 +77,10 @@ jobs:
           - "ether-dream"
           - "idn"
           - "lasercube-wifi"
+          - "avb"
           - "usb-dacs"
           - "network-dacs"
+          - "audio-dacs"
           - "all-dacs"
           - "serde"
     steps:
