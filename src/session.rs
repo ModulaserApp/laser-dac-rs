@@ -281,18 +281,11 @@ impl ReconnectingSession {
             );
             let device = match self.open_device() {
                 Ok(device) => {
-                    log::info!(
-                        "'{}' open_device succeeded",
-                        self.device_id
-                    );
+                    log::info!("'{}' open_device succeeded", self.device_id);
                     device
                 }
                 Err(err) => {
-                    log::warn!(
-                        "'{}' open_device failed: {}",
-                        self.device_id,
-                        err
-                    );
+                    log::warn!("'{}' open_device failed: {}", self.device_id, err);
                     if !Self::is_retriable_connect_error(&err) {
                         return Err(err);
                     }
@@ -315,18 +308,11 @@ impl ReconnectingSession {
 
             let (stream, info) = match device.start_stream(self.config.clone()) {
                 Ok(result) => {
-                    log::info!(
-                        "'{}' start_stream succeeded",
-                        self.device_id
-                    );
+                    log::info!("'{}' start_stream succeeded", self.device_id);
                     result
                 }
                 Err(err) => {
-                    log::warn!(
-                        "'{}' start_stream failed: {}",
-                        self.device_id,
-                        err
-                    );
+                    log::warn!("'{}' start_stream failed: {}", self.device_id, err);
                     if !Self::is_retriable_connect_error(&err) {
                         return Err(err);
                     }
@@ -348,18 +334,12 @@ impl ReconnectingSession {
             };
 
             if connected_once {
-                log::info!(
-                    "'{}' reconnected, firing on_reconnect",
-                    self.device_id
-                );
+                log::info!("'{}' reconnected, firing on_reconnect", self.device_id);
                 if let Some(cb) = self.on_reconnect.as_mut() {
                     cb(&info);
                 }
             } else {
-                log::info!(
-                    "'{}' first connection established",
-                    self.device_id
-                );
+                log::info!("'{}' first connection established", self.device_id);
             }
             connected_once = true;
             retries = 0;
@@ -377,8 +357,12 @@ impl ReconnectingSession {
                 },
                 move |err| {
                     error_count += 1;
-                    if error_count == 1 || error_count % 10000 == 0 {
-                        log::warn!("error callback (#{error_count}): {} (is_disconnected={})", err, err.is_disconnected());
+                    if error_count == 1 || error_count.is_multiple_of(10000) {
+                        log::warn!(
+                            "error callback (#{error_count}): {} (is_disconnected={})",
+                            err,
+                            err.is_disconnected()
+                        );
                     }
                     if err.is_disconnected() {
                         if let Some(cb) = on_disconnect_handle.lock().unwrap().as_mut() {
@@ -404,10 +388,7 @@ impl ReconnectingSession {
 
             match exit {
                 RunExit::Disconnected => {
-                    log::info!(
-                        "'{}' stream disconnected, will retry",
-                        self.device_id
-                    );
+                    log::info!("'{}' stream disconnected, will retry", self.device_id);
                     if let Some(max) = self.max_retries {
                         if retries >= max {
                             return Ok(RunExit::Disconnected);

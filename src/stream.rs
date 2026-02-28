@@ -648,9 +648,7 @@ impl Stream {
                     return Err(Error::Stopped);
                 }
                 Err(e) if e.is_disconnected() => {
-                    log::warn!(
-                        "write got Disconnected error, exiting stream: {e}"
-                    );
+                    log::warn!("write got Disconnected error, exiting stream: {e}");
                     on_error(Error::disconnected("backend disconnected"));
                     return Err(e);
                 }
@@ -3298,9 +3296,7 @@ mod tests {
         );
         let msg = error_received.lock().unwrap();
         assert!(
-            msg.as_ref()
-                .unwrap()
-                .contains("Operation timed out"),
+            msg.as_ref().unwrap().contains("Operation timed out"),
             "Error message should mention timeout, got: {:?}",
             msg
         );
