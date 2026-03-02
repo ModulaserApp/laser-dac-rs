@@ -2912,24 +2912,45 @@ mod tests {
     // forever retrying writes that keep failing.
     // =========================================================================
 
-    /// A backend that returns Error::backend() after N successful writes.
-    /// Simulates the IDN scenario where write_frame() fails with an IO error
-    /// that maps to Error::Backend (not Error::Disconnected).
+    /// A backend that returns `Error::backend()` after N successful writes.
+    ///
+    /// Configurable error kind and message to simulate different DAC failure
+    /// modes: IDN write errors (BrokenPipe), Helios USB timeouts (TimedOut), etc.
     struct FailingWriteBackend {
         inner: TestBackend,
         fail_after: usize,
         write_count: Arc<AtomicUsize>,
         disconnect_called: Arc<AtomicBool>,
+        error_kind: std::io::ErrorKind,
+        error_message: &'static str,
+        report_queue_depth: bool,
     }
 
     impl FailingWriteBackend {
+        /// Create a backend that fails with `BrokenPipe` after `fail_after` writes.
         fn new(fail_after: usize) -> Self {
             Self {
                 inner: TestBackend::new(),
                 fail_after,
                 write_count: Arc::new(AtomicUsize::new(0)),
                 disconnect_called: Arc::new(AtomicBool::new(false)),
+                error_kind: std::io::ErrorKind::BrokenPipe,
+                error_message: "simulated write failure",
+                report_queue_depth: true,
             }
+        }
+
+        /// Configure the error kind and message returned on failure.
+        fn with_error(mut self, kind: std::io::ErrorKind, message: &'static str) -> Self {
+            self.error_kind = kind;
+            self.error_message = message;
+            self
+        }
+
+        /// Don't report queue depth (Helios-like behavior).
+        fn without_queue_depth(mut self) -> Self {
+            self.report_queue_depth = false;
+            self
         }
     }
 
@@ -2958,11 +2979,9 @@ mod tests {
         fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let count = self.write_count.fetch_add(1, Ordering::SeqCst);
             if count >= self.fail_after {
-                // Return a backend error (non-disconnected), like IDN's
-                // write_frame().map_err(Error::backend) would produce.
                 Err(Error::backend(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "simulated write failure",
+                    self.error_kind,
+                    self.error_message,
                 )))
             } else {
                 self.inner.try_write_chunk(pps, points)
@@ -2978,8 +2997,33 @@ mod tests {
         }
 
         fn queued_points(&self) -> Option<u64> {
-            self.inner.queued_points()
+            if self.report_queue_depth {
+                self.inner.queued_points()
+            } else {
+                None
+            }
         }
+    }
+
+    /// Producer that fills up to 10 blanked points per call (shared by write-error tests).
+    fn blank_producer(req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
+        let n = req.target_points.min(buffer.len()).min(10);
+        for i in 0..n {
+            buffer[i] = LaserPoint::blanked(0.0, 0.0);
+        }
+        ChunkResult::Filled(n)
+    }
+
+    /// Build a Stream from a backend with default test config (30 kpps).
+    fn make_test_stream(mut backend: impl StreamBackend + 'static) -> Stream {
+        backend.connect().unwrap();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: backend.dac_type(),
+            caps: backend.caps().clone(),
+        };
+        Stream::with_backend(info, Box::new(backend), StreamConfig::new(30000))
     }
 
     #[test]
@@ -2991,39 +3035,13 @@ mod tests {
         // true. This test would hang/timeout without the backend.disconnect() call.
         use std::thread;
 
-        let mut backend = FailingWriteBackend::new(2); // fail after 2 successful writes
-        backend.inner.connected = true;
+        let backend = FailingWriteBackend::new(2);
         let disconnect_called = backend.disconnect_called.clone();
+        let stream = make_test_stream(backend);
 
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("FailingTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        // Run in a thread so the "loops forever" case (without the fix) would
-        // be caught by the test harness timeout rather than blocking forever.
-        let handle = thread::spawn(move || {
-            stream.run(
-                |req, buffer| {
-                    let n = req.target_points.min(buffer.len()).min(10);
-                    for i in 0..n {
-                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                    }
-                    ChunkResult::Filled(n)
-                },
-                |_err| {},
-            )
-        });
-
-        // If the fix is missing, the stream loops forever. Give it a generous timeout.
+        let handle = thread::spawn(move || stream.run(blank_producer, |_err| {}));
         let result = handle.join().expect("stream thread panicked");
 
-        // With the fix: backend.disconnect() is called, stream exits Disconnected
         assert_eq!(
             result.unwrap(),
             RunExit::Disconnected,
@@ -3038,39 +3056,17 @@ mod tests {
     #[test]
     fn test_backend_write_error_fires_on_error() {
         // Verify the on_error callback is invoked with the backend error.
-        let mut backend = FailingWriteBackend::new(1); // fail after 1 write
-        backend.inner.connected = true;
+        let backend = FailingWriteBackend::new(1);
+        let stream = make_test_stream(backend);
 
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("FailingTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let error_count = Arc::new(AtomicUsize::new(0));
         let got_backend_error = Arc::new(AtomicBool::new(false));
-        let error_count_clone = error_count.clone();
         let got_backend_error_clone = got_backend_error.clone();
 
-        let result = stream.run(
-            |req, buffer| {
-                let n = req.target_points.min(buffer.len()).min(10);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            },
-            move |err| {
-                error_count_clone.fetch_add(1, Ordering::SeqCst);
-                if matches!(err, Error::Backend(_)) {
-                    got_backend_error_clone.store(true, Ordering::SeqCst);
-                }
-            },
-        );
+        let result = stream.run(blank_producer, move |err| {
+            if matches!(err, Error::Backend(_)) {
+                got_backend_error_clone.store(true, Ordering::SeqCst);
+            }
+        });
 
         assert_eq!(result.unwrap(), RunExit::Disconnected);
         assert!(
@@ -3082,29 +3078,9 @@ mod tests {
     #[test]
     fn test_backend_write_error_immediate_fail() {
         // Backend that fails on the very first write should still exit cleanly.
-        let mut backend = FailingWriteBackend::new(0); // fail immediately
-        backend.inner.connected = true;
+        let stream = make_test_stream(FailingWriteBackend::new(0));
 
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("FailingTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let result = stream.run(
-            |req, buffer| {
-                let n = req.target_points.min(buffer.len()).min(10);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            },
-            |_err| {},
-        );
+        let result = stream.run(blank_producer, |_err| {});
 
         assert_eq!(
             result.unwrap(),
@@ -3118,86 +3094,18 @@ mod tests {
     //
     // The Helios DAC disconnects via a USB timeout on the status() poll
     // (inside try_write_chunk), producing Error::Backend with a TimedOut
-    // error — not Error::Disconnected. This backend simulates that exact
-    // behavior: N successful writes, then status() times out.
+    // error — not Error::Disconnected. Uses FailingWriteBackend configured
+    // with TimedOut error kind and no queue depth reporting.
     // =========================================================================
 
-    /// A backend that simulates Helios USB disconnect behavior.
-    ///
-    /// The Helios DAC performs a status() poll (USB interrupt read) before
-    /// every write_frame(). On physical disconnect, the interrupt read times
-    /// out, producing `Error::Backend("Operation timed out")`. This backend
-    /// replicates that pattern: after `fail_after` successful writes, the
-    /// next try_write_chunk returns a TimedOut backend error.
-    struct HeliosLikeBackend {
-        inner: TestBackend,
-        fail_after: usize,
-        write_count: Arc<AtomicUsize>,
-        disconnect_called: Arc<AtomicBool>,
-        error_received: Arc<Mutex<Option<String>>>,
-    }
-
-    impl HeliosLikeBackend {
-        fn new(fail_after: usize) -> Self {
-            Self {
-                inner: TestBackend::new(),
-                fail_after,
-                write_count: Arc::new(AtomicUsize::new(0)),
-                disconnect_called: Arc::new(AtomicBool::new(false)),
-                error_received: Arc::new(Mutex::new(None)),
-            }
-        }
-    }
-
-    impl StreamBackend for HeliosLikeBackend {
-        fn dac_type(&self) -> DacType {
-            DacType::Custom("HeliosLikeTest".to_string())
-        }
-
-        fn caps(&self) -> &DacCapabilities {
-            self.inner.caps()
-        }
-
-        fn connect(&mut self) -> Result<()> {
-            self.inner.connect()
-        }
-
-        fn disconnect(&mut self) -> Result<()> {
-            self.disconnect_called.store(true, Ordering::SeqCst);
-            self.inner.disconnect()
-        }
-
-        fn is_connected(&self) -> bool {
-            self.inner.is_connected()
-        }
-
-        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-            let count = self.write_count.fetch_add(1, Ordering::SeqCst);
-            if count >= self.fail_after {
-                // Simulate Helios: status() interrupt read times out on USB disconnect.
-                // Real error chain: rusb::Error::Timeout → HeliosDacError::UsbError
-                //   → Error::backend("usb connection error: Operation timed out")
-                Err(Error::backend(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "usb connection error: Operation timed out",
-                )))
-            } else {
-                self.inner.try_write_chunk(pps, points)
-            }
-        }
-
-        fn stop(&mut self) -> Result<()> {
-            self.inner.stop()
-        }
-
-        fn set_shutter(&mut self, open: bool) -> Result<()> {
-            self.inner.set_shutter(open)
-        }
-
-        fn queued_points(&self) -> Option<u64> {
-            // Helios does not report queue depth
-            None
-        }
+    /// Create a Helios-like backend: TimedOut error, no queue depth.
+    fn helios_like_backend(fail_after: usize) -> FailingWriteBackend {
+        FailingWriteBackend::new(fail_after)
+            .with_error(
+                std::io::ErrorKind::TimedOut,
+                "usb connection error: Operation timed out",
+            )
+            .without_queue_depth()
     }
 
     #[test]
@@ -3211,33 +3119,11 @@ mod tests {
         //   4. Next loop: is_connected() = false → RunExit::Disconnected
         use std::thread;
 
-        let mut backend = HeliosLikeBackend::new(3);
-        backend.inner.connected = true;
+        let backend = helios_like_backend(3);
         let disconnect_called = backend.disconnect_called.clone();
+        let stream = make_test_stream(backend);
 
-        let info = DacInfo {
-            id: "test-helios".to_string(),
-            name: "Test Helios".to_string(),
-            kind: DacType::Custom("HeliosLikeTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let handle = thread::spawn(move || {
-            stream.run(
-                |req, buffer| {
-                    let n = req.target_points.min(buffer.len()).min(10);
-                    for i in 0..n {
-                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                    }
-                    ChunkResult::Filled(n)
-                },
-                |_err| {},
-            )
-        });
-
+        let handle = thread::spawn(move || stream.run(blank_producer, |_err| {}));
         let result = handle.join().expect("stream thread panicked");
 
         assert_eq!(
@@ -3255,39 +3141,19 @@ mod tests {
     fn test_helios_status_timeout_fires_on_error_with_backend_variant() {
         // Verify the on_error callback receives an Error::Backend (not Disconnected).
         // This matches real Helios behavior: the USB timeout is wrapped as Backend error.
-        let mut backend = HeliosLikeBackend::new(1);
-        backend.inner.connected = true;
-        let error_received = backend.error_received.clone();
-
-        let info = DacInfo {
-            id: "test-helios".to_string(),
-            name: "Test Helios".to_string(),
-            kind: DacType::Custom("HeliosLikeTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let stream = make_test_stream(helios_like_backend(1));
 
         let got_backend_error = Arc::new(AtomicBool::new(false));
+        let error_received: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let got_backend_error_clone = got_backend_error.clone();
         let error_received_clone = error_received.clone();
 
-        let result = stream.run(
-            |req, buffer| {
-                let n = req.target_points.min(buffer.len()).min(10);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            },
-            move |err| {
-                if matches!(err, Error::Backend(_)) {
-                    got_backend_error_clone.store(true, Ordering::SeqCst);
-                    *error_received_clone.lock().unwrap() = Some(err.to_string());
-                }
-            },
-        );
+        let result = stream.run(blank_producer, move |err| {
+            if matches!(err, Error::Backend(_)) {
+                got_backend_error_clone.store(true, Ordering::SeqCst);
+                *error_received_clone.lock().unwrap() = Some(err.to_string());
+            }
+        });
 
         assert_eq!(result.unwrap(), RunExit::Disconnected);
         assert!(
@@ -3306,30 +3172,11 @@ mod tests {
     fn test_helios_immediate_status_timeout() {
         // Helios that fails on the very first status check (device was already
         // disconnected when stream started, or USB enumeration was stale).
-        let mut backend = HeliosLikeBackend::new(0);
-        backend.inner.connected = true;
+        let backend = helios_like_backend(0);
         let disconnect_called = backend.disconnect_called.clone();
+        let stream = make_test_stream(backend);
 
-        let info = DacInfo {
-            id: "test-helios".to_string(),
-            name: "Test Helios".to_string(),
-            kind: DacType::Custom("HeliosLikeTest".to_string()),
-            caps: backend.inner.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-
-        let result = stream.run(
-            |req, buffer| {
-                let n = req.target_points.min(buffer.len()).min(10);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            },
-            |_err| {},
-        );
+        let result = stream.run(blank_producer, |_err| {});
 
         assert_eq!(
             result.unwrap(),
