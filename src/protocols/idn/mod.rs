@@ -404,29 +404,18 @@ impl ServerScanner {
 
         let entry_size = map_header.entry_size as usize;
 
-        for _ in 0..map_header.relay_entry_count {
-            if cursor.len() < entry_size {
-                break;
-            }
-            let read_bytes = entry_size.min(ServiceMapEntry::SIZE_BYTES);
-            let mut entry_buf = [0u8; ServiceMapEntry::SIZE_BYTES];
-            entry_buf[..read_bytes].copy_from_slice(&cursor[..read_bytes]);
-            let entry: ServiceMapEntry = (&entry_buf[..]).read_bytes()?;
-            server.relays.push(RelayInfo::from_entry(&entry));
-            cursor = &cursor[entry_size..];
-        }
-
-        for _ in 0..map_header.service_entry_count {
-            if cursor.len() < entry_size {
-                break;
-            }
-            let read_bytes = entry_size.min(ServiceMapEntry::SIZE_BYTES);
-            let mut entry_buf = [0u8; ServiceMapEntry::SIZE_BYTES];
-            entry_buf[..read_bytes].copy_from_slice(&cursor[..read_bytes]);
-            let entry: ServiceMapEntry = (&entry_buf[..]).read_bytes()?;
-            server.services.push(ServiceInfo::from_entry(&entry));
-            cursor = &cursor[entry_size..];
-        }
+        server.relays = parse_service_map_entries(
+            &mut cursor,
+            map_header.relay_entry_count,
+            entry_size,
+            RelayInfo::from_entry,
+        )?;
+        server.services = parse_service_map_entries(
+            &mut cursor,
+            map_header.service_entry_count,
+            entry_size,
+            ServiceInfo::from_entry,
+        )?;
 
         Ok(())
     }
@@ -468,30 +457,12 @@ impl ServerScanner {
         while start.elapsed() < timeout {
             match self.recv_scan_response_with_port() {
                 Ok((response, src_addr)) => {
-                    if let Some(unit_id) = addr_to_unit.get(&src_addr) {
-                        if let Some(server) = servers.get_mut(unit_id) {
-                            if !server.addresses.contains(&src_addr) {
-                                server.addresses.push(src_addr);
-                            }
-                        }
-                    } else {
-                        let entry = servers.entry(response.unit_id).or_insert_with(|| {
-                            ServerInfo::new(
-                                response.unit_id,
-                                response.hostname_str().to_string(),
-                                (
-                                    response.protocol_version >> 4,
-                                    response.protocol_version & 0x0F,
-                                ),
-                                response.status,
-                            )
-                        });
-
-                        if !entry.addresses.contains(&src_addr) {
-                            entry.addresses.push(src_addr);
-                        }
-                        addr_to_unit.insert(src_addr, response.unit_id);
-                    }
+                    Self::record_server(
+                        &mut servers,
+                        &mut addr_to_unit,
+                        response,
+                        src_addr,
+                    );
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -561,4 +532,26 @@ impl ServerScanner {
         self.unicast_socket.send_to(&packet, addr)?;
         Ok(())
     }
+}
+
+/// Parse a sequence of service map entries from a cursor, advancing it past each entry.
+fn parse_service_map_entries<T>(
+    cursor: &mut &[u8],
+    count: u8,
+    entry_size: usize,
+    convert: fn(&ServiceMapEntry) -> T,
+) -> io::Result<Vec<T>> {
+    let mut result = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        if cursor.len() < entry_size {
+            break;
+        }
+        let read_bytes = entry_size.min(ServiceMapEntry::SIZE_BYTES);
+        let mut entry_buf = [0u8; ServiceMapEntry::SIZE_BYTES];
+        entry_buf[..read_bytes].copy_from_slice(&cursor[..read_bytes]);
+        let entry: ServiceMapEntry = (&entry_buf[..]).read_bytes()?;
+        result.push(convert(&entry));
+        *cursor = &cursor[entry_size..];
+    }
+    Ok(result)
 }

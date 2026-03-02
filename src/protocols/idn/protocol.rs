@@ -104,6 +104,12 @@ pub const EXTENDED_SAMPLE_SIZE: usize = 20;
 //  Traits
 // -------------------------------------------------------------------------------------------------
 
+/// Parse a null-terminated byte array as a UTF-8 string.
+fn null_terminated_str(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
+
 /// A trait for writing any of the IDN protocol types to bytes.
 pub trait WriteBytes {
     fn write_bytes<P: WriteToBytes>(&mut self, protocol: P) -> io::Result<()>;
@@ -241,12 +247,7 @@ impl SizeBytes for ScanResponse {
 impl ScanResponse {
     /// Parse the hostname as a string, trimming null bytes.
     pub fn hostname_str(&self) -> &str {
-        let end = self
-            .hostname
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.hostname.len());
-        std::str::from_utf8(&self.hostname[..end]).unwrap_or("")
+        null_terminated_str(&self.hostname)
     }
 }
 
@@ -353,12 +354,7 @@ impl SizeBytes for ServiceMapEntry {
 impl ServiceMapEntry {
     /// Parse the name as a string, trimming null bytes.
     pub fn name_str(&self) -> &str {
-        let end = self
-            .name
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.name.len());
-        std::str::from_utf8(&self.name[..end]).unwrap_or("")
+        null_terminated_str(&self.name)
     }
 
     /// Check if this entry is a relay (service_id == 0).
