@@ -201,31 +201,30 @@ pub struct AvbBackend {
 }
 
 impl AvbBackend {
-    pub fn new(name: String, duplicate_index: u16) -> Self {
-        Self {
-            selector: AvbSelector {
-                name,
-                duplicate_index,
-            },
-            runtime: None,
-            stop_tx: None,
-            worker_handle: None,
-            engine: Arc::new(CpalAudioEngine),
-            caps: super::default_capabilities(),
-            desired_shutter_open: false,
-        }
-    }
-
-    pub(crate) fn from_selector(selector: AvbSelector) -> Self {
+    fn build(selector: AvbSelector, engine: Arc<dyn AudioEngine>) -> Self {
         Self {
             selector,
             runtime: None,
             stop_tx: None,
             worker_handle: None,
-            engine: Arc::new(CpalAudioEngine),
+            engine,
             caps: super::default_capabilities(),
             desired_shutter_open: false,
         }
+    }
+
+    pub fn new(name: String, duplicate_index: u16) -> Self {
+        Self::build(
+            AvbSelector {
+                name,
+                duplicate_index,
+            },
+            Arc::new(CpalAudioEngine),
+        )
+    }
+
+    pub(crate) fn from_selector(selector: AvbSelector) -> Self {
+        Self::build(selector, Arc::new(CpalAudioEngine))
     }
 
     #[cfg(test)]
@@ -234,18 +233,13 @@ impl AvbBackend {
         duplicate_index: u16,
         engine: Arc<dyn AudioEngine>,
     ) -> Self {
-        Self {
-            selector: AvbSelector {
+        Self::build(
+            AvbSelector {
                 name,
                 duplicate_index,
             },
-            runtime: None,
-            stop_tx: None,
-            worker_handle: None,
             engine,
-            caps: super::default_capabilities(),
-            desired_shutter_open: false,
-        }
+        )
     }
 }
 
@@ -576,8 +570,12 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
         frame.fill(0.0);
         let maybe_point = runtime.pop_point();
 
-        let point = maybe_point.map_or_else(
-            || {
+        let point = match maybe_point {
+            Some(point) => {
+                runtime.set_last_xy(point.x, point.y);
+                point
+            }
+            None => {
                 let (x, y) = runtime.last_xy();
                 StreamPoint {
                     x,
@@ -587,12 +585,8 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
                     b: 0.0,
                     i: 0.0,
                 }
-            },
-            |point| {
-                runtime.set_last_xy(point.x, point.y);
-                point
-            },
-        );
+            }
+        };
 
         if !frame.is_empty() {
             frame[0] = point.x;
@@ -662,7 +656,7 @@ mod tests {
     struct FakeAudioEngine {
         fail_open: AtomicBool,
         paused: Arc<AtomicBool>,
-        captured_frames: Arc<Mutex<Vec<Vec<f32>>>>,
+        captured_frames: Arc<Mutex<std::collections::VecDeque<Vec<f32>>>>,
         frame_count: Arc<std::sync::atomic::AtomicUsize>,
         channels: usize,
     }
@@ -672,7 +666,7 @@ mod tests {
             Self {
                 fail_open: AtomicBool::new(false),
                 paused: Arc::new(AtomicBool::new(false)),
-                captured_frames: Arc::new(Mutex::new(Vec::new())),
+                captured_frames: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 frame_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 channels,
             }
@@ -681,7 +675,7 @@ mod tests {
         fn snapshot(&self) -> Vec<Vec<f32>> {
             self.captured_frames
                 .lock()
-                .map(|frames| frames.clone())
+                .map(|frames| frames.iter().cloned().collect())
                 .unwrap_or_default()
         }
 
@@ -719,9 +713,9 @@ mod tests {
                         let mut frame = vec![0.0; channels];
                         fill_output_buffer(&mut frame, channels, &runtime);
                         if let Ok(mut captured) = captured_frames.lock() {
-                            captured.push(frame);
+                            captured.push_back(frame);
                             if captured.len() > 2048 {
-                                captured.remove(0);
+                                captured.pop_front();
                             }
                         }
                         frame_count.fetch_add(1, Ordering::Release);

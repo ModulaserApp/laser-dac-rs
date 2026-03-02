@@ -37,34 +37,9 @@ pub(crate) fn normalize_device_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Slugify a device name for stable IDs.
-#[cfg(test)]
-pub(crate) fn slugify_device_name(name: &str) -> String {
-    let normalized = normalize_device_name(name);
-    let mut slug = String::with_capacity(normalized.len());
-    let mut prev_dash = false;
-
-    for ch in normalized.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            slug.push('-');
-            prev_dash = true;
-        }
-    }
-
-    slug.trim_matches('-').to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slugify_device_name_collapses_whitespace_and_symbols() {
-        assert_eq!(slugify_device_name("  MOTU  AVB (Main) "), "motu-avb-main");
-    }
 
     #[test]
     fn likely_avb_name_token_match() {
