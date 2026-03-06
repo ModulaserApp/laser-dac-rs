@@ -407,28 +407,7 @@ impl ReconnectingSession {
     fn open_device(&mut self) -> Result<Dac> {
         if let Some(factory) = &self.discovery_factory {
             let mut discovery = factory();
-            let discovered = discovery.scan();
-
-            let device = discovered
-                .into_iter()
-                .find(|d| d.info().stable_id() == self.device_id)
-                .ok_or_else(|| {
-                    Error::disconnected(format!("device not found: {}", self.device_id))
-                })?;
-
-            let info = device.info();
-            let name = info.name();
-            let dac_type = device.dac_type();
-            let stream_backend = discovery.connect(device)?;
-
-            let device_info = crate::types::DacInfo {
-                id: self.device_id.clone(),
-                name,
-                kind: dac_type,
-                caps: stream_backend.caps().clone(),
-            };
-
-            Ok(Dac::new(device_info, stream_backend))
+            discovery.open_by_id(&self.device_id)
         } else {
             crate::open_device(&self.device_id)
         }

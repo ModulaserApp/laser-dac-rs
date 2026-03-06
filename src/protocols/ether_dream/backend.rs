@@ -18,6 +18,8 @@ pub struct EtherDreamBackend {
     last_status_time: Option<Instant>,
     /// The point rate from the last write (for decay calculation).
     last_point_rate: u32,
+    /// Pre-allocated conversion buffer (avoids per-write heap allocation).
+    point_buffer: Vec<DacPoint>,
 }
 
 impl EtherDreamBackend {
@@ -29,6 +31,23 @@ impl EtherDreamBackend {
             caps: super::default_capabilities(),
             last_status_time: None,
             last_point_rate: 0,
+            point_buffer: Vec::new(),
+        }
+    }
+
+    /// Decay a raw buffer fullness value based on elapsed time since last status.
+    fn decay_fullness(
+        raw: u16,
+        capacity: u16,
+        last_status_time: Option<Instant>,
+        point_rate: u32,
+    ) -> u16 {
+        if let Some(last_time) = last_status_time {
+            let elapsed_secs = last_time.elapsed().as_secs_f64();
+            let consumed = (elapsed_secs * point_rate as f64) as u16;
+            raw.saturating_sub(consumed).min(capacity)
+        } else {
+            raw
         }
     }
 }
@@ -68,8 +87,7 @@ impl StreamBackend for EtherDreamBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        let dac_points: Vec<DacPoint> = points.iter().map(|p| p.into()).collect();
-        if dac_points.is_empty() {
+        if points.is_empty() {
             return Ok(WriteOutcome::WouldBlock);
         }
 
@@ -103,16 +121,12 @@ impl StreamBackend for EtherDreamBackend {
 
         let buffer_capacity = stream.dac().buffer_capacity;
         let raw_fullness = stream.dac().status.buffer_fullness;
-
-        // Decay fullness based on elapsed time since last status update.
-        // Between polls, the DAC consumes points at the current point rate.
-        let fullness = if let Some(last_time) = self.last_status_time {
-            let elapsed_secs = last_time.elapsed().as_secs_f64();
-            let consumed = (elapsed_secs * self.last_point_rate as f64) as u16;
-            raw_fullness.saturating_sub(consumed).min(buffer_capacity)
-        } else {
-            raw_fullness
-        };
+        let fullness = Self::decay_fullness(
+            raw_fullness,
+            buffer_capacity,
+            self.last_status_time,
+            self.last_point_rate,
+        );
 
         let available = buffer_capacity.saturating_sub(fullness).saturating_sub(1) as usize;
 
@@ -128,12 +142,11 @@ impl StreamBackend for EtherDreamBackend {
 
         const MIN_POINTS_BEFORE_BEGIN: u16 = 256;
 
-        // Send exactly what the stream scheduler provides, truncated to available space.
-        // No padding — the stream scheduler handles buffer fill-up over multiple iterations.
-        let mut points_to_send = dac_points;
-        if points_to_send.len() > available {
-            points_to_send.truncate(available);
-        }
+        // Convert points into pre-allocated buffer (avoids per-write allocation).
+        self.point_buffer.clear();
+        let count = points.len().min(available);
+        self.point_buffer
+            .extend(points[..count].iter().map(DacPoint::from));
 
         let playback_flags = stream.dac().status.playback_flags;
         let playback = stream.dac().status.playback;
@@ -154,13 +167,13 @@ impl StreamBackend for EtherDreamBackend {
             stream
                 .queue_commands()
                 .update(0, point_rate)
-                .data(points_to_send)
+                .data(self.point_buffer.iter().copied())
                 .submit()
                 .map_err(Error::backend)?;
         } else {
             let send_result = stream
                 .queue_commands()
-                .data(points_to_send.clone())
+                .data(self.point_buffer.iter().copied())
                 .submit();
 
             if send_result.is_err() && stream.dac().status.playback == Playback::Idle {
@@ -172,7 +185,7 @@ impl StreamBackend for EtherDreamBackend {
 
                 stream
                     .queue_commands()
-                    .data(points_to_send)
+                    .data(self.point_buffer.iter().copied())
                     .submit()
                     .map_err(Error::backend)?;
             } else {
@@ -214,15 +227,9 @@ impl StreamBackend for EtherDreamBackend {
 
     fn queued_points(&self) -> Option<u64> {
         self.stream.as_ref().map(|s| {
-            let raw = s.dac().status.buffer_fullness as u64;
-            let cap = s.dac().buffer_capacity as u64;
-            if let Some(last_time) = self.last_status_time {
-                let elapsed_secs = last_time.elapsed().as_secs_f64();
-                let consumed = (elapsed_secs * self.last_point_rate as f64) as u64;
-                raw.saturating_sub(consumed).min(cap)
-            } else {
-                raw
-            }
+            let raw = s.dac().status.buffer_fullness;
+            let cap = s.dac().buffer_capacity;
+            Self::decay_fullness(raw, cap, self.last_status_time, self.last_point_rate) as u64
         })
     }
 }

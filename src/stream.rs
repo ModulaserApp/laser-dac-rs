@@ -192,6 +192,14 @@ struct StreamState {
     /// Total startup blank points (computed once from config).
     startup_blank_points: usize,
 
+    // Cached config-derived values (avoid recomputing per-iteration float math)
+    /// target_buffer as seconds (cached from config).
+    target_buffer_secs: f64,
+    /// min_buffer as seconds (cached from config).
+    min_buffer_secs: f64,
+    /// target_buffer as points (cached from config + pps).
+    target_buffer_points: u64,
+
     /// Statistics.
     stats: StreamStats,
     /// Track the last armed state to detect transitions.
@@ -205,7 +213,14 @@ impl StreamState {
     ///
     /// Buffers are sized to `max_points_per_chunk` from DAC capabilities,
     /// ensuring we can handle any catch-up scenario without reallocation.
-    fn new(max_points_per_chunk: usize, startup_blank_points: usize) -> Self {
+    fn new(
+        max_points_per_chunk: usize,
+        startup_blank_points: usize,
+        config: &StreamConfig,
+    ) -> Self {
+        let pps = config.pps as f64;
+        let target_buffer_secs = config.target_buffer.as_secs_f64();
+        let min_buffer_secs = config.min_buffer.as_secs_f64();
         Self {
             current_instant: StreamInstant::new(0),
             scheduled_ahead: 0,
@@ -215,6 +230,9 @@ impl StreamState {
             color_delay_line: VecDeque::new(),
             startup_blank_remaining: 0,
             startup_blank_points,
+            target_buffer_secs,
+            min_buffer_secs,
+            target_buffer_points: (target_buffer_secs * pps) as u64,
             stats: StreamStats::default(),
             last_armed: false,
             shutter_open: false,
@@ -249,6 +267,15 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Convert a duration in microseconds to a point count at the given PPS, rounding up.
+    fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
+        if micros == 0 {
+            0
+        } else {
+            (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
+        }
+    }
+
     /// Create a new stream with a backend.
     pub(crate) fn with_backend(
         info: DacInfo,
@@ -257,18 +284,15 @@ impl Stream {
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
         let max_points = info.caps.max_points_per_chunk;
-        let startup_blank_points = if config.startup_blank.is_zero() {
-            0
-        } else {
-            (config.startup_blank.as_secs_f64() * config.pps as f64).ceil() as usize
-        };
+        let startup_blank_points =
+            Self::duration_micros_to_points(config.startup_blank.as_micros() as u64, config.pps);
         Self {
             info,
             backend: Some(backend),
             config: config.clone(),
             control: StreamControl::new(control_tx, config.color_delay),
             control_rx,
-            state: StreamState::new(max_points, startup_blank_points),
+            state: StreamState::new(max_points, startup_blank_points, &config),
         }
     }
 
@@ -322,12 +346,8 @@ impl Stream {
             // Pre-fill color delay line with blanked colors so early points
             // come out dark while galvos settle.
             let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
-            let delay_points = if delay_micros == 0 {
-                0
-            } else {
-                (Duration::from_micros(delay_micros).as_secs_f64() * self.config.pps as f64).ceil()
-                    as usize
-            };
+            let delay_points =
+                Self::duration_micros_to_points(delay_micros, self.config.pps);
             self.state.color_delay_line.clear();
             for _ in 0..delay_points {
                 self.state.color_delay_line.push_back((0, 0, 0, 0));
@@ -478,7 +498,7 @@ impl Stream {
 
             // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
-            let target_points = (self.config.target_buffer.as_secs_f64() * pps) as u64;
+            let target_points = self.state.target_buffer_points;
 
             // 3. If buffer is above target, sleep until it drains to target
             // Note: use > not >= so we call producer when exactly at target
@@ -509,8 +529,8 @@ impl Stream {
                 return Ok(RunExit::Stopped);
             }
 
-            // 6. Build fill request with buffer state
-            let req = self.build_fill_request(max_points);
+            // 6. Build fill request with buffer state (reuse cached estimate)
+            let req = self.build_fill_request(max_points, buffered);
 
             // 7. Call producer with pre-allocated buffer
             let buffer = &mut self.state.chunk_buffer[..max_points];
@@ -600,12 +620,8 @@ impl Stream {
 
         // Apply color delay: read current setting, resize deque, shift colors
         let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
-        let color_delay_points = if delay_micros == 0 {
-            0
-        } else {
-            (Duration::from_micros(delay_micros).as_secs_f64() * self.config.pps as f64).ceil()
-                as usize
-        };
+        let color_delay_points =
+            Self::duration_micros_to_points(delay_micros, self.config.pps);
 
         if color_delay_points > 0 {
             // Resize deque to match current delay (handles dynamic changes)
@@ -845,36 +861,35 @@ impl Stream {
     /// # Arguments
     ///
     /// * `max_points` - Maximum points the callback can write (buffer length)
-    fn build_fill_request(&self, max_points: usize) -> ChunkRequest {
+    /// * `buffered_points` - Pre-computed buffer estimate from `estimate_buffer_points()`
+    fn build_fill_request(&self, max_points: usize, buffered_points: u64) -> ChunkRequest {
         let pps = self.config.pps;
+        let pps_f64 = pps as f64;
 
-        // Calculate buffer state using conservative estimation
-        let buffered_points = self.estimate_buffer_points();
-        let buffered = Duration::from_secs_f64(buffered_points as f64 / pps as f64);
+        // Compute buffered duration directly (avoid Duration intermediary)
+        let buffered_secs = buffered_points as f64 / pps_f64;
+        let buffered = Duration::from_secs_f64(buffered_secs);
 
         // Calculate start time for this chunk (when these points will play).
-        // current_instant = total points written = playhead + buffered, so it represents
-        // the stream time at which the next generated points will be played back.
-        // This is the correct value for audio synchronization.
         let start = self.state.current_instant;
 
-        // Calculate point requirements
-        // deficit_target = target_buffer - buffered (how much we're below target)
-        let target_buffer_secs = self.config.target_buffer.as_secs_f64();
-        let min_buffer_secs = self.config.min_buffer.as_secs_f64();
-        let buffered_secs = buffered.as_secs_f64();
+        // Use cached config values (avoid per-iteration as_secs_f64() calls)
+        let target_buffer_secs = self.state.target_buffer_secs;
+        let min_buffer_secs = self.state.min_buffer_secs;
 
         // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
         let deficit_target = (target_buffer_secs - buffered_secs).max(0.0);
-        let target_points = (deficit_target * pps as f64).ceil() as usize;
+        let target_points = (deficit_target * pps_f64).ceil() as usize;
         let target_points = target_points.min(max_points);
 
         // min_points: ceil((min_buffer - buffered) * pps) - minimum to avoid underrun
         let deficit_min = (min_buffer_secs - buffered_secs).max(0.0);
-        let min_points = (deficit_min * pps as f64).ceil() as usize;
+        let min_points = (deficit_min * pps_f64).ceil() as usize;
         let min_points = min_points.min(max_points);
 
-        // Get raw device queue if available
+        // Use buffered_points as the device queue estimate (already computed by
+        // estimate_buffer_points, which includes hardware feedback when available).
+        // This avoids a redundant second call to queued_points().
         let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
 
         ChunkRequest {
@@ -2004,7 +2019,7 @@ mod tests {
         // Set software estimate higher than hardware
         stream.state.scheduled_ahead = 500;
 
-        let req = stream.build_fill_request(1000);
+        let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
 
         // Should use conservative estimate (hardware = 200)
         assert_eq!(req.buffered_points, 200);
@@ -2035,7 +2050,7 @@ mod tests {
 
         // Empty buffer: need full target
         stream.state.scheduled_ahead = 0;
-        let req = stream.build_fill_request(1000);
+        let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
 
         // target_points should be clamped to max_points (1000)
         assert_eq!(req.target_points, 1000);
@@ -2044,7 +2059,7 @@ mod tests {
 
         // Buffer at 500 points (16.67ms): below target (40ms), above min (10ms)
         stream.state.scheduled_ahead = 500;
-        let req = stream.build_fill_request(1000);
+        let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
 
         // target_points = (1200 - 500) = 700
         assert_eq!(req.target_points, 700);
@@ -2053,7 +2068,7 @@ mod tests {
 
         // Buffer full at 1200 points (40ms): at target
         stream.state.scheduled_ahead = 1200;
-        let req = stream.build_fill_request(1000);
+        let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
 
         // target_points = 0 (at target)
         assert_eq!(req.target_points, 0);
@@ -2083,7 +2098,7 @@ mod tests {
 
         // Buffer at 299 points: 1 point below min_buffer
         stream.state.scheduled_ahead = 299;
-        let req = stream.build_fill_request(1000);
+        let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
 
         // min_points should be ceil(300 - 299) = ceil(1) = 1
         // Actually it's ceil((10ms - 299/30000) * 30000) = ceil(300 - 299) = 1

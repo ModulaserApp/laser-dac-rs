@@ -98,13 +98,17 @@ impl From<&LaserPoint> for Point {
     /// [`LaserPoint`] uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// Helios uses u16 12-bit coordinates (0-4095) with inverted axes and u8 colors.
     fn from(p: &LaserPoint) -> Self {
-        let dac_x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
-        let dac_y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16;
-
         Point {
-            coordinate: Coordinate { x: dac_x, y: dac_y },
-            color: Color::new((p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8),
-            intensity: (p.intensity >> 8) as u8,
+            coordinate: Coordinate {
+                x: LaserPoint::coord_to_u12_inverted(p.x),
+                y: LaserPoint::coord_to_u12_inverted(p.y),
+            },
+            color: Color::new(
+                LaserPoint::color_to_u8(p.r),
+                LaserPoint::color_to_u8(p.g),
+                LaserPoint::color_to_u8(p.b),
+            ),
+            intensity: LaserPoint::color_to_u8(p.intensity),
         }
     }
 }

@@ -12,6 +12,8 @@ pub struct LasercubeWifiBackend {
     addressed: Addressed,
     stream: Option<stream::Stream>,
     caps: DacCapabilities,
+    /// Pre-allocated conversion buffer (avoids per-write heap allocation).
+    point_buffer: Vec<LasercubePoint>,
 }
 
 impl LasercubeWifiBackend {
@@ -20,6 +22,7 @@ impl LasercubeWifiBackend {
             addressed,
             stream: None,
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
         }
     }
 
@@ -62,10 +65,12 @@ impl StreamBackend for LasercubeWifiBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        let lc_points: Vec<LasercubePoint> = points.iter().map(|p| p.into()).collect();
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(LasercubePoint::from));
 
         stream
-            .write_frame(&lc_points, pps)
+            .write_frame(&self.point_buffer, pps)
             .map_err(Error::backend)?;
 
         Ok(WriteOutcome::Written)

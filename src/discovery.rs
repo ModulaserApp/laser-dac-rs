@@ -168,15 +168,27 @@ pub struct DiscoveredDevice {
 }
 
 impl DiscoveredDevice {
+    /// Create a new discovered device with the given type and inner data.
+    ///
+    /// All identification fields default to `None`.
+    fn new(dac_type: DacType, inner: DiscoveredDeviceInner) -> Self {
+        Self {
+            dac_type,
+            ip_address: None,
+            mac_address: None,
+            hostname: None,
+            usb_address: None,
+            hardware_name: None,
+            device_index: None,
+            inner,
+        }
+    }
+
     /// Returns the device name (unique identifier).
     /// For network devices: IP address.
     /// For USB devices: hardware name or bus:address.
     pub fn name(&self) -> String {
-        self.ip_address
-            .map(|ip| ip.to_string())
-            .or_else(|| self.hardware_name.clone())
-            .or_else(|| self.usb_address.clone())
-            .unwrap_or_else(|| "Unknown".into())
+        self.info().name()
     }
 
     /// Returns the DAC type.
@@ -416,16 +428,10 @@ impl HeliosDiscovery {
             };
 
             let hardware_name = opened.name().unwrap_or_else(|_| "Unknown Helios".into());
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::Helios,
-                ip_address: None,
-                mac_address: None,
-                hostname: None,
-                usb_address: None,
-                hardware_name: Some(hardware_name),
-                device_index: None,
-                inner: DiscoveredDeviceInner::Helios(opened),
-            });
+            let mut device =
+                DiscoveredDevice::new(DacType::Helios, DiscoveredDeviceInner::Helios(opened));
+            device.hardware_name = Some(hardware_name);
+            discovered.push(device);
         }
         discovered
     }
@@ -479,21 +485,19 @@ impl EtherDreamDiscovery {
             let ip = source_addr.ip();
 
             // Skip duplicate MACs - but keep polling to find other devices
-            if seen_macs.contains(&broadcast.mac_address) {
+            let device_mac = broadcast.mac_address;
+            if seen_macs.contains(&device_mac) {
                 continue;
             }
-            seen_macs.insert(broadcast.mac_address);
+            seen_macs.insert(device_mac);
 
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::EtherDream,
-                ip_address: Some(ip),
-                mac_address: Some(broadcast.mac_address),
-                hostname: None,
-                usb_address: None,
-                hardware_name: None,
-                device_index: None,
-                inner: DiscoveredDeviceInner::EtherDream { broadcast, ip },
-            });
+            let mut device = DiscoveredDevice::new(
+                DacType::EtherDream,
+                DiscoveredDeviceInner::EtherDream { broadcast, ip },
+            );
+            device.ip_address = Some(ip);
+            device.mac_address = Some(device_mac);
+            discovered.push(device);
         }
         discovered
     }
@@ -536,28 +540,7 @@ impl IdnDiscovery {
         let Ok(servers) = scan_for_servers(self.scan_timeout) else {
             return Vec::new();
         };
-
-        let mut discovered = Vec::new();
-        for server in servers {
-            let Some(service) = server.find_laser_projector().cloned() else {
-                continue;
-            };
-
-            let ip_address = server.addresses.first().map(|addr| addr.ip());
-            let hostname = server.hostname.clone();
-
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::Idn,
-                ip_address,
-                mac_address: None,
-                hostname: Some(hostname),
-                usb_address: None,
-                hardware_name: None,
-                device_index: None,
-                inner: DiscoveredDeviceInner::Idn { server, service },
-            });
-        }
-        discovered
+        Self::servers_to_devices(servers)
     }
 
     /// Connect to a discovered IDN device.
@@ -585,27 +568,26 @@ impl IdnDiscovery {
             return Vec::new();
         };
 
-        let mut discovered = Vec::new();
-        for server in servers {
-            let Some(service) = server.find_laser_projector().cloned() else {
-                continue;
-            };
+        Self::servers_to_devices(servers)
+    }
 
-            let ip_address = server.addresses.first().map(|addr| addr.ip());
-            let hostname = server.hostname.clone();
-
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::Idn,
-                ip_address,
-                mac_address: None,
-                hostname: Some(hostname),
-                usb_address: None,
-                hardware_name: None,
-                device_index: None,
-                inner: DiscoveredDeviceInner::Idn { server, service },
-            });
-        }
-        discovered
+    /// Convert discovered IDN servers into `DiscoveredDevice` entries.
+    fn servers_to_devices(servers: Vec<IdnServerInfo>) -> Vec<DiscoveredDevice> {
+        servers
+            .into_iter()
+            .filter_map(|server| {
+                let service = server.find_laser_projector().cloned()?;
+                let ip_address = server.addresses.first().map(|addr| addr.ip());
+                let hostname = server.hostname.clone();
+                let mut device = DiscoveredDevice::new(
+                    DacType::Idn,
+                    DiscoveredDeviceInner::Idn { server, service },
+                );
+                device.ip_address = ip_address;
+                device.hostname = Some(hostname);
+                Some(device)
+            })
+            .collect()
     }
 }
 
@@ -652,19 +634,15 @@ impl LasercubeWifiDiscovery {
 
             let ip_address = source_addr.ip();
 
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::LasercubeWifi,
-                ip_address: Some(ip_address),
-                mac_address: None,
-                hostname: None,
-                usb_address: None,
-                hardware_name: None,
-                device_index: None,
-                inner: DiscoveredDeviceInner::LasercubeWifi {
+            let mut device = DiscoveredDevice::new(
+                DacType::LasercubeWifi,
+                DiscoveredDeviceInner::LasercubeWifi {
                     info: device_info,
                     source_addr,
                 },
-            });
+            );
+            device.ip_address = Some(ip_address);
+            discovered.push(device);
         }
         discovered
     }
@@ -717,16 +695,13 @@ impl LasercubeUsbDiscovery {
             let usb_address = format!("{}:{}", device.bus_number(), device.address());
             let serial = crate::protocols::lasercube_usb::get_serial_number(&device);
 
-            discovered.push(DiscoveredDevice {
-                dac_type: DacType::LasercubeUsb,
-                ip_address: None,
-                mac_address: None,
-                hostname: None,
-                usb_address: Some(usb_address),
-                hardware_name: serial,
-                device_index: None,
-                inner: DiscoveredDeviceInner::LasercubeUsb(device),
-            });
+            let mut discovered_device = DiscoveredDevice::new(
+                DacType::LasercubeUsb,
+                DiscoveredDeviceInner::LasercubeUsb(device),
+            );
+            discovered_device.usb_address = Some(usb_address);
+            discovered_device.hardware_name = serial;
+            discovered.push(discovered_device);
         }
         discovered
     }
@@ -766,16 +741,11 @@ impl AvbDiscovery {
             .map(|selector| {
                 let hardware_name = selector.name.clone();
                 let index = selector.duplicate_index;
-                DiscoveredDevice {
-                    dac_type: DacType::Avb,
-                    ip_address: None,
-                    mac_address: None,
-                    hostname: None,
-                    usb_address: None,
-                    hardware_name: Some(hardware_name),
-                    device_index: Some(index),
-                    inner: DiscoveredDeviceInner::Avb(selector),
-                }
+                let mut device =
+                    DiscoveredDevice::new(DacType::Avb, DiscoveredDeviceInner::Avb(selector));
+                device.hardware_name = Some(hardware_name);
+                device.device_index = Some(index);
+                device
             })
             .collect()
     }
@@ -960,23 +930,81 @@ impl DacDiscovery {
         for (index, discoverer) in self.external.iter_mut().enumerate() {
             let dac_type = discoverer.dac_type();
             for ext_device in discoverer.scan() {
-                devices.push(DiscoveredDevice {
-                    dac_type: dac_type.clone(),
-                    ip_address: ext_device.ip_address,
-                    mac_address: ext_device.mac_address,
-                    hostname: ext_device.hostname,
-                    usb_address: ext_device.usb_address,
-                    hardware_name: ext_device.hardware_name,
-                    device_index: ext_device.device_index,
-                    inner: DiscoveredDeviceInner::External {
+                let mut device = DiscoveredDevice::new(
+                    dac_type.clone(),
+                    DiscoveredDeviceInner::External {
                         discoverer_index: index,
                         opaque_data: ext_device.opaque_data,
                     },
-                });
+                );
+                device.ip_address = ext_device.ip_address;
+                device.mac_address = ext_device.mac_address;
+                device.hostname = ext_device.hostname;
+                device.usb_address = ext_device.usb_address;
+                device.hardware_name = ext_device.hardware_name;
+                device.device_index = ext_device.device_index;
+                devices.push(device);
             }
         }
 
         devices
+    }
+
+    /// Parse the protocol prefix from a stable ID and return the corresponding `DacType`.
+    ///
+    /// Stable IDs are formatted as `<protocol>:<identifier>`, e.g. `etherdream:01:23:...`.
+    /// Returns `None` if the prefix doesn't match a known built-in type.
+    fn dac_type_from_id_prefix(id: &str) -> Option<DacType> {
+        // Find the first ':' — the prefix is everything before it.
+        // Note: some prefixes contain hyphens (lasercube-usb, lasercube-wifi).
+        let prefix = id.split(':').next()?;
+        match prefix {
+            "etherdream" => Some(DacType::EtherDream),
+            "idn" => Some(DacType::Idn),
+            "helios" => Some(DacType::Helios),
+            "lasercube-usb" => Some(DacType::LasercubeUsb),
+            "lasercube-wifi" => Some(DacType::LasercubeWifi),
+            "avb" => Some(DacType::Avb),
+            _ => None,
+        }
+    }
+
+    /// Scan for a device by stable ID, connect, and return a `Dac`.
+    ///
+    /// This is a convenience method combining `scan()`, lookup by `stable_id()`,
+    /// and `connect()` into a single call.
+    ///
+    /// When the ID has a known protocol prefix (e.g. `etherdream:`, `idn:`),
+    /// only that protocol is scanned, avoiding unnecessary network timeouts.
+    pub(crate) fn open_by_id(&mut self, id: &str) -> Result<crate::stream::Dac> {
+        // Narrow the scan to just the relevant protocol if we can parse the prefix.
+        let discovered = if let Some(dac_type) = Self::dac_type_from_id_prefix(id) {
+            let saved = self.enabled.clone();
+            self.enabled = std::iter::once(dac_type).collect();
+            let result = self.scan();
+            self.enabled = saved;
+            result
+        } else {
+            self.scan()
+        };
+
+        let device = discovered
+            .into_iter()
+            .find(|d| d.info().stable_id() == id)
+            .ok_or_else(|| Error::disconnected(format!("DAC not found: {}", id)))?;
+
+        let name = device.info().name();
+        let dac_type = device.dac_type();
+        let stream_backend = self.connect(device)?;
+
+        let dac_info = crate::types::DacInfo {
+            id: id.to_string(),
+            name,
+            kind: dac_type,
+            caps: stream_backend.caps().clone(),
+        };
+
+        Ok(crate::stream::Dac::new(dac_info, stream_backend))
     }
 
     /// Connect to a discovered device and return a streaming backend.

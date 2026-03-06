@@ -13,6 +13,8 @@ pub struct LasercubeUsbBackend {
     device: Option<rusb::Device<rusb::Context>>,
     stream: Option<Stream<rusb::Context>>,
     caps: DacCapabilities,
+    /// Pre-allocated conversion buffer (avoids per-write heap allocation).
+    point_buffer: Vec<LasercubeUsbSample>,
 }
 
 impl LasercubeUsbBackend {
@@ -21,6 +23,7 @@ impl LasercubeUsbBackend {
             device: Some(device),
             stream: None,
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
         }
     }
 
@@ -29,6 +32,7 @@ impl LasercubeUsbBackend {
             device: None,
             stream: Some(stream),
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
         }
     }
 
@@ -109,9 +113,11 @@ impl StreamBackend for LasercubeUsbBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        let samples: Vec<LasercubeUsbSample> = points.iter().map(|p| p.into()).collect();
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(LasercubeUsbSample::from));
 
-        match stream.write_frame(&samples, pps) {
+        match stream.write_frame(&self.point_buffer, pps) {
             Ok(()) => Ok(WriteOutcome::Written),
             Err(e) => self.handle_stream_error(e),
         }

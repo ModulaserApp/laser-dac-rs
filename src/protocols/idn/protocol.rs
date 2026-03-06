@@ -920,15 +920,13 @@ impl From<&LaserPoint> for PointXyrgbi {
     /// IDN PointXyrgbi uses i16 signed coordinates (-32768 to 32767) and u8 colors.
     /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * -32767.0).round() as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * -32767.0).round() as i16;
         PointXyrgbi::new(
-            x,
-            y,
-            (p.r >> 8) as u8,
-            (p.g >> 8) as u8,
-            (p.b >> 8) as u8,
-            (p.intensity >> 8) as u8,
+            LaserPoint::coord_to_i16_inverted(p.x),
+            LaserPoint::coord_to_i16_inverted(p.y),
+            LaserPoint::color_to_u8(p.r),
+            LaserPoint::color_to_u8(p.g),
+            LaserPoint::color_to_u8(p.b),
+            LaserPoint::color_to_u8(p.intensity),
         )
     }
 }

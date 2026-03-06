@@ -193,24 +193,5 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 /// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    let discovered = discovery.scan();
-
-    let device = discovered
-        .into_iter()
-        .find(|d| d.info().stable_id() == id)
-        .ok_or_else(|| backend::Error::disconnected(format!("DAC not found: {}", id)))?;
-
-    let info = device.info();
-    let name = info.name();
-    let dac_type = device.dac_type();
-    let stream_backend = discovery.connect(device)?;
-
-    let dac_info = DacInfo {
-        id: id.to_string(),
-        name,
-        kind: dac_type,
-        caps: stream_backend.caps().clone(),
-    };
-
-    Ok(Dac::new(dac_info, stream_backend))
+    discovery.open_by_id(id)
 }

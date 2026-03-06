@@ -58,6 +58,46 @@ impl LaserPoint {
             ..Default::default()
         }
     }
+
+    // =========================================================================
+    // Coordinate conversion helpers (shared across protocol backends)
+    // =========================================================================
+
+    /// Convert a coordinate from [-1.0, 1.0] to 12-bit unsigned (0-4095) with axis inversion.
+    ///
+    /// Used by Helios and LaserCube WiFi backends.
+    #[inline]
+    pub(crate) fn coord_to_u12_inverted(v: f32) -> u16 {
+        ((1.0 - (v + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16
+    }
+
+    /// Convert a coordinate from [-1.0, 1.0] to 12-bit unsigned (0-4095).
+    ///
+    /// Used by LaserCube USB backend.
+    #[inline]
+    pub(crate) fn coord_to_u12(v: f32) -> u16 {
+        (((v.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0).round() as u16
+    }
+
+    /// Convert a coordinate from [-1.0, 1.0] to signed 16-bit (-32767 to 32767) with inversion.
+    ///
+    /// Used by Ether Dream and IDN backends.
+    #[inline]
+    pub(crate) fn coord_to_i16_inverted(v: f32) -> i16 {
+        (v.clamp(-1.0, 1.0) * -32767.0).round() as i16
+    }
+
+    /// Downscale a u16 color channel (0-65535) to u8 (0-255).
+    #[inline]
+    pub(crate) fn color_to_u8(v: u16) -> u8 {
+        (v >> 8) as u8
+    }
+
+    /// Downscale a u16 color channel (0-65535) to 12-bit (0-4095).
+    #[inline]
+    pub(crate) fn color_to_u12(v: u16) -> u16 {
+        v >> 4
+    }
 }
 
 /// Types of laser DAC hardware supported.
@@ -142,7 +182,6 @@ impl EnabledDacTypes {
     }
 
     /// Creates an empty set (no DAC types enabled).
-    #[allow(dead_code)]
     pub fn none() -> Self {
         Self {
             types: HashSet::new(),
@@ -195,13 +234,11 @@ impl EnabledDacTypes {
     }
 
     /// Returns an iterator over enabled DAC types.
-    #[allow(dead_code)]
     pub fn iter(&self) -> impl Iterator<Item = DacType> + '_ {
         self.types.iter().cloned()
     }
 
     /// Returns true if no DAC types are enabled.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.types.is_empty()
     }
@@ -499,50 +536,35 @@ pub struct StreamConfig {
 }
 
 #[cfg(feature = "serde")]
-mod duration_millis {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
+macro_rules! duration_serde_module {
+    ($mod_name:ident, $as_unit:ident, $from_unit:ident) => {
+        mod $mod_name {
+            use serde::{Deserialize, Deserializer, Serialize, Serializer};
+            use std::time::Duration;
 
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Use u64 for both serialize and deserialize to ensure round-trip compatibility.
-        // Clamp to u64::MAX for durations > ~584 million years (practically never hit).
-        let millis = duration.as_millis().min(u64::MAX as u128) as u64;
-        millis.serialize(serializer)
-    }
+            pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let value = duration.$as_unit().min(u64::MAX as u128) as u64;
+                value.serialize(serializer)
+            }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let millis = u64::deserialize(deserializer)?;
-        Ok(Duration::from_millis(millis))
-    }
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = u64::deserialize(deserializer)?;
+                Ok(Duration::$from_unit(value))
+            }
+        }
+    };
 }
 
 #[cfg(feature = "serde")]
-mod duration_micros {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::time::Duration;
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
-        micros.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let micros = u64::deserialize(deserializer)?;
-        Ok(Duration::from_micros(micros))
-    }
-}
+duration_serde_module!(duration_millis, as_millis, from_millis);
+#[cfg(feature = "serde")]
+duration_serde_module!(duration_micros, as_micros, from_micros);
 
 impl Default for StreamConfig {
     fn default() -> Self {

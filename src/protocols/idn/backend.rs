@@ -12,6 +12,8 @@ pub struct IdnBackend {
     service: ServiceInfo,
     stream: Option<stream::Stream>,
     caps: DacCapabilities,
+    /// Pre-allocated conversion buffer (avoids per-write heap allocation).
+    point_buffer: Vec<PointXyrgbi>,
 }
 
 impl IdnBackend {
@@ -21,6 +23,7 @@ impl IdnBackend {
             service,
             stream: None,
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
         }
     }
 }
@@ -65,9 +68,11 @@ impl StreamBackend for IdnBackend {
         }
 
         stream.set_scan_speed(pps);
-        let idn_points: Vec<PointXyrgbi> = points.iter().map(|p| p.into()).collect();
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(PointXyrgbi::from));
 
-        stream.write_frame(&idn_points).map_err(Error::backend)?;
+        stream.write_frame(&self.point_buffer).map_err(Error::backend)?;
 
         Ok(WriteOutcome::Written)
     }
