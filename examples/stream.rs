@@ -43,10 +43,11 @@ fn main() -> Result<()> {
     stream.control().arm()?;
 
     let shape = args.shape;
+    let scale = args.scale;
 
     // Run stream with zero-allocation callback
     let exit = stream.run(
-        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, req, buffer),
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, scale, req, buffer),
         |err| {
             eprintln!("Stream error: {}", err);
         },

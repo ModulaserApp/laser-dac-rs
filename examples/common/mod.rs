@@ -18,6 +18,10 @@ pub struct Args {
     /// Minimum number of points per frame
     #[arg(short, long, default_value_t = 200)]
     pub min_points: usize,
+
+    /// Geometry scale around center (0,0); range: (0, 10]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
+    pub scale: f32,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -46,7 +50,12 @@ impl Shape {
 ///
 /// The `req` parameter provides timing info for time-based shapes.
 /// Returns `ChunkResult::Filled(n)` where n is the number of points written.
-pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
+pub fn fill_points(
+    shape: Shape,
+    scale: f32,
+    req: &ChunkRequest,
+    buffer: &mut [LaserPoint],
+) -> ChunkResult {
     let n_points = req.target_points.min(buffer.len());
     match shape {
         Shape::Triangle => fill_triangle_points(buffer, n_points),
@@ -57,6 +66,9 @@ pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) 
             audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default())
         }
     }
+    if (scale - 1.0).abs() > f32::EPSILON {
+        scale_points(&mut buffer[..n_points], scale);
+    }
     ChunkResult::Filled(n_points)
 }
 
@@ -66,7 +78,7 @@ pub fn fill_points(shape: Shape, req: &ChunkRequest, buffer: &mut [LaserPoint]) 
 /// a static frame at t=0. Use `fill_points` with a real ChunkRequest
 /// for proper time-based animation.
 #[allow(dead_code)] // Used by frame_adapter example, not all examples
-pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
+pub fn create_frame_points(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
     // Create a dummy request for frame-based usage
     let dummy_req = ChunkRequest {
         start: StreamInstant::new(0),
@@ -78,8 +90,25 @@ pub fn create_frame_points(shape: Shape, n_points: usize) -> Vec<LaserPoint> {
         device_queued_points: None,
     };
     let mut buffer = vec![LaserPoint::default(); n_points];
-    fill_points(shape, &dummy_req, &mut buffer);
+    fill_points(shape, scale, &dummy_req, &mut buffer);
     buffer
+}
+
+fn parse_scale(value: &str) -> Result<f32, String> {
+    let scale: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid scale '{value}': expected a float in (0, 10]"))?;
+    if !scale.is_finite() || scale <= 0.0 || scale > 10.0 {
+        return Err("scale must be finite and in (0, 10]".to_string());
+    }
+    Ok(scale)
+}
+
+fn scale_points(points: &mut [LaserPoint], scale: f32) {
+    for point in points {
+        point.x = (point.x * scale).clamp(-1.0, 1.0);
+        point.y = (point.y * scale).clamp(-1.0, 1.0);
+    }
 }
 
 /// Fill an RGB triangle with proper blanking and interpolation into buffer.
@@ -257,5 +286,32 @@ fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
 
     for (i, point) in points.iter().cycle().take(n_points).enumerate() {
         buffer[i] = *point;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_points_scales_xy_around_origin() {
+        let mut points = [
+            LaserPoint::new(0.5, -0.4, 1, 2, 3, 4),
+            LaserPoint::new(-0.8, 0.9, 5, 6, 7, 8),
+        ];
+        scale_points(&mut points, 0.3);
+
+        assert!((points[0].x - 0.15).abs() < 1e-6);
+        assert!((points[0].y + 0.12).abs() < 1e-6);
+        assert!((points[1].x + 0.24).abs() < 1e-6);
+        assert!((points[1].y - 0.27).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_scale_enforces_bounds() {
+        assert!(parse_scale("0.3").is_ok());
+        assert!(parse_scale("10").is_ok());
+        assert!(parse_scale("0").is_err());
+        assert!(parse_scale("10.0001").is_err());
     }
 }

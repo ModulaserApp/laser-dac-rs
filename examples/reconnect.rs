@@ -47,8 +47,9 @@ fn main() -> Result<()> {
 
     // Run the stream - reconnects automatically on disconnect
     let shape = args.shape;
+    let scale = args.scale;
     session.run(
-        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, req, buffer),
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, scale, req, buffer),
         |err| eprintln!("Stream error: {}", err),
     )?;
 

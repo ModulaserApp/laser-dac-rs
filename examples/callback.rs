@@ -49,6 +49,7 @@ fn main() -> Result<()> {
     stream.control().arm()?;
 
     let shape = args.shape;
+    let scale = args.scale;
 
     // Run in callback mode with zero-allocation API
     let exit = stream.run(
@@ -61,7 +62,7 @@ fn main() -> Result<()> {
                 println!("Chunks sent: {}", count);
             }
 
-            fill_points(shape, req, buffer)
+            fill_points(shape, scale, req, buffer)
         },
         // Error callback
         |err| {

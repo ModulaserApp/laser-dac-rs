@@ -37,6 +37,10 @@ struct Args {
     #[arg(long, default_value_t = 5.0)]
     seconds: f32,
 
+    /// Geometry scale around center (0,0); range: (0, 10]
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
+    scale: f32,
+
     /// Output WAV path
     #[arg(long, default_value = "avb-validation.wav")]
     output: PathBuf,
@@ -85,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut points = vec![LaserPoint::default(); n_points];
-        let written = match fill_points(args.shape, &req, &mut points) {
+        let written = match fill_points(args.shape, args.scale, &req, &mut points) {
             ChunkResult::Filled(n) => n.min(points.len()),
             ChunkResult::Starved | ChunkResult::End => n_points,
         };
@@ -128,4 +132,14 @@ fn point_to_avb_samples(point: &LaserPoint) -> [f32; 6] {
 
 fn u16_to_unit(value: u16) -> f32 {
     value as f32 / u16::MAX as f32
+}
+
+fn parse_scale(value: &str) -> Result<f32, String> {
+    let scale: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid scale '{value}': expected a float in (0, 10]"))?;
+    if !scale.is_finite() || scale <= 0.0 || scale > 10.0 {
+        return Err("scale must be finite and in (0, 10]".to_string());
+    }
+    Ok(scale)
 }

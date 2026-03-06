@@ -63,7 +63,7 @@ fn main() -> Result<()> {
     let mut adapter = FrameAdapter::new();
 
     // Create the frame - a static point buffer that will be cycled
-    let points = create_frame_points(args.shape, args.min_points);
+    let points = create_frame_points(args.shape, args.min_points, args.scale);
     adapter.update(Frame::new(points));
 
     // Arm the output
