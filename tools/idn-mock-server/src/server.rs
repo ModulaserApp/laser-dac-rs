@@ -102,9 +102,7 @@ impl<B: ServerBehavior> MockIdnServer<B> {
 
             // Check for link timeout
             if let Some(last_time) = self.last_activity {
-                if last_time.elapsed() > self.config.link_timeout
-                    && self.last_client_ip.is_some()
-                {
+                if last_time.elapsed() > self.config.link_timeout && self.last_client_ip.is_some() {
                     log::info!("Client timed out");
                     self.last_client_ip = None;
                     self.last_client_addr = None;

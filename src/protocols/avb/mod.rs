@@ -21,13 +21,6 @@ pub fn default_capabilities() -> DacCapabilities {
     }
 }
 
-/// True when the device name likely represents an AVB endpoint.
-pub(crate) fn is_likely_avb_device_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let tokens = ["avb", "motu", "digiface", "sollinger", "laseranimation"];
-    tokens.iter().any(|token| name.contains(token))
-}
-
 /// Normalize a device name for deterministic comparison.
 pub(crate) fn normalize_device_name(name: &str) -> String {
     name.split_whitespace()
@@ -35,15 +28,4 @@ pub(crate) fn normalize_device_name(name: &str) -> String {
         .join(" ")
         .trim()
         .to_ascii_lowercase()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn likely_avb_name_token_match() {
-        assert!(is_likely_avb_device_name("MOTU Pro AVB"));
-        assert!(!is_likely_avb_device_name("Built-in Output"));
-    }
 }

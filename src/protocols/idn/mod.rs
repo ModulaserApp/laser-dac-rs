@@ -233,12 +233,7 @@ impl ServerScanner {
                     if let Some((response, src_addr)) =
                         Self::process_scan_response(&self.buffer[..len], &src_addr)
                     {
-                        Self::record_server(
-                            &mut servers,
-                            &mut addr_to_unit,
-                            response,
-                            src_addr,
-                        );
+                        Self::record_server(&mut servers, &mut addr_to_unit, response, src_addr);
                     }
                     received_any = true;
                 }
@@ -457,12 +452,7 @@ impl ServerScanner {
         while start.elapsed() < timeout {
             match self.recv_scan_response_with_port() {
                 Ok((response, src_addr)) => {
-                    Self::record_server(
-                        &mut servers,
-                        &mut addr_to_unit,
-                        response,
-                        src_addr,
-                    );
+                    Self::record_server(&mut servers, &mut addr_to_unit, response, src_addr);
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock

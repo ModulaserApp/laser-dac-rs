@@ -2,7 +2,7 @@
 
 use crate::backend::{StreamBackend, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::protocols::avb::{is_likely_avb_device_name, normalize_device_name};
+use crate::protocols::avb::normalize_device_name;
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const REQUIRED_CHANNELS: u16 = 6;
+const REQUIRED_CHANNELS: u16 = 5;
 const FIXED_SAMPLE_RATE: u32 = 48_000;
 // 9_600 points = 200ms at 48kHz.
 // Chosen as a conservative jitter cushion while keeping queueing latency bounded.
@@ -254,9 +254,15 @@ impl StreamBackend for AvbBackend {
 
     fn connect(&mut self) -> Result<()> {
         if self.is_connected() {
+            log::debug!("AVB: connect called but already connected");
             return Ok(());
         }
 
+        log::debug!(
+            "AVB: connecting to {:?} (duplicate_index={})",
+            self.selector.name,
+            self.selector.duplicate_index
+        );
         let runtime = Arc::new(RuntimeState::new(self.desired_shutter_open));
         let runtime_for_worker = Arc::clone(&runtime);
         let selector = self.selector.clone();
@@ -271,16 +277,23 @@ impl StreamBackend for AvbBackend {
 
         match init_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
+                log::info!(
+                    "AVB: connected to {:?} (duplicate_index={})",
+                    self.selector.name,
+                    self.selector.duplicate_index
+                );
                 self.runtime = Some(runtime);
                 self.stop_tx = Some(stop_tx);
                 self.worker_handle = Some(handle);
                 Ok(())
             }
             Ok(Err(err)) => {
+                log::error!("AVB: audio worker failed to start: {}", err);
                 let _ = handle.join();
                 Err(err)
             }
             Err(_) => {
+                log::error!("AVB: audio worker init timed out (5s)");
                 let _ = handle.join();
                 Err(Error::backend(super::error::Error::StreamStartFailed))
             }
@@ -288,6 +301,11 @@ impl StreamBackend for AvbBackend {
     }
 
     fn disconnect(&mut self) -> Result<()> {
+        log::debug!(
+            "AVB: disconnecting from {:?} (duplicate_index={})",
+            self.selector.name,
+            self.selector.duplicate_index
+        );
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -300,6 +318,7 @@ impl StreamBackend for AvbBackend {
             runtime.clear_queue();
         }
 
+        log::info!("AVB: disconnected from {:?}", self.selector.name);
         Ok(())
     }
 
@@ -307,14 +326,9 @@ impl StreamBackend for AvbBackend {
         self.runtime.is_some() && self.worker_handle.is_some()
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        if pps != FIXED_SAMPLE_RATE {
-            return Err(Error::invalid_config(format!(
-                "AVB backend requires {} PPS, got {}",
-                FIXED_SAMPLE_RATE, pps
-            )));
-        }
-
+    fn try_write_chunk(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        // The audio output always runs at FIXED_SAMPLE_RATE (48kHz).
+        // Points are enqueued and drained at the hardware rate regardless of the caller's PPS.
         let runtime = self
             .runtime
             .as_ref()
@@ -353,7 +367,19 @@ impl StreamBackend for AvbBackend {
 
 pub fn discover_device_selectors() -> Result<Vec<AvbSelector>> {
     let candidates = collect_candidates()?;
-    Ok(candidates.into_iter().map(|c| c.selector).collect())
+    let selectors: Vec<AvbSelector> = candidates.into_iter().map(|c| c.selector).collect();
+    if selectors.is_empty() {
+        log::debug!("AVB: no candidate devices found");
+    } else {
+        for s in &selectors {
+            log::debug!(
+                "AVB: candidate device {:?} (duplicate_index={})",
+                s.name,
+                s.duplicate_index
+            );
+        }
+    }
+    Ok(selectors)
 }
 
 fn run_audio_worker(
@@ -363,9 +389,18 @@ fn run_audio_worker(
     stop_rx: mpsc::Receiver<()>,
     init_tx: mpsc::Sender<Result<()>>,
 ) {
+    log::debug!(
+        "AVB: audio worker starting for {:?} (duplicate_index={})",
+        selector.name,
+        selector.duplicate_index
+    );
     let stream = match engine.open_stream(&selector, Arc::clone(&runtime)) {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            log::debug!("AVB: audio stream opened successfully");
+            stream
+        }
         Err(err) => {
+            log::error!("AVB: failed to open audio stream: {}", err);
             let _ = init_tx.send(Err(err));
             return;
         }
@@ -381,13 +416,24 @@ fn run_audio_worker(
         }
     }
 
+    log::debug!("AVB: audio worker stopping, clearing queue");
     runtime.clear_queue();
     runtime.shutter_open.store(false, Ordering::Release);
     drop(stream);
+    log::debug!("AVB: audio worker stopped");
 }
 
 fn select_device(selector: &AvbSelector) -> Result<DeviceCandidate<cpal::Device>> {
+    log::debug!(
+        "AVB: selecting device {:?} (duplicate_index={})",
+        selector.name,
+        selector.duplicate_index
+    );
     let candidates = collect_candidates()?;
+    log::debug!(
+        "AVB: {} candidate(s) available for selection",
+        candidates.len()
+    );
     candidates
         .into_iter()
         .find(|candidate| {
@@ -395,6 +441,11 @@ fn select_device(selector: &AvbSelector) -> Result<DeviceCandidate<cpal::Device>
                 && candidate.selector.duplicate_index == selector.duplicate_index
         })
         .ok_or_else(|| {
+            log::warn!(
+                "AVB: device {:?} (index {}) not found among candidates",
+                selector.name,
+                selector.duplicate_index
+            );
             Error::disconnected(
                 super::error::Error::DeviceNotFound(format!(
                     "{} (index {})",
@@ -417,6 +468,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
 
     for device in devices {
         let Ok(name) = device.name() else {
+            log::debug!("AVB: skipping audio output with unreadable name");
             continue;
         };
 
@@ -438,6 +490,20 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
             .ok()
             .map(|cfg| cfg.channels());
 
+        log::debug!(
+            "AVB: found audio output {:?} — config ranges: [{}], default channels: {:?}",
+            name,
+            output_config_ranges
+                .iter()
+                .map(|r| format!(
+                    "{}ch {}-{}Hz",
+                    r.channels, r.min_sample_rate, r.max_sample_rate
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            default_output_channels,
+        );
+
         records.push(DeviceRecord {
             name,
             device,
@@ -446,6 +512,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
         });
     }
 
+    log::debug!("AVB: enumerated {} audio output(s) total", records.len());
     Ok(records)
 }
 
@@ -453,7 +520,15 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
     let mut records: Vec<DeviceRecord<D>> = records
         .into_iter()
         .filter(|record| {
-            is_likely_avb_device_name(&record.name) && supports_required_channels(record)
+            let channel_ok = supports_required_channels(record);
+            if !channel_ok {
+                log::debug!(
+                    "AVB: skipping {:?} — insufficient channels (need >= {})",
+                    record.name,
+                    REQUIRED_CHANNELS
+                );
+            }
+            channel_ok
         })
         .collect();
 
@@ -499,8 +574,23 @@ fn supports_required_channels<D>(record: &DeviceRecord<D>) -> bool {
 
 fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<cpal::StreamConfig> {
     let channels = match choose_stream_channels(&candidate.output_config_ranges) {
-        Some(channels) => channels,
-        None => return Err(Error::backend(super::error::Error::UnsupportedOutputConfig)),
+        Some(channels) => {
+            log::debug!(
+                "AVB: selected {} channels for {:?}",
+                channels,
+                candidate.selector.name
+            );
+            channels
+        }
+        None => {
+            log::error!(
+                "AVB: no compatible output config for {:?} — need >= {} channels at {}Hz",
+                candidate.selector.name,
+                REQUIRED_CHANNELS,
+                FIXED_SAMPLE_RATE
+            );
+            return Err(Error::backend(super::error::Error::UnsupportedOutputConfig));
+        }
     };
 
     let buffer_size = if cfg!(target_os = "windows") {
@@ -757,10 +847,10 @@ mod tests {
     fn collect_candidates_filters_and_assigns_duplicate_indices() {
         let records = vec![
             make_record("Built-in Output", 8, 44_100, 48_000),
-            make_record("MOTU AVB Main", 8, 44_100, 48_000),
-            make_record("MOTU AVB Main", 8, 44_100, 48_000),
-            make_record("RME Digiface AVB", 2, 44_100, 48_000),
-            make_record("RME Digiface AVB", 8, 44_100, 48_000),
+            make_record("Broadcom NetXtreme A", 8, 44_100, 48_000),
+            make_record("Broadcom NetXtreme A", 8, 44_100, 48_000),
+            make_record("Broadcom NetXtreme B", 2, 44_100, 48_000),
+            make_record("Broadcom NetXtreme B", 8, 44_100, 48_000),
         ];
 
         let candidates = collect_candidates_from_records(records);
@@ -772,9 +862,9 @@ mod tests {
         assert_eq!(
             selectors,
             vec![
-                ("MOTU AVB Main".to_string(), 0),
-                ("MOTU AVB Main".to_string(), 1),
-                ("RME Digiface AVB".to_string(), 0),
+                ("Broadcom NetXtreme A".to_string(), 0),
+                ("Broadcom NetXtreme A".to_string(), 1),
+                ("Broadcom NetXtreme B".to_string(), 0),
             ]
         );
     }
@@ -782,7 +872,7 @@ mod tests {
     #[test]
     fn supports_required_channels_uses_default_fallback() {
         let record = DeviceRecord {
-            name: "MOTU AVB Main".to_string(),
+            name: "Broadcom NetXtreme".to_string(),
             device: (),
             output_config_ranges: Vec::new(),
             default_output_channels: Some(8),
