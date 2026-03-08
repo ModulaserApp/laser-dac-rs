@@ -803,10 +803,10 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
         };
 
         if !frame.is_empty() {
-            frame[0] = point.x;
+            frame[0] = -point.x;
         }
         if frame.len() > 1 {
-            frame[1] = point.y;
+            frame[1] = -point.y;
         }
         if shutter_open && frame.len() >= CHANNELS_XYRGB {
             frame[2] = point.r;
