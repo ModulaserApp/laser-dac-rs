@@ -3853,4 +3853,49 @@ mod tests {
         assert_eq!(stream.state.stats.chunks_written, 2);
         assert_eq!(stream.state.stats.points_written, 2 * n as u64);
     }
+
+    #[test]
+    fn test_validate_config_rejects_pps_below_min() {
+        // Helios-like caps: pps_min = 7
+        let caps = DacCapabilities {
+            pps_min: 7,
+            pps_max: 65535,
+            max_points_per_chunk: 1000,
+            output_model: OutputModel::NetworkFifo,
+        };
+        let cfg = StreamConfig::new(5);
+        let result = Dac::validate_config(&caps, &cfg);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("PPS 5"), "expected PPS 5 in error: {msg}");
+    }
+
+    #[test]
+    fn test_validate_config_rejects_pps_above_max() {
+        // LaserCube-like caps: pps_max = 35000
+        let caps = DacCapabilities {
+            pps_min: 1,
+            pps_max: 35_000,
+            max_points_per_chunk: 1000,
+            output_model: OutputModel::NetworkFifo,
+        };
+        let cfg = StreamConfig::new(50_000);
+        let result = Dac::validate_config(&caps, &cfg);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("PPS 50000"), "expected PPS 50000 in error: {msg}");
+    }
+
+    #[test]
+    fn test_validate_config_avb_accepts_standard_pps() {
+        // AVB caps: wide range due to resampling
+        let caps = DacCapabilities {
+            pps_min: 1,
+            pps_max: 100_000,
+            max_points_per_chunk: 4096,
+            output_model: OutputModel::NetworkFifo,
+        };
+        let cfg = StreamConfig::new(30_000);
+        assert!(Dac::validate_config(&caps, &cfg).is_ok());
+    }
 }

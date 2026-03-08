@@ -13,12 +13,16 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-const REQUIRED_CHANNELS: u16 = 5;
-const FIXED_SAMPLE_RATE: u32 = 48_000;
-// 9_600 points = 200ms at 48kHz.
-// Chosen as a conservative jitter cushion while keeping queueing latency bounded.
-const MAX_QUEUE_POINTS: usize = 9_600;
-const MAPPED_CHANNELS: usize = 6;
+const MIN_CHANNELS: u16 = 5;
+const CHANNELS_XYRGB: usize = 5;
+const CHANNELS_XYRGBI: usize = 6;
+/// Duration of the queue buffer in milliseconds.
+/// Chosen as a conservative jitter cushion while keeping queueing latency bounded.
+const QUEUE_DURATION_MS: u32 = 200;
+
+fn queue_capacity_for_rate(sample_rate: u32) -> usize {
+    (sample_rate as usize * QUEUE_DURATION_MS as usize) / 1000
+}
 
 /// Returns the platform-appropriate cpal audio host.
 ///
@@ -58,17 +62,25 @@ struct OutputConfigRange {
     max_sample_rate: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedStreamConfig {
+    channels: u16,
+    sample_rate: u32,
+}
+
 struct DeviceRecord<D> {
     name: String,
     device: D,
     output_config_ranges: Vec<OutputConfigRange>,
     default_output_channels: Option<u16>,
+    default_output_sample_rate: Option<u32>,
 }
 
 struct DeviceCandidate<D> {
     selector: AvbSelector,
     device: D,
     output_config_ranges: Vec<OutputConfigRange>,
+    default_output_sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,15 +95,17 @@ struct StreamPoint {
 
 struct RuntimeState {
     queue: ArrayQueue<StreamPoint>,
+    sample_rate: u32,
     shutter_open: AtomicBool,
     last_x_bits: AtomicU32,
     last_y_bits: AtomicU32,
 }
 
 impl RuntimeState {
-    fn new(shutter_open: bool) -> Self {
+    fn new(shutter_open: bool, sample_rate: u32) -> Self {
         Self {
-            queue: ArrayQueue::new(MAX_QUEUE_POINTS),
+            queue: ArrayQueue::new(queue_capacity_for_rate(sample_rate)),
+            sample_rate,
             shutter_open: AtomicBool::new(shutter_open),
             last_x_bits: AtomicU32::new(0.0f32.to_bits()),
             last_y_bits: AtomicU32::new(0.0f32.to_bits()),
@@ -107,7 +121,7 @@ impl RuntimeState {
     }
 
     fn remaining_capacity(&self) -> usize {
-        MAX_QUEUE_POINTS.saturating_sub(self.queue.len())
+        self.queue.capacity().saturating_sub(self.queue.len())
     }
 
     fn pop_point(&self) -> Option<StreamPoint> {
@@ -143,9 +157,11 @@ impl RuntimeState {
 trait RunningAudioStream {}
 
 trait AudioEngine: Send + Sync {
+    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<SelectedStreamConfig>;
     fn open_stream(
         &self,
         selector: &AvbSelector,
+        stream_config: SelectedStreamConfig,
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>>;
 }
@@ -159,13 +175,19 @@ impl RunningAudioStream for CpalRunningStream {}
 struct CpalAudioEngine;
 
 impl AudioEngine for CpalAudioEngine {
+    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<SelectedStreamConfig> {
+        let candidate = select_device(selector)?;
+        select_stream_config(&candidate)
+    }
+
     fn open_stream(
         &self,
         selector: &AvbSelector,
+        stream_config: SelectedStreamConfig,
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>> {
         let selected = select_device(selector)?;
-        let stream_config = select_stream_config(&selected)?;
+        let stream_config = build_cpal_stream_config(stream_config);
         let output_channels = stream_config.channels as usize;
         let callback_state = Arc::clone(&runtime);
 
@@ -263,7 +285,16 @@ impl StreamBackend for AvbBackend {
             self.selector.name,
             self.selector.duplicate_index
         );
-        let runtime = Arc::new(RuntimeState::new(self.desired_shutter_open));
+        let stream_config = self.engine.resolve_stream_config(&self.selector)?;
+        log::info!(
+            "AVB: selected {} channels at {}Hz",
+            stream_config.channels,
+            stream_config.sample_rate
+        );
+        let runtime = Arc::new(RuntimeState::new(
+            self.desired_shutter_open,
+            stream_config.sample_rate,
+        ));
         let runtime_for_worker = Arc::clone(&runtime);
         let selector = self.selector.clone();
         let engine = Arc::clone(&self.engine);
@@ -272,15 +303,23 @@ impl StreamBackend for AvbBackend {
         let (init_tx, init_rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            run_audio_worker(engine, selector, runtime_for_worker, stop_rx, init_tx);
+            run_audio_worker(
+                engine,
+                selector,
+                stream_config,
+                runtime_for_worker,
+                stop_rx,
+                init_tx,
+            );
         });
 
         match init_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => {
                 log::info!(
-                    "AVB: connected to {:?} (duplicate_index={})",
+                    "AVB: connected to {:?} (duplicate_index={}) at {}Hz",
                     self.selector.name,
-                    self.selector.duplicate_index
+                    self.selector.duplicate_index,
+                    stream_config.sample_rate
                 );
                 self.runtime = Some(runtime);
                 self.stop_tx = Some(stop_tx);
@@ -326,9 +365,7 @@ impl StreamBackend for AvbBackend {
         self.runtime.is_some() && self.worker_handle.is_some()
     }
 
-    fn try_write_chunk(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        // The audio output always runs at FIXED_SAMPLE_RATE (48kHz).
-        // Points are enqueued and drained at the hardware rate regardless of the caller's PPS.
+    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let runtime = self
             .runtime
             .as_ref()
@@ -338,7 +375,12 @@ impl StreamBackend for AvbBackend {
             return Ok(WriteOutcome::Written);
         }
 
-        Ok(enqueue_points(runtime, points))
+        // Fast path: no resampling needed when PPS matches the audio sample rate.
+        if pps == runtime.sample_rate {
+            Ok(enqueue_points(runtime, points))
+        } else {
+            Ok(enqueue_resampled(runtime, points, pps))
+        }
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -385,6 +427,7 @@ pub fn discover_device_selectors() -> Result<Vec<AvbSelector>> {
 fn run_audio_worker(
     engine: Arc<dyn AudioEngine>,
     selector: AvbSelector,
+    stream_config: SelectedStreamConfig,
     runtime: Arc<RuntimeState>,
     stop_rx: mpsc::Receiver<()>,
     init_tx: mpsc::Sender<Result<()>>,
@@ -394,7 +437,7 @@ fn run_audio_worker(
         selector.name,
         selector.duplicate_index
     );
-    let stream = match engine.open_stream(&selector, Arc::clone(&runtime)) {
+    let stream = match engine.open_stream(&selector, stream_config, Arc::clone(&runtime)) {
         Ok(stream) => {
             log::debug!("AVB: audio stream opened successfully");
             stream
@@ -485,13 +528,12 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
             })
             .unwrap_or_default();
 
-        let default_output_channels = device
-            .default_output_config()
-            .ok()
-            .map(|cfg| cfg.channels());
+        let default_config = device.default_output_config().ok();
+        let default_output_channels = default_config.as_ref().map(|cfg| cfg.channels());
+        let default_output_sample_rate = default_config.as_ref().map(|cfg| cfg.sample_rate().0);
 
         log::debug!(
-            "AVB: found audio output {:?} — config ranges: [{}], default channels: {:?}",
+            "AVB: found audio output {:?} — config ranges: [{}], default channels: {:?}, default sample rate: {:?}",
             name,
             output_config_ranges
                 .iter()
@@ -502,6 +544,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
                 .collect::<Vec<_>>()
                 .join(", "),
             default_output_channels,
+            default_output_sample_rate,
         );
 
         records.push(DeviceRecord {
@@ -509,6 +552,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
             device,
             output_config_ranges,
             default_output_channels,
+            default_output_sample_rate,
         });
     }
 
@@ -525,7 +569,7 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
                 log::debug!(
                     "AVB: skipping {:?} — insufficient channels (need >= {})",
                     record.name,
-                    REQUIRED_CHANNELS
+                    MIN_CHANNELS
                 );
             }
             channel_ok
@@ -552,6 +596,7 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
             },
             device: record.device,
             output_config_ranges: record.output_config_ranges,
+            default_output_sample_rate: record.default_output_sample_rate,
         });
     }
 
@@ -562,67 +607,92 @@ fn supports_required_channels<D>(record: &DeviceRecord<D>) -> bool {
     if record
         .output_config_ranges
         .iter()
-        .any(|cfg| cfg.channels >= REQUIRED_CHANNELS)
+        .any(|cfg| cfg.channels >= MIN_CHANNELS)
     {
         return true;
     }
 
     record
         .default_output_channels
-        .is_some_and(|channels| channels >= REQUIRED_CHANNELS)
+        .is_some_and(|channels| channels >= MIN_CHANNELS)
 }
 
-fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<cpal::StreamConfig> {
-    let channels = match choose_stream_channels(&candidate.output_config_ranges) {
-        Some(channels) => {
+fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<SelectedStreamConfig> {
+    let (channels, sample_rate) = match choose_stream_config(
+        &candidate.output_config_ranges,
+        candidate.default_output_sample_rate,
+    ) {
+        Some(config) => {
             log::debug!(
-                "AVB: selected {} channels for {:?}",
-                channels,
+                "AVB: selected {} channels at {}Hz for {:?}",
+                config.0,
+                config.1,
                 candidate.selector.name
             );
-            channels
+            config
         }
         None => {
             log::error!(
-                "AVB: no compatible output config for {:?} — need >= {} channels at {}Hz",
+                "AVB: no compatible output config for {:?} — need >= {} channels",
                 candidate.selector.name,
-                REQUIRED_CHANNELS,
-                FIXED_SAMPLE_RATE
+                MIN_CHANNELS,
             );
             return Err(Error::backend(super::error::Error::UnsupportedOutputConfig));
         }
     };
 
+    Ok(SelectedStreamConfig {
+        channels,
+        sample_rate,
+    })
+}
+
+fn build_cpal_stream_config(stream_config: SelectedStreamConfig) -> cpal::StreamConfig {
     let buffer_size = if cfg!(target_os = "windows") {
         cpal::BufferSize::Fixed(256)
     } else {
         cpal::BufferSize::Default
     };
 
-    Ok(cpal::StreamConfig {
-        channels,
-        sample_rate: cpal::SampleRate(FIXED_SAMPLE_RATE),
+    cpal::StreamConfig {
+        channels: stream_config.channels,
+        sample_rate: cpal::SampleRate(stream_config.sample_rate),
         buffer_size,
-    })
+    }
 }
 
-fn choose_stream_channels(config_ranges: &[OutputConfigRange]) -> Option<u16> {
-    let mut channel_choice: Option<u16> = None;
+/// Choose the best (channels, sample_rate) pair from the available config ranges.
+///
+/// Prefers the default sample rate when it falls within a qualifying range,
+/// otherwise falls back to the max sample rate from the best qualifying range.
+/// Always picks the lowest channel count >= MIN_CHANNELS.
+fn choose_stream_config(
+    config_ranges: &[OutputConfigRange],
+    default_sample_rate: Option<u32>,
+) -> Option<(u16, u32)> {
+    let mut qualifying = config_ranges
+        .iter()
+        .filter(|r| r.channels >= MIN_CHANNELS)
+        .peekable();
 
-    for range in config_ranges {
-        if range.channels < REQUIRED_CHANNELS {
-            continue;
-        }
-        if (range.min_sample_rate..=range.max_sample_rate).contains(&FIXED_SAMPLE_RATE) {
-            channel_choice = Some(
-                channel_choice
-                    .map(|value| value.min(range.channels))
-                    .unwrap_or(range.channels),
-            );
+    qualifying.peek()?;
+
+    // Try the default sample rate first.
+    if let Some(rate) = default_sample_rate {
+        if let Some(best) = config_ranges
+            .iter()
+            .filter(|r| r.channels >= MIN_CHANNELS)
+            .filter(|r| (r.min_sample_rate..=r.max_sample_rate).contains(&rate))
+            .min_by_key(|r| r.channels)
+        {
+            return Some((best.channels, rate));
         }
     }
 
-    channel_choice
+    // Fallback: pick the lowest-channel qualifying range and use its max sample rate.
+    qualifying
+        .min_by_key(|r| r.channels)
+        .map(|r| (r.channels, r.max_sample_rate))
 }
 
 fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome {
@@ -633,6 +703,60 @@ fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome
     for point in points {
         runtime.push_point(StreamPoint::from(point));
     }
+    WriteOutcome::Written
+}
+
+/// Calculate the number of output samples when resampling `input_len` points
+/// from `from_rate` to `to_rate`.
+fn resampled_len(input_len: usize, from_rate: u32, to_rate: u32) -> usize {
+    if input_len == 0 {
+        return 0;
+    }
+    (input_len as u64 * to_rate as u64).div_ceil(from_rate as u64) as usize
+}
+
+/// Linearly interpolate all fields of two `StreamPoint`s.
+fn lerp_stream_point(a: &StreamPoint, b: &StreamPoint, t: f32) -> StreamPoint {
+    StreamPoint {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        i: a.i + (b.i - a.i) * t,
+    }
+}
+
+/// Resample `points` from `pps` to `sample_rate` and enqueue directly.
+///
+/// Caller must ensure `points` is non-empty (the `try_write_chunk` fast path handles this).
+fn enqueue_resampled(
+    runtime: &RuntimeState,
+    points: &[LaserPoint],
+    pps: u32,
+) -> WriteOutcome {
+    debug_assert!(!points.is_empty());
+    let output_len = resampled_len(points.len(), pps, runtime.sample_rate);
+    if !runtime.has_capacity_for(output_len) {
+        return WriteOutcome::WouldBlock;
+    }
+
+    let src: Vec<StreamPoint> = points.iter().map(StreamPoint::from).collect();
+    let last_src_idx = (src.len() - 1) as f32;
+    let step = if output_len > 1 {
+        last_src_idx / (output_len - 1) as f32
+    } else {
+        0.0
+    };
+
+    for i in 0..output_len {
+        let src_pos = i as f32 * step;
+        let idx = (src_pos as usize).min(src.len() - 1);
+        let next = (idx + 1).min(src.len() - 1);
+        let t = src_pos - idx as f32;
+        runtime.push_point(lerp_stream_point(&src[idx], &src[next], t));
+    }
+
     WriteOutcome::Written
 }
 
@@ -684,17 +808,12 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
         if frame.len() > 1 {
             frame[1] = point.y;
         }
-        if frame.len() >= MAPPED_CHANNELS {
-            if shutter_open {
-                frame[2] = point.r;
-                frame[3] = point.g;
-                frame[4] = point.b;
+        if shutter_open && frame.len() >= CHANNELS_XYRGB {
+            frame[2] = point.r;
+            frame[3] = point.g;
+            frame[4] = point.b;
+            if frame.len() >= CHANNELS_XYRGBI {
                 frame[5] = point.i;
-            } else {
-                frame[2] = 0.0;
-                frame[3] = 0.0;
-                frame[4] = 0.0;
-                frame[5] = 0.0;
             }
         }
     }
@@ -722,6 +841,7 @@ mod tests {
                 max_sample_rate,
             }],
             default_output_channels: Some(channels),
+            default_output_sample_rate: Some(max_sample_rate),
         }
     }
 
@@ -747,18 +867,41 @@ mod tests {
         fail_open: AtomicBool,
         paused: Arc<AtomicBool>,
         captured_frames: Arc<Mutex<std::collections::VecDeque<Vec<f32>>>>,
+        opened_stream_configs: Arc<Mutex<Vec<SelectedStreamConfig>>>,
+        frame_budget: Arc<AtomicU32>,
         frame_count: Arc<std::sync::atomic::AtomicUsize>,
         channels: usize,
+        sample_rate: AtomicU32,
+        sample_rate_after_resolve: Option<u32>,
     }
 
     impl FakeAudioEngine {
         fn new(channels: usize) -> Self {
+            Self::with_sample_rate(channels, 48_000)
+        }
+
+        fn with_sample_rate(channels: usize, sample_rate: u32) -> Self {
             Self {
                 fail_open: AtomicBool::new(false),
                 paused: Arc::new(AtomicBool::new(false)),
                 captured_frames: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                opened_stream_configs: Arc::new(Mutex::new(Vec::new())),
+                frame_budget: Arc::new(AtomicU32::new(u32::MAX)),
                 frame_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 channels,
+                sample_rate: AtomicU32::new(sample_rate),
+                sample_rate_after_resolve: None,
+            }
+        }
+
+        fn with_sample_rate_change_on_open(
+            channels: usize,
+            sample_rate: u32,
+            next_sample_rate: u32,
+        ) -> Self {
+            Self {
+                sample_rate_after_resolve: Some(next_sample_rate),
+                ..Self::with_sample_rate(channels, sample_rate)
             }
         }
 
@@ -772,12 +915,40 @@ mod tests {
         fn frame_count(&self) -> usize {
             self.frame_count.load(Ordering::Acquire)
         }
+
+        fn set_frame_budget(&self, frames: u32) {
+            self.frame_budget.store(frames, Ordering::Release);
+        }
+
+        fn opened_stream_configs(&self) -> Vec<SelectedStreamConfig> {
+            self.opened_stream_configs
+                .lock()
+                .map(|configs| configs.clone())
+                .unwrap_or_default()
+        }
     }
 
     impl AudioEngine for FakeAudioEngine {
+        fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<SelectedStreamConfig> {
+            if self.fail_open.load(Ordering::Acquire) {
+                return Err(Error::backend(
+                    crate::protocols::avb::error::Error::StreamStartFailed,
+                ));
+            }
+            let sample_rate = self.sample_rate.load(Ordering::Acquire);
+            if let Some(next_sample_rate) = self.sample_rate_after_resolve {
+                self.sample_rate.store(next_sample_rate, Ordering::Release);
+            }
+            Ok(SelectedStreamConfig {
+                channels: self.channels as u16,
+                sample_rate,
+            })
+        }
+
         fn open_stream(
             &self,
             _selector: &AvbSelector,
+            stream_config: SelectedStreamConfig,
             runtime: Arc<RuntimeState>,
         ) -> Result<Box<dyn RunningAudioStream>> {
             if self.fail_open.load(Ordering::Acquire) {
@@ -788,9 +959,14 @@ mod tests {
 
             let (stop_tx, stop_rx) = mpsc::channel();
             let captured_frames = Arc::clone(&self.captured_frames);
+            let frame_budget = Arc::clone(&self.frame_budget);
             let frame_count = Arc::clone(&self.frame_count);
             let paused = Arc::clone(&self.paused);
-            let channels = self.channels;
+            let channels = stream_config.channels as usize;
+
+            if let Ok(mut configs) = self.opened_stream_configs.lock() {
+                configs.push(stream_config);
+            }
 
             let handle = thread::spawn(move || loop {
                 match stop_rx.recv_timeout(Duration::from_millis(2)) {
@@ -798,6 +974,9 @@ mod tests {
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
                         if paused.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        if !try_acquire_frame_budget(&frame_budget) {
                             continue;
                         }
                         let mut frame = vec![0.0; channels];
@@ -820,6 +999,39 @@ mod tests {
         }
     }
 
+    fn try_acquire_frame_budget(frame_budget: &AtomicU32) -> bool {
+        loop {
+            let current = frame_budget.load(Ordering::Acquire);
+            if current == u32::MAX {
+                return true;
+            }
+            if current == 0 {
+                return false;
+            }
+            if frame_budget
+                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    fn wait_for_frame_count(engine: &FakeAudioEngine, target: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            if engine.frame_count() >= target {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "timed out waiting for frame count {}, got {}",
+            target,
+            engine.frame_count()
+        );
+    }
+
     #[test]
     fn stream_point_from_laser_point_clamps_and_scales() {
         let point = LaserPoint::new(2.0, -2.0, 65535, 32768, 0, 65535);
@@ -834,8 +1046,9 @@ mod tests {
 
     #[test]
     fn enqueue_points_returns_would_block_when_capacity_exceeded() {
-        let runtime = RuntimeState::new(true);
-        let points = vec![LaserPoint::blanked(0.0, 0.0); MAX_QUEUE_POINTS];
+        let cap = queue_capacity_for_rate(48_000);
+        let runtime = RuntimeState::new(true, 48_000);
+        let points = vec![LaserPoint::blanked(0.0, 0.0); cap];
         assert_eq!(enqueue_points(&runtime, &points), WriteOutcome::Written);
         assert_eq!(
             enqueue_points(&runtime, &[LaserPoint::blanked(0.0, 0.0)]),
@@ -865,6 +1078,7 @@ mod tests {
                 ("Broadcom NetXtreme A".to_string(), 0),
                 ("Broadcom NetXtreme A".to_string(), 1),
                 ("Broadcom NetXtreme B".to_string(), 0),
+                ("Built-in Output".to_string(), 0),
             ]
         );
     }
@@ -876,18 +1090,19 @@ mod tests {
             device: (),
             output_config_ranges: Vec::new(),
             default_output_channels: Some(8),
+            default_output_sample_rate: Some(48_000),
         };
         assert!(supports_required_channels(&record));
     }
 
     #[test]
     fn fill_output_buffer_shutter_closed_blanks_rgbi_only() {
-        let runtime = RuntimeState::new(false);
+        let runtime = RuntimeState::new(false, 48_000);
         let points = [LaserPoint::new(0.25, -0.5, 65535, 32768, 1000, 65535)];
         assert_eq!(enqueue_points(&runtime, &points), WriteOutcome::Written);
 
-        let mut data = vec![0.0; MAPPED_CHANNELS];
-        fill_output_buffer(&mut data, MAPPED_CHANNELS, &runtime);
+        let mut data = vec![0.0; CHANNELS_XYRGBI];
+        fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
         assert!((data[0] - 0.25).abs() < 0.0001);
         assert!((data[1] + 0.5).abs() < 0.0001);
@@ -900,21 +1115,21 @@ mod tests {
 
     #[test]
     fn fill_output_buffer_underrun_outputs_zeroes() {
-        let runtime = RuntimeState::new(true);
-        let mut data = vec![1.0; MAPPED_CHANNELS * 2];
-        fill_output_buffer(&mut data, MAPPED_CHANNELS, &runtime);
+        let runtime = RuntimeState::new(true, 48_000);
+        let mut data = vec![1.0; CHANNELS_XYRGBI * 2];
+        fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
         assert!(data.iter().all(|v| *v == 0.0));
         assert_eq!(runtime.queued_points(), 0);
     }
 
     #[test]
     fn fill_output_buffer_open_shutter_writes_full_channels() {
-        let runtime = RuntimeState::new(true);
+        let runtime = RuntimeState::new(true, 48_000);
         let point = LaserPoint::new(0.1, 0.2, 65535, 0, 65535, 32768);
         assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
 
-        let mut data = vec![0.0; MAPPED_CHANNELS];
-        fill_output_buffer(&mut data, MAPPED_CHANNELS, &runtime);
+        let mut data = vec![0.0; CHANNELS_XYRGBI];
+        fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
         assert!((data[0] - 0.1).abs() < 0.0001);
         assert!((data[1] - 0.2).abs() < 0.0001);
@@ -926,12 +1141,12 @@ mod tests {
 
     #[test]
     fn underrun_holds_last_xy_blanked() {
-        let runtime = RuntimeState::new(true);
+        let runtime = RuntimeState::new(true, 48_000);
         let point = LaserPoint::new(0.3, -0.4, 65535, 1000, 0, 65535);
         assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
 
-        let mut data = vec![0.0; MAPPED_CHANNELS * 2];
-        fill_output_buffer(&mut data, MAPPED_CHANNELS, &runtime);
+        let mut data = vec![0.0; CHANNELS_XYRGBI * 2];
+        fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
         // First frame: queued point.
         assert!((data[0] - 0.3).abs() < 0.0001);
@@ -949,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_stream_channels_prefers_lowest_compatible_channel_count() {
+    fn choose_stream_config_prefers_lowest_compatible_channel_count() {
         let ranges = vec![
             OutputConfigRange {
                 channels: 8,
@@ -962,29 +1177,94 @@ mod tests {
                 max_sample_rate: 48_000,
             },
         ];
-        assert_eq!(choose_stream_channels(&ranges), Some(6));
+        assert_eq!(choose_stream_config(&ranges, Some(48_000)), Some((6, 48_000)));
     }
 
     #[test]
-    fn choose_stream_channels_returns_none_without_48k_range() {
+    fn choose_stream_config_uses_default_rate_when_in_range() {
+        let ranges = vec![OutputConfigRange {
+            channels: 8,
+            min_sample_rate: 44_100,
+            max_sample_rate: 96_000,
+        }];
+        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((8, 96_000)));
+    }
+
+    #[test]
+    fn choose_stream_config_prefers_default_rate_when_supported() {
+        let ranges = vec![OutputConfigRange {
+            channels: 6,
+            min_sample_rate: 48_000,
+            max_sample_rate: 96_000,
+        }];
+        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((6, 96_000)));
+    }
+
+    #[test]
+    fn choose_stream_config_falls_back_to_max_rate() {
         let ranges = vec![OutputConfigRange {
             channels: 8,
             min_sample_rate: 44_100,
             max_sample_rate: 44_100,
         }];
-        assert_eq!(choose_stream_channels(&ranges), None);
+        // Default rate 48kHz is not in range, so falls back to max_sample_rate.
+        assert_eq!(choose_stream_config(&ranges, Some(48_000)), Some((8, 44_100)));
+    }
+
+    #[test]
+    fn choose_stream_config_falls_back_when_default_rate_not_supported_with_required_channels() {
+        let ranges = vec![
+            OutputConfigRange {
+                channels: 2,
+                min_sample_rate: 48_000,
+                max_sample_rate: 96_000,
+            },
+            OutputConfigRange {
+                channels: 6,
+                min_sample_rate: 48_000,
+                max_sample_rate: 48_000,
+            },
+        ];
+        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((6, 48_000)));
+    }
+
+    #[test]
+    fn choose_stream_config_returns_none_without_qualifying_channels() {
+        let ranges = vec![OutputConfigRange {
+            channels: 2,
+            min_sample_rate: 44_100,
+            max_sample_rate: 96_000,
+        }];
+        assert_eq!(choose_stream_config(&ranges, Some(48_000)), None);
+    }
+
+    #[test]
+    fn choose_stream_config_selects_valid_channels_and_rate_from_same_range() {
+        let ranges = vec![
+            OutputConfigRange {
+                channels: 8,
+                min_sample_rate: 96_000,
+                max_sample_rate: 96_000,
+            },
+            OutputConfigRange {
+                channels: 6,
+                min_sample_rate: 48_000,
+                max_sample_rate: 48_000,
+            },
+        ];
+        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((8, 96_000)));
     }
 
     #[test]
     fn fake_engine_connect_write_disconnect_end_to_end() {
-        let fake_engine = Arc::new(FakeAudioEngine::new(MAPPED_CHANNELS));
+        let fake_engine = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI));
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
 
         backend.connect().unwrap();
         backend.set_shutter(true).unwrap();
         let points = vec![LaserPoint::new(0.25, -0.25, 65535, 0, 0, 65535)];
-        let outcome = backend.try_write_chunk(FIXED_SAMPLE_RATE, &points).unwrap();
+        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
         assert_eq!(outcome, WriteOutcome::Written);
 
         thread::sleep(Duration::from_millis(20));
@@ -1000,7 +1280,7 @@ mod tests {
 
     #[test]
     fn fake_engine_open_failure_propagates_from_connect() {
-        let fake_engine = Arc::new(FakeAudioEngine::new(MAPPED_CHANNELS));
+        let fake_engine = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI));
         fake_engine.fail_open.store(true, Ordering::Release);
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
 
@@ -1015,7 +1295,7 @@ mod tests {
 
     #[test]
     fn wouldblock_then_recover_after_callback_drains() {
-        let fake_engine = Arc::new(FakeAudioEngine::new(MAPPED_CHANNELS));
+        let fake_engine = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI));
         fake_engine.paused.store(true, Ordering::Release);
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
@@ -1023,12 +1303,13 @@ mod tests {
         backend.connect().unwrap();
         backend.set_shutter(true).unwrap();
 
-        let fill = vec![LaserPoint::blanked(0.0, 0.0); MAX_QUEUE_POINTS];
-        let first = backend.try_write_chunk(FIXED_SAMPLE_RATE, &fill).unwrap();
+        let cap = queue_capacity_for_rate(48_000);
+        let fill = vec![LaserPoint::blanked(0.0, 0.0); cap];
+        let first = backend.try_write_chunk(48_000, &fill).unwrap();
         assert_eq!(first, WriteOutcome::Written);
 
         let blocked = backend
-            .try_write_chunk(FIXED_SAMPLE_RATE, &[LaserPoint::blanked(0.0, 0.0)])
+            .try_write_chunk(48_000, &[LaserPoint::blanked(0.0, 0.0)])
             .unwrap();
         assert_eq!(blocked, WriteOutcome::WouldBlock);
 
@@ -1036,7 +1317,7 @@ mod tests {
         thread::sleep(Duration::from_millis(25));
 
         let recovered = backend
-            .try_write_chunk(FIXED_SAMPLE_RATE, &[LaserPoint::blanked(0.0, 0.0)])
+            .try_write_chunk(48_000, &[LaserPoint::blanked(0.0, 0.0)])
             .unwrap();
         assert_eq!(recovered, WriteOutcome::Written);
 
@@ -1045,14 +1326,22 @@ mod tests {
 
     #[test]
     fn callback_progresses_under_producer_contention() {
-        let engine = FakeAudioEngine::new(MAPPED_CHANNELS);
-        let runtime = Arc::new(RuntimeState::new(true));
+        let cap = queue_capacity_for_rate(48_000);
+        let engine = FakeAudioEngine::new(CHANNELS_XYRGBI);
+        let runtime = Arc::new(RuntimeState::new(true, 48_000));
         let selector = AvbSelector {
             name: "MOTU AVB Main".to_string(),
             duplicate_index: 0,
         };
         let _stream = engine
-            .open_stream(&selector, Arc::clone(&runtime))
+            .open_stream(
+                &selector,
+                SelectedStreamConfig {
+                    channels: CHANNELS_XYRGBI as u16,
+                    sample_rate: runtime.sample_rate,
+                },
+                Arc::clone(&runtime),
+            )
             .expect("stream should open");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -1074,19 +1363,27 @@ mod tests {
         let _ = writer.join();
 
         assert!(end_frames > start_frames);
-        assert!(runtime.queued_points() <= MAX_QUEUE_POINTS as u64);
+        assert!(runtime.queued_points() <= cap as u64);
     }
 
     #[test]
     fn queue_bound_invariant_under_stress() {
-        let engine = FakeAudioEngine::new(MAPPED_CHANNELS);
-        let runtime = Arc::new(RuntimeState::new(true));
+        let cap = queue_capacity_for_rate(48_000);
+        let engine = FakeAudioEngine::new(CHANNELS_XYRGBI);
+        let runtime = Arc::new(RuntimeState::new(true, 48_000));
         let selector = AvbSelector {
             name: "MOTU AVB Main".to_string(),
             duplicate_index: 0,
         };
         let _stream = engine
-            .open_stream(&selector, Arc::clone(&runtime))
+            .open_stream(
+                &selector,
+                SelectedStreamConfig {
+                    channels: CHANNELS_XYRGBI as u16,
+                    sample_rate: runtime.sample_rate,
+                },
+                Arc::clone(&runtime),
+            )
             .expect("stream should open");
 
         for _ in 0..300 {
@@ -1094,14 +1391,14 @@ mod tests {
                 &runtime,
                 &[LaserPoint::new(0.1, 0.1, 65535, 0, 0, 65535); 64],
             );
-            assert!(runtime.queued_points() <= MAX_QUEUE_POINTS as u64);
+            assert!(runtime.queued_points() <= cap as u64);
             thread::sleep(Duration::from_millis(1));
         }
     }
 
     #[test]
     fn disconnect_completes_under_load() {
-        let fake_engine = Arc::new(FakeAudioEngine::new(MAPPED_CHANNELS));
+        let fake_engine = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI));
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
 
@@ -1126,5 +1423,382 @@ mod tests {
         let _ = writer.join();
 
         assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn resampled_len_upsample() {
+        // 3 points at 30k → ceil(3 * 48000 / 30000) = ceil(4.8) = 5
+        assert_eq!(resampled_len(3, 30_000, 48_000), 5);
+    }
+
+    #[test]
+    fn resampled_len_downsample() {
+        // 5 points at 60k → ceil(5 * 48000 / 60000) = ceil(4.0) = 4
+        assert_eq!(resampled_len(5, 60_000, 48_000), 4);
+    }
+
+    #[test]
+    fn resampled_len_passthrough() {
+        assert_eq!(resampled_len(10, 48_000, 48_000), 10);
+        assert_eq!(resampled_len(1, 48_000, 48_000), 1);
+        assert_eq!(resampled_len(0, 48_000, 48_000), 0);
+    }
+
+    #[test]
+    fn enqueue_resampled_interpolates_xy() {
+        let runtime = RuntimeState::new(true, 48_000);
+        let points = vec![
+            LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+        ];
+        // 2 points at 24k → ceil(2 * 48000 / 24000) = 4 output samples
+        let outcome = enqueue_resampled(&runtime, &points, 24_000);
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert_eq!(runtime.queued_points(), 4);
+
+        // First sample should be at input start
+        let p0 = runtime.pop_point().unwrap();
+        assert!((p0.x - (-1.0)).abs() < 0.01);
+        assert!((p0.y - (-1.0)).abs() < 0.01);
+        assert!(p0.r < 0.01);
+
+        // Middle samples should be interpolated (position and color)
+        let p1 = runtime.pop_point().unwrap();
+        assert!(p1.x > -1.0 && p1.x < 1.0);
+        assert!(p1.y > -1.0 && p1.y < 1.0);
+        assert!(p1.r > 0.0 && p1.r < 1.0);
+        assert!(p1.g > 0.0 && p1.g < 1.0);
+
+        let _p2 = runtime.pop_point().unwrap();
+
+        // Last sample should be at input end
+        let p3 = runtime.pop_point().unwrap();
+        assert!((p3.x - 1.0).abs() < 0.01);
+        assert!((p3.y - 1.0).abs() < 0.01);
+        assert!(p3.r > 0.99);
+    }
+
+    #[test]
+    fn enqueue_resampled_checks_capacity() {
+        let cap = queue_capacity_for_rate(48_000);
+        let runtime = RuntimeState::new(true, 48_000);
+        // Fill the queue to near capacity
+        let fill = vec![LaserPoint::blanked(0.0, 0.0); cap - 1];
+        assert_eq!(enqueue_points(&runtime, &fill), WriteOutcome::Written);
+
+        // 2 points at 24k → 4 output samples, but only 1 slot remains
+        let points = vec![
+            LaserPoint::new(0.0, 0.0, 0, 0, 0, 0),
+            LaserPoint::new(1.0, 1.0, 0, 0, 0, 0),
+        ];
+        let outcome = enqueue_resampled(&runtime, &points, 24_000);
+        assert_eq!(outcome, WriteOutcome::WouldBlock);
+    }
+
+    #[test]
+    fn engine_at_96khz_uses_correct_queue_capacity_and_resampling() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+
+        let runtime = backend.runtime.as_ref().unwrap().clone();
+        assert_eq!(runtime.sample_rate, 96_000);
+        assert_eq!(runtime.queue.capacity(), queue_capacity_for_rate(96_000));
+
+        // Resampling: 2 points at 48kHz → ceil(2 * 96000 / 48000) = 4 output samples
+        let points = vec![
+            LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+        ];
+        backend.set_shutter(true).unwrap();
+        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert_eq!(runtime.queued_points(), 4);
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn try_write_chunk_passthrough_when_pps_matches_selected_audio_rate() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
+        fake_engine.paused.store(true, Ordering::Release);
+        fake_engine.set_frame_budget(3);
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+        backend.set_shutter(true).unwrap();
+
+        let points = vec![
+            LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
+            LaserPoint::new(0.0, 0.0, 32768, 0, 0, 32768),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+        ];
+        assert_eq!(
+            backend.try_write_chunk(96_000, &points).unwrap(),
+            WriteOutcome::Written
+        );
+
+        let start_frames = fake_engine.frame_count();
+        fake_engine.paused.store(false, Ordering::Release);
+        wait_for_frame_count(fake_engine.as_ref(), start_frames + 3);
+        fake_engine.paused.store(true, Ordering::Release);
+
+        let frames = fake_engine.snapshot();
+        let captured = &frames[frames.len() - 3..];
+        assert_eq!(captured.len(), 3);
+        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!((captured[1][0] - 0.0).abs() < 0.01);
+        assert!((captured[2][0] - 1.0).abs() < 0.01);
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn try_write_chunk_resamples_up_to_selected_audio_rate() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
+        fake_engine.paused.store(true, Ordering::Release);
+        fake_engine.set_frame_budget(4);
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+        backend.set_shutter(true).unwrap();
+
+        let points = vec![
+            LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+        ];
+        assert_eq!(
+            backend.try_write_chunk(48_000, &points).unwrap(),
+            WriteOutcome::Written
+        );
+
+        let start_frames = fake_engine.frame_count();
+        fake_engine.paused.store(false, Ordering::Release);
+        wait_for_frame_count(fake_engine.as_ref(), start_frames + 4);
+        fake_engine.paused.store(true, Ordering::Release);
+
+        let frames = fake_engine.snapshot();
+        let captured = &frames[frames.len() - 4..];
+        assert_eq!(captured.len(), 4);
+        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!(captured[1][0] > -1.0 && captured[1][0] < 1.0);
+        assert!(captured[2][0] > -1.0 && captured[2][0] < 1.0);
+        assert!((captured[3][0] - 1.0).abs() < 0.01);
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn try_write_chunk_resamples_down_to_selected_audio_rate() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 48_000));
+        fake_engine.paused.store(true, Ordering::Release);
+        fake_engine.set_frame_budget(3);
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+        backend.set_shutter(true).unwrap();
+
+        let points = vec![
+            LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
+            LaserPoint::new(-0.5, -0.5, 0, 0, 0, 0),
+            LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+            LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
+        ];
+        assert_eq!(
+            backend.try_write_chunk(96_000, &points).unwrap(),
+            WriteOutcome::Written
+        );
+
+        let start_frames = fake_engine.frame_count();
+        fake_engine.paused.store(false, Ordering::Release);
+        wait_for_frame_count(fake_engine.as_ref(), start_frames + 3);
+        fake_engine.paused.store(true, Ordering::Release);
+
+        let frames = fake_engine.snapshot();
+        let captured = &frames[frames.len() - 3..];
+        assert_eq!(captured.len(), 3);
+        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!(captured[1][0] > -1.0 && captured[1][0] < 1.0);
+        assert!((captured[2][0] - 1.0).abs() < 0.01);
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn queue_capacity_scales_with_audio_sample_rate() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
+        fake_engine.paused.store(true, Ordering::Release);
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+
+        let cap = queue_capacity_for_rate(96_000);
+        let fill = vec![LaserPoint::blanked(0.0, 0.0); cap];
+        assert_eq!(
+            backend.try_write_chunk(96_000, &fill).unwrap(),
+            WriteOutcome::Written
+        );
+        assert_eq!(
+            backend
+                .try_write_chunk(96_000, &[LaserPoint::blanked(0.0, 0.0)])
+                .unwrap(),
+            WriteOutcome::WouldBlock
+        );
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn reconnect_rebuilds_runtime_for_new_audio_sample_rate() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 48_000));
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+        let first_runtime = backend.runtime.as_ref().unwrap().clone();
+        assert_eq!(first_runtime.sample_rate, 48_000);
+        assert_eq!(first_runtime.queue.capacity(), queue_capacity_for_rate(48_000));
+        backend.disconnect().unwrap();
+
+        fake_engine.sample_rate.store(96_000, Ordering::Release);
+
+        backend.connect().unwrap();
+        let second_runtime = backend.runtime.as_ref().unwrap().clone();
+        assert_eq!(second_runtime.sample_rate, 96_000);
+        assert_eq!(second_runtime.queue.capacity(), queue_capacity_for_rate(96_000));
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn fill_output_buffer_5ch_open_shutter_writes_xyrgb_no_intensity() {
+        let runtime = RuntimeState::new(true, 48_000);
+        let point = LaserPoint::new(0.1, 0.2, 65535, 0, 65535, 32768);
+        assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
+
+        let mut data = vec![0.0; CHANNELS_XYRGB];
+        fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
+
+        assert!((data[0] - 0.1).abs() < 0.0001);
+        assert!((data[1] - 0.2).abs() < 0.0001);
+        assert_eq!(data[2], 1.0); // R
+        assert_eq!(data[3], 0.0); // G
+        assert_eq!(data[4], 1.0); // B
+    }
+
+    #[test]
+    fn fill_output_buffer_5ch_shutter_closed_blanks_rgb() {
+        let runtime = RuntimeState::new(false, 48_000);
+        let points = [LaserPoint::new(0.25, -0.5, 65535, 32768, 1000, 65535)];
+        assert_eq!(enqueue_points(&runtime, &points), WriteOutcome::Written);
+
+        let mut data = vec![0.0; CHANNELS_XYRGB];
+        fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
+
+        assert!((data[0] - 0.25).abs() < 0.0001);
+        assert!((data[1] + 0.5).abs() < 0.0001);
+        assert_eq!(data[2], 0.0);
+        assert_eq!(data[3], 0.0);
+        assert_eq!(data[4], 0.0);
+    }
+
+    #[test]
+    fn fill_output_buffer_5ch_underrun_holds_last_xy_blanked() {
+        let runtime = RuntimeState::new(true, 48_000);
+        let point = LaserPoint::new(0.3, -0.4, 65535, 1000, 0, 65535);
+        assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
+
+        let mut data = vec![0.0; CHANNELS_XYRGB * 2];
+        fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
+
+        // First frame: queued point.
+        assert!((data[0] - 0.3).abs() < 0.0001);
+        assert!((data[1] + 0.4).abs() < 0.0001);
+        assert!(data[2] > 0.0); // R
+
+        // Second frame: underrun; keep XY, blank colors.
+        assert!((data[5] - 0.3).abs() < 0.0001);
+        assert!((data[6] + 0.4).abs() < 0.0001);
+        assert_eq!(data[7], 0.0);
+        assert_eq!(data[8], 0.0);
+        assert_eq!(data[9], 0.0);
+    }
+
+    #[test]
+    fn fake_engine_5ch_connect_write_disconnect_end_to_end() {
+        let fake_engine = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGB));
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+        backend.set_shutter(true).unwrap();
+        let points = vec![LaserPoint::new(0.25, -0.25, 65535, 0, 0, 65535)];
+        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
+        assert_eq!(outcome, WriteOutcome::Written);
+
+        thread::sleep(Duration::from_millis(20));
+        let frames = fake_engine.snapshot();
+        assert!(!frames.is_empty());
+        // 5-channel frames should have RGB but no intensity channel
+        assert!(frames
+            .iter()
+            .any(|frame| frame.len() == 5 && frame[2] > 0.0));
+
+        backend.disconnect().unwrap();
+        assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn choose_stream_config_selects_5ch_when_lowest_qualifying() {
+        let ranges = vec![
+            OutputConfigRange {
+                channels: 8,
+                min_sample_rate: 44_100,
+                max_sample_rate: 96_000,
+            },
+            OutputConfigRange {
+                channels: 5,
+                min_sample_rate: 48_000,
+                max_sample_rate: 48_000,
+            },
+        ];
+        assert_eq!(
+            choose_stream_config(&ranges, Some(48_000)),
+            Some((5, 48_000))
+        );
+    }
+
+    #[test]
+    fn connect_and_open_use_same_stream_config_when_rate_changes_mid_connect() {
+        let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate_change_on_open(
+            CHANNELS_XYRGBI,
+            48_000,
+            96_000,
+        ));
+        let engine: Arc<dyn AudioEngine> = fake_engine.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+
+        backend.connect().unwrap();
+
+        let runtime = backend.runtime.as_ref().unwrap().clone();
+        let opened_configs = fake_engine.opened_stream_configs();
+
+        assert_eq!(runtime.sample_rate, 48_000);
+        assert_eq!(runtime.queue.capacity(), queue_capacity_for_rate(48_000));
+        assert_eq!(
+            opened_configs,
+            vec![SelectedStreamConfig {
+                channels: CHANNELS_XYRGBI as u16,
+                sample_rate: 48_000,
+            }]
+        );
+
+        backend.disconnect().unwrap();
     }
 }
