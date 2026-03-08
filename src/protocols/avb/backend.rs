@@ -730,11 +730,7 @@ fn lerp_stream_point(a: &StreamPoint, b: &StreamPoint, t: f32) -> StreamPoint {
 /// Resample `points` from `pps` to `sample_rate` and enqueue directly.
 ///
 /// Caller must ensure `points` is non-empty (the `try_write_chunk` fast path handles this).
-fn enqueue_resampled(
-    runtime: &RuntimeState,
-    points: &[LaserPoint],
-    pps: u32,
-) -> WriteOutcome {
+fn enqueue_resampled(runtime: &RuntimeState, points: &[LaserPoint], pps: u32) -> WriteOutcome {
     debug_assert!(!points.is_empty());
     let output_len = resampled_len(points.len(), pps, runtime.sample_rate);
     if !runtime.has_capacity_for(output_len) {
@@ -1104,8 +1100,8 @@ mod tests {
         let mut data = vec![0.0; CHANNELS_XYRGBI];
         fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
-        assert!((data[0] - 0.25).abs() < 0.0001);
-        assert!((data[1] + 0.5).abs() < 0.0001);
+        assert!((data[0] + 0.25).abs() < 0.0001);
+        assert!((data[1] - 0.5).abs() < 0.0001);
         assert_eq!(data[2], 0.0);
         assert_eq!(data[3], 0.0);
         assert_eq!(data[4], 0.0);
@@ -1131,8 +1127,8 @@ mod tests {
         let mut data = vec![0.0; CHANNELS_XYRGBI];
         fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
-        assert!((data[0] - 0.1).abs() < 0.0001);
-        assert!((data[1] - 0.2).abs() < 0.0001);
+        assert!((data[0] + 0.1).abs() < 0.0001);
+        assert!((data[1] + 0.2).abs() < 0.0001);
         assert_eq!(data[2], 1.0);
         assert_eq!(data[3], 0.0);
         assert_eq!(data[4], 1.0);
@@ -1149,14 +1145,14 @@ mod tests {
         fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
 
         // First frame: queued point.
-        assert!((data[0] - 0.3).abs() < 0.0001);
-        assert!((data[1] + 0.4).abs() < 0.0001);
+        assert!((data[0] + 0.3).abs() < 0.0001);
+        assert!((data[1] - 0.4).abs() < 0.0001);
         assert!(data[2] > 0.0);
         assert!(data[5] > 0.0);
 
         // Second frame: underrun; keep XY, blank colors/intensity.
-        assert!((data[6] - 0.3).abs() < 0.0001);
-        assert!((data[7] + 0.4).abs() < 0.0001);
+        assert!((data[6] + 0.3).abs() < 0.0001);
+        assert!((data[7] - 0.4).abs() < 0.0001);
         assert_eq!(data[8], 0.0);
         assert_eq!(data[9], 0.0);
         assert_eq!(data[10], 0.0);
@@ -1177,7 +1173,10 @@ mod tests {
                 max_sample_rate: 48_000,
             },
         ];
-        assert_eq!(choose_stream_config(&ranges, Some(48_000)), Some((6, 48_000)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(48_000)),
+            Some((6, 48_000))
+        );
     }
 
     #[test]
@@ -1187,7 +1186,10 @@ mod tests {
             min_sample_rate: 44_100,
             max_sample_rate: 96_000,
         }];
-        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((8, 96_000)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(96_000)),
+            Some((8, 96_000))
+        );
     }
 
     #[test]
@@ -1197,7 +1199,10 @@ mod tests {
             min_sample_rate: 48_000,
             max_sample_rate: 96_000,
         }];
-        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((6, 96_000)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(96_000)),
+            Some((6, 96_000))
+        );
     }
 
     #[test]
@@ -1208,7 +1213,10 @@ mod tests {
             max_sample_rate: 44_100,
         }];
         // Default rate 48kHz is not in range, so falls back to max_sample_rate.
-        assert_eq!(choose_stream_config(&ranges, Some(48_000)), Some((8, 44_100)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(48_000)),
+            Some((8, 44_100))
+        );
     }
 
     #[test]
@@ -1225,7 +1233,10 @@ mod tests {
                 max_sample_rate: 48_000,
             },
         ];
-        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((6, 48_000)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(96_000)),
+            Some((6, 48_000))
+        );
     }
 
     #[test]
@@ -1252,7 +1263,10 @@ mod tests {
                 max_sample_rate: 48_000,
             },
         ];
-        assert_eq!(choose_stream_config(&ranges, Some(96_000)), Some((8, 96_000)));
+        assert_eq!(
+            choose_stream_config(&ranges, Some(96_000)),
+            Some((8, 96_000))
+        );
     }
 
     #[test]
@@ -1549,9 +1563,9 @@ mod tests {
         let frames = fake_engine.snapshot();
         let captured = &frames[frames.len() - 3..];
         assert_eq!(captured.len(), 3);
-        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!((captured[0][0] - 1.0).abs() < 0.01);
         assert!((captured[1][0] - 0.0).abs() < 0.01);
-        assert!((captured[2][0] - 1.0).abs() < 0.01);
+        assert!((captured[2][0] - (-1.0)).abs() < 0.01);
 
         backend.disconnect().unwrap();
     }
@@ -1584,10 +1598,10 @@ mod tests {
         let frames = fake_engine.snapshot();
         let captured = &frames[frames.len() - 4..];
         assert_eq!(captured.len(), 4);
-        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!((captured[0][0] - 1.0).abs() < 0.01);
         assert!(captured[1][0] > -1.0 && captured[1][0] < 1.0);
         assert!(captured[2][0] > -1.0 && captured[2][0] < 1.0);
-        assert!((captured[3][0] - 1.0).abs() < 0.01);
+        assert!((captured[3][0] - (-1.0)).abs() < 0.01);
 
         backend.disconnect().unwrap();
     }
@@ -1623,9 +1637,9 @@ mod tests {
         let frames = fake_engine.snapshot();
         let captured = &frames[frames.len() - 3..];
         assert_eq!(captured.len(), 3);
-        assert!((captured[0][0] - (-1.0)).abs() < 0.01);
+        assert!((captured[0][0] - 1.0).abs() < 0.01);
         assert!(captured[1][0] > -1.0 && captured[1][0] < 1.0);
-        assert!((captured[2][0] - 1.0).abs() < 0.01);
+        assert!((captured[2][0] - (-1.0)).abs() < 0.01);
 
         backend.disconnect().unwrap();
     }
@@ -1664,7 +1678,10 @@ mod tests {
         backend.connect().unwrap();
         let first_runtime = backend.runtime.as_ref().unwrap().clone();
         assert_eq!(first_runtime.sample_rate, 48_000);
-        assert_eq!(first_runtime.queue.capacity(), queue_capacity_for_rate(48_000));
+        assert_eq!(
+            first_runtime.queue.capacity(),
+            queue_capacity_for_rate(48_000)
+        );
         backend.disconnect().unwrap();
 
         fake_engine.sample_rate.store(96_000, Ordering::Release);
@@ -1672,7 +1689,10 @@ mod tests {
         backend.connect().unwrap();
         let second_runtime = backend.runtime.as_ref().unwrap().clone();
         assert_eq!(second_runtime.sample_rate, 96_000);
-        assert_eq!(second_runtime.queue.capacity(), queue_capacity_for_rate(96_000));
+        assert_eq!(
+            second_runtime.queue.capacity(),
+            queue_capacity_for_rate(96_000)
+        );
         backend.disconnect().unwrap();
     }
 
@@ -1685,8 +1705,8 @@ mod tests {
         let mut data = vec![0.0; CHANNELS_XYRGB];
         fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
 
-        assert!((data[0] - 0.1).abs() < 0.0001);
-        assert!((data[1] - 0.2).abs() < 0.0001);
+        assert!((data[0] + 0.1).abs() < 0.0001);
+        assert!((data[1] + 0.2).abs() < 0.0001);
         assert_eq!(data[2], 1.0); // R
         assert_eq!(data[3], 0.0); // G
         assert_eq!(data[4], 1.0); // B
@@ -1701,8 +1721,8 @@ mod tests {
         let mut data = vec![0.0; CHANNELS_XYRGB];
         fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
 
-        assert!((data[0] - 0.25).abs() < 0.0001);
-        assert!((data[1] + 0.5).abs() < 0.0001);
+        assert!((data[0] + 0.25).abs() < 0.0001);
+        assert!((data[1] - 0.5).abs() < 0.0001);
         assert_eq!(data[2], 0.0);
         assert_eq!(data[3], 0.0);
         assert_eq!(data[4], 0.0);
@@ -1718,13 +1738,13 @@ mod tests {
         fill_output_buffer(&mut data, CHANNELS_XYRGB, &runtime);
 
         // First frame: queued point.
-        assert!((data[0] - 0.3).abs() < 0.0001);
-        assert!((data[1] + 0.4).abs() < 0.0001);
+        assert!((data[0] + 0.3).abs() < 0.0001);
+        assert!((data[1] - 0.4).abs() < 0.0001);
         assert!(data[2] > 0.0); // R
 
         // Second frame: underrun; keep XY, blank colors.
-        assert!((data[5] - 0.3).abs() < 0.0001);
-        assert!((data[6] + 0.4).abs() < 0.0001);
+        assert!((data[5] + 0.3).abs() < 0.0001);
+        assert!((data[6] - 0.4).abs() < 0.0001);
         assert_eq!(data[7], 0.0);
         assert_eq!(data[8], 0.0);
         assert_eq!(data[9], 0.0);

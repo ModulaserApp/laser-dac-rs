@@ -346,8 +346,7 @@ impl Stream {
             // Pre-fill color delay line with blanked colors so early points
             // come out dark while galvos settle.
             let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
-            let delay_points =
-                Self::duration_micros_to_points(delay_micros, self.config.pps);
+            let delay_points = Self::duration_micros_to_points(delay_micros, self.config.pps);
             self.state.color_delay_line.clear();
             for _ in 0..delay_points {
                 self.state.color_delay_line.push_back((0, 0, 0, 0));
@@ -620,8 +619,7 @@ impl Stream {
 
         // Apply color delay: read current setting, resize deque, shift colors
         let delay_micros = self.control.inner.color_delay_micros.load(Ordering::SeqCst);
-        let color_delay_points =
-            Self::duration_micros_to_points(delay_micros, self.config.pps);
+        let color_delay_points = Self::duration_micros_to_points(delay_micros, self.config.pps);
 
         if color_delay_points > 0 {
             // Resize deque to match current delay (handles dynamic changes)
@@ -3883,7 +3881,10 @@ mod tests {
         let result = Dac::validate_config(&caps, &cfg);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("PPS 50000"), "expected PPS 50000 in error: {msg}");
+        assert!(
+            msg.contains("PPS 50000"),
+            "expected PPS 50000 in error: {msg}"
+        );
     }
 
     #[test]

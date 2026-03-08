@@ -72,7 +72,9 @@ impl StreamBackend for IdnBackend {
         self.point_buffer
             .extend(points.iter().map(PointXyrgbi::from));
 
-        stream.write_frame(&self.point_buffer).map_err(Error::backend)?;
+        stream
+            .write_frame(&self.point_buffer)
+            .map_err(Error::backend)?;
 
         Ok(WriteOutcome::Written)
     }
