@@ -60,7 +60,7 @@ pub fn default_capabilities() -> DacCapabilities {
     DacCapabilities {
         pps_min: 1,
         pps_max: 100_000,
-        max_points_per_chunk: 4096,
+        max_points_per_chunk: 179,
         output_model: OutputModel::UdpTimed,
     }
 }

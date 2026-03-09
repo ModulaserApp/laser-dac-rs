@@ -14,6 +14,7 @@ use crate::protocols::idn::protocol::{
     IDNVAL_CNKTYPE_LPGRF_WAVE, IDNVAL_CNKTYPE_VOID, IDNVAL_SMOD_LPGRF_CONTINUOUS, MAX_UDP_PAYLOAD,
     XYRGBI_SAMPLE_SIZE, XYRGB_HIGHRES_SAMPLE_SIZE,
 };
+use log::{debug, trace, warn};
 use std::io;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -124,13 +125,29 @@ pub fn connect_with_group(
         .primary_address()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "server has no addresses"))?;
 
+    debug!(
+        "IDN stream: connecting to {} (service_id={}, group={}, address={})",
+        server.hostname, service_id, client_group, address
+    );
+
     let service = server
         .find_service(service_id)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "service not found"))?;
 
+    debug!(
+        "IDN stream: found service '{}' type={:?} flags=0x{:02x}",
+        service.name, service.service_type, service.flags
+    );
+
     // Create UDP socket
     let socket = UdpSocket::bind("0.0.0.0:0")?;
+    let local_addr = socket.local_addr().ok();
     socket.connect(address)?;
+
+    debug!(
+        "IDN stream: UDP socket bound to {:?}, connected to {}",
+        local_addr, address
+    );
 
     let dac = Addressed::new(server.clone(), service.clone(), *address);
 
@@ -207,6 +224,13 @@ impl Stream {
         let content_id =
             IDNFLG_CONTENTID_CHANNELMSG | self.channel_id() | IDNVAL_CNKTYPE_VOID as u16;
 
+        debug!(
+            "IDN stream: sending keepalive (seq={}, timestamp={}, time_since_last={:?})",
+            self.sequence,
+            self.timestamp,
+            self.last_send_time.map(|t| t.elapsed()),
+        );
+
         self.packet_buffer.clear();
 
         let packet_header = PacketHeader {
@@ -223,8 +247,14 @@ impl Stream {
         };
         self.packet_buffer.write_bytes(channel_msg)?;
 
-        self.socket.send(&self.packet_buffer)?;
+        let sent_bytes = self.socket.send(&self.packet_buffer)?;
         self.last_send_time = Some(Instant::now());
+
+        trace!(
+            "IDN stream: keepalive sent ({} bytes, content_id=0x{:04x})",
+            sent_bytes,
+            content_id
+        );
 
         Ok(())
     }
@@ -235,12 +265,27 @@ impl Stream {
     /// as UDP packets with appropriate timing information.
     pub fn write_frame<P: Point>(&mut self, points: &[P]) -> Result<()> {
         if points.is_empty() {
+            trace!("IDN stream: write_frame called with empty points, skipping");
             return Ok(());
         }
+
+        debug!(
+            "IDN stream: write_frame #{} - {} points, pps={}, format={:?}, time_since_last={:?}",
+            self.frame_count,
+            points.len(),
+            self.scan_speed,
+            self.point_format,
+            self.last_send_time.map(|t| t.elapsed()),
+        );
 
         // Pad to minimum sample count by repeating the last point
         let padded;
         let points = if points.len() < MIN_SAMPLES_PER_FRAME {
+            debug!(
+                "IDN stream: padding {} points to minimum {}",
+                points.len(),
+                MIN_SAMPLES_PER_FRAME
+            );
             padded = Self::pad_points(points);
             &padded[..]
         } else {
@@ -248,6 +293,7 @@ impl Stream {
         };
 
         if self.scan_speed == 0 {
+            warn!("IDN stream: scan_speed is 0, cannot send frame");
             return Err(CommunicationError::Protocol(
                 ProtocolError::InvalidPointFormat,
             ));
@@ -255,20 +301,39 @@ impl Stream {
 
         let now = Instant::now();
 
-        // Determine if we need to send config
+        // Determine if we need to send config.
         let needs_config = self.frame_count == 0
             || self.previous_format != Some(self.point_format)
             || self
                 .last_config_time
                 .is_none_or(|t| now.duration_since(t).as_millis() > 250);
 
+        if needs_config {
+            debug!(
+                "IDN stream: will send config (frame_count={}, prev_format={:?}, cur_format={:?}, last_config={:?})",
+                self.frame_count,
+                self.previous_format,
+                self.point_format,
+                self.last_config_time.map(|t| t.elapsed()),
+            );
+        }
+
         if self.previous_format != Some(self.point_format) {
             self.service_data_match = self.service_data_match.wrapping_add(1);
+            debug!(
+                "IDN stream: format changed, service_data_match now {}",
+                self.service_data_match
+            );
         }
 
         // Set non-zero initial timestamp on the first frame
         if self.frame_count == 0 {
             self.timestamp = self.connect_time.elapsed().as_micros() as u64;
+            debug!(
+                "IDN stream: first frame, initial timestamp = {} us ({} ms since connect)",
+                self.timestamp,
+                self.timestamp / 1000
+            );
         }
 
         let bytes_per_sample = P::SIZE_BYTES;
@@ -293,11 +358,27 @@ impl Stream {
         // Calculate how many points fit in one packet, distributing samples
         // evenly across packets to produce uniform timing (matching C++ reference).
         let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / bytes_per_sample;
-        let num_packets = (points.len() / max_points_per_packet) + 1;
+        let num_packets = points.len().div_ceil(max_points_per_packet);
         let points_to_send = points.len() / num_packets;
 
         // Calculate duration for this chunk
         let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
+
+        debug!(
+            "IDN stream: packet layout - service_id={}, channel_id=0x{:04x}, content_id=0x{:04x}, \
+             bytes_per_sample={}, header_size={}, max_pts/pkt={}, num_packets={}, pts_this_pkt={}, \
+             duration={}us, timestamp={}",
+            service_id,
+            self.channel_id(),
+            content_id | IDNVAL_CNKTYPE_LPGRF_WAVE as u16,
+            bytes_per_sample,
+            header_size,
+            max_points_per_packet,
+            num_packets,
+            points_to_send,
+            duration_us,
+            self.timestamp,
+        );
 
         // Build the packet
         self.packet_buffer.clear();
@@ -326,14 +407,28 @@ impl Stream {
         };
         self.packet_buffer.write_bytes(channel_msg)?;
 
+        trace!(
+            "IDN stream: channel_msg total_size={}, content_id=0x{:04x}, timestamp={}",
+            msg_size,
+            channel_msg.content_id,
+            channel_msg.timestamp,
+        );
+
         // Channel config (if needed)
         if needs_config {
             self.write_config(service_id, now)?;
         }
 
         // Sample chunk header
-        let chunk_header = SampleChunkHeader::new(self.sdm_flags(), duration_us as u32);
+        let sdm = self.sdm_flags();
+        let chunk_header = SampleChunkHeader::new(sdm, duration_us as u32);
         self.packet_buffer.write_bytes(chunk_header)?;
+
+        trace!(
+            "IDN stream: sample_chunk sdm_flags=0x{:02x}, duration={}us",
+            sdm,
+            duration_us
+        );
 
         // Write points
         for point in points.iter().take(points_to_send) {
@@ -341,8 +436,21 @@ impl Stream {
         }
 
         // Send the packet
-        self.socket.send(&self.packet_buffer)?;
+        let total_bytes = self.packet_buffer.len();
+        let sent_bytes = self.socket.send(&self.packet_buffer)?;
         self.last_send_time = Some(now);
+
+        if sent_bytes != total_bytes {
+            warn!(
+                "IDN stream: partial send! wanted {} bytes, sent {}",
+                total_bytes, sent_bytes
+            );
+        }
+
+        debug!(
+            "IDN stream: sent frame #{} packet - seq={}, {} bytes, {} points",
+            self.frame_count, seq, sent_bytes, points_to_send,
+        );
 
         // Update state
         self.timestamp += duration_us;
@@ -350,6 +458,11 @@ impl Stream {
 
         // If there are remaining points, send them in subsequent packets
         if points_to_send < points.len() {
+            let remaining = points.len() - points_to_send;
+            debug!(
+                "IDN stream: {} remaining points, sending continuation",
+                remaining
+            );
             self.write_frame_continuation(&points[points_to_send..])?;
         }
 
@@ -372,18 +485,27 @@ impl Stream {
 
         let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / bytes_per_sample;
         // Distribute remaining samples evenly across packets (matching C++ reference)
-        let num_packets = (points.len() / max_points_per_packet) + 1;
+        let num_packets = points.len().div_ceil(max_points_per_packet);
         let points_to_send = points.len() / num_packets;
 
         let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
 
+        trace!(
+            "IDN stream: continuation - {} points remaining, sending {}, duration={}us, timestamp={}",
+            points.len(),
+            points_to_send,
+            duration_us,
+            self.timestamp,
+        );
+
         self.packet_buffer.clear();
 
         // Packet header
+        let seq = self.next_sequence();
         let packet_header = PacketHeader {
             command: IDNCMD_RT_CNLMSG,
             flags: self.client_group,
-            sequence: self.next_sequence(),
+            sequence: seq,
         };
         self.packet_buffer.write_bytes(packet_header)?;
 
@@ -409,8 +531,15 @@ impl Stream {
             self.packet_buffer.write_bytes(point)?;
         }
 
-        self.socket.send(&self.packet_buffer)?;
+        let sent_bytes = self.socket.send(&self.packet_buffer)?;
         self.last_send_time = Some(Instant::now());
+
+        trace!(
+            "IDN stream: continuation sent - seq={}, {} bytes, {} points",
+            seq,
+            sent_bytes,
+            points_to_send,
+        );
 
         self.timestamp += duration_us;
 
@@ -457,7 +586,7 @@ impl Stream {
 
         let now = Instant::now();
 
-        // Determine if we need to send config
+        // Determine if we need to send config.
         let needs_config = self.frame_count == 0
             || self.previous_format != Some(self.point_format)
             || self
@@ -495,7 +624,7 @@ impl Stream {
         // Calculate how many points fit in one packet, distributing samples
         // evenly across packets to produce uniform timing (matching C++ reference).
         let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / bytes_per_sample;
-        let num_packets = (points.len() / max_points_per_packet) + 1;
+        let num_packets = points.len().div_ceil(max_points_per_packet);
         let points_to_send = points.len() / num_packets;
 
         // Calculate duration for this chunk
@@ -571,11 +700,22 @@ impl Stream {
         timeout: Duration,
         expected_seq: u16,
     ) -> Result<AcknowledgeResponse> {
+        trace!(
+            "IDN stream: waiting for ack (expected_seq={}, timeout={:?})",
+            expected_seq,
+            timeout,
+        );
         let ack: AcknowledgeResponse =
             self.recv_response(timeout, IDNCMD_RT_ACKNOWLEDGE, expected_seq)?;
 
+        debug!(
+            "IDN stream: received ack - result_code={}, seq={}",
+            ack.result_code, expected_seq,
+        );
+
         // Check for errors
         if let Some(error) = ResponseError::from_ack_code(ack.result_code) {
+            warn!("IDN stream: ack error: {:?}", error);
             return Err(CommunicationError::Response(error));
         }
 
@@ -697,6 +837,11 @@ impl Stream {
 
     /// Close the streaming connection gracefully.
     pub fn close(&mut self) -> Result<()> {
+        debug!(
+            "IDN stream: closing connection (frames sent: {}, timestamp: {})",
+            self.frame_count, self.timestamp
+        );
+
         self.send_channel_close()?;
 
         // Send session close
@@ -708,6 +853,8 @@ impl Stream {
         };
         self.packet_buffer.write_bytes(close_header)?;
         self.socket.send(&self.packet_buffer)?;
+
+        debug!("IDN stream: close complete");
 
         Ok(())
     }
@@ -739,6 +886,7 @@ impl Stream {
 
     /// Send the channel-close packet (shared by `close` and `close_with_ack`).
     fn send_channel_close(&mut self) -> Result<()> {
+        debug!("IDN stream: sending channel close");
         let service_id = self.dac.service_id();
         let channel_id = self.channel_id();
 
@@ -853,19 +1001,36 @@ impl Stream {
 
     /// Receive a UDP packet into `recv_buffer`, returning the number of bytes received.
     fn recv_into_buffer(&mut self, timeout: Duration) -> Result<usize> {
+        trace!("IDN stream: waiting for response (timeout={:?})", timeout);
         self.socket.set_read_timeout(Some(timeout))?;
 
         let len = match self.socket.recv(&mut self.recv_buffer) {
-            Ok(len) => len,
+            Ok(len) => {
+                trace!(
+                    "IDN stream: received {} bytes: {:02x?}",
+                    len,
+                    &self.recv_buffer[..len.min(32)]
+                );
+                len
+            }
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
+                debug!("IDN stream: receive timeout ({:?})", timeout);
                 return Err(CommunicationError::Response(ResponseError::Timeout));
             }
-            Err(e) => return Err(CommunicationError::Io(e)),
+            Err(e) => {
+                warn!("IDN stream: receive error: {}", e);
+                return Err(CommunicationError::Io(e));
+            }
         };
 
         if len < PacketHeader::SIZE_BYTES {
+            warn!(
+                "IDN stream: received packet too small ({} bytes, need {})",
+                len,
+                PacketHeader::SIZE_BYTES
+            );
             return Err(CommunicationError::Protocol(ProtocolError::BufferTooSmall));
         }
 
@@ -881,6 +1046,22 @@ impl Stream {
             service_id,
             service_mode: IDNVAL_SMOD_LPGRF_CONTINUOUS,
         };
+
+        debug!(
+            "IDN stream: write_config - service_id={}, word_count={}, flags=0x{:02x}, \
+             service_mode=0x{:02x}, format={:?}, descriptors={:?}",
+            service_id,
+            config.word_count,
+            flags,
+            IDNVAL_SMOD_LPGRF_CONTINUOUS,
+            self.point_format,
+            self.point_format
+                .descriptors()
+                .iter()
+                .map(|d| format!("0x{:04x}", d))
+                .collect::<Vec<_>>(),
+        );
+
         self.packet_buffer.write_bytes(config)?;
 
         // Write descriptors (big-endian)
@@ -934,6 +1115,10 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        debug!(
+            "IDN stream: dropping (frames sent: {}, timestamp: {})",
+            self.frame_count, self.timestamp
+        );
         // Try to close gracefully, ignore errors
         let _ = self.close();
     }
@@ -1206,7 +1391,7 @@ mod tests {
     #[test]
     fn test_even_distribution_300_points() {
         // With config headers (Xyrgbi): max_points_per_packet = 177
-        // 300 points: num_packets = (300 / 177) + 1 = 2
+        // 300 points: ceil(300 / 177) = 2
         // points_to_send = 300 / 2 = 150
         let header_size = PacketHeader::SIZE_BYTES
             + ChannelMessageHeader::SIZE_BYTES
@@ -1217,7 +1402,7 @@ mod tests {
         assert_eq!(max_points_per_packet, 177);
 
         let total = 300usize;
-        let num_packets = (total / max_points_per_packet) + 1;
+        let num_packets = total.div_ceil(max_points_per_packet);
         let points_to_send = total / num_packets;
 
         assert_eq!(num_packets, 2);
@@ -1234,9 +1419,10 @@ mod tests {
         let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / PointXyrgbi::SIZE_BYTES;
 
         let total = 500usize;
-        let num_packets = (total / max_points_per_packet) + 1;
+        let num_packets = total.div_ceil(max_points_per_packet);
         let points_to_send = total / num_packets;
 
+        // ceil(500/177) = 3, points_to_send = 500/3 = 166
         assert_eq!(num_packets, 3);
         assert_eq!(points_to_send, 166);
     }
@@ -1251,11 +1437,28 @@ mod tests {
         let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / PointXyrgbi::SIZE_BYTES;
 
         let total = 50usize;
-        let num_packets = (total / max_points_per_packet) + 1;
+        let num_packets = total.div_ceil(max_points_per_packet);
         let points_to_send = total / num_packets;
 
         // Fits in 1 packet, all 50 sent
         assert_eq!(num_packets, 1);
         assert_eq!(points_to_send, 50);
+    }
+
+    #[test]
+    fn test_even_distribution_exact_max() {
+        // When points == max_points_per_packet, should fit in exactly 1 packet
+        let header_size = PacketHeader::SIZE_BYTES
+            + ChannelMessageHeader::SIZE_BYTES
+            + SampleChunkHeader::SIZE_BYTES;
+        let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / PointXyrgbi::SIZE_BYTES;
+        assert_eq!(max_points_per_packet, 179);
+
+        let total = 179usize;
+        let num_packets = total.div_ceil(max_points_per_packet);
+        let points_to_send = total / num_packets;
+
+        assert_eq!(num_packets, 1);
+        assert_eq!(points_to_send, 179);
     }
 }
