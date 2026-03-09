@@ -25,9 +25,9 @@ This crate does not apply any additional processing on points (like blanking), e
 | Helios                     | USB        | ✅       |
 | Ether Dream                | Network    | ✅       |
 | IDN (ILDA Digital Network) | Network    | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
-| LaserCube WiFi             | Network    | ✅       | Recommend to not use through WiFi mode; use LAN only                                                       |
+| LaserCube WiFi             | Network    | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
 | LaserCube USB / Laserdock  | USB        | ✅       |
-| AVB Audio Device           | Network    | ⚠️       | Experimental; audio output backend using CoreAudio (macOS), ASIO (Windows), ALSA (Linux)                    |
+| AVB Audio Device           | Network    | ✅       | Uses CoreAudio (macOS), ASIO (Windows), ALSA. Tested with [LaserAnimation Sollinger](https://laseranimation.com). (Linux)                                                   |
 
 All DACs have been manually verified to work.
 
@@ -124,16 +124,16 @@ Each backend handles conversion to its native format internally.
 
 ## Data Types
 
-| Type           | Description                                      |
-| -------------- | ------------------------------------------------ |
-| `DacInfo`      | DAC metadata (name, type, capabilities)          |
-| `Dac`          | Opened DAC ready for streaming                   |
-| `Stream`       | Active streaming session                         |
-| `ReconnectingSession` | Stream wrapper with automatic reconnect   |
-| `StreamConfig` | Stream settings (PPS, buffering, color delay, blanking) |
-| `ChunkRequest`  | Request info for filling point buffer            |
-| `LaserPoint`   | Single point with position (f32) and color (u16) |
-| `DacType`      | Enum of supported DAC hardware                   |
+| Type                  | Description                                             |
+| --------------------- | ------------------------------------------------------- |
+| `DacInfo`             | DAC metadata (name, type, capabilities)                 |
+| `Dac`                 | Opened DAC ready for streaming                          |
+| `Stream`              | Active streaming session                                |
+| `ReconnectingSession` | Stream wrapper with automatic reconnect                 |
+| `StreamConfig`        | Stream settings (PPS, buffering, color delay, blanking) |
+| `ChunkRequest`        | Request info for filling point buffer                   |
+| `LaserPoint`          | Single point with position (f32) and color (u16)        |
+| `DacType`             | Enum of supported DAC hardware                          |
 
 ## Advanced Configuration
 
@@ -219,6 +219,7 @@ cargo run -p idn-simulator -- --hostname "Test-DAC" --service-name "Simulator" -
 ```
 
 **Features:**
+
 - Responds to IDN discovery (appears as a real DAC)
 - Renders received laser frames as connected lines
 - Handles blanking (intensity=0 creates gaps between shapes)

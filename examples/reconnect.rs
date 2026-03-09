@@ -45,6 +45,13 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire) - persists across reconnects
     session.control().arm()?;
 
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = session.control();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
+
     // Run the stream - reconnects automatically on disconnect
     let shape = args.shape;
     let scale = args.scale;

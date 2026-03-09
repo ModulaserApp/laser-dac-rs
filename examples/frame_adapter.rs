@@ -69,6 +69,13 @@ fn main() -> Result<()> {
     // Arm the output
     stream.control().arm()?;
 
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
+
     // Run stream with frame adapter using zero-allocation API
     let exit = stream.run(
         move |req: &ChunkRequest, buffer: &mut [LaserPoint]| adapter.fill_chunk(req, buffer),

@@ -48,6 +48,13 @@ fn main() -> Result<()> {
     // Arm the output
     stream.control().arm()?;
 
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
+
     let shape = args.shape;
     let scale = args.scale;
 
