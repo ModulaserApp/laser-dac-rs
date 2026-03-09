@@ -8,10 +8,8 @@
 mod common;
 
 use clap::Parser;
-use common::{fill_points, Args};
-use laser_dac::{
-    list_devices, ChunkRequest, LaserPoint, ReconnectingSession, Result, StreamConfig,
-};
+use common::{make_producer, Args};
+use laser_dac::{list_devices, ReconnectingSession, Result, StreamConfig};
 use std::time::Duration;
 
 fn main() -> Result<()> {
@@ -53,10 +51,9 @@ fn main() -> Result<()> {
     .expect("failed to set Ctrl+C handler");
 
     // Run the stream - reconnects automatically on disconnect
-    let shape = args.shape;
-    let scale = args.scale;
+    let mut producer = make_producer(args.shape, args.points, args.scale);
     session.run(
-        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, scale, req, buffer),
+        move |req, buffer| producer(req, buffer),
         |err| eprintln!("Stream error: {}", err),
     )?;
 

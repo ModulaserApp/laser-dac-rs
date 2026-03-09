@@ -3,10 +3,9 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, StreamInstant};
+use laser_dac::{ChunkRequest, ChunkResult, Frame, FrameAdapter, LaserPoint};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(about = "Send test patterns to connected laser DACs")]
@@ -15,9 +14,9 @@ pub struct Args {
     #[arg(value_enum, default_value_t = Shape::Triangle)]
     pub shape: Shape,
 
-    /// Minimum number of points per frame
+    /// Number of points per frame (detail level for static shapes)
     #[arg(short, long, default_value_t = 200)]
-    pub min_points: usize,
+    pub points: usize,
 
     /// Geometry scale around center (0,0); range: (0, 10]
     #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
@@ -46,52 +45,66 @@ impl Shape {
     }
 }
 
-/// Fill points for the given shape into the buffer (streaming API).
+/// Generate a complete frame of points for a static shape.
 ///
-/// The `req` parameter provides timing info for time-based shapes.
-/// Returns `ChunkResult::Filled(n)` where n is the number of points written.
-pub fn fill_points(
-    shape: Shape,
-    scale: f32,
-    req: &ChunkRequest,
-    buffer: &mut [LaserPoint],
-) -> ChunkResult {
-    let n_points = req.target_points.min(buffer.len());
+/// The frame contains exactly `n_points` points representing one full cycle
+/// of the shape. This frame is then streamed continuously by wrapping around
+/// — the DAC never waits for frame boundaries.
+///
+/// For time-based shapes (OrbitingCircle, Audio), use `make_producer` instead.
+pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
+    let mut frame = vec![LaserPoint::default(); n_points];
     match shape {
-        Shape::Triangle => fill_triangle_points(buffer, n_points),
-        Shape::Circle => fill_circle_points(buffer, n_points),
-        Shape::OrbitingCircle => fill_orbiting_circle_points(req, buffer, n_points),
-        Shape::TestPattern => fill_test_pattern_points(buffer, n_points),
-        Shape::Audio => {
-            audio::fill_audio_points(req, buffer, n_points, &audio::AudioConfig::default())
+        Shape::Triangle => fill_triangle_points(&mut frame, n_points),
+        Shape::Circle => fill_circle_points(&mut frame, n_points),
+        Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
+        Shape::OrbitingCircle | Shape::Audio => {
+            panic!("time-based shapes don't have static frames; use make_producer()")
         }
     }
     if (scale - 1.0).abs() > f32::EPSILON {
-        scale_points(&mut buffer[..n_points], scale);
+        scale_points(&mut frame[..n_points], scale);
     }
-    ChunkResult::Filled(n_points)
+    frame
 }
 
-/// Create points for frame-based usage (no stream timing).
+/// Create a producer callback for streaming any shape to a DAC.
 ///
-/// For shapes that need stream time (OrbitingCircle, Audio), this produces
-/// a static frame at t=0. Use `fill_points` with a real ChunkRequest
-/// for proper time-based animation.
-#[allow(dead_code)] // Used by frame_adapter example, not all examples
-pub fn create_frame_points(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
-    // Create a dummy request for frame-based usage
-    let dummy_req = ChunkRequest {
-        start: StreamInstant::new(0),
-        pps: 30_000,
-        min_points: n_points,
-        target_points: n_points,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
-    };
-    let mut buffer = vec![LaserPoint::default(); n_points];
-    fill_points(shape, scale, &dummy_req, &mut buffer);
-    buffer
+/// For static shapes (Triangle, Circle, TestPattern), this generates a frame
+/// once and streams it continuously using `FrameAdapter` — the cursor wraps
+/// around at the end of the frame, just like real laser software works.
+///
+/// For time-based shapes (OrbitingCircle, Audio), the callback computes each
+/// point from the stream timestamp, producing smooth continuous animation.
+pub fn make_producer(
+    shape: Shape,
+    points: usize,
+    scale: f32,
+) -> Box<dyn FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send> {
+    match shape {
+        Shape::OrbitingCircle => Box::new(move |req, buffer| {
+            let n = req.target_points.min(buffer.len());
+            fill_orbiting_circle_points(req, buffer, n);
+            if (scale - 1.0).abs() > f32::EPSILON {
+                scale_points(&mut buffer[..n], scale);
+            }
+            ChunkResult::Filled(n)
+        }),
+        Shape::Audio => {
+            let audio_config = audio::AudioConfig::default();
+            Box::new(move |req, buffer| {
+                let n = req.target_points.min(buffer.len());
+                audio::fill_audio_points(req, buffer, n, &audio_config);
+                ChunkResult::Filled(n)
+            })
+        }
+        _ => {
+            let frame = generate_frame(shape, points, scale);
+            let mut adapter = FrameAdapter::new();
+            adapter.update(Frame::new(frame));
+            Box::new(move |req, buffer| adapter.fill_chunk(req, buffer))
+        }
+    }
 }
 
 fn parse_scale(value: &str) -> Result<f32, String> {
@@ -292,6 +305,25 @@ fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_frame_produces_correct_point_count() {
+        let frame = generate_frame(Shape::Circle, 200, 1.0);
+        assert_eq!(frame.len(), 200);
+        // First 5 points are blanked (leading blank), rest have color
+        assert!(frame[..5].iter().all(|p| p.intensity == 0));
+        assert!(frame[5..].iter().any(|p| p.intensity != 0));
+    }
+
+    #[test]
+    fn generate_frame_applies_scale() {
+        let unscaled = generate_frame(Shape::Circle, 100, 1.0);
+        let scaled = generate_frame(Shape::Circle, 100, 0.5);
+        // Scaled points should be closer to center
+        let unscaled_max_x = unscaled.iter().map(|p| p.x.abs()).fold(0.0f32, f32::max);
+        let scaled_max_x = scaled.iter().map(|p| p.x.abs()).fold(0.0f32, f32::max);
+        assert!(scaled_max_x < unscaled_max_x);
+    }
 
     #[test]
     fn scale_points_scales_xy_around_origin() {

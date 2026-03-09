@@ -12,7 +12,7 @@
 mod common;
 
 use clap::Parser;
-use common::{fill_points, Shape};
+use common::{make_producer, Shape};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, StreamInstant};
 use std::path::PathBuf;
@@ -25,8 +25,12 @@ struct Args {
     #[arg(value_enum, default_value_t = Shape::Triangle)]
     shape: Shape,
 
-    /// Points per chunk
-    #[arg(short, long, default_value_t = 512)]
+    /// Points per frame (detail level for static shapes)
+    #[arg(short, long, default_value_t = 200)]
+    points: usize,
+
+    /// Points per chunk when writing to WAV
+    #[arg(long, default_value_t = 512)]
     chunk_points: usize,
 
     /// Point/sample rate (Hz)
@@ -73,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut writer = WavWriter::create(&args.output, spec)?;
 
+    let mut producer = make_producer(args.shape, args.points, args.scale);
     let mut current = 0_u64;
     while current < total_points {
         let remaining = total_points - current;
@@ -89,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut points = vec![LaserPoint::default(); n_points];
-        let written = match fill_points(args.shape, args.scale, &req, &mut points) {
+        let written = match producer(&req, &mut points) {
             ChunkResult::Filled(n) => n.min(points.len()),
             ChunkResult::Starved | ChunkResult::End => n_points,
         };

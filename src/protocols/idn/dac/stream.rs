@@ -171,6 +171,14 @@ pub fn connect_with_group(
 }
 
 impl Stream {
+    fn needs_config(
+        frame_count: u64,
+        previous_format: Option<PointFormat>,
+        point_format: PointFormat,
+    ) -> bool {
+        frame_count == 0 || previous_format != Some(point_format)
+    }
+
     /// Get a reference to the addressed DAC.
     pub fn dac(&self) -> &Addressed {
         &self.dac
@@ -224,7 +232,7 @@ impl Stream {
         let content_id =
             IDNFLG_CONTENTID_CHANNELMSG | self.channel_id() | IDNVAL_CNKTYPE_VOID as u16;
 
-        debug!(
+        trace!(
             "IDN stream: sending keepalive (seq={}, timestamp={}, time_since_last={:?})",
             self.sequence,
             self.timestamp,
@@ -269,7 +277,7 @@ impl Stream {
             return Ok(());
         }
 
-        debug!(
+        trace!(
             "IDN stream: write_frame #{} - {} points, pps={}, format={:?}, time_since_last={:?}",
             self.frame_count,
             points.len(),
@@ -281,7 +289,7 @@ impl Stream {
         // Pad to minimum sample count by repeating the last point
         let padded;
         let points = if points.len() < MIN_SAMPLES_PER_FRAME {
-            debug!(
+            trace!(
                 "IDN stream: padding {} points to minimum {}",
                 points.len(),
                 MIN_SAMPLES_PER_FRAME
@@ -302,14 +310,11 @@ impl Stream {
         let now = Instant::now();
 
         // Determine if we need to send config.
-        let needs_config = self.frame_count == 0
-            || self.previous_format != Some(self.point_format)
-            || self
-                .last_config_time
-                .is_none_or(|t| now.duration_since(t).as_millis() > 250);
+        let needs_config =
+            Self::needs_config(self.frame_count, self.previous_format, self.point_format);
 
         if needs_config {
-            debug!(
+            trace!(
                 "IDN stream: will send config (frame_count={}, prev_format={:?}, cur_format={:?}, last_config={:?})",
                 self.frame_count,
                 self.previous_format,
@@ -320,7 +325,7 @@ impl Stream {
 
         if self.previous_format != Some(self.point_format) {
             self.service_data_match = self.service_data_match.wrapping_add(1);
-            debug!(
+            trace!(
                 "IDN stream: format changed, service_data_match now {}",
                 self.service_data_match
             );
@@ -329,7 +334,7 @@ impl Stream {
         // Set non-zero initial timestamp on the first frame
         if self.frame_count == 0 {
             self.timestamp = self.connect_time.elapsed().as_micros() as u64;
-            debug!(
+            trace!(
                 "IDN stream: first frame, initial timestamp = {} us ({} ms since connect)",
                 self.timestamp,
                 self.timestamp / 1000
@@ -364,7 +369,7 @@ impl Stream {
         // Calculate duration for this chunk
         let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
 
-        debug!(
+        trace!(
             "IDN stream: packet layout - service_id={}, channel_id=0x{:04x}, content_id=0x{:04x}, \
              bytes_per_sample={}, header_size={}, max_pts/pkt={}, num_packets={}, pts_this_pkt={}, \
              duration={}us, timestamp={}",
@@ -447,9 +452,12 @@ impl Stream {
             );
         }
 
-        debug!(
+        trace!(
             "IDN stream: sent frame #{} packet - seq={}, {} bytes, {} points",
-            self.frame_count, seq, sent_bytes, points_to_send,
+            self.frame_count,
+            seq,
+            sent_bytes,
+            points_to_send,
         );
 
         // Update state
@@ -459,7 +467,7 @@ impl Stream {
         // If there are remaining points, send them in subsequent packets
         if points_to_send < points.len() {
             let remaining = points.len() - points_to_send;
-            debug!(
+            trace!(
                 "IDN stream: {} remaining points, sending continuation",
                 remaining
             );
@@ -587,11 +595,8 @@ impl Stream {
         let now = Instant::now();
 
         // Determine if we need to send config.
-        let needs_config = self.frame_count == 0
-            || self.previous_format != Some(self.point_format)
-            || self
-                .last_config_time
-                .is_none_or(|t| now.duration_since(t).as_millis() > 250);
+        let needs_config =
+            Self::needs_config(self.frame_count, self.previous_format, self.point_format);
 
         if self.previous_format != Some(self.point_format) {
             self.service_data_match = self.service_data_match.wrapping_add(1);
@@ -708,9 +713,10 @@ impl Stream {
         let ack: AcknowledgeResponse =
             self.recv_response(timeout, IDNCMD_RT_ACKNOWLEDGE, expected_seq)?;
 
-        debug!(
+        trace!(
             "IDN stream: received ack - result_code={}, seq={}",
-            ack.result_code, expected_seq,
+            ack.result_code,
+            expected_seq,
         );
 
         // Check for errors
@@ -1047,7 +1053,7 @@ impl Stream {
             service_mode: IDNVAL_SMOD_LPGRF_CONTINUOUS,
         };
 
-        debug!(
+        trace!(
             "IDN stream: write_config - service_id={}, word_count={}, flags=0x{:02x}, \
              service_mode=0x{:02x}, format={:?}, descriptors={:?}",
             service_id,
@@ -1313,6 +1319,29 @@ mod tests {
 
         sdm = sdm.wrapping_add(1);
         assert_eq!(sdm, 0);
+    }
+
+    #[test]
+    fn config_needed_on_first_frame() {
+        assert!(Stream::needs_config(0, None, PointFormat::Xyrgbi));
+    }
+
+    #[test]
+    fn config_needed_on_format_change() {
+        assert!(Stream::needs_config(
+            42,
+            Some(PointFormat::Xyrgbi),
+            PointFormat::XyrgbHighRes
+        ));
+    }
+
+    #[test]
+    fn config_not_needed_for_periodic_refresh_only() {
+        assert!(!Stream::needs_config(
+            42,
+            Some(PointFormat::Xyrgbi),
+            PointFormat::Xyrgbi
+        ));
     }
 
     // -----------------------------------------------------------------------------------------

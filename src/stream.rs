@@ -175,6 +175,10 @@ struct StreamState {
     current_instant: StreamInstant,
     /// Points scheduled ahead of current_instant.
     scheduled_ahead: u64,
+    /// Fractional points consumed but not yet subtracted from scheduled_ahead.
+    /// Accumulates sub-point remainders to prevent stalls when per-iteration
+    /// elapsed time is too small to yield a whole point (the u64 truncation bug).
+    fractional_consumed: f64,
 
     // Pre-allocated buffers (no per-chunk allocation in hot path)
     /// Buffer for callback to fill points into.
@@ -224,6 +228,7 @@ impl StreamState {
         Self {
             current_instant: StreamInstant::new(0),
             scheduled_ahead: 0,
+            fractional_consumed: 0.0,
             chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk_len: 0,
@@ -293,6 +298,18 @@ impl Stream {
             control: StreamControl::new(control_tx, config.color_delay),
             control_rx,
             state: StreamState::new(max_points, startup_blank_points, &config),
+        }
+    }
+
+    /// Compute the software buffer target for scheduler pacing.
+    ///
+    /// Timed-UDP backends already carry playback timing in each chunk, so
+    /// burst-filling a synthetic software queue only creates back-to-back
+    /// packets on the wire. Keep only a bounded lead for jitter absorption.
+    fn scheduler_target_buffer_points(&self) -> u64 {
+        match self.info.caps.output_model {
+            OutputModel::UdpTimed => (self.info.caps.max_points_per_chunk / 2) as u64,
+            OutputModel::UsbFrameSwap | OutputModel::NetworkFifo => self.state.target_buffer_points,
         }
     }
 
@@ -374,10 +391,13 @@ impl Stream {
 
         self.control.stop()?;
 
-        // Directly close shutter and stop backend (defense-in-depth)
+        // Directly close shutter, stop, and disconnect backend (defense-in-depth).
+        // Disconnect is needed for protocols like IDN where stop() only blanks
+        // but the DAC keeps replaying its buffer until the session is closed.
         if let Some(backend) = &mut self.backend {
             let _ = backend.set_shutter(false);
-            backend.stop()?;
+            let _ = backend.stop();
+            backend.disconnect()?;
         }
 
         Ok(())
@@ -489,15 +509,20 @@ impl Stream {
             // Decrement scheduled_ahead based on elapsed time since last iteration.
             // This is critical for backends without queued_points() - without this,
             // scheduled_ahead would never decrease and target_points would stay 0.
+            // Use fractional accumulator to avoid the truncation-to-zero bug: when
+            // loop iterations are faster than 1/pps, (elapsed * pps) as u64 rounds
+            // to 0 and scheduled_ahead never decrements, causing a permanent stall.
             let now = Instant::now();
             let elapsed = now.duration_since(last_iteration);
-            let points_consumed = (elapsed.as_secs_f64() * pps) as u64;
+            let consumed_f64 = elapsed.as_secs_f64() * pps + self.state.fractional_consumed;
+            let points_consumed = consumed_f64 as u64;
+            self.state.fractional_consumed = consumed_f64 - points_consumed as f64;
             self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
             last_iteration = now;
 
             // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
-            let target_points = self.state.target_buffer_points;
+            let target_points = self.scheduler_target_buffer_points();
 
             // 3. If buffer is above target, sleep until it drains to target
             // Note: use > not >= so we call producer when exactly at target
@@ -1163,6 +1188,11 @@ mod tests {
             }
         }
 
+        fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
+            self.caps.max_points_per_chunk = max_points_per_chunk;
+            self
+        }
+
         fn with_would_block_count(mut self, count: usize) -> Self {
             self.would_block_count = Arc::new(AtomicUsize::new(count));
             self
@@ -1199,6 +1229,11 @@ mod tests {
             Self {
                 inner: TestBackend::new(),
             }
+        }
+
+        fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
+            self.inner = self.inner.with_max_points_per_chunk(max_points_per_chunk);
+            self
         }
 
         fn with_output_model(mut self, model: OutputModel) -> Self {
@@ -3853,6 +3888,74 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_timed_does_not_burst_fill_target_buffer() {
+        use std::thread;
+
+        let mut backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        let write_count = backend.inner.write_count.clone();
+        backend.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: backend.dac_type(),
+            caps: backend.caps().clone(),
+        };
+        let cfg = StreamConfig::new(1000)
+            .with_target_buffer(Duration::from_millis(500))
+            .with_min_buffer(Duration::from_millis(100));
+        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let control = stream.control();
+
+        let handle = thread::spawn(move || {
+            stream.run(
+                |req, buffer| {
+                    let n = req.target_points.max(req.min_points).min(buffer.len());
+                    for point in &mut buffer[..n] {
+                        *point = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ChunkResult::Filled(n)
+                },
+                |_err| {},
+            )
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        let writes = write_count.load(Ordering::SeqCst);
+
+        control.stop().unwrap();
+        let exit = handle.join().unwrap().unwrap();
+
+        assert_eq!(exit, RunExit::Stopped);
+        assert_eq!(
+            writes, 1,
+            "UdpTimed should pace one timed chunk, not burst-fill the software target buffer"
+        );
+    }
+
+    #[test]
+    fn test_udp_timed_keeps_bounded_lead_instead_of_large_burst() {
+        let backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000);
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        assert_eq!(stream.scheduler_target_buffer_points(), 89);
+    }
+
+    #[test]
     fn test_validate_config_rejects_pps_below_min() {
         // Helios-like caps: pps_min = 7
         let caps = DacCapabilities {
@@ -3898,5 +4001,59 @@ mod tests {
         };
         let cfg = StreamConfig::new(30_000);
         assert!(Dac::validate_config(&caps, &cfg).is_ok());
+    }
+
+    // =========================================================================
+    // Fractional consumed accumulator: prevent scheduled_ahead stall
+    // =========================================================================
+
+    #[test]
+    fn test_fractional_consumed_prevents_stall() {
+        // Regression test: when scheduled_ahead equals target_buffer_points
+        // exactly, the run loop used to stall because (elapsed * pps) as u64
+        // truncated to 0 on sub-microsecond iterations. The fractional
+        // accumulator ensures sub-point remainders carry over until they add
+        // up to a whole point.
+        use std::thread;
+        use std::time::Duration;
+
+        let backend = NoQueueTestBackend::new();
+        let write_count = backend.inner.write_count.clone();
+        let stream = make_test_stream(backend);
+        let control = stream.control();
+
+        // Run the stream in a thread. If the bug regresses, the stream
+        // stalls in a tight loop and never writes after the initial burst.
+        let handle = thread::spawn(move || {
+            stream.run(
+                |req, buffer| {
+                    let n = req.target_points.min(buffer.len()).min(100);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ChunkResult::Filled(n)
+                },
+                |_err| {},
+            )
+        });
+
+        // Wait enough for the target buffer to be filled AND for subsequent
+        // writes to happen (proving the stream isn't stalled).
+        thread::sleep(Duration::from_millis(800));
+
+        let writes = write_count.load(Ordering::SeqCst);
+
+        // At 30 kpps with 500ms target buffer, the initial burst is ~15
+        // writes of 1000 points. After 800ms, the buffer should have
+        // drained enough for many more writes. If stalled, writes would
+        // be stuck at ~15.
+        assert!(
+            writes > 20,
+            "expected >20 writes after 800ms, got {writes} — stream likely stalled"
+        );
+
+        control.stop().unwrap();
+        let exit = handle.join().unwrap().unwrap();
+        assert_eq!(exit, RunExit::Stopped);
     }
 }
