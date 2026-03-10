@@ -308,7 +308,7 @@ impl Stream {
     /// packets on the wire. Keep only a bounded lead for jitter absorption.
     fn scheduler_target_buffer_points(&self) -> u64 {
         match self.info.caps.output_model {
-            OutputModel::UdpTimed => (self.info.caps.max_points_per_chunk / 2) as u64,
+            OutputModel::UdpTimed => self.info.caps.max_points_per_chunk as u64,
             OutputModel::UsbFrameSwap | OutputModel::NetworkFifo => self.state.target_buffer_points,
         }
     }
@@ -899,6 +899,19 @@ impl Stream {
         // Use cached config values (avoid per-iteration as_secs_f64() calls)
         let target_buffer_secs = self.state.target_buffer_secs;
         let min_buffer_secs = self.state.min_buffer_secs;
+
+        if self.info.caps.output_model == OutputModel::UdpTimed {
+            let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
+            return ChunkRequest {
+                start,
+                pps,
+                min_points: max_points,
+                target_points: max_points,
+                buffered_points,
+                buffered,
+                device_queued_points,
+            };
+        }
 
         // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
         let deficit_target = (target_buffer_secs - buffered_secs).max(0.0);
@@ -3888,7 +3901,7 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_timed_does_not_burst_fill_target_buffer() {
+    fn test_udp_timed_prefills_two_packets_not_entire_target_buffer() {
         use std::thread;
 
         let mut backend = NoQueueTestBackend::new()
@@ -3930,13 +3943,13 @@ mod tests {
 
         assert_eq!(exit, RunExit::Stopped);
         assert_eq!(
-            writes, 1,
-            "UdpTimed should pace one timed chunk, not burst-fill the software target buffer"
+            writes, 2,
+            "UdpTimed should prefill a small lead, not burst-fill the entire software target buffer"
         );
     }
 
     #[test]
-    fn test_udp_timed_keeps_bounded_lead_instead_of_large_burst() {
+    fn test_udp_timed_keeps_one_packet_lead_target() {
         let backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
@@ -3952,7 +3965,31 @@ mod tests {
         let cfg = StreamConfig::new(30_000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
-        assert_eq!(stream.scheduler_target_buffer_points(), 89);
+        assert_eq!(stream.scheduler_target_buffer_points(), 179);
+    }
+
+    #[test]
+    fn test_udp_timed_build_fill_request_uses_full_packet() {
+        let backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+        stream.state.scheduled_ahead = 120;
+
+        let req = stream.build_fill_request(179, 120);
+
+        assert_eq!(req.target_points, 179);
+        assert_eq!(req.min_points, 179);
     }
 
     #[test]
