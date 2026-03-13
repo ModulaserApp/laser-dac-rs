@@ -109,7 +109,9 @@ impl BufferEstimator {
     pub fn record_send(&mut self, message_number: u8, points_sent: u16, now: Instant) {
         let current_fullness = self.estimated_buffer_fullness(now);
         self.last_data_sent_time = Some(now);
-        self.last_data_sent_buffer_size = current_fullness + points_sent;
+        self.last_data_sent_buffer_size = current_fullness
+            .saturating_add(points_sent)
+            .min(self.capacity);
         self.message_times.insert(message_number, now);
     }
 
@@ -453,5 +455,16 @@ mod tests {
         est.set_point_rate(60000);
         // At 60000 pps, after 50ms from t: consumed = 3000, fullness = 0
         assert_eq!(est.estimated_buffer_fullness(later), 0);
+    }
+
+    #[test]
+    fn send_fullness_is_clamped_to_capacity() {
+        let mut est = BufferEstimator::new(6000, 30000);
+        let t = now();
+
+        est.record_send(0, 5900, t);
+        est.record_send(1, 500, t);
+
+        assert_eq!(est.estimated_buffer_fullness(t), 6000);
     }
 }

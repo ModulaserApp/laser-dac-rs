@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 /// Default command socket receive timeout.
 const CMD_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Initial playback rate used during stream setup.
+const INITIAL_POINT_RATE: u32 = 30_000;
+
 /// Delay between sending chunks of a frame (microseconds).
 const CHUNK_DELAY_US: u64 = 10;
 
@@ -72,7 +75,7 @@ impl Stream {
         data_socket.connect(data_addr)?;
 
         let mut stream = Stream {
-            buffer_estimator: BufferEstimator::new(dac.max_buffer_space, 0),
+            buffer_estimator: BufferEstimator::new(dac.max_buffer_space, INITIAL_POINT_RATE),
             dac: dac.clone(),
             cmd_socket,
             data_socket,
@@ -105,10 +108,10 @@ impl Stream {
         self.dac.status.output_enabled = true;
 
         // Set initial rate (30 kHz is a safe default)
-        let initial_rate = 30000;
-        self.send_command_repeated(&command::set_rate(initial_rate))?;
-        self.current_rate = initial_rate;
-        self.dac.status.point_rate = initial_rate;
+        self.send_command_repeated(&command::set_rate(INITIAL_POINT_RATE))?;
+        self.current_rate = INITIAL_POINT_RATE;
+        self.dac.status.point_rate = INITIAL_POINT_RATE;
+        self.buffer_estimator.set_point_rate(INITIAL_POINT_RATE);
 
         // Perform warmup
         self.warmup()?;
@@ -237,8 +240,8 @@ impl Stream {
             self.send_command_repeated(&command::set_rate(rate))?;
             self.current_rate = rate;
             self.dac.status.point_rate = rate;
-            self.buffer_estimator.set_point_rate(rate);
         }
+        self.buffer_estimator.set_point_rate(rate);
         Ok(())
     }
 
