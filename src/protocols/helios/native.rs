@@ -98,34 +98,7 @@ impl HeliosDac {
     /// Writes and outputs a frame to the DAC.
     pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
         if let HeliosDac::Open { handle, .. } = self {
-            let mut frame_buffer = Vec::with_capacity(frame.points.len() * 7 + 5);
-
-            // this is a bug workaround, the mcu won't correctly receive transfers with these sizes
-            let mut pps_actual = frame.pps;
-            let mut num_of_points_actual = frame.points.len();
-            if (frame.points.len() - 45).is_multiple_of(64) {
-                num_of_points_actual -= 1;
-                // adjust pps to keep the same frame duration even with one less point
-                pps_actual = frame.pps
-                    * ((num_of_points_actual as f32) / (frame.points.len() as f32) + 0.5f32) as u32;
-            }
-
-            for point in frame.points {
-                frame_buffer.push((point.coordinate.x >> 4) as u8);
-                frame_buffer.push(
-                    ((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8,
-                );
-                frame_buffer.push((point.coordinate.y & 0xFF) as u8);
-                frame_buffer.push(point.color.r);
-                frame_buffer.push(point.color.g);
-                frame_buffer.push(point.color.b);
-                frame_buffer.push(point.intensity);
-            }
-            frame_buffer.push((pps_actual & 0xFF) as u8);
-            frame_buffer.push((pps_actual >> 8) as u8);
-            frame_buffer.push((num_of_points_actual & 0xFF) as u8);
-            frame_buffer.push((num_of_points_actual >> 8) as u8);
-            frame_buffer.push(frame.flags.bits());
+            let frame_buffer = encode_frame(frame);
 
             handle.write_bulk(
                 ENDPOINT_BULK_OUT,
@@ -232,6 +205,49 @@ impl From<rusb::Device<rusb::Context>> for HeliosDac {
     }
 }
 
+fn encode_frame(frame: Frame) -> Vec<u8> {
+    let requested_points = frame.points.len();
+    let (pps_actual, num_of_points_actual) = adjusted_frame_params(frame.pps, requested_points);
+
+    let mut frame_buffer = Vec::with_capacity(num_of_points_actual * 7 + 5);
+    for point in frame.points.into_iter().take(num_of_points_actual) {
+        frame_buffer.push((point.coordinate.x >> 4) as u8);
+        frame_buffer
+            .push(((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8);
+        frame_buffer.push((point.coordinate.y & 0xFF) as u8);
+        frame_buffer.push(point.color.r);
+        frame_buffer.push(point.color.g);
+        frame_buffer.push(point.color.b);
+        frame_buffer.push(point.intensity);
+    }
+    frame_buffer.push((pps_actual & 0xFF) as u8);
+    frame_buffer.push((pps_actual >> 8) as u8);
+    frame_buffer.push((num_of_points_actual & 0xFF) as u8);
+    frame_buffer.push((num_of_points_actual >> 8) as u8);
+    frame_buffer.push(frame.flags.bits());
+
+    frame_buffer
+}
+
+fn adjusted_frame_params(requested_pps: u32, requested_points: usize) -> (u32, usize) {
+    if requested_points >= 45 && (requested_points - 45).is_multiple_of(64) {
+        let actual_points = requested_points - 1;
+        let pps_actual = (((requested_pps as u64) * (actual_points as u64))
+            + (requested_points as u64 / 2))
+            / (requested_points as u64);
+        log::debug!(
+            "helios transfer-size workaround applied: requested_points={}, actual_points={}, requested_pps={}, actual_pps={}",
+            requested_points,
+            actual_points,
+            requested_pps,
+            pps_actual
+        );
+        (pps_actual as u32, actual_points)
+    } else {
+        (requested_pps, requested_points)
+    }
+}
+
 /// Compute the USB bulk transfer timeout for a frame buffer.
 ///
 /// Matches the Helios C++ SDK formula: `8 + (bufferSize >> 5)` ms.
@@ -256,6 +272,15 @@ pub enum HeliosDacError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::helios::{Color, Coordinate, Point, WriteFrameFlags};
+
+    fn test_point() -> Point {
+        Point {
+            coordinate: Coordinate { x: 0x123, y: 0x456 },
+            color: Color::new(0x11, 0x22, 0x33),
+            intensity: 0x44,
+        }
+    }
 
     #[test]
     fn test_bulk_transfer_timeout_matches_sdk() {
@@ -276,5 +301,34 @@ mod tests {
 
         // Empty buffer → still 8ms minimum
         assert_eq!(bulk_transfer_timeout(0), Duration::from_millis(8));
+    }
+
+    #[test]
+    fn test_adjusted_frame_params_leaves_small_frames_unchanged() {
+        assert_eq!(adjusted_frame_params(30_000, 1), (30_000, 1));
+        assert_eq!(adjusted_frame_params(30_000, 44), (30_000, 44));
+    }
+
+    #[test]
+    fn test_adjusted_frame_params_applies_problem_size_workaround() {
+        assert_eq!(adjusted_frame_params(30_000, 45), (29_333, 44));
+        assert_eq!(adjusted_frame_params(30_000, 109), (29_725, 108));
+    }
+
+    #[test]
+    fn test_encode_frame_truncates_problematic_transfer_payload() {
+        let points = vec![test_point(); 109];
+        let buffer = encode_frame(Frame::new_with_flags(
+            30_000,
+            points,
+            WriteFrameFlags::SINGLE_MODE,
+        ));
+
+        assert_eq!(buffer.len(), 108 * 7 + 5);
+
+        let footer = &buffer[buffer.len() - 5..];
+        assert_eq!(u16::from_le_bytes([footer[0], footer[1]]), 29_725);
+        assert_eq!(u16::from_le_bytes([footer[2], footer[3]]), 108);
+        assert_eq!(footer[4], WriteFrameFlags::SINGLE_MODE.bits());
     }
 }
