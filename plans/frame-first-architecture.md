@@ -615,6 +615,8 @@ A different cadence:
 
 The hardware frame is composed at the moment of sending — not precomputed at submission time. This ensures the ending (self-loop or transition) always reflects the actual pending state, regardless of timing mismatches between the application's frame rate and the DAC's playback rate.
 
+Padding to `frame_capacity()`: when the composed drawable (base + ending) is shorter than the device's frame capacity, the remaining space is filled. For blanking endings, the last blank lands at the target position, so the drawable can be cycled to fill the frame. For SamePoint endings, pad with blanked points held at the ending position to avoid introducing jumps.
+
 For streaming mode on a frame-swap backend (quantized streaming):
 - The scheduler calls the user callback with `target_points == frame_capacity()`
 - The callback fills exactly one frame's worth of points
@@ -852,6 +854,31 @@ For frame-swap DACs, the blanking ending is composed at the moment the hardware 
 ### FIFO DAC behavior
 
 For FIFO DACs, blanking is stitched dynamically at the cursor wrap point in `fill_chunk()`. When the cursor reaches the end of the drawable, the engine checks the pending state, computes the appropriate transition, and continues filling the buffer. This is exactly the `PathChunkRenderer` model.
+
+### Before first frame
+
+If no frame has been submitted yet, the engine has no `current_base`. Both `fill_chunk()` and `compose_hardware_frame()` should output blanked points at origin `(0, 0)` until the first frame arrives via `set_pending()`.
+
+### Complete scenario matrix
+
+All scenarios funnel through `compute_transition()`. The only variables are the target point and whether a pending frame exists.
+
+| Scenario | DAC type | Seam result | What happens |
+|---|---|---|---|
+| A→A (self-loop) | FIFO | Blanking | Loop blanking appended at cursor wrap, cursor resets |
+| A→A (self-loop) | FIFO | SamePoint | Last point omitted, cursor wraps seamlessly |
+| A→A (self-loop) | Frame-swap | Blanking | Composed with loop blanking, cycled to fill frame |
+| A→A (self-loop) | Frame-swap | SamePoint | Composed without last point, cycled seamlessly |
+| A→B (transition) | FIFO | Blanking | Transition blanking stitched at cursor wrap, B promoted |
+| A→B (transition) | FIFO | SamePoint | Last point omitted at wrap, B promoted seamlessly |
+| A→B (transition) | Frame-swap | Blanking | Transition frame composed with blanking A→B, B promoted, next frame is B self-loop |
+| A→B (transition) | Frame-swap | SamePoint | Frame composed without last point, B promoted, next frame is B self-loop |
+| A→C (frame skip) | FIFO | Blanking | B overwritten by `set_pending()`, transition blanking goes A→C directly |
+| A→C (frame skip) | FIFO | SamePoint | B overwritten, last point omitted, C starts seamlessly |
+| A→C (frame skip) | Frame-swap | Blanking | B overwritten, transition frame goes A→C, C promoted |
+| A→C (frame skip) | Frame-swap | SamePoint | B overwritten, same as A→B SamePoint but targeting C |
+
+A→B and A→C are mechanically identical. `set_pending()` overwrites the pending slot (latest-wins), and `compute_transition()` only sees whatever is pending at the moment of delivery. Frame skip is not a special case — it is the natural result of latest-wins semantics.
 
 ---
 
