@@ -855,13 +855,38 @@ For FIFO DACs, blanking is stitched dynamically at the cursor wrap point in `fil
 
 ---
 
-## Migration path
+## Current vs proposed pipeline
 
-### Phase 1: Trait split + frame-swap scheduling
+### Current pipeline
 
-**Backend implementors** (internal to crate):
+1. `open_device()` → `Dac`
+2. `Dac::start_stream(config)` → `Stream`
+3. `Stream::run(callback)` — callback fills arbitrary-size chunks
+4. All backends go through `try_write_chunk()` regardless of transport type
+5. Frame users wrap a `FrameAdapter` into the streaming callback manually
+6. Seam handling, blanking, frame transitions — all downstream responsibility
+7. Frame-swap DACs (Helios) receive whatever chunk size the scheduler chose, leading to tiny replacement frames and visual artifacts
 
-Each protocol backend changes from `impl StreamBackend for XxxBackend` to either `impl FifoBackend for XxxBackend` or `impl FrameSwapBackend for XxxBackend`. The method signatures are nearly identical to today — the main change is renaming `try_write_chunk` to `try_write_points` or `write_frame`.
+### Proposed pipeline (frame mode — recommended)
+
+1. `open_device()` → `Dac`
+2. `Dac::start_frame_session(config)` → `FrameSession`
+3. `FrameSession::send_frame(AuthoredFrame)` — submit frames, latest-wins
+4. Library owns seam handling, blanking, transitions via `PresentationEngine`
+5. Frame-swap backends: scheduler calls `compose_hardware_frame()` when device is ready, composing the correct ending just-in-time, then sends via `write_frame()`
+6. FIFO backends: scheduler calls `fill_chunk()` which traverses the drawable with cursor-based delivery, stitching blanking at frame boundaries
+
+### Proposed pipeline (streaming mode — expert)
+
+1. `open_device()` → `Dac`
+2. `Dac::start_stream(config)` → `Stream`
+3. `Stream::run(callback)` — same callback API as today
+4. FIFO backends: unchanged behavior, variable chunk sizes
+5. Frame-swap backends: quantized streaming — `target_points == frame_capacity()`, callback fills one frame's worth, sent via `write_frame()`
+
+### What changes for backend implementors
+
+Each protocol backend changes from `impl StreamBackend` to either `impl FifoBackend` or `impl FrameSwapBackend`. The method signatures are nearly identical — the main change is renaming `try_write_chunk` to `try_write_points` or `write_frame`, and for frame-swap backends, separating the readiness check into `is_ready_for_frame()`.
 
 Example for Helios:
 
@@ -895,56 +920,9 @@ impl FrameSwapBackend for HeliosBackend {
 }
 ```
 
-**Compatibility bridge**:
+### What changes for downstream consumers (Modulaser)
 
-During Phase 1, a temporary `StreamBackend` adapter can wrap either backend type so the existing `Stream::run()` code path continues to work unchanged. This allows incremental migration without breaking the streaming API.
-
-```rust
-/// Temporary adapter: wraps a BackendKind as a StreamBackend
-/// for backward compatibility during migration.
-pub(crate) struct BackendAdapter {
-    kind: BackendKind,
-}
-
-impl StreamBackend for BackendAdapter {
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        match &mut self.kind {
-            BackendKind::Fifo(b) => b.try_write_points(pps, points),
-            BackendKind::FrameSwap(b) => {
-                if !b.is_ready_for_frame() {
-                    return Ok(WriteOutcome::WouldBlock);
-                }
-                b.write_frame(pps, points)
-            }
-        }
-    }
-    // ... delegate other methods
-}
-```
-
-This adapter gets removed in Phase 3 when `Stream` is updated to use `BackendKind` directly.
-
-**Public API impact**: None. `Dac::start_stream()` continues to work. `list_devices()` and `open_device()` are unchanged.
-
-**Deliverable**: The type boundary becomes honest. Helios artifacts caused by tiny replacement writes are eliminated.
-
-### Phase 2: Presentation engine
-
-**New code only.** The `presentation/` module is added. No existing APIs change.
-
-The engine follows the base frame / drawable model: base frames are cached, endings are composed reactively based on pending state. `compute_transition()` handles all seam/blanking decisions. Modulaser can begin migrating `PathChunkRenderer` logic to use the library's `PresentationEngine` and `SeamConfig`.
-
-**Deliverable**: Seam/transition behavior is owned by the library. The engine correctly handles self-loop, frame switch, and frame skip scenarios for both FIFO and frame-swap delivery.
-
-### Phase 3: Public frame API + retire FrameAdapter
-
-**New API**: `Dac::start_frame_session()`, `FrameSession`, `FrameSessionConfig`.
-
-**Deprecated**: `FrameAdapter`, `SharedFrameAdapter`. These are replaced by `FrameSession` which handles everything the adapter did plus seam handling, transport-correct delivery, and proper lifecycle management.
-
-**Breaking change**: If Decision 1 (f32 colors) is taken, this is the release that ships it. All downstream code updates point construction.
-
-**Modulaser migration**:
+`FrameAdapter` and `SharedFrameAdapter` are replaced by `FrameSession`. Modulaser's `PathChunkRenderer` is replaced by the library's `PresentationEngine`. Seam tolerance, loop blanking, and transition blanking are configured via `SeamConfig` instead of custom application code.
 
 ```rust
 // Before (current):
@@ -955,15 +933,19 @@ stream.run(
     |err| log::error!("{}", err),
 )?;
 
-// After (Phase 3):
+// After:
 let session = device.start_frame_session(config)?;
 session.control().arm()?;
 session.send_frame(AuthoredFrame::new(points));
 ```
 
-Modulaser's `PathChunkRenderer` is replaced by the library's `PresentationEngine`. Seam tolerance, loop blanking, and transition blanking are configured via `SeamConfig` instead of custom application code.
+### What stays the same
 
-**Deliverable**: Downstream apps can adopt the frame-first path without reimplementing `PathChunkRenderer`. The public API reflects the new architecture.
+- `list_devices()`, `open_device()`, device discovery — unchanged
+- `Dac::start_stream()` and `Stream::run()` — still available as expert/FIFO path
+- `StreamControl` / `SessionControl` arm/disarm/stop model — unchanged
+- `ReconnectingSession` — extended to support frame sessions, existing streaming usage unchanged
+- Per-protocol implementations — same structure, different trait
 
 ---
 
@@ -985,39 +967,38 @@ Modulaser's `PathChunkRenderer` is replaced by the library's `PresentationEngine
 
 ## Testing strategy
 
-### Phase 1
+### Trait split
 
-- Unit tests for `BackendAdapter` compatibility bridge
-- Existing `stream.rs` tests pass unchanged via adapter
-- New tests: `FrameSwapBackend` mock that verifies:
-  - `write_frame` is never called with fewer than `frame_capacity()` points
+- `FrameSwapBackend` mock that verifies:
   - `write_frame` is never called when `is_ready_for_frame()` returns false
+  - scheduler always sends `frame_capacity()`-sized frames
+- `FifoBackend` mock that verifies variable-size writes and `WouldBlock` backpressure
+- Existing `stream.rs` tests continue to pass
 
-### Phase 2
+### Presentation engine
 
 - `compute_transition` unit tests:
   - SamePoint returned when endpoints match within tolerance
   - Blanking returned when endpoints differ
   - correct blank point count and interpolation
-- `PresentationEngine::fill_chunk` (FIFO) tests:
+- `PresentationEngine::fill_chunk` (FIFO delivery) tests:
   - correct cursor traversal with wrap
   - self-loop ending computed correctly at wrap point
   - pending frame swap at wrap point with transition blanking
   - SamePoint transition at wrap (last point omitted)
   - latest-wins: pending overwritten before consumed
-- `PresentationEngine::compose_hardware_frame` (frame-swap) tests:
+- `PresentationEngine::compose_hardware_frame` (frame-swap delivery) tests:
   - self-loop ending when no pending
   - transition ending when pending exists
   - pending replaced mid-play (frame skip) produces correct transition
   - SamePoint suppression for closed shapes
   - composed frame respects frame_capacity padding
 
-### Phase 3
+### Frame session
 
 - Integration tests: `FrameSession` with mock FIFO and frame-swap backends
 - Verify frame delivery cadence matches backend type
 - `ReconnectingSession::run_frame_session` reconnection test
-- Deprecation warnings on `FrameAdapter` usage
 
 ---
 
