@@ -272,12 +272,27 @@ pub struct Stream {
 }
 
 impl Stream {
+    const UDP_TIMED_SLEEP_SLICE: Duration = Duration::from_millis(1);
+    const UDP_TIMED_BUSY_WAIT_THRESHOLD: Duration = Duration::from_micros(500);
+
     /// Convert a duration in microseconds to a point count at the given PPS, rounding up.
     fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
         if micros == 0 {
             0
         } else {
             (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
+        }
+    }
+
+    fn udp_timed_sleep_slice(remaining: Duration) -> Option<Duration> {
+        if remaining <= Self::UDP_TIMED_BUSY_WAIT_THRESHOLD {
+            None
+        } else {
+            Some(
+                remaining
+                    .saturating_sub(Self::UDP_TIMED_BUSY_WAIT_THRESHOLD)
+                    .min(Self::UDP_TIMED_SLEEP_SLICE),
+            )
         }
     }
 
@@ -303,14 +318,10 @@ impl Stream {
 
     /// Compute the software buffer target for scheduler pacing.
     ///
-    /// Timed-UDP backends already carry playback timing in each chunk, so
-    /// burst-filling a synthetic software queue only creates back-to-back
-    /// packets on the wire. Keep only a bounded lead for jitter absorption.
+    /// Even for timed-UDP backends, this target is the timestamp/lookahead
+    /// cushion against host/network jitter.
     fn scheduler_target_buffer_points(&self) -> u64 {
-        match self.info.caps.output_model {
-            OutputModel::UdpTimed => self.info.caps.max_points_per_chunk as u64,
-            OutputModel::UsbFrameSwap | OutputModel::NetworkFifo => self.state.target_buffer_points,
-        }
+        self.state.target_buffer_points
     }
 
     /// Returns the device info.
@@ -499,6 +510,7 @@ impl Stream {
         // that don't report queued_points(). This prevents stalls when buffered
         // equals target_points exactly.
         let mut last_iteration = Instant::now();
+        let mut last_stats_log = Instant::now();
 
         loop {
             // 1. Check for stop request
@@ -524,12 +536,32 @@ impl Stream {
             let buffered = self.estimate_buffer_points();
             let target_points = self.scheduler_target_buffer_points();
 
+            // Log scheduler state periodically (~2Hz)
+            if now.duration_since(last_stats_log) >= Duration::from_millis(500) {
+                let lead_ms = self.state.scheduled_ahead as f64 / pps * 1000.0;
+                let target_ms = target_points as f64 / pps * 1000.0;
+                log::debug!(
+                    "scheduler: lead={:.1}ms target={:.1}ms ahead={} buffered={} target_pts={}",
+                    lead_ms,
+                    target_ms,
+                    self.state.scheduled_ahead,
+                    buffered,
+                    target_points,
+                );
+                last_stats_log = now;
+            }
+
             // 3. If buffer is above target, sleep until it drains to target
             // Note: use > not >= so we call producer when exactly at target
             if buffered > target_points {
                 let excess_points = buffered - target_points;
                 let sleep_time = Duration::from_secs_f64(excess_points as f64 / pps);
-                if self.sleep_with_control_check(sleep_time)? {
+                let stop = if self.info.caps.output_model == OutputModel::UdpTimed {
+                    self.sleep_until_with_control_check(Instant::now() + sleep_time)?
+                } else {
+                    self.sleep_with_control_check(sleep_time)?
+                };
+                if stop {
                     return Ok(RunExit::Stopped);
                 }
                 continue; // Re-check buffer after sleep
@@ -608,6 +640,29 @@ impl Stream {
         }
 
         Ok(false)
+    }
+
+    /// Sleep until a deadline with finer granularity for timed-UDP pacing.
+    ///
+    /// Uses coarse sleeps first, then yields near the deadline to reduce wake-up jitter.
+    fn sleep_until_with_control_check(&mut self, deadline: std::time::Instant) -> Result<bool> {
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+
+            let remaining = deadline.duration_since(now);
+            if let Some(slice) = Self::udp_timed_sleep_slice(remaining) {
+                std::thread::sleep(slice);
+            } else {
+                std::thread::yield_now();
+            }
+
+            if self.process_control_messages() {
+                return Ok(true);
+            }
+        }
     }
 
     /// Write points from chunk_buffer to the backend.
@@ -1139,6 +1194,8 @@ impl Dac {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
 
+        let cfg = Self::apply_backend_buffer_defaults(&self.info.caps, cfg);
+
         Self::validate_config(&self.info.caps, &cfg)?;
 
         // Connect the backend if not already connected
@@ -1149,6 +1206,26 @@ impl Dac {
         let stream = Stream::with_backend(self.info.clone(), backend, cfg);
 
         Ok((stream, self.info))
+    }
+
+    fn apply_backend_buffer_defaults(
+        caps: &DacCapabilities,
+        mut cfg: StreamConfig,
+    ) -> StreamConfig {
+        let untouched_defaults = cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER
+            && cfg.min_buffer == StreamConfig::DEFAULT_MIN_BUFFER;
+
+        if untouched_defaults
+            && matches!(
+                caps.output_model,
+                OutputModel::NetworkFifo | OutputModel::UdpTimed
+            )
+        {
+            cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
+            cfg.min_buffer = StreamConfig::NETWORK_DEFAULT_MIN_BUFFER;
+        }
+
+        cfg
     }
 
     fn validate_config(caps: &DacCapabilities, cfg: &StreamConfig) -> Result<()> {
@@ -1402,6 +1479,72 @@ mod tests {
 
         let (stream, _info) = result.unwrap();
         assert!(stream.backend.as_ref().unwrap().is_connected());
+    }
+
+    #[test]
+    fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::NetworkFifo;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+        assert_eq!(
+            stream.config.target_buffer,
+            StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
+        );
+        assert_eq!(
+            stream.config.min_buffer,
+            StreamConfig::NETWORK_DEFAULT_MIN_BUFFER
+        );
+    }
+
+    #[test]
+    fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::UdpTimed;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let cfg = StreamConfig::new(30_000)
+            .with_target_buffer(Duration::from_millis(12))
+            .with_min_buffer(Duration::from_millis(4));
+        let (stream, _info) = device.start_stream(cfg).unwrap();
+
+        assert_eq!(stream.config.target_buffer, Duration::from_millis(12));
+        assert_eq!(stream.config.min_buffer, Duration::from_millis(4));
+    }
+
+    #[test]
+    fn test_device_start_stream_keeps_usb_defaults() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::UsbFrameSwap;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+        assert_eq!(
+            stream.config.target_buffer,
+            StreamConfig::DEFAULT_TARGET_BUFFER
+        );
+        assert_eq!(stream.config.min_buffer, StreamConfig::DEFAULT_MIN_BUFFER);
     }
 
     #[test]
@@ -3901,13 +4044,10 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_timed_prefills_two_packets_not_entire_target_buffer() {
-        use std::thread;
-
+    fn test_udp_timed_prefills_configured_lead_using_packet_chunks() {
         let mut backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
-        let write_count = backend.inner.write_count.clone();
         backend.connect().unwrap();
 
         let info = DacInfo {
@@ -3919,37 +4059,29 @@ mod tests {
         let cfg = StreamConfig::new(1000)
             .with_target_buffer(Duration::from_millis(500))
             .with_min_buffer(Duration::from_millis(100));
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
-        let control = stream.control();
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
 
-        let handle = thread::spawn(move || {
-            stream.run(
-                |req, buffer| {
-                    let n = req.target_points.max(req.min_points).min(buffer.len());
-                    for point in &mut buffer[..n] {
-                        *point = LaserPoint::blanked(0.0, 0.0);
-                    }
-                    ChunkResult::Filled(n)
-                },
-                |_err| {},
-            )
-        });
+        let mut writes = 0;
+        while stream.state.scheduled_ahead <= stream.scheduler_target_buffer_points() {
+            let buffered = stream.estimate_buffer_points();
+            let req = stream.build_fill_request(179, buffered);
+            assert_eq!(req.target_points, 179);
+            stream.record_write(req.target_points, false);
+            writes += 1;
+        }
 
-        thread::sleep(Duration::from_millis(50));
-        let writes = write_count.load(Ordering::SeqCst);
-
-        control.stop().unwrap();
-        let exit = handle.join().unwrap().unwrap();
-
-        assert_eq!(exit, RunExit::Stopped);
         assert_eq!(
-            writes, 2,
-            "UdpTimed should prefill a small lead, not burst-fill the entire software target buffer"
+            writes, 3,
+            "UdpTimed should need multiple full-packet writes to reach configured lead"
+        );
+        assert!(
+            stream.state.scheduled_ahead > stream.scheduler_target_buffer_points(),
+            "simulation should end only after target lead is exceeded"
         );
     }
 
     #[test]
-    fn test_udp_timed_keeps_one_packet_lead_target() {
+    fn test_udp_timed_uses_configured_target_buffer_for_lead() {
         let backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
@@ -3965,7 +4097,7 @@ mod tests {
         let cfg = StreamConfig::new(30_000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
-        assert_eq!(stream.scheduler_target_buffer_points(), 179);
+        assert_eq!(stream.scheduler_target_buffer_points(), 600);
     }
 
     #[test]
@@ -3990,6 +4122,22 @@ mod tests {
 
         assert_eq!(req.target_points, 179);
         assert_eq!(req.min_points, 179);
+    }
+
+    #[test]
+    fn test_udp_timed_sleep_slice_caps_coarse_sleep() {
+        assert_eq!(
+            Stream::udp_timed_sleep_slice(Duration::from_millis(5)),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn test_udp_timed_sleep_slice_switches_to_busy_wait_near_deadline() {
+        assert_eq!(
+            Stream::udp_timed_sleep_slice(Duration::from_micros(400)),
+            None
+        );
     }
 
     #[test]

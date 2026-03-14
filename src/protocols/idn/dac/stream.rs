@@ -11,13 +11,29 @@ use crate::protocols::idn::protocol::{
     IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_SERVICE_PARAMS_RESPONSE,
     IDNCMD_UNIT_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_RESPONSE, IDNFLG_CHNCFG_CLOSE,
     IDNFLG_CHNCFG_ROUTING, IDNFLG_CONTENTID_CHANNELMSG, IDNFLG_CONTENTID_CONFIG_LSTFRG,
-    IDNVAL_CNKTYPE_LPGRF_WAVE, IDNVAL_CNKTYPE_VOID, IDNVAL_SMOD_LPGRF_CONTINUOUS, MAX_UDP_PAYLOAD,
-    XYRGBI_SAMPLE_SIZE, XYRGB_HIGHRES_SAMPLE_SIZE,
+    IDNVAL_CNKTYPE_LPGRF_FRAME, IDNVAL_CNKTYPE_LPGRF_FRAME_FIRST,
+    IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL, IDNVAL_CNKTYPE_LPGRF_WAVE, IDNVAL_CNKTYPE_VOID,
+    IDNVAL_SMOD_LPGRF_CONTINUOUS, IDNVAL_SMOD_LPGRF_DISCRETE, MAX_UDP_PAYLOAD, XYRGBI_SAMPLE_SIZE,
+    XYRGB_HIGHRES_SAMPLE_SIZE,
 };
 use log::{debug, trace, warn};
 use std::io;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
+
+/// Frame mode for IDN streaming.
+///
+/// In **Wave** mode the receiver splices chunks end-to-end; any processing gap
+/// causes a brief blank (flicker). In **Frame** mode the receiver loops the
+/// previous frame until the next one arrives, making it resilient to jitter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FrameMode {
+    /// Wave (continuous) mode — chunks are spliced end-to-end.
+    #[default]
+    Wave,
+    /// Frame (discrete) mode — the receiver loops the previous frame until the next arrives.
+    Frame,
+}
 
 /// Point format for streaming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +115,8 @@ pub struct Stream {
     last_send_time: Option<Instant>,
     /// Time when the stream was created (for non-zero initial timestamp)
     connect_time: Instant,
+    /// Frame mode (wave vs frame)
+    frame_mode: FrameMode,
 }
 
 /// Connect to an IDN server for streaming.
@@ -167,6 +185,7 @@ pub fn connect_with_group(
         recv_buffer: [0u8; 64],
         last_send_time: None,
         connect_time: Instant::now(),
+        frame_mode: FrameMode::Wave,
     })
 }
 
@@ -202,6 +221,16 @@ impl Stream {
     /// Set the point format for subsequent frames.
     pub fn set_point_format(&mut self, format: PointFormat) {
         self.point_format = format;
+    }
+
+    /// Get the current frame mode.
+    pub fn frame_mode(&self) -> FrameMode {
+        self.frame_mode
+    }
+
+    /// Set the frame mode (wave vs frame).
+    pub fn set_frame_mode(&mut self, mode: FrameMode) {
+        self.frame_mode = mode;
     }
 
     /// Check if a keepalive is needed to maintain the link.
@@ -369,13 +398,16 @@ impl Stream {
         // Calculate duration for this chunk
         let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
 
+        let is_only = num_packets == 1;
+        let cnk_type = self.chunk_type(true, is_only);
+
         trace!(
             "IDN stream: packet layout - service_id={}, channel_id=0x{:04x}, content_id=0x{:04x}, \
              bytes_per_sample={}, header_size={}, max_pts/pkt={}, num_packets={}, pts_this_pkt={}, \
              duration={}us, timestamp={}",
             service_id,
             self.channel_id(),
-            content_id | IDNVAL_CNKTYPE_LPGRF_WAVE as u16,
+            content_id | cnk_type as u16,
             bytes_per_sample,
             header_size,
             max_points_per_packet,
@@ -407,7 +439,7 @@ impl Stream {
 
         let channel_msg = ChannelMessageHeader {
             total_size: msg_size as u16,
-            content_id: content_id | IDNVAL_CNKTYPE_LPGRF_WAVE as u16,
+            content_id: content_id | cnk_type as u16,
             timestamp: (self.timestamp & 0xFFFF_FFFF) as u32,
         };
         self.packet_buffer.write_bytes(channel_msg)?;
@@ -523,9 +555,10 @@ impl Stream {
             + SampleChunkHeader::SIZE_BYTES
             + points_to_send * bytes_per_sample;
 
+        let cnk_type = self.chunk_type(false, false);
         let channel_msg = ChannelMessageHeader {
             total_size: msg_size as u16,
-            content_id: content_id | IDNVAL_CNKTYPE_LPGRF_WAVE as u16,
+            content_id: content_id | cnk_type as u16,
             timestamp: (self.timestamp & 0xFFFF_FFFF) as u32,
         };
         self.packet_buffer.write_bytes(channel_msg)?;
@@ -654,9 +687,11 @@ impl Stream {
             + SampleChunkHeader::SIZE_BYTES
             + points_to_send * bytes_per_sample;
 
+        let is_only = num_packets == 1;
+        let cnk_type = self.chunk_type(true, is_only);
         let channel_msg = ChannelMessageHeader {
             total_size: msg_size as u16,
-            content_id: content_id | IDNVAL_CNKTYPE_LPGRF_WAVE as u16,
+            content_id: content_id | cnk_type as u16,
             timestamp: (self.timestamp & 0xFFFF_FFFF) as u32,
         };
         self.packet_buffer.write_bytes(channel_msg)?;
@@ -1046,11 +1081,15 @@ impl Stream {
     /// Write channel config + descriptors into the packet buffer and update state.
     fn write_config(&mut self, service_id: u8, now: Instant) -> Result<()> {
         let flags = IDNFLG_CHNCFG_ROUTING | self.sdm_flags();
+        let service_mode = match self.frame_mode {
+            FrameMode::Wave => IDNVAL_SMOD_LPGRF_CONTINUOUS,
+            FrameMode::Frame => IDNVAL_SMOD_LPGRF_DISCRETE,
+        };
         let config = ChannelConfigHeader {
             word_count: self.point_format.word_count(),
             flags,
             service_id,
-            service_mode: IDNVAL_SMOD_LPGRF_CONTINUOUS,
+            service_mode,
         };
 
         trace!(
@@ -1059,7 +1098,7 @@ impl Stream {
             service_id,
             config.word_count,
             flags,
-            IDNVAL_SMOD_LPGRF_CONTINUOUS,
+            service_mode,
             self.point_format,
             self.point_format
                 .descriptors()
@@ -1079,6 +1118,16 @@ impl Stream {
         self.last_config_time = Some(now);
         self.previous_format = Some(self.point_format);
         Ok(())
+    }
+
+    /// Return the chunk type byte for the current frame mode and packet position.
+    fn chunk_type(&self, is_first: bool, is_only: bool) -> u8 {
+        match self.frame_mode {
+            FrameMode::Wave => IDNVAL_CNKTYPE_LPGRF_WAVE,
+            FrameMode::Frame if is_only => IDNVAL_CNKTYPE_LPGRF_FRAME,
+            FrameMode::Frame if is_first => IDNVAL_CNKTYPE_LPGRF_FRAME_FIRST,
+            FrameMode::Frame => IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL,
+        }
     }
 
     /// Compute the IDN channel ID from the service ID.
