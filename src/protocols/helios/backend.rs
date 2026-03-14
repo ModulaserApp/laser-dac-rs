@@ -98,13 +98,29 @@ impl StreamBackend for HeliosBackend {
         };
 
         match dac.status().map_err(map_err)? {
-            DeviceStatus::Ready => {}
-            DeviceStatus::NotReady => return Ok(WriteOutcome::WouldBlock),
+            DeviceStatus::Ready => {
+                log::trace!("helios ready for frame: points={}", points.len());
+            }
+            DeviceStatus::NotReady => {
+                log::trace!(
+                    "helios not ready yet: pending frame attempt points={}",
+                    points.len()
+                );
+                return Ok(WriteOutcome::WouldBlock);
+            }
         }
 
         let helios_points: Vec<HeliosPoint> = points.iter().map(|p| p.into()).collect();
         let helios_frame = Frame::new(pps, helios_points);
 
+        if points.len() <= 64 {
+            log::debug!(
+                "helios writing small frame: points={}, pps={pps}",
+                points.len()
+            );
+        } else {
+            log::trace!("helios writing frame: points={}, pps={pps}", points.len());
+        }
         dac.write_frame(helios_frame).map_err(map_err)?;
 
         Ok(WriteOutcome::Written)
