@@ -83,8 +83,8 @@ name = "callback"
 path = "examples/callback.rs"
 
 [[example]]
-name = "frame_adapter"
-path = "examples/frame_adapter.rs"
+name = "frame_session"
+path = "examples/frame_session.rs"
 
 [[example]]
 name = "audio"

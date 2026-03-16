@@ -3,7 +3,7 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, ChunkResult, Frame, FrameAdapter, LaserPoint};
+use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
 
@@ -71,8 +71,8 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
 /// Create a producer callback for streaming any shape to a DAC.
 ///
 /// For static shapes (Triangle, Circle, TestPattern), this generates a frame
-/// once and streams it continuously using `FrameAdapter` — the cursor wraps
-/// around at the end of the frame, just like real laser software works.
+/// once and cycles through it with a cursor — the index wraps at the end,
+/// just like real laser software works.
 ///
 /// For time-based shapes (OrbitingCircle, Audio), the callback computes each
 /// point from the stream timestamp, producing smooth continuous animation.
@@ -100,9 +100,18 @@ pub fn make_producer(
         }
         _ => {
             let frame = generate_frame(shape, points, scale);
-            let mut adapter = FrameAdapter::new();
-            adapter.update(Frame::new(frame));
-            Box::new(move |req, buffer| adapter.fill_chunk(req, buffer))
+            let mut cursor = 0usize;
+            Box::new(move |req, buffer| {
+                let n = req.target_points.min(buffer.len());
+                for i in 0..n {
+                    buffer[i] = frame[cursor];
+                    cursor += 1;
+                    if cursor >= frame.len() {
+                        cursor = 0;
+                    }
+                }
+                ChunkResult::Filled(n)
+            })
         }
     }
 }
