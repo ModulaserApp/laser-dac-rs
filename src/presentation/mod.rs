@@ -523,7 +523,13 @@ impl FrameSession {
             }
 
             // 3. Estimate buffer
-            let buffered = if let Some(hw) = backend.queued_points() {
+            // UdpTimed: use software estimate only. Hardware feedback is too
+            // laggy for burst-sent UDP — mixing it in via min() causes the
+            // scheduler to think the buffer is empty right after a write and
+            // flood the device.
+            let buffered = if is_udp_timed {
+                scheduled_ahead
+            } else if let Some(hw) = backend.queued_points() {
                 hw.min(scheduled_ahead)
             } else {
                 scheduled_ahead
