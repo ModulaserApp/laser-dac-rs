@@ -522,14 +522,8 @@ impl FrameSession {
                 engine.set_pending(Arc::new(frame));
             }
 
-            // 3. Estimate buffer
-            // UdpTimed: use software estimate only. Hardware feedback is too
-            // laggy for burst-sent UDP — mixing it in via min() causes the
-            // scheduler to think the buffer is empty right after a write and
-            // flood the device.
-            let buffered = if is_udp_timed {
-                scheduled_ahead
-            } else if let Some(hw) = backend.queued_points() {
+            // 3. Estimate buffer (conservative: min of hardware and software)
+            let buffered = if let Some(hw) = backend.queued_points() {
                 hw.min(scheduled_ahead)
             } else {
                 scheduled_ahead
@@ -573,9 +567,17 @@ impl FrameSession {
             }
             last_armed = is_armed;
 
-            // 8. Fill chunk from engine — fill the deficit to reach target buffer.
-            let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
-            let target_points = ((deficit * pps).ceil() as usize).min(max_points);
+            // 8. Fill chunk from engine.
+            // UdpTimed: always fill max_points for constant packet cadence
+            // (matches Stream::run() behavior). The buffer estimator's hw
+            // feedback prevents overflow — it tracks sends and decays them.
+            // Other FIFO: fill the deficit to reach target buffer level.
+            let target_points = if is_udp_timed {
+                max_points
+            } else {
+                let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
+                ((deficit * pps).ceil() as usize).min(max_points)
+            };
             if target_points == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
