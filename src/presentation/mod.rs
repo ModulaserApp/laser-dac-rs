@@ -89,18 +89,21 @@ impl From<Vec<LaserPoint>> for AuthoredFrame {
 /// stream. Return an empty vec to skip transition points entirely.
 pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> Vec<LaserPoint> + Send>;
 
-/// Default transition: 8 linearly-interpolated blanked points.
+/// Default transition: linearly-interpolated blanked points scaled by distance.
 ///
-/// Produces 8 points with XY linearly interpolated from `from` to `to`,
-/// all with colors and intensity set to zero. This gives the galvo mirrors
-/// time to travel between frames without visible artifacts.
-///
-/// Always produces exactly 8 points, even when `from` and `to` are identical.
+/// Produces blanked points with XY linearly interpolated from `from` to `to`.
+/// The count scales with the distance between points: 15 points minimum (for
+/// overlapping positions), up to 150 points for a full-range diagonal jump.
+/// At 30kpps this gives 0.5ms–5ms of blanking — enough for typical galvo
+/// settling times.
 pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
-    const N: usize = 8;
-    (0..N)
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
+    let n = (15.0 + distance * 48.0).ceil() as usize; // 15..~150
+    (0..n)
         .map(|i| {
-            let t = (i + 1) as f32 / (N + 1) as f32;
+            let t = (i + 1) as f32 / (n + 1) as f32;
             LaserPoint::blanked(
                 from.x + (to.x - from.x) * t,
                 from.y + (to.y - from.y) * t,

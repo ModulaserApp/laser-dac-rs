@@ -66,11 +66,20 @@ fn test_authored_frame_clone_shares_data() {
 // =========================================================================
 
 #[test]
-fn test_default_transition_produces_8_points() {
-    let from = make_point(0.0, 0.0);
-    let to = make_point(1.0, 1.0);
-    let result = default_transition(&from, &to);
-    assert_eq!(result.len(), 8);
+fn test_default_transition_scales_with_distance() {
+    // Close together: ~15 points
+    let near = default_transition(&make_point(0.0, 0.0), &make_point(0.0, 0.0));
+    assert_eq!(near.len(), 15);
+
+    // Far apart (diagonal ~2.83): ~150 points
+    let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
+    assert!(far.len() >= 100, "far distance should produce many points, got {}", far.len());
+    assert!(far.len() <= 160, "should cap around 150, got {}", far.len());
+
+    // Medium distance
+    let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
+    assert!(mid.len() > near.len(), "medium should be more than near");
+    assert!(mid.len() < far.len(), "medium should be less than far");
 }
 
 #[test]
@@ -109,11 +118,10 @@ fn test_default_transition_interpolates_xy() {
 }
 
 #[test]
-fn test_default_transition_same_point_still_produces_8() {
+fn test_default_transition_same_point_still_produces_points() {
     let p = make_point(0.5, -0.3);
     let result = default_transition(&p, &p);
-    assert_eq!(result.len(), 8);
-    // All points should be at the same position
+    assert_eq!(result.len(), 15); // minimum count for zero distance
     for point in &result {
         assert!((point.x - 0.5).abs() < 1e-6);
         assert!((point.y - (-0.3)).abs() < 1e-6);
@@ -128,10 +136,11 @@ fn test_default_transition_endpoints_not_included() {
     let to = make_point(1.0, 0.0);
     let result = default_transition(&from, &to);
     assert!(result[0].x > 0.0, "first point should not be at from.x");
+    let last = result.last().unwrap();
     assert!(
-        result[7].x < 1.0,
+        last.x < 1.0,
         "last point should not be at to.x, got {}",
-        result[7].x
+        last.x
     );
 }
 
