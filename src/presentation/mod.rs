@@ -480,12 +480,151 @@ impl FrameSession {
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_rx: mpsc::Receiver<AuthoredFrame>,
     ) -> Result<RunExit> {
+        let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
+
+        if is_udp_timed {
+            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_rx)
+        } else {
+            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_rx)
+        }
+    }
+
+    /// Fixed-rate loop for UdpTimed backends (LaserCube WiFi).
+    ///
+    /// Sends a fixed chunk every cycle at precise intervals. No buffer
+    /// estimation — just metronomic pacing. This avoids all the overflow
+    /// and estimation issues that plague UDP-based laser DACs.
+    fn run_udp_timed_loop(
+        mut backend: BackendKind,
+        config: FrameSessionConfig,
+        control: StreamControl,
+        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
+        frame_rx: mpsc::Receiver<AuthoredFrame>,
+    ) -> Result<RunExit> {
+        use std::time::{Duration, Instant};
+
+        let pps = config.pps;
+        let pps_f64 = pps as f64;
+        // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
+        // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
+        let chunk_points = ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
+        let chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+
+        let mut engine = PresentationEngine::new(config.transition_fn);
+        let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
+        let mut shutter_open = false;
+        let mut startup_blank_remaining: usize = 0;
+        let startup_blank_points = if config.startup_blank.is_zero() {
+            0
+        } else {
+            (config.startup_blank.as_secs_f64() * pps_f64).ceil() as usize
+        };
+        let mut last_armed = false;
+        let mut next_send = Instant::now();
+
+        loop {
+            // 1. High-precision wait until next send time
+            Self::sleep_until_precise(&control, &control_rx, next_send, &mut shutter_open, &mut backend)?;
+            next_send += chunk_duration;
+
+            // Catch up if we fell behind (don't accumulate debt)
+            let now = Instant::now();
+            if next_send < now {
+                next_send = now;
+            }
+
+            // 2. Check stop
+            if control.is_stop_requested() {
+                return Ok(RunExit::Stopped);
+            }
+
+            // 3. Drain frame channel
+            while let Ok(frame) = frame_rx.try_recv() {
+                engine.set_pending(Arc::new(frame));
+            }
+
+            // 4. Check connection
+            if !backend.is_connected() {
+                return Ok(RunExit::Disconnected);
+            }
+
+            // 5. Process control messages
+            if Self::process_control_messages(&control_rx, &mut shutter_open, &mut backend) {
+                return Ok(RunExit::Stopped);
+            }
+
+            // 6. Handle arm/disarm transitions
+            let is_armed = control.is_armed();
+            if !last_armed && is_armed {
+                startup_blank_remaining = startup_blank_points;
+                if !shutter_open {
+                    let _ = backend.set_shutter(true);
+                    shutter_open = true;
+                }
+            } else if last_armed && !is_armed {
+                if shutter_open {
+                    let _ = backend.set_shutter(false);
+                    shutter_open = false;
+                }
+            }
+            last_armed = is_armed;
+
+            // 7. Fill chunk from engine
+            let n = engine.fill_chunk(&mut chunk_buffer, chunk_points);
+            if n == 0 {
+                continue;
+            }
+
+            // Apply blanking when disarmed
+            if !is_armed {
+                for p in &mut chunk_buffer[..n] {
+                    *p = LaserPoint::blanked(p.x, p.y);
+                }
+            }
+
+            // Apply startup blanking
+            if is_armed && startup_blank_remaining > 0 {
+                let blank_count = n.min(startup_blank_remaining);
+                for p in &mut chunk_buffer[..blank_count] {
+                    p.r = 0;
+                    p.g = 0;
+                    p.b = 0;
+                    p.intensity = 0;
+                }
+                startup_blank_remaining -= blank_count;
+            }
+
+            // Apply color delay
+            Self::apply_color_delay(&mut chunk_buffer[..n], config.color_delay_points);
+
+            // 8. Write (no retry — if device is busy, skip this cycle
+            // and catch up next time. Retrying stalls the fixed-rate loop.)
+            match backend.try_write(pps, &chunk_buffer[..n]) {
+                Ok(WriteOutcome::Written) => {}
+                Ok(WriteOutcome::WouldBlock) => {
+                    // Device busy — we'll catch up next cycle
+                }
+                Err(e) if e.is_disconnected() => {
+                    return Ok(RunExit::Disconnected);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Buffer-estimation loop for standard FIFO backends (Ether Dream, IDN, etc).
+    fn run_fifo_estimation_loop(
+        mut backend: BackendKind,
+        config: FrameSessionConfig,
+        control: StreamControl,
+        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
+        frame_rx: mpsc::Receiver<AuthoredFrame>,
+    ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
         let pps = config.pps as f64;
         let max_points = backend.caps().max_points_per_chunk;
-        let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
-        let target_buffer_secs = if is_udp_timed { 0.050_f64 } else { 0.020_f64 };
+        let target_buffer_secs = 0.020_f64;
         let target_buffer_points = (target_buffer_secs * pps) as u64;
 
         let mut engine = PresentationEngine::new(config.transition_fn);
@@ -522,22 +661,18 @@ impl FrameSession {
                 engine.set_pending(Arc::new(frame));
             }
 
-            // 3. Estimate buffer (conservative: min of hardware and software)
+            // 3. Estimate buffer
             let buffered = if let Some(hw) = backend.queued_points() {
                 hw.min(scheduled_ahead)
             } else {
                 scheduled_ahead
             };
 
-            // 4. Sleep if buffer healthy (use high-precision for UdpTimed)
+            // 4. Sleep if buffer healthy
             if buffered > target_buffer_points {
                 let excess = buffered - target_buffer_points;
                 let sleep_time = Duration::from_secs_f64(excess as f64 / pps);
-                if is_udp_timed {
-                    Self::sleep_until_precise(&control, &control_rx, Instant::now() + sleep_time, &mut shutter_open, &mut backend)?;
-                } else {
-                    Self::sleep_with_control_check(&control, &control_rx, sleep_time, &mut shutter_open, &mut backend)?;
-                }
+                Self::sleep_with_control_check(&control, &control_rx, sleep_time, &mut shutter_open, &mut backend)?;
                 continue;
             }
 
@@ -567,17 +702,9 @@ impl FrameSession {
             }
             last_armed = is_armed;
 
-            // 8. Fill chunk from engine.
-            // UdpTimed: always fill max_points for constant packet cadence
-            // (matches Stream::run() behavior). The buffer estimator's hw
-            // feedback prevents overflow — it tracks sends and decays them.
-            // Other FIFO: fill the deficit to reach target buffer level.
-            let target_points = if is_udp_timed {
-                max_points
-            } else {
-                let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
-                ((deficit * pps).ceil() as usize).min(max_points)
-            };
+            // 8. Fill chunk from engine
+            let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
+            let target_points = ((deficit * pps).ceil() as usize).min(max_points);
             if target_points == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
@@ -612,9 +739,6 @@ impl FrameSession {
             Self::apply_color_delay(&mut chunk_buffer[..n], config.color_delay_points);
 
             // 9. Write to backend with retry on WouldBlock
-            //
-            // The engine cursor has already advanced past these points.
-            // If we don't retry, they're lost and the output glitches.
             loop {
                 match backend.try_write(config.pps, &chunk_buffer[..n]) {
                     Ok(WriteOutcome::Written) => {
@@ -632,7 +756,7 @@ impl FrameSession {
                         return Ok(RunExit::Disconnected);
                     }
                     Err(_) => {
-                        break; // Backend error — drop chunk, continue
+                        break;
                     }
                 }
             }
