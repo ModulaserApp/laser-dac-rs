@@ -78,8 +78,6 @@
 pub mod backend;
 pub mod discovery;
 mod error;
-#[allow(deprecated)]
-mod frame_adapter;
 #[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
 mod net_utils;
 pub mod presentation;
@@ -125,10 +123,6 @@ pub use types::{
 // Stream and Dac types
 pub use session::{FrameSessionHandle, ReconnectingSession, SessionControl};
 pub use stream::{Dac, Stream, StreamControl};
-
-// Frame adapters (deprecated — use FrameSession and AuthoredFrame instead)
-#[allow(deprecated)]
-pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
 
 // Presentation types (frame-first API)
 pub use presentation::{
