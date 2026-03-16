@@ -22,7 +22,7 @@ At the same time, downstream applications like Modulaser already need a richer f
 - same-point seam suppression with tolerance
 - pending-frame switching
 
-That logic belongs in the library, not in each application.
+The frame lifecycle and delivery logic (pending-frame switching, cursor traversal, just-in-time composition) belongs in the library. Transition blanking strategy is delegated to a user-supplied callback, with a simple default helper provided.
 
 ## Core conclusion
 
@@ -208,7 +208,7 @@ Migration: search-and-replace `65535` → `1.0`, `0` → `0.0` in color fields. 
 - **Frame API**: Color delay is applied when the drawable is composed. The presentation engine shifts RGB channels relative to XY within the composed point buffer. Frame-swap DACs receive already-correct data with no runtime FIFO needed.
 - **Streaming API**: The existing runtime color delay line remains, applied in `write_fill_points` as today. This is the right model for truly continuous procedural sources where there is no discrete frame to precompute.
 
-This means `StreamConfig::color_delay` stays for streaming mode, and `SeamConfig` (or a broader `PresentationConfig`) gains a `color_delay_points` field for frame mode.
+This means `StreamConfig::color_delay` stays for streaming mode, and `FrameSessionConfig` gains a `color_delay_points` field for frame mode.
 
 **Alternative**: Keep color delay as runtime-only for both paths. Simpler, but frame-swap DACs get cross-frame color bleed (the first N points of a new frame inherit colors from the previous frame's tail, which is the current libera-core behavior).
 
@@ -339,7 +339,7 @@ src/
     presentation/
         mod.rs                      # PresentationEngine, public frame session API
         frame.rs                    # AuthoredFrame
-        seam.rs                     # SeamConfig, compute_transition(), Transition enum
+        transition.rs               # TransitionFn type alias, default_transition() helper
 
     session.rs                      # ReconnectingSession (updated for both modes)
 
@@ -414,71 +414,44 @@ impl AuthoredFrame {
 impl From<Vec<LaserPoint>> for AuthoredFrame { ... }
 ```
 
-### SeamConfig
+### Transition callback
+
+Transition handling is delegated to a user-supplied callback. The engine calls this function at every frame boundary (loop seam or frame switch) with the last point of the outgoing frame and the first point of the incoming frame. The callback returns the points to insert between them — or an empty vec for no transition.
 
 ```rust
-/// Configuration for seam and transition behavior.
-pub struct SeamConfig {
-    /// Distance threshold below which seam blanking is suppressed.
-    ///
-    /// If the Euclidean distance between two points is less than this
-    /// value (in normalized coordinate space), blanking is omitted and
-    /// the last point of the outgoing segment is dropped instead.
-    /// This enables seamless closed shapes and smooth frame transitions
-    /// when endpoints happen to match.
-    pub same_point_tolerance: f32,
-
-    /// Number of blank points to insert at loop seams.
-    ///
-    /// These are blanked points that travel from the last authored point
-    /// back to the first, giving the galvos time to reposition.
-    pub loop_blank_count: usize,
-
-    /// Number of blank points for frame-to-frame transitions.
-    ///
-    /// Inserted when switching from one frame to a different frame.
-    pub transition_blank_count: usize,
-}
-
-impl Default for SeamConfig {
-    fn default() -> Self {
-        Self {
-            same_point_tolerance: 0.01,
-            loop_blank_count: 8,
-            transition_blank_count: 12,
-        }
-    }
-}
-```
-
-### Transition computation
-
-The seam module provides a single function that computes the ending for a base frame, given a target point (the first point of whatever comes next):
-
-```rust
-/// Compute the transition from one endpoint to a target point.
+/// Callback type for computing transition points between frames.
 ///
-/// Returns one of:
-/// - `Transition::SamePoint` — positions (and optionally colors) match
-///   within tolerance. The caller should omit the last point of the
-///   outgoing frame so the next segment's first point continues seamlessly.
-/// - `Transition::Blanking(Vec<LaserPoint>)` — points differ. Returns
-///   blanking points that travel from `from` to `to` with appropriate
-///   dwell and interpolation.
-pub enum Transition {
-    SamePoint,
-    Blanking(Vec<LaserPoint>),
-}
-
-pub fn compute_transition(
-    from: &LaserPoint,
-    to: &LaserPoint,
-    config: &SeamConfig,
-    is_loop: bool,  // use loop_blank_count vs transition_blank_count
-) -> Transition { ... }
+/// Called with the last point of the outgoing frame and the first point
+/// of the incoming frame (which may be the same frame for self-loops).
+/// Returns the points to insert between them. Return an empty vec
+/// to suppress blanking entirely (e.g., for same-point seams).
+pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> Vec<LaserPoint> + Send>;
 ```
 
-This mirrors Modulaser's `compute_point_transition()`. All scenarios (self-loop, frame switch, frame skip) funnel through the same function — the only difference is what the target point is.
+The crate ships a simple default helper:
+
+```rust
+/// Default transition: linearly interpolated blank points from A to B.
+///
+/// Always blanks, regardless of distance. For same-point detection,
+/// custom dwell stages, or other advanced blanking strategies, provide
+/// a custom `TransitionFn`.
+pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
+    let count = 8;
+    (0..count)
+        .map(|i| {
+            let t = (i + 1) as f32 / (count + 1) as f32;
+            LaserPoint {
+                x: from.x + (to.x - from.x) * t,
+                y: from.y + (to.y - from.y) * t,
+                r: 0.0, g: 0.0, b: 0.0, intensity: 0.0,
+            }
+        })
+        .collect()
+}
+```
+
+This keeps the crate simple. Applications like Modulaser that need richer blanking (same-point suppression, multi-stage dwell, galvo settling curves) provide their own callback — a natural 1:1 migration from `PathChunkRenderer::compute_point_transition()`.
 
 ---
 
@@ -496,6 +469,7 @@ The engine manages current/pending frames and drives delivery to either backend 
 ///
 /// The ending is never baked in at submission time. It is always
 /// computed at the moment of delivery, based on the current pending state.
+/// Transition points are produced by a user-supplied callback.
 pub(crate) struct PresentationEngine {
     /// The current base frame (authored content, no ending).
     current_base: Option<Arc<AuthoredFrame>>,
@@ -508,8 +482,8 @@ pub(crate) struct PresentationEngine {
     drawable_dirty: bool,
     /// Traversal cursor within the drawable.
     cursor: usize,
-    /// Seam configuration.
-    seam_config: SeamConfig,
+    /// User-supplied callback for computing transition points.
+    transition_fn: TransitionFn,
 }
 ```
 
@@ -517,7 +491,7 @@ pub(crate) struct PresentationEngine {
 
 ```rust
 impl PresentationEngine {
-    pub fn new(seam_config: SeamConfig) -> Self { ... }
+    pub fn new(transition_fn: TransitionFn) -> Self { ... }
 
     /// Submit a new frame. Latest-wins semantics.
     ///
@@ -530,18 +504,20 @@ impl PresentationEngine {
     /// Recompute the drawable from the current base frame.
     ///
     /// The ending is determined by the current pending state:
-    /// - No pending: self-loop (target = current base's first point)
-    /// - Pending B: transition (target = B's first point)
+    /// - No pending: self-loop — calls `transition_fn(last, first)` for
+    ///   the current frame and appends the result.
+    /// - Pending B: transition — calls `transition_fn(last, B.first)`
+    ///   and appends the result.
     ///
-    /// Uses `compute_transition()` to determine SamePoint vs Blanking.
+    /// The transition callback decides what points to insert (or none).
     fn refresh_drawable(&mut self) { ... }
 
     /// Compose a complete hardware frame for frame-swap delivery.
     ///
     /// Called by the frame-swap scheduler when the device is ready.
-    /// Computes the correct ending based on what's pending right now,
-    /// appends it to the base frame content, and promotes the pending
-    /// frame if a transition was produced.
+    /// Calls `transition_fn` based on what's pending right now,
+    /// appends the result to the base frame content, and promotes
+    /// the pending frame if one exists.
     ///
     /// Returns the composed point buffer ready for `write_frame()`.
     pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] { ... }
@@ -550,9 +526,9 @@ impl PresentationEngine {
     ///
     /// Traverses the drawable from the cursor position. At the wrap
     /// point (cursor reaches drawable end):
-    /// - If pending exists: promote it, recompute drawable with
-    ///   appropriate transition or SamePoint handling.
-    /// - If no pending: recompute drawable as self-loop, reset cursor.
+    /// - If pending exists: promote it, call `transition_fn` for the
+    ///   transition, recompute drawable.
+    /// - If no pending: call `transition_fn` for self-loop, reset cursor.
     ///
     /// Returns the number of points written.
     pub fn fill_chunk(&mut self, buffer: &mut [LaserPoint], max_points: usize) -> usize { ... }
@@ -561,26 +537,23 @@ impl PresentationEngine {
 
 ### How scenarios play out
 
-All scenarios funnel through the same `compute_transition()` path. The only difference is what the target point is: the current frame's first point (self-loop) or the pending frame's first point (transition).
+All scenarios call `transition_fn(from, to)` at the frame boundary. The only difference is what the target point is: the current frame's first point (self-loop) or the pending frame's first point (transition). The engine inserts whatever the callback returns.
 
-**Self-loop, no pending**: Target = `current_base.first_point()`. If SamePoint (closed shape), last point is omitted and the loop is seamless. If different, blanking is appended from last to first.
+**Self-loop, no pending**: Calls `transition_fn(A.last(), A.first())`. The callback decides what to insert (blanking points, or empty vec if same-point).
 
-**Next frame ready**: Target = `pending_base.first_point()`. If SamePoint, last point is omitted and the transition is seamless. If different, transition blanking is appended. Pending is promoted to current after the transition plays.
+**Next frame ready**: Calls `transition_fn(A.last(), B.first())`. Inserts the result, promotes B to current.
 
-**Frame skip (C replaces B before B is consumed)**: `set_pending()` overwrites B with C. The drawable is marked dirty. Next time the ending is computed, target = C's first point. B is never drawn. Blanking goes directly from A's endpoint to C's start.
+**Frame skip (C replaces B before B is consumed)**: `set_pending()` overwrites B with C. Next boundary calls `transition_fn(A.last(), C.first())`. B is never drawn.
 
-**Frame-swap DAC replays faster than updates arrive**: `compose_hardware_frame()` is called each time the device is ready. If no new pending has arrived, it composes the same base frame with self-loop ending. The self-loop is recomputed each time (cheap) to ensure correctness.
+**Frame-swap DAC replays faster than updates arrive**: `compose_hardware_frame()` is called each time the device is ready. If no new pending has arrived, it composes the same base frame with self-loop transition. Recomputed each time (cheap) to ensure correctness.
 
-**Pending arrives while frame-swap DAC is mid-play**: The currently-playing hardware frame is committed and can't be changed. When the device finishes and signals ready, `compose_hardware_frame()` sees the pending frame and composes a transition. The transition blanking starts from where the current frame actually ends (which the engine tracks).
+**Pending arrives while frame-swap DAC is mid-play**: The currently-playing hardware frame is committed and can't be changed. When the device finishes and signals ready, `compose_hardware_frame()` sees the pending frame and composes a transition.
 
-| Scenario | Target point | SamePoint result | Drawable ending |
-|---|---|---|---|
-| Self-loop (no pending) | A.first() | Match → omit last point | Seamless wrap |
-| Self-loop (no pending) | A.first() | Differ → append blanking A→A | Blanking then wrap |
-| Next frame ready | B.first() | Match → omit last point | Seamless transition |
-| Next frame ready | B.first() | Differ → append blanking A→B | Blanking then swap |
-| Frame skip (C pending) | C.first() | Match → omit last point | Seamless transition |
-| Frame skip (C pending) | C.first() | Differ → append blanking A→C | Blanking then swap |
+| Scenario | transition_fn call | Drawable ending |
+|---|---|---|
+| Self-loop (no pending) | `(A.last(), A.first())` | Callback result appended, then wrap |
+| Next frame ready | `(A.last(), B.first())` | Callback result appended, B promoted |
+| Frame skip (C pending) | `(A.last(), C.first())` | Callback result appended, C promoted |
 
 ---
 
@@ -629,11 +602,14 @@ For streaming mode on a frame-swap backend (quantized streaming):
 ### Frame mode (recommended path)
 
 ```rust
-use laser_dac::{open_device, AuthoredFrame, FrameSession, FrameSessionConfig, LaserPoint};
+use laser_dac::{
+    open_device, AuthoredFrame, FrameSession, FrameSessionConfig,
+    LaserPoint, default_transition,
+};
 
 // 1. Open and configure
 let device = open_device("helios:ABC123")?;
-let config = FrameSessionConfig::new(30_000);
+let config = FrameSessionConfig::new(30_000, default_transition);
 
 // 2. Start frame session
 let session = device.start_frame_session(config)?;
@@ -657,20 +633,20 @@ loop {
 /// Configuration for a frame session.
 pub struct FrameSessionConfig {
     pub pps: u32,
-    pub seam: SeamConfig,
+    pub transition_fn: TransitionFn,
     pub startup_blank: Duration,
 }
 
 impl FrameSessionConfig {
-    pub fn new(pps: u32) -> Self { ... }
-    pub fn with_seam(mut self, seam: SeamConfig) -> Self { ... }
+    pub fn new(pps: u32, transition_fn: impl Fn(&LaserPoint, &LaserPoint) -> Vec<LaserPoint> + Send + 'static) -> Self { ... }
 }
 
 /// A running frame presentation session.
 ///
 /// Owns the backend and drives delivery. Submit frames via `send_frame()`.
-/// The session handles looping, seam blanking, and transport-appropriate
-/// delivery automatically.
+/// The session handles looping and transport-appropriate delivery
+/// automatically. Transition blanking is computed by the user-supplied
+/// `transition_fn` at each frame boundary.
 pub struct FrameSession { ... }
 
 impl FrameSession {
@@ -828,32 +804,30 @@ The `SessionControl` survives reconnections as it does today — arm/disarm stat
 
 ## Blanking behavior
 
-Blanking is always computed reactively based on the current engine state, not baked into frames at submission time. This follows the base frame / drawable model described above and mirrors Modulaser's `PathChunkRenderer` design.
+Blanking is delegated to the user-supplied `transition_fn` callback, called reactively at each frame boundary based on the current engine state. The engine never bakes transition points into frames at submission time — they are always computed at the moment of delivery.
 
-All scenarios (self-loop, frame switch, frame skip) funnel through the same `compute_transition(from, to, config)` function. The only variable is what the target point is:
+The engine calls `transition_fn(from, to)` at every frame boundary:
 
-- **Self-loop**: target = first point of the current frame
-- **Transition**: target = first point of the pending frame
+- **Self-loop**: `transition_fn(current.last(), current.first())`
+- **Transition**: `transition_fn(current.last(), pending.first())`
 
-### SamePoint detection
+The callback returns `Vec<LaserPoint>` — the points to insert between frames. An empty vec means no transition points (useful for same-point seams or other cases where blanking is undesirable).
 
-If the outgoing endpoint and the incoming start point are within `same_point_tolerance` (Euclidean distance in normalized coordinates), blanking is suppressed entirely. Instead, the last point of the outgoing frame is omitted so the cursor continues seamlessly from the next frame's first point. This enables smooth closed shapes and clean transitions between frames that share an endpoint.
+### Default behavior
 
-### Blanking sequence
-
-When points differ beyond tolerance, a blanking sequence is generated that travels from the outgoing endpoint to the incoming start point. The sequence structure follows Modulaser's proven 5-stage model: post-on dwell, end dwell (laser off), transit points (interpolated), start dwell (laser off), pre-on dwell.
+The shipped `default_transition()` helper always generates linearly interpolated blank points from A to B. It does not detect same-point seams. Applications that need richer blanking (same-point suppression, multi-stage dwell, galvo settling curves) provide their own callback.
 
 ### Frame-swap DAC invariant
 
-For frame-swap DACs, the blanking ending is composed at the moment the hardware signals readiness — not at frame submission time. This guarantees correctness regardless of timing mismatches between the application's update rate and the device's playback rate.
+For frame-swap DACs, `transition_fn` is called at the moment the hardware signals readiness — not at frame submission time. This guarantees correctness regardless of timing mismatches between the application's update rate and the device's playback rate.
 
-- If the DAC replays faster than updates arrive, each replay composes a self-loop ending. The blanking always points back to the current frame's start.
-- If a pending frame arrives, the next composition produces a transition ending. The blanking goes from the current frame's endpoint to the pending frame's start.
-- If a pending frame is overwritten before it plays (frame skip), the ending is recomputed for the new pending frame. The skipped frame is never drawn.
+- If the DAC replays faster than updates arrive, each replay calls `transition_fn` for a self-loop. The transition always targets the current frame's start.
+- If a pending frame arrives, the next composition calls `transition_fn` for the transition. The result goes from the current frame's endpoint to the pending frame's start.
+- If a pending frame is overwritten before it plays (frame skip), `transition_fn` is called for the new pending frame. The skipped frame is never drawn.
 
 ### FIFO DAC behavior
 
-For FIFO DACs, blanking is stitched dynamically at the cursor wrap point in `fill_chunk()`. When the cursor reaches the end of the drawable, the engine checks the pending state, computes the appropriate transition, and continues filling the buffer. This is exactly the `PathChunkRenderer` model.
+For FIFO DACs, `transition_fn` is called at the cursor wrap point in `fill_chunk()`. When the cursor reaches the end of the drawable, the engine checks the pending state, calls `transition_fn` with the appropriate target, inserts the result, and continues filling the buffer.
 
 ### Before first frame
 
@@ -861,24 +835,16 @@ If no frame has been submitted yet, the engine has no `current_base`. Both `fill
 
 ### Complete scenario matrix
 
-All scenarios funnel through `compute_transition()`. The only variables are the target point and whether a pending frame exists.
+All scenarios call `transition_fn(from, to)`. The only variables are the target point and whether a pending frame exists. Frame skip is not a special case — it is the natural result of latest-wins semantics.
 
-| Scenario | DAC type | Seam result | What happens |
+| Scenario | DAC type | transition_fn call | What happens |
 |---|---|---|---|
-| A→A (self-loop) | FIFO | Blanking | Loop blanking appended at cursor wrap, cursor resets |
-| A→A (self-loop) | FIFO | SamePoint | Last point omitted, cursor wraps seamlessly |
-| A→A (self-loop) | Frame-swap | Blanking | Composed with loop blanking, cycled to fill frame |
-| A→A (self-loop) | Frame-swap | SamePoint | Composed without last point, cycled seamlessly |
-| A→B (transition) | FIFO | Blanking | Transition blanking stitched at cursor wrap, B promoted |
-| A→B (transition) | FIFO | SamePoint | Last point omitted at wrap, B promoted seamlessly |
-| A→B (transition) | Frame-swap | Blanking | Transition frame composed with blanking A→B, B promoted, next frame is B self-loop |
-| A→B (transition) | Frame-swap | SamePoint | Frame composed without last point, B promoted, next frame is B self-loop |
-| A→C (frame skip) | FIFO | Blanking | B overwritten by `set_pending()`, transition blanking goes A→C directly |
-| A→C (frame skip) | FIFO | SamePoint | B overwritten, last point omitted, C starts seamlessly |
-| A→C (frame skip) | Frame-swap | Blanking | B overwritten, transition frame goes A→C, C promoted |
-| A→C (frame skip) | Frame-swap | SamePoint | B overwritten, same as A→B SamePoint but targeting C |
-
-A→B and A→C are mechanically identical. `set_pending()` overwrites the pending slot (latest-wins), and `compute_transition()` only sees whatever is pending at the moment of delivery. Frame skip is not a special case — it is the natural result of latest-wins semantics.
+| A→A (self-loop) | FIFO | `(A.last, A.first)` | Result appended at cursor wrap, cursor resets |
+| A→A (self-loop) | Frame-swap | `(A.last, A.first)` | Result appended, cycled to fill frame |
+| A→B (transition) | FIFO | `(A.last, B.first)` | Result stitched at cursor wrap, B promoted |
+| A→B (transition) | Frame-swap | `(A.last, B.first)` | Transition frame composed, B promoted, next frame is B self-loop |
+| A→C (frame skip) | FIFO | `(A.last, C.first)` | B overwritten by `set_pending()`, transition goes A→C directly |
+| A→C (frame skip) | Frame-swap | `(A.last, C.first)` | B overwritten, transition frame goes A→C, C promoted |
 
 ---
 
@@ -899,9 +865,9 @@ A→B and A→C are mechanically identical. `set_pending()` overwrites the pendi
 1. `open_device()` → `Dac`
 2. `Dac::start_frame_session(config)` → `FrameSession`
 3. `FrameSession::send_frame(AuthoredFrame)` — submit frames, latest-wins
-4. Library owns seam handling, blanking, transitions via `PresentationEngine`
-5. Frame-swap backends: scheduler calls `compose_hardware_frame()` when device is ready, composing the correct ending just-in-time, then sends via `write_frame()`
-6. FIFO backends: scheduler calls `fill_chunk()` which traverses the drawable with cursor-based delivery, stitching blanking at frame boundaries
+4. `PresentationEngine` owns frame lifecycle; transition blanking is produced by the user-supplied `transition_fn` callback
+5. Frame-swap backends: scheduler calls `compose_hardware_frame()` when device is ready, which calls `transition_fn` just-in-time, then sends via `write_frame()`
+6. FIFO backends: scheduler calls `fill_chunk()` which traverses the drawable with cursor-based delivery, calling `transition_fn` at frame boundaries
 
 ### Proposed pipeline (streaming mode — expert)
 
@@ -949,7 +915,7 @@ impl FrameSwapBackend for HeliosBackend {
 
 ### What changes for downstream consumers (Modulaser)
 
-`FrameAdapter` and `SharedFrameAdapter` are replaced by `FrameSession`. Modulaser's `PathChunkRenderer` is replaced by the library's `PresentationEngine`. Seam tolerance, loop blanking, and transition blanking are configured via `SeamConfig` instead of custom application code.
+`FrameAdapter` and `SharedFrameAdapter` are replaced by `FrameSession`. Modulaser's `PathChunkRenderer` frame lifecycle logic (pending frame management, cursor traversal, frame promotion) is replaced by the library's `PresentationEngine`. Modulaser's transition blanking logic migrates into a `TransitionFn` callback.
 
 ```rust
 // Before (current):
@@ -961,9 +927,52 @@ stream.run(
 )?;
 
 // After:
+let config = FrameSessionConfig::new(30_000, modulaser_transition);
 let session = device.start_frame_session(config)?;
 session.control().arm()?;
 session.send_frame(AuthoredFrame::new(points));
+```
+
+Modulaser's transition callback would roughly look like:
+
+```rust
+/// Modulaser's transition callback — migrated from PathChunkRenderer.
+///
+/// Implements same-point suppression and multi-stage blanking
+/// (dwell → transit → dwell) for clean galvo settling.
+fn modulaser_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
+    let dx = to.x - from.x;
+    let dy = to.y - from.y;
+    let distance = (dx * dx + dy * dy).sqrt();
+
+    // Same-point suppression: if endpoints match, no blanking needed
+    if distance < SAME_POINT_TOLERANCE {
+        return vec![];
+    }
+
+    let mut points = Vec::new();
+
+    // Stage 1: end dwell — hold at `from` with laser off
+    for _ in 0..END_DWELL_COUNT {
+        points.push(LaserPoint::blanked(from.x, from.y));
+    }
+
+    // Stage 2: transit — interpolate from → to with laser off
+    for i in 1..=TRANSIT_COUNT {
+        let t = i as f32 / (TRANSIT_COUNT + 1) as f32;
+        points.push(LaserPoint::blanked(
+            from.x + dx * t,
+            from.y + dy * t,
+        ));
+    }
+
+    // Stage 3: start dwell — hold at `to` with laser off
+    for _ in 0..START_DWELL_COUNT {
+        points.push(LaserPoint::blanked(to.x, to.y));
+    }
+
+    points
+}
 ```
 
 ### What stays the same
@@ -982,7 +991,7 @@ session.send_frame(AuthoredFrame::new(points));
 |---|---|---|
 | Transport correctness | Runtime branch on output model | Compile-time trait split |
 | Frame preparation | Recomputed every callback | Base frame cached, ending composed at delivery time |
-| Seam handling | Not in library (downstream) | Library-owned, configurable, reactive to pending state |
+| Seam handling | Not in library (downstream) | Callback-driven, called reactively at delivery time; default helper shipped |
 | Color delay in frame mode | Runtime FIFO, cross-frame bleed | Baked into drawable at composition time |
 | Frame scheduling | Global static latency | Per-session configuration |
 | Reconnection | Internal, not surfaced cleanly | `ReconnectingSession` with callbacks |
@@ -1004,21 +1013,19 @@ session.send_frame(AuthoredFrame::new(points));
 
 ### Presentation engine
 
-- `compute_transition` unit tests:
-  - SamePoint returned when endpoints match within tolerance
-  - Blanking returned when endpoints differ
+- `default_transition` unit tests:
   - correct blank point count and interpolation
+  - points are blanked (zero color/intensity)
 - `PresentationEngine::fill_chunk` (FIFO delivery) tests:
   - correct cursor traversal with wrap
-  - self-loop ending computed correctly at wrap point
-  - pending frame swap at wrap point with transition blanking
-  - SamePoint transition at wrap (last point omitted)
+  - self-loop: transition_fn called with `(last, first)` at wrap point
+  - pending frame swap: transition_fn called with `(last, pending.first)` at wrap
+  - empty transition result (callback returns `vec![]`): no points inserted
   - latest-wins: pending overwritten before consumed
 - `PresentationEngine::compose_hardware_frame` (frame-swap delivery) tests:
-  - self-loop ending when no pending
-  - transition ending when pending exists
-  - pending replaced mid-play (frame skip) produces correct transition
-  - SamePoint suppression for closed shapes
+  - self-loop: transition_fn called when no pending
+  - transition: transition_fn called when pending exists
+  - pending replaced mid-play (frame skip) calls transition_fn for new pending
   - composed frame respects frame_capacity padding
 
 ### Frame session
@@ -1034,7 +1041,7 @@ session.send_frame(AuthoredFrame::new(points));
 - A user should be able to stay frame-first and still get correct behavior on every DAC.
 - A user should still be able to generate continuous streaming content if they need it.
 - Helios and ShowNET should be honest quantized-frame devices, not faux FIFO devices.
-- Applications should not need to reimplement seam handling and transition blanking.
+- Applications should not need to reimplement frame lifecycle management (pending frames, cursor traversal, just-in-time composition).
 - Backends should focus on hardware transport, not presentation semantics.
 - The type system should make incorrect transport usage difficult rather than easy.
 
@@ -1049,7 +1056,7 @@ session.send_frame(AuthoredFrame::new(points));
 This refactor is successful when:
 
 - Helios/ShowNET no longer show tiny replacement-frame artifacts under normal use
-- downstream apps do not need their own `PathChunkRenderer`-style infrastructure
+- downstream apps do not need their own frame lifecycle infrastructure (pending management, cursor traversal)
 - FIFO DACs still perform well for true continuous streaming use cases
 - the public API makes the real DAC semantics easier to understand, not harder
 - the type system makes incorrect transport usage difficult rather than easy
