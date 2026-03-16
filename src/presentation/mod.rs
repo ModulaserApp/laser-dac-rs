@@ -315,19 +315,30 @@ pub struct FrameSessionConfig {
     pub startup_blank: std::time::Duration,
     /// Number of points to shift RGB relative to XY (0 = disabled).
     ///
-    /// Applied at composition time in the `PresentationEngine`. Frame-swap DACs
-    /// receive already-correct data with no cross-frame color bleed.
+    /// Delays color channels relative to XY coordinates, compensating for
+    /// the difference in galvo mirror and laser modulation response times.
+    /// Applied at composition time. Default: 0.2ms worth of points (e.g.,
+    /// 6 points at 30kpps), matching typical show galvo requirements.
+    ///
+    /// Set to 0 to disable. Typical range: 3–10 points at 30kpps.
     pub color_delay_points: usize,
 }
 
 impl FrameSessionConfig {
+    /// Default color delay: 0.2ms, matching typical galvo scanner sync requirements.
+    const DEFAULT_COLOR_DELAY: std::time::Duration = std::time::Duration::from_micros(200);
+
     /// Create a new config with the given PPS and default transition.
+    ///
+    /// Defaults: startup blank = 1ms, color delay = 0.2ms (6 points at 30kpps).
     pub fn new(pps: u32) -> Self {
+        let color_delay_points =
+            (Self::DEFAULT_COLOR_DELAY.as_secs_f64() * pps as f64).ceil() as usize;
         Self {
             pps,
             transition_fn: Box::new(default_transition),
             startup_blank: std::time::Duration::from_millis(1),
-            color_delay_points: 0,
+            color_delay_points,
         }
     }
 
