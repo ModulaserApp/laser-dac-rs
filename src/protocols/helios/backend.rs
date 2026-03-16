@@ -1,6 +1,6 @@
 //! Helios DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FrameSwapBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::helios::{
     DeviceStatus, Frame, HeliosDac, HeliosDacController, Point as HeliosPoint,
@@ -41,9 +41,13 @@ impl HeliosBackend {
             .list_devices()
             .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))
     }
+
+    fn map_err(e: crate::protocols::helios::native::HeliosDacError) -> Error {
+        Error::backend(std::io::Error::other(e.to_string()))
+    }
 }
 
-impl StreamBackend for HeliosBackend {
+impl DacBackend for HeliosBackend {
     fn dac_type(&self) -> DacType {
         DacType::Helios
     }
@@ -53,17 +57,13 @@ impl StreamBackend for HeliosBackend {
     }
 
     fn connect(&mut self) -> Result<()> {
-        let map_err = |e: crate::protocols::helios::native::HeliosDacError| {
-            Error::backend(std::io::Error::other(e.to_string()))
-        };
-
         if let Some(dac) = self.dac.take() {
-            self.dac = Some(dac.open().map_err(map_err)?);
+            self.dac = Some(dac.open().map_err(Self::map_err)?);
             return Ok(());
         }
 
-        let controller = HeliosDacController::new().map_err(map_err)?;
-        let mut dacs = controller.list_devices().map_err(map_err)?;
+        let controller = HeliosDacController::new().map_err(Self::map_err)?;
+        let mut dacs = controller.list_devices().map_err(Self::map_err)?;
 
         if self.device_index >= dacs.len() {
             return Err(Error::disconnected(format!(
@@ -73,7 +73,7 @@ impl StreamBackend for HeliosBackend {
             )));
         }
 
-        let dac = dacs.remove(self.device_index).open().map_err(map_err)?;
+        let dac = dacs.remove(self.device_index).open().map_err(Self::map_err)?;
         self.dac = Some(dac);
         Ok(())
     }
@@ -87,17 +87,40 @@ impl StreamBackend for HeliosBackend {
         matches!(self.dac, Some(HeliosDac::Open { .. }))
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn stop(&mut self) -> Result<()> {
+        if let Some(dac) = &self.dac {
+            dac.stop().map_err(Self::map_err)?;
+        }
+        Ok(())
+    }
+
+    fn set_shutter(&mut self, open: bool) -> Result<()> {
+        if let Some(dac) = &self.dac {
+            dac.set_shutter(open).map_err(Self::map_err)?;
+        }
+        Ok(())
+    }
+}
+
+impl FrameSwapBackend for HeliosBackend {
+    fn frame_capacity(&self) -> usize {
+        self.caps.max_points_per_chunk
+    }
+
+    fn is_ready_for_frame(&mut self) -> bool {
+        let Some(dac) = self.dac.as_mut() else {
+            return false;
+        };
+        matches!(dac.status(), Ok(DeviceStatus::Ready))
+    }
+
+    fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let dac = self
             .dac
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        let map_err = |e: crate::protocols::helios::native::HeliosDacError| {
-            Error::backend(std::io::Error::other(e.to_string()))
-        };
-
-        match dac.status().map_err(map_err)? {
+        match dac.status().map_err(Self::map_err)? {
             DeviceStatus::Ready => {
                 log::trace!("helios ready for frame: points={}", points.len());
             }
@@ -121,24 +144,8 @@ impl StreamBackend for HeliosBackend {
         } else {
             log::trace!("helios writing frame: points={}, pps={pps}", points.len());
         }
-        dac.write_frame(helios_frame).map_err(map_err)?;
+        dac.write_frame(helios_frame).map_err(Self::map_err)?;
 
         Ok(WriteOutcome::Written)
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if let Some(dac) = &self.dac {
-            dac.stop()
-                .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
-    }
-
-    fn set_shutter(&mut self, open: bool) -> Result<()> {
-        if let Some(dac) = &self.dac {
-            dac.set_shutter(open)
-                .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
     }
 }

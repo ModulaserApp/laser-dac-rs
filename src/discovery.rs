@@ -10,7 +10,7 @@ use std::net::IpAddr;
 #[cfg(any(feature = "ether-dream", feature = "idn", feature = "lasercube-wifi"))]
 use std::time::Duration;
 
-use crate::backend::{Error, Result, StreamBackend};
+use crate::backend::{BackendKind, Error, FifoBackend, Result};
 use crate::types::{DacType, EnabledDacTypes};
 
 // =============================================================================
@@ -27,7 +27,7 @@ use crate::types::{DacType, EnabledDacTypes};
 /// ```ignore
 /// use laser_dac::{
 ///     DacDiscovery, ExternalDiscoverer, ExternalDevice,
-///     StreamBackend, DacType, EnabledDacTypes, Result,
+///     FifoBackend, DacType, EnabledDacTypes, Result,
 /// };
 /// use std::any::Any;
 ///
@@ -43,7 +43,7 @@ use crate::types::{DacType, EnabledDacTypes};
 ///         vec![]
 ///     }
 ///
-///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>> {
+///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>> {
 ///         // Your connection logic here
 ///         todo!()
 ///     }
@@ -58,7 +58,7 @@ pub trait ExternalDiscoverer: Send {
 
     /// Connect to a previously discovered device.
     /// The `opaque_data` is the same data returned in `ExternalDevice`.
-    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>>;
+    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>>;
 }
 
 /// Device info returned by external discoverers.
@@ -437,11 +437,11 @@ impl HeliosDiscovery {
     }
 
     /// Connect to a discovered Helios device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::Helios(dac) = device.inner else {
             return Err(Error::invalid_config("Invalid device type for Helios"));
         };
-        Ok(Box::new(HeliosBackend::from_dac(dac)))
+        Ok(BackendKind::FrameSwap(Box::new(HeliosBackend::from_dac(dac))))
     }
 }
 
@@ -503,13 +503,13 @@ impl EtherDreamDiscovery {
     }
 
     /// Connect to a discovered Ether Dream device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::EtherDream { broadcast, ip } = device.inner else {
             return Err(Error::invalid_config("Invalid device type for EtherDream"));
         };
 
         let backend = EtherDreamBackend::new(broadcast, ip);
-        Ok(Box::new(backend))
+        Ok(BackendKind::Fifo(Box::new(backend)))
     }
 }
 
@@ -544,12 +544,12 @@ impl IdnDiscovery {
     }
 
     /// Connect to a discovered IDN device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::Idn { server, service } = device.inner else {
             return Err(Error::invalid_config("Invalid device type for IDN"));
         };
 
-        Ok(Box::new(IdnBackend::new(server, service)))
+        Ok(BackendKind::Fifo(Box::new(IdnBackend::new(server, service))))
     }
 
     /// Scan a specific address for IDN devices.
@@ -648,7 +648,7 @@ impl LasercubeWifiDiscovery {
     }
 
     /// Connect to a discovered LaserCube WiFi device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::LasercubeWifi { info, source_addr } = device.inner else {
             return Err(Error::invalid_config(
                 "Invalid device type for LaserCube WiFi",
@@ -656,7 +656,7 @@ impl LasercubeWifiDiscovery {
         };
 
         let addressed = LasercubeAddressed::from_discovery(&info, source_addr);
-        Ok(Box::new(LasercubeWifiBackend::new(addressed)))
+        Ok(BackendKind::Fifo(Box::new(LasercubeWifiBackend::new(addressed))))
     }
 }
 
@@ -707,7 +707,7 @@ impl LasercubeUsbDiscovery {
     }
 
     /// Connect to a discovered LaserCube USB device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::LasercubeUsb(usb_device) = device.inner else {
             return Err(Error::invalid_config(
                 "Invalid device type for LaserCube USB",
@@ -715,7 +715,7 @@ impl LasercubeUsbDiscovery {
         };
 
         let backend = LasercubeUsbBackend::new(usb_device);
-        Ok(Box::new(backend))
+        Ok(BackendKind::Fifo(Box::new(backend)))
     }
 }
 
@@ -751,12 +751,12 @@ impl AvbDiscovery {
     }
 
     /// Connect to a discovered AVB output device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
         let DiscoveredDeviceInner::Avb(selector) = device.inner else {
             return Err(Error::invalid_config("Invalid device type for AVB"));
         };
 
-        Ok(Box::new(AvbBackend::from_selector(selector)))
+        Ok(BackendKind::Fifo(Box::new(AvbBackend::from_selector(selector))))
     }
 }
 
@@ -1009,18 +1009,19 @@ impl DacDiscovery {
 
     /// Connect to a discovered device and return a streaming backend.
     #[allow(unreachable_patterns)]
-    pub fn connect(&mut self, device: DiscoveredDevice) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect(&mut self, device: DiscoveredDevice) -> Result<BackendKind> {
         // Handle external devices first (check inner variant)
         if let DiscoveredDeviceInner::External {
             discoverer_index,
             opaque_data,
         } = device.inner
         {
-            return self
+            let backend = self
                 .external
                 .get_mut(discoverer_index)
                 .ok_or_else(|| Error::invalid_config("External discoverer not found"))?
-                .connect(opaque_data);
+                .connect(opaque_data)?;
+            return Ok(BackendKind::Fifo(backend));
         }
 
         // Handle built-in DAC types
@@ -1174,6 +1175,7 @@ mod tests {
     // External Discoverer Tests
     // =========================================================================
 
+    use crate::backend::{DacBackend, FifoBackend};
     use crate::types::{DacCapabilities, LaserPoint};
     use crate::WriteOutcome;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1190,7 +1192,7 @@ mod tests {
         connected: bool,
     }
 
-    impl StreamBackend for MockBackend {
+    impl DacBackend for MockBackend {
         fn dac_type(&self) -> DacType {
             DacType::Custom("MockDAC".into())
         }
@@ -1219,16 +1221,18 @@ mod tests {
             self.connected
         }
 
-        fn try_write_chunk(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
-            Ok(WriteOutcome::Written)
-        }
-
         fn stop(&mut self) -> Result<()> {
             Ok(())
         }
 
         fn set_shutter(&mut self, _open: bool) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl FifoBackend for MockBackend {
+        fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
         }
     }
 
@@ -1267,7 +1271,7 @@ mod tests {
                 .collect()
         }
 
-        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn StreamBackend>> {
+        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>> {
             self.connect_called.store(true, Ordering::SeqCst);
             let _info = opaque_data
                 .downcast::<MockConnectionInfo>()

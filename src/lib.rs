@@ -73,8 +73,8 @@ pub mod types;
 // Crate-level error types
 pub use error::{Error, Result};
 
-// Backend trait and types
-pub use backend::{StreamBackend, WriteOutcome};
+// Backend traits and types
+pub use backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend, WriteOutcome};
 
 // Discovery types
 pub use discovery::{

@@ -33,7 +33,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{Error, Result, StreamBackend, WriteOutcome};
+use crate::backend::{BackendKind, Error, Result, WriteOutcome};
 use crate::types::{
     ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
     StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
@@ -260,7 +260,7 @@ pub struct Stream {
     /// Device info for this stream.
     info: DacInfo,
     /// The backend.
-    backend: Option<Box<dyn StreamBackend>>,
+    backend: Option<BackendKind>,
     /// Stream configuration.
     config: StreamConfig,
     /// Thread-safe control handle.
@@ -299,7 +299,7 @@ impl Stream {
     /// Create a new stream with a backend.
     pub(crate) fn with_backend(
         info: DacInfo,
-        backend: Box<dyn StreamBackend>,
+        backend: BackendKind,
         config: StreamConfig,
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
@@ -344,11 +344,7 @@ impl Stream {
         let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
 
         Ok(StreamStatus {
-            connected: self
-                .backend
-                .as_ref()
-                .map(|b| b.is_connected())
-                .unwrap_or(false),
+            connected: self.backend.as_ref().is_some_and(|b| b.is_connected()),
             scheduled_ahead_points: self.state.scheduled_ahead,
             device_queued_points,
             stats: Some(self.state.stats.clone()),
@@ -405,10 +401,10 @@ impl Stream {
         // Directly close shutter, stop, and disconnect backend (defense-in-depth).
         // Disconnect is needed for protocols like IDN where stop() only blanks
         // but the DAC keeps replaying its buffer until the session is closed.
-        if let Some(backend) = &mut self.backend {
-            let _ = backend.set_shutter(false);
-            let _ = backend.stop();
-            backend.disconnect()?;
+        if let Some(b) = &mut self.backend {
+            let _ = b.set_shutter(false);
+            let _ = b.stop();
+            b.disconnect()?;
         }
 
         Ok(())
@@ -568,8 +564,8 @@ impl Stream {
             }
 
             // 4. Check backend connection
-            if let Some(backend) = &self.backend {
-                if !backend.is_connected() {
+            if let Some(b) = &self.backend {
+                if !b.is_connected() {
                     log::warn!("backend.is_connected() = false, exiting with Disconnected");
                     on_error(Error::disconnected("backend disconnected"));
                     return Ok(RunExit::Disconnected);
@@ -729,7 +725,7 @@ impl Stream {
                 None => return Err(Error::disconnected("no backend")),
             };
 
-            match backend.try_write_chunk(pps, &self.state.chunk_buffer[..n]) {
+            match backend.try_write(pps, &self.state.chunk_buffer[..n]) {
                 Ok(WriteOutcome::Written) => {
                     self.record_write(n, is_armed);
                     return Ok(());
@@ -819,7 +815,7 @@ impl Stream {
 
         // Write the fill points
         if let Some(backend) = &mut self.backend {
-            match backend.try_write_chunk(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
+            match backend.try_write(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
                 Ok(WriteOutcome::Written) => {
                     self.record_write(fill_start, is_armed);
                 }
@@ -852,7 +848,7 @@ impl Stream {
             self.state.last_chunk_len = n;
         }
         self.state.current_instant += n as u64;
-        if self.info.caps.output_model == OutputModel::UsbFrameSwap {
+        if self.backend.as_ref().is_some_and(|b| b.is_frame_swap()) {
             // Double-buffered devices (e.g. Helios) hold at most one frame.
             // Replace rather than accumulate to reflect the actual queue depth.
             self.state.scheduled_ahead = n as u64;
@@ -1072,17 +1068,17 @@ impl Stream {
     /// in shutdown path.
     fn blank_and_close_shutter(&mut self) {
         // Close shutter (best-effort)
-        if let Some(backend) = &mut self.backend {
-            let _ = backend.set_shutter(false);
+        if let Some(b) = &mut self.backend {
+            let _ = b.set_shutter(false);
         }
         self.state.shutter_open = false;
 
         // Output a small blank chunk to ensure laser is off
         // (some DACs may hold the last point otherwise)
-        if let Some(backend) = &mut self.backend {
+        if let Some(b) = &mut self.backend {
             let blank_point = LaserPoint::blanked(0.0, 0.0);
             let blank_chunk = [blank_point; 16];
-            let _ = backend.try_write_chunk(self.config.pps, &blank_chunk);
+            let _ = b.try_write(self.config.pps, &blank_chunk);
         }
     }
 }
@@ -1115,12 +1111,12 @@ impl Drop for Stream {
 /// ```
 pub struct Dac {
     info: DacInfo,
-    backend: Option<Box<dyn StreamBackend>>,
+    backend: Option<BackendKind>,
 }
 
 impl Dac {
     /// Create a new device from a backend.
-    pub fn new(info: DacInfo, backend: Box<dyn StreamBackend>) -> Self {
+    pub fn new(info: DacInfo, backend: BackendKind) -> Self {
         Self {
             info,
             backend: Some(backend),
@@ -1159,10 +1155,7 @@ impl Dac {
 
     /// Returns whether the device is connected.
     pub fn is_connected(&self) -> bool {
-        self.backend
-            .as_ref()
-            .map(|b| b.is_connected())
-            .unwrap_or(false)
+        self.backend.as_ref().is_some_and(|b| b.is_connected())
     }
 
     /// Starts a streaming session, consuming the device.
@@ -1243,7 +1236,7 @@ impl Dac {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{StreamBackend, WriteOutcome};
+    use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1332,7 +1325,7 @@ mod tests {
         }
     }
 
-    impl StreamBackend for NoQueueTestBackend {
+    impl DacBackend for NoQueueTestBackend {
         fn dac_type(&self) -> DacType {
             self.inner.dac_type()
         }
@@ -1353,16 +1346,18 @@ mod tests {
             self.inner.is_connected()
         }
 
-        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-            self.inner.try_write_chunk(pps, points)
-        }
-
         fn stop(&mut self) -> Result<()> {
             self.inner.stop()
         }
 
         fn set_shutter(&mut self, open: bool) -> Result<()> {
             self.inner.set_shutter(open)
+        }
+    }
+
+    impl FifoBackend for NoQueueTestBackend {
+        fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+            self.inner.try_write_points(pps, points)
         }
 
         /// Returns None - simulates a DAC that cannot report queue depth
@@ -1371,7 +1366,7 @@ mod tests {
         }
     }
 
-    impl StreamBackend for TestBackend {
+    impl DacBackend for TestBackend {
         fn dac_type(&self) -> DacType {
             DacType::Custom("Test".to_string())
         }
@@ -1394,7 +1389,18 @@ mod tests {
             self.connected
         }
 
-        fn try_write_chunk(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.shutter_open.store(open, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl FifoBackend for TestBackend {
+        fn try_write_points(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             self.write_count.fetch_add(1, Ordering::SeqCst);
 
             // Return WouldBlock until count reaches 0
@@ -1408,17 +1414,69 @@ mod tests {
             Ok(WriteOutcome::Written)
         }
 
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
-
-        fn set_shutter(&mut self, open: bool) -> Result<()> {
-            self.shutter_open.store(open, Ordering::SeqCst);
-            Ok(())
-        }
-
         fn queued_points(&self) -> Option<u64> {
             Some(self.queued.load(Ordering::SeqCst))
+        }
+    }
+
+    /// Mock FrameSwapBackend for testing frame-swap specific behavior.
+    ///
+    /// Wraps a TestBackend and implements FrameSwapBackend instead of FifoBackend.
+    /// Use with `BackendKind::FrameSwap(Box::new(...))` to test frame-swap dispatch.
+    struct FrameSwapTestBackend {
+        inner: TestBackend,
+        frame_capacity: usize,
+        ready: Arc<AtomicBool>,
+    }
+
+    impl FrameSwapTestBackend {
+        fn new() -> Self {
+            Self {
+                inner: TestBackend::new().with_output_model(OutputModel::UsbFrameSwap),
+                frame_capacity: 4095,
+                ready: Arc::new(AtomicBool::new(true)),
+            }
+        }
+    }
+
+    impl DacBackend for FrameSwapTestBackend {
+        fn dac_type(&self) -> DacType {
+            self.inner.dac_type()
+        }
+        fn caps(&self) -> &DacCapabilities {
+            self.inner.caps()
+        }
+        fn connect(&mut self) -> Result<()> {
+            self.inner.connect()
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            self.inner.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.inner.set_shutter(open)
+        }
+    }
+
+    impl crate::backend::FrameSwapBackend for FrameSwapTestBackend {
+        fn frame_capacity(&self) -> usize {
+            self.frame_capacity
+        }
+
+        fn is_ready_for_frame(&mut self) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+
+        fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+            if !self.ready.load(Ordering::SeqCst) {
+                return Ok(WriteOutcome::WouldBlock);
+            }
+            self.inner.try_write_points(pps, points)
         }
     }
 
@@ -1467,7 +1525,7 @@ mod tests {
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
         // Device should not be connected initially
         assert!(!device.is_connected());
@@ -1491,7 +1549,7 @@ mod tests {
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
         let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -1515,7 +1573,7 @@ mod tests {
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
         let cfg = StreamConfig::new(30_000)
             .with_target_buffer(Duration::from_millis(12))
@@ -1536,7 +1594,7 @@ mod tests {
             kind: DacType::Custom("Test".to_string()),
             caps: backend.caps().clone(),
         };
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
         let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -1559,7 +1617,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Record initial state
         let initial_instant = stream.state.current_instant;
@@ -1593,7 +1651,7 @@ mod tests {
         let backend = TestBackend::new().with_would_block_count(3);
         let write_count = backend.write_count.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1635,7 +1693,7 @@ mod tests {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1673,7 +1731,7 @@ mod tests {
     fn test_handle_underrun_blanks_when_disarmed() {
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1721,7 +1779,7 @@ mod tests {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1749,7 +1807,7 @@ mod tests {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1809,7 +1867,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(10))
             .with_min_buffer(Duration::from_millis(5));
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1860,7 +1918,7 @@ mod tests {
             .with_target_buffer(Duration::from_millis(5))
             .with_min_buffer(Duration::from_millis(2))
             .with_drain_timeout(Duration::ZERO);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1905,7 +1963,7 @@ mod tests {
 
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1946,7 +2004,7 @@ mod tests {
         // Test that ChunkResult::End terminates the stream gracefully
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -1991,7 +2049,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2038,7 +2096,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2095,7 +2153,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Set software estimate to 500 points
         stream.state.scheduled_ahead = 500;
@@ -2111,7 +2169,7 @@ mod tests {
         let backend = TestBackend::new().with_initial_queue(300);
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2148,7 +2206,7 @@ mod tests {
         let backend = TestBackend::new().with_initial_queue(100);
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2190,7 +2248,7 @@ mod tests {
         // Verify that build_fill_request uses conservative buffer estimation
         let backend = TestBackend::new().with_initial_queue(200);
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2235,7 +2293,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(40))
             .with_min_buffer(Duration::from_millis(10));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Empty buffer: need full target
         stream.state.scheduled_ahead = 0;
@@ -2283,7 +2341,7 @@ mod tests {
         let cfg = StreamConfig::new(30000)
             .with_target_buffer(Duration::from_millis(40))
             .with_min_buffer(Duration::from_millis(10));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Buffer at 299 points: 1 point below min_buffer
         stream.state.scheduled_ahead = 299;
@@ -2307,7 +2365,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2368,7 +2426,7 @@ mod tests {
         // Test that Filled(n) updates last_chunk for RepeatLast policy when armed
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2420,7 +2478,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2477,7 +2535,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2527,7 +2585,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2573,7 +2631,7 @@ mod tests {
         // Test that Starved with Stop policy terminates the stream
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2613,7 +2671,7 @@ mod tests {
         // Test that End terminates the stream with ProducerEnded
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2643,7 +2701,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2709,7 +2767,7 @@ mod tests {
         };
 
         // 1. Create device and start stream
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
         assert!(!device.is_connected());
 
         let cfg = StreamConfig::new(30000);
@@ -2766,7 +2824,7 @@ mod tests {
         let backend = TestBackend::new();
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2833,7 +2891,7 @@ mod tests {
 
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2883,7 +2941,7 @@ mod tests {
         };
 
         // First stream session
-        let device = Dac::new(info, Box::new(backend));
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
         let cfg = StreamConfig::new(30000);
         let (stream, _) = device.start_stream(cfg).unwrap();
 
@@ -2918,7 +2976,7 @@ mod tests {
         // Test that stream statistics are tracked correctly
         let backend = TestBackend::new();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -2968,7 +3026,7 @@ mod tests {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3023,7 +3081,7 @@ mod tests {
             call_count: Arc<AtomicUsize>,
         }
 
-        impl StreamBackend for DisconnectingBackend {
+        impl DacBackend for DisconnectingBackend {
             fn dac_type(&self) -> DacType {
                 self.inner.dac_type()
             }
@@ -3049,17 +3107,19 @@ mod tests {
                 self.inner.is_connected()
             }
 
-            fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-                self.call_count.fetch_add(1, Ordering::SeqCst);
-                self.inner.try_write_chunk(pps, points)
-            }
-
             fn stop(&mut self) -> Result<()> {
                 self.inner.stop()
             }
 
             fn set_shutter(&mut self, open: bool) -> Result<()> {
                 self.inner.set_shutter(open)
+            }
+        }
+
+        impl FifoBackend for DisconnectingBackend {
+            fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.inner.try_write_points(pps, points)
             }
 
             fn queued_points(&self) -> Option<u64> {
@@ -3082,7 +3142,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000);
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         let error_occurred = Arc::new(AtomicBool::new(false));
         let error_occurred_clone = error_occurred.clone();
@@ -3158,7 +3218,7 @@ mod tests {
         }
     }
 
-    impl StreamBackend for FailingWriteBackend {
+    impl DacBackend for FailingWriteBackend {
         fn dac_type(&self) -> DacType {
             DacType::Custom("FailingTest".to_string())
         }
@@ -3180,7 +3240,17 @@ mod tests {
             self.inner.is_connected()
         }
 
-        fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        fn stop(&mut self) -> Result<()> {
+            self.inner.stop()
+        }
+
+        fn set_shutter(&mut self, open: bool) -> Result<()> {
+            self.inner.set_shutter(open)
+        }
+    }
+
+    impl FifoBackend for FailingWriteBackend {
+        fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
             let count = self.write_count.fetch_add(1, Ordering::SeqCst);
             if count >= self.fail_after {
                 Err(Error::backend(std::io::Error::new(
@@ -3188,16 +3258,8 @@ mod tests {
                     self.error_message,
                 )))
             } else {
-                self.inner.try_write_chunk(pps, points)
+                self.inner.try_write_points(pps, points)
             }
-        }
-
-        fn stop(&mut self) -> Result<()> {
-            self.inner.stop()
-        }
-
-        fn set_shutter(&mut self, open: bool) -> Result<()> {
-            self.inner.set_shutter(open)
         }
 
         fn queued_points(&self) -> Option<u64> {
@@ -3219,7 +3281,7 @@ mod tests {
     }
 
     /// Build a Stream from a backend with default test config (30 kpps).
-    fn make_test_stream(mut backend: impl StreamBackend + 'static) -> Stream {
+    fn make_test_stream(mut backend: impl FifoBackend + 'static) -> Stream {
         backend.connect().unwrap();
         let info = DacInfo {
             id: "test".to_string(),
@@ -3227,7 +3289,7 @@ mod tests {
             kind: backend.dac_type(),
             caps: backend.caps().clone(),
         };
-        Stream::with_backend(info, Box::new(backend), StreamConfig::new(30000))
+        Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), StreamConfig::new(30000))
     }
 
     #[test]
@@ -3405,7 +3467,7 @@ mod tests {
         let backend = TestBackend::new().with_initial_queue(1000);
         let queued = backend.queued.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3443,7 +3505,7 @@ mod tests {
 
         let backend = TestBackend::new().with_initial_queue(100000); // Large queue that won't drain
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3478,7 +3540,7 @@ mod tests {
 
         let backend = TestBackend::new().with_initial_queue(100000);
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3523,7 +3585,7 @@ mod tests {
 
         // Short drain timeout
         let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
-        let stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         let start = Instant::now();
         let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -3546,7 +3608,7 @@ mod tests {
         let backend = TestBackend::new();
         let shutter_open = backend.shutter_open.clone();
 
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3601,7 +3663,7 @@ mod tests {
         };
 
         let cfg = StreamConfig::new(30000); // color_delay defaults to ZERO
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Arm the stream so points aren't blanked
         stream.control.arm().unwrap();
@@ -3638,7 +3700,7 @@ mod tests {
 
         // 10000 PPS, delay = 300µs → ceil(0.0003 * 10000) = 3 points
         let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(300));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Arm the stream
         stream.control.arm().unwrap();
@@ -3699,7 +3761,7 @@ mod tests {
 
         // 10000 PPS, delay = 200µs → ceil(0.0002 * 10000) = 2 points
         let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Arm: should pre-fill delay line
         stream.handle_shutter_transition(true);
@@ -3730,7 +3792,7 @@ mod tests {
 
         // Start with 200µs delay at 10000 PPS → 2 points
         let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         // Arm
         stream.control.arm().unwrap();
@@ -3783,7 +3845,7 @@ mod tests {
     #[test]
     fn test_startup_blank_blanks_first_n_points() {
         let backend = TestBackend::new();
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3840,7 +3902,7 @@ mod tests {
     #[test]
     fn test_startup_blank_resets_on_rearm() {
         let backend = TestBackend::new();
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3892,7 +3954,7 @@ mod tests {
     #[test]
     fn test_startup_blank_zero_is_noop() {
         let backend = TestBackend::new();
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3936,8 +3998,8 @@ mod tests {
 
     #[test]
     fn test_usb_frame_swap_replaces_scheduled_ahead() {
-        let backend = TestBackend::new().with_output_model(OutputModel::UsbFrameSwap);
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let backend = FrameSwapTestBackend::new();
+        let mut backend_box = BackendKind::FrameSwap(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -3971,8 +4033,8 @@ mod tests {
 
     #[test]
     fn test_usb_frame_swap_no_queue_reporting() {
-        let backend = NoQueueTestBackend::new().with_output_model(OutputModel::UsbFrameSwap);
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let backend = FrameSwapTestBackend::new();
+        let mut backend_box = BackendKind::FrameSwap(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -4011,7 +4073,7 @@ mod tests {
     #[test]
     fn test_network_fifo_accumulates_scheduled_ahead() {
         let backend = TestBackend::new(); // default: NetworkFifo
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -4059,7 +4121,7 @@ mod tests {
         let cfg = StreamConfig::new(1000)
             .with_target_buffer(Duration::from_millis(500))
             .with_min_buffer(Duration::from_millis(100));
-        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+        let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
         let mut writes = 0;
         while stream.state.scheduled_ahead <= stream.scheduler_target_buffer_points() {
@@ -4085,7 +4147,7 @@ mod tests {
         let backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
@@ -4105,7 +4167,7 @@ mod tests {
         let backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
-        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        let mut backend_box = BackendKind::Fifo(Box::new(backend));
         backend_box.connect().unwrap();
 
         let info = DacInfo {
