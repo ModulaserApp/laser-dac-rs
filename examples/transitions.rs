@@ -1,18 +1,18 @@
 //! Transition blanking test — alternates between two shapes at different positions.
 //!
-//! Visually tests the `TransitionFn` callback in `FrameSession`. Two shapes are
-//! placed far apart so the inter-frame transition is clearly visible:
+//! Visually tests the `TransitionFn` callback in `FrameSession`. Two shapes swap
+//! every 50ms so transition blanking is clearly visible (~20 transitions/second).
 //!
-//! - **Pass**: clean dark travel between shapes (blanking points inserted)
-//! - **Fail**: bright line connecting the two shapes
+//! - **Pass**: clean dark travel between shapes
+//! - **Fail**: bright line or flash connecting the two shapes
 //!
 //! Modes:
-//! - `default`  — uses `default_transition` (8 blanked interpolated points)
-//! - `long`     — 32 blanked points (more dwell time, very safe)
-//! - `none`     — zero transition points (should show bright travel lines!)
-//! - `animated` — alternates between 3 frames every 2 seconds
+//! - `default`  — 8 blanked points (0.27ms at 30kpps — only enough for nearby shapes)
+//! - `safe`     — 150 blanked points (5ms at 30kpps — enough for full-range galvo travel)
+//! - `none`     — zero transition points (expect bright flash + galvo stress!)
+//! - `animated` — 3 shapes cycling every 2 seconds with safe transition
 //!
-//! Run with: `cargo run --example transitions -- [default|long|none|animated]`
+//! Run with: `cargo run --example transitions -- [default|safe|none|animated]`
 
 mod common;
 
@@ -29,7 +29,7 @@ use std::time::Duration;
 #[command(about = "Test transition blanking between frames")]
 struct Args {
     /// Transition mode
-    #[arg(value_enum, default_value_t = Mode::Default)]
+    #[arg(value_enum, default_value_t = Mode::Safe)]
     mode: Mode,
 
     /// Points per shape
@@ -39,14 +39,27 @@ struct Args {
 
 #[derive(Copy, Clone, clap::ValueEnum)]
 enum Mode {
-    /// Default 8-point blanked transition
+    /// Default 8-point blanked transition (short — for nearby shapes)
     Default,
-    /// 32-point blanked transition (extra safe)
-    Long,
-    /// No transition points (expect bright travel lines)
+    /// 150-point blanked transition (5ms at 30kpps — full-range galvo safe)
+    Safe,
+    /// No transition points (expect bright flash and galvo stress!)
     None,
-    /// Animated: cycle through 3 frames every 2 seconds
+    /// Animated: cycle through 3 frames every 2 seconds with safe transition
     Animated,
+}
+
+/// Generate N linearly-interpolated blanked points between two positions.
+fn blanked_transition(n: usize, from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
+    if n == 0 {
+        return vec![];
+    }
+    (0..n)
+        .map(|i| {
+            let t = (i + 1) as f32 / (n + 1) as f32;
+            LaserPoint::blanked(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
@@ -78,23 +91,10 @@ fn main() -> Result<()> {
 
     let transition_fn: TransitionFn = match args.mode {
         Mode::Default => Box::new(default_transition),
-        Mode::Long => Box::new(|from: &LaserPoint, to: &LaserPoint| {
-            let n = 32;
-            (0..n)
-                .map(|i| {
-                    let t = (i + 1) as f32 / (n + 1) as f32;
-                    LaserPoint::blanked(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
-                })
-                .collect()
-        }),
-        Mode::None | Mode::Animated => Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]),
-    };
-
-    // For animated mode, use default_transition (override the "none" above)
-    let transition_fn: TransitionFn = if matches!(args.mode, Mode::Animated) {
-        Box::new(default_transition)
-    } else {
-        transition_fn
+        Mode::Safe | Mode::Animated => {
+            Box::new(|from: &LaserPoint, to: &LaserPoint| blanked_transition(150, from, to))
+        }
+        Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]),
     };
 
     let config = FrameSessionConfig::new(30_000)
@@ -104,10 +104,10 @@ fn main() -> Result<()> {
     let (session, info) = device.start_frame_session(config)?;
 
     let mode_name = match args.mode {
-        Mode::Default => "default (8-point blank)",
-        Mode::Long => "long (32-point blank)",
-        Mode::None => "none (expect bright travel lines!)",
-        Mode::Animated => "animated (3 frames cycling, default transition)",
+        Mode::Default => "default (8 points, 0.27ms — may show flash for distant shapes)",
+        Mode::Safe => "safe (150 points, 5ms — clean for any distance)",
+        Mode::None => "none (expect bright flash + galvo stress!)",
+        Mode::Animated => "animated (3 shapes cycling, 150-point transition)",
     };
     println!(
         "\nTransition test [{}] on {}... Press Ctrl+C to stop\n",
@@ -126,11 +126,10 @@ fn main() -> Result<()> {
     let n = args.points;
 
     if matches!(args.mode, Mode::Animated) {
-        // Animated: cycle through 3 frames at different positions
         let frames = vec![
-            make_circle(n, -0.5, 0.3, 0.25, 65535, 0, 0),     // red, top-left
-            make_circle(n, 0.5, 0.3, 0.25, 0, 65535, 0),       // green, top-right
-            make_circle(n, 0.0, -0.4, 0.25, 0, 0, 65535),      // blue, bottom-center
+            make_circle(n, -0.4, 0.25, 0.2, 65535, 0, 0),    // red, top-left
+            make_circle(n, 0.4, 0.25, 0.2, 0, 65535, 0),      // green, top-right
+            make_circle(n, 0.0, -0.35, 0.2, 0, 0, 65535),     // blue, bottom-center
         ];
 
         println!("  Cycling 3 colored circles every 2 seconds.");
@@ -141,7 +140,6 @@ fn main() -> Result<()> {
             session.send_frame(frames[idx].clone());
             idx = (idx + 1) % frames.len();
 
-            // Sleep 2 seconds, checking for stop
             for _ in 0..40 {
                 thread::sleep(Duration::from_millis(50));
                 if session.control().is_stop_requested() {
@@ -152,17 +150,17 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        // Two separate frames at different positions — alternates rapidly.
-        // Swaps every ~50ms so transitions fire ~20x/second, making blanking
-        // quality visible as a steady pattern between shapes.
-        let frame_left = AuthoredFrame::new(make_triangle(n, -0.5, 0.0, 0.4));
-        let frame_right = make_circle(n, 0.5, 0.0, 0.2, 0, 65535, 0);
+        // Two shapes — alternates every 50ms (~20 swaps/second).
+        // Shapes are 0.6 units apart (moderate distance).
+        let frame_left = AuthoredFrame::new(make_triangle(n, -0.3, 0.0, 0.35));
+        let frame_right = make_circle(n, 0.3, 0.0, 0.18, 0, 65535, 0);
 
         println!("  Alternating: red triangle (left) ↔ green circle (right)");
         println!("  Swapping every ~50ms — watch the gap between shapes.\n");
 
         if matches!(args.mode, Mode::None) {
-            println!("  !! Mode=none: you SHOULD see a bright line between the shapes.\n");
+            println!("  !! Mode=none: you SHOULD see a bright flash between shapes.");
+            println!("  !! Stop quickly if galvos sound stressed.\n");
         }
 
         let frames = [frame_left, frame_right];
@@ -179,8 +177,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 /// Generate a circle at an offset position.
