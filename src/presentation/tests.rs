@@ -214,22 +214,45 @@ fn test_engine_fill_chunk_cycles_frame() {
 }
 
 #[test]
-fn test_engine_fill_chunk_self_loop_calls_transition() {
-    let mut engine = make_engine(); // 2-point transition
+fn test_engine_fill_chunk_self_loop_no_transition() {
+    let mut engine = make_engine(); // 2-point transition (unused on self-loop)
     let frame = make_frame(vec![make_point(0.0, 0.0), make_point(1.0, 0.0)]);
     engine.set_pending(frame);
 
-    // Drawable = [transition(last→first)] + [frame points]
-    // = 2 transition pts + 2 frame pts = 4 total per cycle
+    // Self-loop: no transition points, just frame cycling: [0.0, 1.0, 0.0, 1.0, ...]
     let mut buffer = vec![LaserPoint::default(); 8];
     let n = engine.fill_chunk(&mut buffer, 8);
     assert_eq!(n, 8);
 
-    // First cycle: [trans0, trans1, 0.0, 1.0]
-    // trans0 is blanked (midpoint of last(1.0) and first(0.0) = 0.5)
-    assert_eq!(buffer[0].intensity, 0); // transition point
-    assert_eq!(buffer[2].x, 0.0); // frame point
-    assert_eq!(buffer[3].x, 1.0); // frame point
+    // All points are frame points, cycling
+    assert_eq!(buffer[0].x, 0.0);
+    assert_eq!(buffer[1].x, 1.0);
+    assert_eq!(buffer[2].x, 0.0);
+    assert_eq!(buffer[3].x, 1.0);
+    // No blanked transition points
+    assert_eq!(buffer[0].intensity, 65535);
+    assert_eq!(buffer[1].intensity, 65535);
+}
+
+#[test]
+fn test_engine_fill_chunk_frame_change_inserts_transition() {
+    let mut engine = make_engine(); // 2-point transition
+    let frame_a = make_frame(vec![make_point(0.0, 0.0)]);
+    let frame_b = make_frame(vec![make_point(1.0, 0.0)]);
+
+    engine.set_pending(frame_a);
+    engine.set_pending(frame_b); // pending
+
+    // frame_a (1 point) → transition (2 points) → frame_b cycling
+    let mut buffer = vec![LaserPoint::default(); 6];
+    let n = engine.fill_chunk(&mut buffer, 6);
+    assert_eq!(n, 6);
+
+    assert_eq!(buffer[0].x, 0.0);        // frame_a
+    assert_eq!(buffer[1].intensity, 0);   // transition point (blanked)
+    assert_eq!(buffer[2].intensity, 0);   // transition point (blanked)
+    assert_eq!(buffer[3].x, 1.0);        // frame_b
+    assert_eq!(buffer[4].x, 1.0);        // frame_b self-loop
 }
 
 #[test]

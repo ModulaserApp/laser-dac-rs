@@ -127,14 +127,18 @@ pub(crate) struct PresentationEngine {
     current_base: Option<Arc<AuthoredFrame>>,
     /// The next frame to promote (latest-wins).
     pending_base: Option<Arc<AuthoredFrame>>,
-    /// Composed drawable: base points + transition points for current state.
+    /// Current frame's points (no transition — just the raw frame).
     drawable: Vec<LaserPoint>,
-    /// Whether the drawable needs to be recomposed.
+    /// Whether the drawable needs to be rebuilt from current_base.
     drawable_dirty: bool,
     /// Current read cursor within `drawable`.
     cursor: usize,
     /// Transition function for generating blanking between frames.
     transition_fn: TransitionFn,
+    /// Buffer for transition points injected between frames.
+    transition_buf: Vec<LaserPoint>,
+    /// Read cursor within transition_buf.
+    transition_cursor: usize,
 }
 
 impl PresentationEngine {
@@ -147,6 +151,8 @@ impl PresentationEngine {
             drawable_dirty: true,
             cursor: 0,
             transition_fn,
+            transition_buf: Vec::new(),
+            transition_cursor: 0,
         }
     }
 
@@ -165,11 +171,12 @@ impl PresentationEngine {
         }
     }
 
-    /// FIFO delivery: fill `buffer[..max_points]` from the drawable.
+    /// FIFO delivery: fill `buffer[..max_points]` from the current frame.
     ///
-    /// Traverses the current frame cyclically, inserting transition points
-    /// at wrap boundaries. When the frame completes and a pending frame
-    /// exists, promotes it and continues filling.
+    /// Traverses the current frame cyclically. On self-loop, the cursor
+    /// wraps without inserting transition points. When a pending frame is
+    /// promoted, transition points are injected between the old frame's
+    /// last point and the new frame's first point.
     ///
     /// Returns the number of points written (always `max_points` if a
     /// frame is available, 0 if no frame has been submitted).
@@ -198,23 +205,34 @@ impl PresentationEngine {
 
         let mut written = 0;
         while written < max_points {
-            // Output current point
+            // Drain any pending transition points first
+            if self.transition_cursor < self.transition_buf.len() {
+                buffer[written] = self.transition_buf[self.transition_cursor];
+                self.transition_cursor += 1;
+                written += 1;
+                continue;
+            }
+
+            // Output current frame point
             buffer[written] = self.drawable[self.cursor];
             written += 1;
             self.cursor += 1;
 
-            // Check if we've completed the drawable
+            // Check if we've completed the frame
             if self.cursor >= self.drawable.len() {
-                // Promote pending if available
                 if let Some(pending) = self.pending_base.take() {
-                    self.current_base = Some(pending);
-                    self.drawable_dirty = true;
+                    // Frame change: inject transition, then promote
+                    let last = self.drawable.last().unwrap();
+                    let new_frame = pending;
+                    if let Some(first) = new_frame.first_point() {
+                        self.transition_buf = (self.transition_fn)(last, first);
+                        self.transition_cursor = 0;
+                    }
+                    self.current_base = Some(new_frame);
                     self.refresh_drawable();
                     self.cursor = 0;
                 } else {
-                    // Self-loop: reset cursor, recompose for self-transition
-                    self.drawable_dirty = true;
-                    self.refresh_drawable();
+                    // Self-loop: just wrap the cursor, no transition
                     self.cursor = 0;
                 }
             }
@@ -225,8 +243,10 @@ impl PresentationEngine {
 
     /// Frame-swap delivery: compose and return a complete hardware frame.
     ///
-    /// Returns the composed frame (base + transition) for the current state.
-    /// If a pending frame exists, it is promoted first.
+    /// Returns the frame points for the current state. If a pending frame
+    /// exists, it is promoted first. For frame-swap DACs, the self-loop
+    /// transition (last→first of same frame) is prepended so the device
+    /// receives one atomic frame with clean blanking at the loop point.
     pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] {
         // Promote pending if available
         if let Some(pending) = self.pending_base.take() {
@@ -235,14 +255,17 @@ impl PresentationEngine {
         }
 
         if self.drawable_dirty {
-            self.refresh_drawable();
+            self.refresh_drawable_for_frame_swap();
         }
 
         &self.drawable
     }
 
-    /// Rebuild the drawable from the current base frame + transition.
-    fn refresh_drawable(&mut self) {
+    /// Rebuild drawable for frame-swap: includes self-loop transition.
+    ///
+    /// Frame-swap DACs send the entire drawable as one atomic frame, so the
+    /// transition from last→first point must be included for clean looping.
+    fn refresh_drawable_for_frame_swap(&mut self) {
         self.drawable.clear();
         self.drawable_dirty = false;
 
@@ -255,15 +278,23 @@ impl PresentationEngine {
         }
 
         let points = current.points();
-
-        // Add transition from last point to first point (self-loop or inter-frame)
         let last = points.last().unwrap();
         let first = points.first().unwrap();
         let transition = (self.transition_fn)(last, first);
         self.drawable.extend_from_slice(&transition);
-
-        // Add the base frame points
         self.drawable.extend_from_slice(points);
+    }
+
+    /// Rebuild the drawable from the current base frame.
+    fn refresh_drawable(&mut self) {
+        self.drawable.clear();
+        self.drawable_dirty = false;
+
+        let Some(current) = &self.current_base else {
+            return;
+        };
+
+        self.drawable.extend_from_slice(current.points());
     }
 }
 
