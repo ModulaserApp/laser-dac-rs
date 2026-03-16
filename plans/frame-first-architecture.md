@@ -171,37 +171,9 @@ Because the crate is early, this is exactly the right moment to do it properly i
 
 ---
 
-## Open decisions
+## Decisions
 
-These two questions require a deliberate decision. A direction is proposed for each but they are marked explicitly as open.
-
-### Decision 1: Point color representation
-
-**Proposed direction**: Move to `f32` colors (0.0–1.0) for the public `LaserPoint` type.
-
-Rationale:
-
-- The presentation layer needs to synthesize blanking ramps, fades, and transitions. Float arithmetic is natural; integer arithmetic is awkward.
-- libera-core uses floats and it works well in practice.
-- Conversion to device-native formats (u8, u12, u16) happens once per backend, at the write boundary.
-- The crate is pre-1.0. This is the last good window for this change.
-
-```rust
-pub struct LaserPoint {
-    pub x: f32,          // -1.0 to 1.0
-    pub y: f32,          // -1.0 to 1.0
-    pub r: f32,          // 0.0 to 1.0
-    pub g: f32,          // 0.0 to 1.0
-    pub b: f32,          // 0.0 to 1.0
-    pub intensity: f32,  // 0.0 to 1.0
-}
-```
-
-Migration: search-and-replace `65535` → `1.0`, `0` → `0.0` in color fields. Provide `LaserPoint::new()` and `LaserPoint::blanked()` with the same signatures (just f32). Backends update their conversion helpers (already isolated in `coord_to_u12` etc.).
-
-**Alternative**: Keep `u16` colors. Add `f32` convenience constructors. The presentation layer works in `f32` internally and converts at its own boundary. This avoids a breaking change but creates two representations in the crate.
-
-### Decision 2: Scanner sync placement
+### Scanner sync placement
 
 **Proposed direction**: Dual-path.
 
@@ -210,7 +182,7 @@ Migration: search-and-replace `65535` → `1.0`, `0` → `0.0` in color fields. 
 
 This means `StreamConfig::color_delay` stays for streaming mode, and `FrameSessionConfig` gains a `color_delay_points` field for frame mode.
 
-**Alternative**: Keep color delay as runtime-only for both paths. Simpler, but frame-swap DACs get cross-frame color bleed (the first N points of a new frame inherit colors from the previous frame's tail, which is the current libera-core behavior).
+**Alternative**: Keep color delay as runtime-only for both paths. Simpler, but frame-swap DACs get cross-frame color bleed (the first N points of a new frame inherit colors from the previous frame's tail).
 
 ---
 
@@ -984,20 +956,6 @@ fn modulaser_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
 - Per-protocol implementations — same structure, different trait
 
 ---
-
-## What this design does better than libera-core
-
-| Concern | libera-core (C++) | laser-dac-rs (proposed) |
-|---|---|---|
-| Transport correctness | Runtime branch on output model | Compile-time trait split |
-| Frame preparation | Recomputed every callback | Base frame cached, ending composed at delivery time |
-| Seam handling | Not in library (downstream) | Callback-driven, called reactively at delivery time; default helper shipped |
-| Color delay in frame mode | Runtime FIFO, cross-frame bleed | Baked into drawable at composition time |
-| Frame scheduling | Global static latency | Per-session configuration |
-| Reconnection | Internal, not surfaced cleanly | `ReconnectingSession` with callbacks |
-| Error contract | Assert + silent pad/truncate | Typed `ChunkResult` enum |
-| Thread safety | Manual atomics + mutex | Ownership model, `Send` bounds |
-| Stream lifecycle | Manual start/stop/join | `Stream` consumes `Dac`, RAII cleanup |
 
 ---
 
