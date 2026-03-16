@@ -2,7 +2,7 @@
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::protocols::avb::normalize_device_name;
+use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -566,6 +566,10 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
     let mut records: Vec<DeviceRecord<D>> = records
         .into_iter()
         .filter(|record| {
+            if is_blacklisted_device(&record.name) {
+                log::debug!("AVB: skipping {:?} — blacklisted (not a laser DAC)", record.name);
+                return false;
+            }
             let channel_ok = supports_required_channels(record);
             if !channel_ok {
                 log::debug!(
@@ -1062,6 +1066,7 @@ mod tests {
             make_record("Broadcom NetXtreme A", 8, 44_100, 48_000),
             make_record("Broadcom NetXtreme B", 2, 44_100, 48_000),
             make_record("Broadcom NetXtreme B", 8, 44_100, 48_000),
+            make_record("Studio Display Speakers", 6, 44_100, 48_000),
         ];
 
         let candidates = collect_candidates_from_records(records);

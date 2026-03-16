@@ -32,3 +32,39 @@ pub(crate) fn normalize_device_name(name: &str) -> String {
         .trim()
         .to_ascii_lowercase()
 }
+
+/// Exact device names (matched case-insensitively) that are definitely *not*
+/// laser DACs, even though they may expose enough channels to pass the
+/// channel-count filter.
+const BLACKLISTED_DEVICE_NAMES: &[&str] = &[
+    "studio display speakers",
+];
+
+/// Returns `true` when the device name matches a known non-laser audio device.
+pub(crate) fn is_blacklisted_device(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    BLACKLISTED_DEVICE_NAMES
+        .iter()
+        .any(|blocked| lower == *blocked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blacklist_matches_exact_name_case_insensitively() {
+        assert!(is_blacklisted_device("Studio Display Speakers"));
+        assert!(is_blacklisted_device("studio display speakers"));
+        assert!(is_blacklisted_device("STUDIO DISPLAY SPEAKERS"));
+    }
+
+    #[test]
+    fn blacklist_does_not_match_partial_or_unrelated() {
+        assert!(!is_blacklisted_device("Apple Studio Display"));
+        assert!(!is_blacklisted_device("Studio Display"));
+        assert!(!is_blacklisted_device("Broadcom NetXtreme"));
+        assert!(!is_blacklisted_device("MOTU AVB 24Ao"));
+        assert!(!is_blacklisted_device("Built-in Output"));
+    }
+}
