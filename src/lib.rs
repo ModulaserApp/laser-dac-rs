@@ -65,6 +65,7 @@ mod error;
 mod frame_adapter;
 #[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
 mod net_utils;
+pub mod presentation;
 pub mod protocols;
 pub mod session;
 pub mod stream;
@@ -110,6 +111,9 @@ pub use stream::{Dac, Stream, StreamControl};
 
 // Frame adapters (converts point buffers to continuous streams)
 pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
+
+// Presentation types (frame-first API)
+pub use presentation::{default_transition, AuthoredFrame, TransitionFn};
 
 // Conditional exports based on features
 
