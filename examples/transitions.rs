@@ -152,16 +152,17 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        // Two separate frames at different positions — alternates every 2 seconds.
-        // The inter-frame transition blanking is what we're testing.
+        // Two separate frames at different positions — alternates rapidly.
+        // Swaps every ~50ms so transitions fire ~20x/second, making blanking
+        // quality visible as a steady pattern between shapes.
         let frame_left = AuthoredFrame::new(make_triangle(n, -0.5, 0.0, 0.4));
         let frame_right = make_circle(n, 0.5, 0.0, 0.2, 0, 65535, 0);
 
         println!("  Alternating: red triangle (left) ↔ green circle (right)");
-        println!("  Watch the transition blanking when shapes swap every 2 seconds.\n");
+        println!("  Swapping every ~50ms — watch the gap between shapes.\n");
 
         if matches!(args.mode, Mode::None) {
-            println!("  !! Mode=none: you SHOULD see a bright line during swaps.\n");
+            println!("  !! Mode=none: you SHOULD see a bright line between the shapes.\n");
         }
 
         let frames = [frame_left, frame_right];
@@ -170,13 +171,11 @@ fn main() -> Result<()> {
             session.send_frame(frames[idx].clone());
             idx = (idx + 1) % frames.len();
 
-            for _ in 0..40 {
-                thread::sleep(Duration::from_millis(50));
-                if session.control().is_stop_requested() {
-                    let exit = session.join()?;
-                    println!("\nSession ended: {:?}", exit);
-                    return Ok(());
-                }
+            thread::sleep(Duration::from_millis(50));
+            if session.control().is_stop_requested() {
+                let exit = session.join()?;
+                println!("\nSession ended: {:?}", exit);
+                return Ok(());
             }
         }
     }
