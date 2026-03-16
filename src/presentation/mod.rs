@@ -573,15 +573,9 @@ impl FrameSession {
             }
             last_armed = is_armed;
 
-            // 8. Fill chunk from engine
-            // UdpTimed: always fill max_points for constant packet cadence.
-            // Other FIFO: fill the deficit to reach target buffer level.
-            let target_points = if is_udp_timed {
-                max_points
-            } else {
-                let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
-                ((deficit * pps).ceil() as usize).min(max_points)
-            };
+            // 8. Fill chunk from engine — fill the deficit to reach target buffer.
+            let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
+            let target_points = ((deficit * pps).ceil() as usize).min(max_points);
             if target_points == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
