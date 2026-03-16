@@ -94,5 +94,9 @@ path = "examples/audio.rs"
 name = "reconnect"
 path = "examples/reconnect.rs"
 
+[[example]]
+name = "transitions"
+path = "examples/transitions.rs"
+
 [package.metadata.docs.rs]
 features = ["all-dacs"]
