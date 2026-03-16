@@ -8,8 +8,8 @@
 mod common;
 
 use clap::Parser;
-use common::{fill_points, Args};
-use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
+use common::{make_producer, Args};
+use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -42,12 +42,19 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire)
     stream.control().arm()?;
 
-    let shape = args.shape;
-    let scale = args.scale;
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
 
-    // Run stream with zero-allocation callback
+    let mut producer = make_producer(args.shape, args.points, args.scale);
+
+    // Run stream — static shapes cycle through a pre-generated frame,
+    // time-based shapes compute points from stream timestamps
     let exit = stream.run(
-        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| fill_points(shape, scale, req, buffer),
+        move |req, buffer| producer(req, buffer),
         |err| {
             eprintln!("Stream error: {}", err);
         },

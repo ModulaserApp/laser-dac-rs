@@ -467,12 +467,15 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 /// # Buffer-Driven Timing
 ///
 /// The streaming API uses pure buffer-driven timing:
-/// - `target_buffer`: Target buffer level to maintain (default: 20ms)
-/// - `min_buffer`: Minimum buffer before requesting urgent fill (default: 8ms)
+/// - `target_buffer`: Target buffer level to maintain (default baseline: 20ms)
+/// - `min_buffer`: Minimum buffer before requesting urgent fill (default baseline: 8ms)
 ///
 /// The callback is invoked when `buffered < target_buffer`. The callback receives
 /// a `ChunkRequest` with `min_points` and `target_points` calculated from these
 /// durations and the current buffer state.
+///
+/// `Dac::start_stream()` may promote untouched defaults to safer network values
+/// for `NetworkFifo` / `UdpTimed` backends.
 ///
 /// To reduce perceived latency, reduce `target_buffer`.
 #[derive(Clone, Debug)]
@@ -568,20 +571,30 @@ duration_serde_module!(duration_micros, as_micros, from_micros);
 
 impl Default for StreamConfig {
     fn default() -> Self {
-        use std::time::Duration;
         Self {
             pps: 30_000,
-            target_buffer: Duration::from_millis(20),
-            min_buffer: Duration::from_millis(8),
+            target_buffer: Self::DEFAULT_TARGET_BUFFER,
+            min_buffer: Self::DEFAULT_MIN_BUFFER,
             underrun: UnderrunPolicy::default(),
-            drain_timeout: Duration::from_secs(1),
-            color_delay: Duration::ZERO,
-            startup_blank: Duration::from_millis(1),
+            drain_timeout: std::time::Duration::from_secs(1),
+            color_delay: std::time::Duration::ZERO,
+            startup_blank: std::time::Duration::from_millis(1),
         }
     }
 }
 
 impl StreamConfig {
+    /// Baseline default target buffer used by `StreamConfig::new()`.
+    pub const DEFAULT_TARGET_BUFFER: std::time::Duration = std::time::Duration::from_millis(20);
+    /// Baseline default minimum buffer used by `StreamConfig::new()`.
+    pub const DEFAULT_MIN_BUFFER: std::time::Duration = std::time::Duration::from_millis(8);
+    /// Safer default target buffer for network DACs when caller leaves defaults untouched.
+    pub const NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
+        std::time::Duration::from_millis(50);
+    /// Safer default minimum buffer for network DACs when caller leaves defaults untouched.
+    pub const NETWORK_DEFAULT_MIN_BUFFER: std::time::Duration =
+        std::time::Duration::from_millis(20);
+
     /// Create a new stream configuration with the given PPS.
     pub fn new(pps: u32) -> Self {
         Self {

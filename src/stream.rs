@@ -175,6 +175,10 @@ struct StreamState {
     current_instant: StreamInstant,
     /// Points scheduled ahead of current_instant.
     scheduled_ahead: u64,
+    /// Fractional points consumed but not yet subtracted from scheduled_ahead.
+    /// Accumulates sub-point remainders to prevent stalls when per-iteration
+    /// elapsed time is too small to yield a whole point (the u64 truncation bug).
+    fractional_consumed: f64,
 
     // Pre-allocated buffers (no per-chunk allocation in hot path)
     /// Buffer for callback to fill points into.
@@ -224,6 +228,7 @@ impl StreamState {
         Self {
             current_instant: StreamInstant::new(0),
             scheduled_ahead: 0,
+            fractional_consumed: 0.0,
             chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk_len: 0,
@@ -267,12 +272,27 @@ pub struct Stream {
 }
 
 impl Stream {
+    const UDP_TIMED_SLEEP_SLICE: Duration = Duration::from_millis(1);
+    const UDP_TIMED_BUSY_WAIT_THRESHOLD: Duration = Duration::from_micros(500);
+
     /// Convert a duration in microseconds to a point count at the given PPS, rounding up.
     fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
         if micros == 0 {
             0
         } else {
             (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
+        }
+    }
+
+    fn udp_timed_sleep_slice(remaining: Duration) -> Option<Duration> {
+        if remaining <= Self::UDP_TIMED_BUSY_WAIT_THRESHOLD {
+            None
+        } else {
+            Some(
+                remaining
+                    .saturating_sub(Self::UDP_TIMED_BUSY_WAIT_THRESHOLD)
+                    .min(Self::UDP_TIMED_SLEEP_SLICE),
+            )
         }
     }
 
@@ -294,6 +314,14 @@ impl Stream {
             control_rx,
             state: StreamState::new(max_points, startup_blank_points, &config),
         }
+    }
+
+    /// Compute the software buffer target for scheduler pacing.
+    ///
+    /// Even for timed-UDP backends, this target is the timestamp/lookahead
+    /// cushion against host/network jitter.
+    fn scheduler_target_buffer_points(&self) -> u64 {
+        self.state.target_buffer_points
     }
 
     /// Returns the device info.
@@ -374,10 +402,13 @@ impl Stream {
 
         self.control.stop()?;
 
-        // Directly close shutter and stop backend (defense-in-depth)
+        // Directly close shutter, stop, and disconnect backend (defense-in-depth).
+        // Disconnect is needed for protocols like IDN where stop() only blanks
+        // but the DAC keeps replaying its buffer until the session is closed.
         if let Some(backend) = &mut self.backend {
             let _ = backend.set_shutter(false);
-            backend.stop()?;
+            let _ = backend.stop();
+            backend.disconnect()?;
         }
 
         Ok(())
@@ -479,6 +510,7 @@ impl Stream {
         // that don't report queued_points(). This prevents stalls when buffered
         // equals target_points exactly.
         let mut last_iteration = Instant::now();
+        let mut last_stats_log = Instant::now();
 
         loop {
             // 1. Check for stop request
@@ -489,22 +521,47 @@ impl Stream {
             // Decrement scheduled_ahead based on elapsed time since last iteration.
             // This is critical for backends without queued_points() - without this,
             // scheduled_ahead would never decrease and target_points would stay 0.
+            // Use fractional accumulator to avoid the truncation-to-zero bug: when
+            // loop iterations are faster than 1/pps, (elapsed * pps) as u64 rounds
+            // to 0 and scheduled_ahead never decrements, causing a permanent stall.
             let now = Instant::now();
             let elapsed = now.duration_since(last_iteration);
-            let points_consumed = (elapsed.as_secs_f64() * pps) as u64;
+            let consumed_f64 = elapsed.as_secs_f64() * pps + self.state.fractional_consumed;
+            let points_consumed = consumed_f64 as u64;
+            self.state.fractional_consumed = consumed_f64 - points_consumed as f64;
             self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
             last_iteration = now;
 
             // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
-            let target_points = self.state.target_buffer_points;
+            let target_points = self.scheduler_target_buffer_points();
+
+            // Log scheduler state periodically (~2Hz)
+            if now.duration_since(last_stats_log) >= Duration::from_millis(500) {
+                let lead_ms = self.state.scheduled_ahead as f64 / pps * 1000.0;
+                let target_ms = target_points as f64 / pps * 1000.0;
+                log::debug!(
+                    "scheduler: lead={:.1}ms target={:.1}ms ahead={} buffered={} target_pts={}",
+                    lead_ms,
+                    target_ms,
+                    self.state.scheduled_ahead,
+                    buffered,
+                    target_points,
+                );
+                last_stats_log = now;
+            }
 
             // 3. If buffer is above target, sleep until it drains to target
             // Note: use > not >= so we call producer when exactly at target
             if buffered > target_points {
                 let excess_points = buffered - target_points;
                 let sleep_time = Duration::from_secs_f64(excess_points as f64 / pps);
-                if self.sleep_with_control_check(sleep_time)? {
+                let stop = if self.info.caps.output_model == OutputModel::UdpTimed {
+                    self.sleep_until_with_control_check(Instant::now() + sleep_time)?
+                } else {
+                    self.sleep_with_control_check(sleep_time)?
+                };
+                if stop {
                     return Ok(RunExit::Stopped);
                 }
                 continue; // Re-check buffer after sleep
@@ -583,6 +640,29 @@ impl Stream {
         }
 
         Ok(false)
+    }
+
+    /// Sleep until a deadline with finer granularity for timed-UDP pacing.
+    ///
+    /// Uses coarse sleeps first, then yields near the deadline to reduce wake-up jitter.
+    fn sleep_until_with_control_check(&mut self, deadline: std::time::Instant) -> Result<bool> {
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+
+            let remaining = deadline.duration_since(now);
+            if let Some(slice) = Self::udp_timed_sleep_slice(remaining) {
+                std::thread::sleep(slice);
+            } else {
+                std::thread::yield_now();
+            }
+
+            if self.process_control_messages() {
+                return Ok(true);
+            }
+        }
     }
 
     /// Write points from chunk_buffer to the backend.
@@ -875,6 +955,19 @@ impl Stream {
         let target_buffer_secs = self.state.target_buffer_secs;
         let min_buffer_secs = self.state.min_buffer_secs;
 
+        if self.info.caps.output_model == OutputModel::UdpTimed {
+            let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
+            return ChunkRequest {
+                start,
+                pps,
+                min_points: max_points,
+                target_points: max_points,
+                buffered_points,
+                buffered,
+                device_queued_points,
+            };
+        }
+
         // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
         let deficit_target = (target_buffer_secs - buffered_secs).max(0.0);
         let target_points = (deficit_target * pps_f64).ceil() as usize;
@@ -1101,6 +1194,8 @@ impl Dac {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
 
+        let cfg = Self::apply_backend_buffer_defaults(&self.info.caps, cfg);
+
         Self::validate_config(&self.info.caps, &cfg)?;
 
         // Connect the backend if not already connected
@@ -1111,6 +1206,26 @@ impl Dac {
         let stream = Stream::with_backend(self.info.clone(), backend, cfg);
 
         Ok((stream, self.info))
+    }
+
+    fn apply_backend_buffer_defaults(
+        caps: &DacCapabilities,
+        mut cfg: StreamConfig,
+    ) -> StreamConfig {
+        let untouched_defaults = cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER
+            && cfg.min_buffer == StreamConfig::DEFAULT_MIN_BUFFER;
+
+        if untouched_defaults
+            && matches!(
+                caps.output_model,
+                OutputModel::NetworkFifo | OutputModel::UdpTimed
+            )
+        {
+            cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
+            cfg.min_buffer = StreamConfig::NETWORK_DEFAULT_MIN_BUFFER;
+        }
+
+        cfg
     }
 
     fn validate_config(caps: &DacCapabilities, cfg: &StreamConfig) -> Result<()> {
@@ -1163,6 +1278,11 @@ mod tests {
             }
         }
 
+        fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
+            self.caps.max_points_per_chunk = max_points_per_chunk;
+            self
+        }
+
         fn with_would_block_count(mut self, count: usize) -> Self {
             self.would_block_count = Arc::new(AtomicUsize::new(count));
             self
@@ -1199,6 +1319,11 @@ mod tests {
             Self {
                 inner: TestBackend::new(),
             }
+        }
+
+        fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
+            self.inner = self.inner.with_max_points_per_chunk(max_points_per_chunk);
+            self
         }
 
         fn with_output_model(mut self, model: OutputModel) -> Self {
@@ -1354,6 +1479,72 @@ mod tests {
 
         let (stream, _info) = result.unwrap();
         assert!(stream.backend.as_ref().unwrap().is_connected());
+    }
+
+    #[test]
+    fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::NetworkFifo;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+        assert_eq!(
+            stream.config.target_buffer,
+            StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
+        );
+        assert_eq!(
+            stream.config.min_buffer,
+            StreamConfig::NETWORK_DEFAULT_MIN_BUFFER
+        );
+    }
+
+    #[test]
+    fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::UdpTimed;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let cfg = StreamConfig::new(30_000)
+            .with_target_buffer(Duration::from_millis(12))
+            .with_min_buffer(Duration::from_millis(4));
+        let (stream, _info) = device.start_stream(cfg).unwrap();
+
+        assert_eq!(stream.config.target_buffer, Duration::from_millis(12));
+        assert_eq!(stream.config.min_buffer, Duration::from_millis(4));
+    }
+
+    #[test]
+    fn test_device_start_stream_keeps_usb_defaults() {
+        let mut backend = TestBackend::new();
+        backend.caps.output_model = OutputModel::UsbFrameSwap;
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, Box::new(backend));
+
+        let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+        assert_eq!(
+            stream.config.target_buffer,
+            StreamConfig::DEFAULT_TARGET_BUFFER
+        );
+        assert_eq!(stream.config.min_buffer, StreamConfig::DEFAULT_MIN_BUFFER);
     }
 
     #[test]
@@ -3853,6 +4044,103 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_timed_prefills_configured_lead_using_packet_chunks() {
+        let mut backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        backend.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: backend.dac_type(),
+            caps: backend.caps().clone(),
+        };
+        let cfg = StreamConfig::new(1000)
+            .with_target_buffer(Duration::from_millis(500))
+            .with_min_buffer(Duration::from_millis(100));
+        let mut stream = Stream::with_backend(info, Box::new(backend), cfg);
+
+        let mut writes = 0;
+        while stream.state.scheduled_ahead <= stream.scheduler_target_buffer_points() {
+            let buffered = stream.estimate_buffer_points();
+            let req = stream.build_fill_request(179, buffered);
+            assert_eq!(req.target_points, 179);
+            stream.record_write(req.target_points, false);
+            writes += 1;
+        }
+
+        assert_eq!(
+            writes, 3,
+            "UdpTimed should need multiple full-packet writes to reach configured lead"
+        );
+        assert!(
+            stream.state.scheduled_ahead > stream.scheduler_target_buffer_points(),
+            "simulation should end only after target lead is exceeded"
+        );
+    }
+
+    #[test]
+    fn test_udp_timed_uses_configured_target_buffer_for_lead() {
+        let backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000);
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        assert_eq!(stream.scheduler_target_buffer_points(), 600);
+    }
+
+    #[test]
+    fn test_udp_timed_build_fill_request_uses_full_packet() {
+        let backend = NoQueueTestBackend::new()
+            .with_output_model(OutputModel::UdpTimed)
+            .with_max_points_per_chunk(179);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000);
+        let mut stream = Stream::with_backend(info, backend_box, cfg);
+        stream.state.scheduled_ahead = 120;
+
+        let req = stream.build_fill_request(179, 120);
+
+        assert_eq!(req.target_points, 179);
+        assert_eq!(req.min_points, 179);
+    }
+
+    #[test]
+    fn test_udp_timed_sleep_slice_caps_coarse_sleep() {
+        assert_eq!(
+            Stream::udp_timed_sleep_slice(Duration::from_millis(5)),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn test_udp_timed_sleep_slice_switches_to_busy_wait_near_deadline() {
+        assert_eq!(
+            Stream::udp_timed_sleep_slice(Duration::from_micros(400)),
+            None
+        );
+    }
+
+    #[test]
     fn test_validate_config_rejects_pps_below_min() {
         // Helios-like caps: pps_min = 7
         let caps = DacCapabilities {
@@ -3898,5 +4186,59 @@ mod tests {
         };
         let cfg = StreamConfig::new(30_000);
         assert!(Dac::validate_config(&caps, &cfg).is_ok());
+    }
+
+    // =========================================================================
+    // Fractional consumed accumulator: prevent scheduled_ahead stall
+    // =========================================================================
+
+    #[test]
+    fn test_fractional_consumed_prevents_stall() {
+        // Regression test: when scheduled_ahead equals target_buffer_points
+        // exactly, the run loop used to stall because (elapsed * pps) as u64
+        // truncated to 0 on sub-microsecond iterations. The fractional
+        // accumulator ensures sub-point remainders carry over until they add
+        // up to a whole point.
+        use std::thread;
+        use std::time::Duration;
+
+        let backend = NoQueueTestBackend::new();
+        let write_count = backend.inner.write_count.clone();
+        let stream = make_test_stream(backend);
+        let control = stream.control();
+
+        // Run the stream in a thread. If the bug regresses, the stream
+        // stalls in a tight loop and never writes after the initial burst.
+        let handle = thread::spawn(move || {
+            stream.run(
+                |req, buffer| {
+                    let n = req.target_points.min(buffer.len()).min(100);
+                    for i in 0..n {
+                        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                    }
+                    ChunkResult::Filled(n)
+                },
+                |_err| {},
+            )
+        });
+
+        // Wait enough for the target buffer to be filled AND for subsequent
+        // writes to happen (proving the stream isn't stalled).
+        thread::sleep(Duration::from_millis(800));
+
+        let writes = write_count.load(Ordering::SeqCst);
+
+        // At 30 kpps with 500ms target buffer, the initial burst is ~15
+        // writes of 1000 points. After 800ms, the buffer should have
+        // drained enough for many more writes. If stalled, writes would
+        // be stuck at ~15.
+        assert!(
+            writes > 20,
+            "expected >20 writes after 800ms, got {writes} — stream likely stalled"
+        );
+
+        control.stop().unwrap();
+        let exit = handle.join().unwrap().unwrap();
+        assert_eq!(exit, RunExit::Stopped);
     }
 }

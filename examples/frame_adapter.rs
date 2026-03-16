@@ -13,7 +13,7 @@
 mod common;
 
 use clap::Parser;
-use common::{create_frame_points, Args};
+use common::{generate_frame, Args};
 use laser_dac::{
     list_devices, open_device, ChunkRequest, Frame, FrameAdapter, LaserPoint, Result, StreamConfig,
 };
@@ -63,11 +63,18 @@ fn main() -> Result<()> {
     let mut adapter = FrameAdapter::new();
 
     // Create the frame - a static point buffer that will be cycled
-    let points = create_frame_points(args.shape, args.min_points, args.scale);
+    let points = generate_frame(args.shape, args.points, args.scale);
     adapter.update(Frame::new(points));
 
     // Arm the output
     stream.control().arm()?;
+
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
 
     // Run stream with frame adapter using zero-allocation API
     let exit = stream.run(

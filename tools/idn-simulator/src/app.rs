@@ -74,6 +74,17 @@ pub struct SimulatorApp {
 
     /// FPS estimator for detecting frame cycle rate
     fps_estimator: FpsEstimator,
+
+    // Underrun tracking
+    /// Number of frames where playback hit the received-data frontier.
+    underrun_count: u64,
+    /// Underruns in the current stats window.
+    underruns_in_window: u64,
+    /// Calculated underruns per second.
+    current_underruns_per_sec: f64,
+    /// Current lead: how far received data is ahead of playback (microseconds).
+    /// Negative means playback is stalled at the frontier.
+    current_lead_us: i64,
 }
 
 impl SimulatorApp {
@@ -108,6 +119,10 @@ impl SimulatorApp {
             current_cps: 0.0,
             last_chunk_size: 0,
             fps_estimator: FpsEstimator::new(),
+            underrun_count: 0,
+            underruns_in_window: 0,
+            current_underruns_per_sec: 0.0,
+            current_lead_us: 0,
         }
     }
 }
@@ -149,8 +164,23 @@ impl eframe::App for SimulatorApp {
         if stats_elapsed >= 0.5 {
             self.current_pps = self.points_in_window as f64 / stats_elapsed;
             self.current_cps = self.chunks_in_window as f64 / stats_elapsed;
+            self.current_underruns_per_sec = self.underruns_in_window as f64 / stats_elapsed;
+
+            // Log stats periodically when a client is connected
+            if self.client_address.is_some() {
+                log::info!(
+                    "lead={:.1}ms pps={:.0} cps={:.0} underruns={}/s total_underruns={}",
+                    self.current_lead_us as f64 / 1000.0,
+                    self.current_pps,
+                    self.current_cps,
+                    self.underruns_in_window,
+                    self.underrun_count,
+                );
+            }
+
             self.points_in_window = 0;
             self.chunks_in_window = 0;
+            self.underruns_in_window = 0;
             self.stats_window_start = now_real;
         }
 
@@ -233,6 +263,11 @@ impl eframe::App for SimulatorApp {
                     self.stats_window_start = now_real;
                     // Reset FPS estimator
                     self.fps_estimator.reset();
+                    // Reset underrun tracking
+                    self.underrun_count = 0;
+                    self.underruns_in_window = 0;
+                    self.current_underruns_per_sec = 0.0;
+                    self.current_lead_us = 0;
                 }
             }
         }
@@ -250,6 +285,26 @@ impl eframe::App for SimulatorApp {
         let now_stream_us = if let Some(start_real) = self.playback_start_real {
             let elapsed_us = now_real.duration_since(start_real).as_micros() as u64;
             let target_stream_us = self.playback_start_stream_us + elapsed_us;
+
+            // Track lead: positive = receiver has data ahead, negative = stalled
+            let lead_us = self.max_received_stream_us as i64 - target_stream_us as i64;
+            self.current_lead_us = lead_us;
+
+            // Detect underrun: playback wants to advance past received data
+            if target_stream_us > self.max_received_stream_us {
+                self.underrun_count += 1;
+                self.underruns_in_window += 1;
+                if self.underrun_count <= 20 || self.underrun_count % 100 == 0 {
+                    log::warn!(
+                        "underrun #{}: lead={:.2}ms, playback={}us, frontier={}us",
+                        self.underrun_count,
+                        lead_us as f64 / 1000.0,
+                        target_stream_us,
+                        self.max_received_stream_us,
+                    );
+                }
+            }
+
             // Don't advance past received data (avoid rendering future points)
             self.playback_stream_us = target_stream_us.min(self.max_received_stream_us);
             self.playback_stream_us
@@ -721,6 +776,22 @@ impl eframe::App for SimulatorApp {
                 ui.label(format!("Chunk: {} pts", self.last_chunk_size));
                 ui.separator();
                 ui.label(format!("Buffer: {}", self.point_buffer.len()));
+                ui.separator();
+                // Lead: how far received data is ahead of playback
+                let lead_ms = self.current_lead_us as f64 / 1000.0;
+                let lead_label = ui.label(format!("Lead: {:.1}ms", lead_ms));
+                if self.current_lead_us <= 0 {
+                    lead_label.highlight();
+                }
+                ui.separator();
+                // Underrun counter
+                let underrun_label = ui.label(format!(
+                    "Underruns: {} ({:.0}/s)",
+                    self.underrun_count, self.current_underruns_per_sec
+                ));
+                if self.underrun_count > 0 {
+                    underrun_label.highlight();
+                }
                 if let Some(addr) = &self.client_address {
                     ui.separator();
                     ui.label(format!("Client: {}", addr));

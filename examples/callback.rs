@@ -8,8 +8,8 @@
 mod common;
 
 use clap::Parser;
-use common::{fill_points, Args};
-use laser_dac::{list_devices, open_device, ChunkRequest, LaserPoint, Result, StreamConfig};
+use common::{make_producer, Args};
+use laser_dac::{list_devices, open_device, Result, StreamConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -48,21 +48,22 @@ fn main() -> Result<()> {
     // Arm the output
     stream.control().arm()?;
 
-    let shape = args.shape;
-    let scale = args.scale;
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
+
+    let mut producer = make_producer(args.shape, args.points, args.scale);
 
     // Run in callback mode with zero-allocation API
     let exit = stream.run(
         // Producer callback - invoked when buffer needs filling
-        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
-            let count = counter.fetch_add(1, Ordering::Relaxed);
+        move |req, buffer| {
+            counter.fetch_add(1, Ordering::Relaxed);
 
-            // Print progress periodically
-            if count.is_multiple_of(100) {
-                println!("Chunks sent: {}", count);
-            }
-
-            fill_points(shape, scale, req, buffer)
+            producer(req, buffer)
         },
         // Error callback
         |err| {
