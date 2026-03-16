@@ -317,20 +317,14 @@ pub struct FrameSessionConfig {
     ///
     /// Delays color channels relative to XY coordinates, compensating for
     /// the difference in galvo mirror and laser modulation response times.
-    /// Applied at composition time. Default: 0.2ms worth of points (e.g.,
-    /// 6 points at 30kpps), matching typical show galvo requirements.
-    ///
-    /// Set to 0 to disable. Typical range: 3–10 points at 30kpps.
+    /// Applied at composition time. Set to 0 to disable.
     pub color_delay_points: usize,
 }
 
 impl FrameSessionConfig {
-    /// Default color delay: 0.2ms, matching typical galvo scanner sync requirements.
-    const DEFAULT_COLOR_DELAY: std::time::Duration = std::time::Duration::from_micros(200);
+    const DEFAULT_COLOR_DELAY: std::time::Duration = std::time::Duration::from_micros(150);
 
     /// Create a new config with the given PPS and default transition.
-    ///
-    /// Defaults: startup blank = 1ms, color delay = 0.2ms (6 points at 30kpps).
     pub fn new(pps: u32) -> Self {
         let color_delay_points =
             (Self::DEFAULT_COLOR_DELAY.as_secs_f64() * pps as f64).ceil() as usize;
