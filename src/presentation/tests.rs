@@ -67,17 +67,12 @@ fn test_authored_frame_clone_shares_data() {
 
 #[test]
 fn test_default_transition_scales_with_distance() {
-    // Close together: ~15 points
     let near = default_transition(&make_point(0.0, 0.0), &make_point(0.0, 0.0));
-    assert_eq!(near.len(), 15);
-
-    // Far apart (diagonal ~2.83): ~150 points
     let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
-    assert!(far.len() >= 100, "far distance should produce many points, got {}", far.len());
-    assert!(far.len() <= 160, "should cap around 150, got {}", far.len());
-
-    // Medium distance
     let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
+
+    assert!(near.len() >= 10, "near should have dwell points, got {}", near.len());
+    assert!(far.len() >= 100, "far should produce many points, got {}", far.len());
     assert!(mid.len() > near.len(), "medium should be more than near");
     assert!(mid.len() < far.len(), "medium should be less than far");
 }
@@ -96,52 +91,37 @@ fn test_default_transition_all_blanked() {
 }
 
 #[test]
-fn test_default_transition_interpolates_xy() {
+fn test_default_transition_has_dwell_travel_dwell_structure() {
     let from = make_point(0.0, 0.0);
-    let to = make_point(9.0, 9.0);
+    let to = make_point(1.0, 0.0);
     let result = default_transition(&from, &to);
 
-    // Points should be between from and to, strictly increasing
-    for i in 0..result.len() {
-        let p = &result[i];
-        assert!(p.x > 0.0, "point {} x={} should be > 0", i, p.x);
-        assert!(p.x < 9.0, "point {} x={} should be < 9", i, p.x);
-        if i > 0 {
-            assert!(
-                result[i].x > result[i - 1].x,
-                "x should be increasing: {} vs {}",
-                result[i - 1].x,
-                result[i].x
-            );
-        }
-    }
+    // First points should dwell at `from`
+    assert_eq!(result[0].x, 0.0, "should start dwelling at from");
+    assert_eq!(result[1].x, 0.0, "should still be dwelling at from");
+
+    // Last points should dwell at `to`
+    let last = result.last().unwrap();
+    assert_eq!(last.x, 1.0, "should end dwelling at to");
+    let second_last = &result[result.len() - 2];
+    assert_eq!(second_last.x, 1.0, "should still be dwelling at to");
+
+    // Middle points should be between from and to
+    let mid_idx = result.len() / 2;
+    assert!(result[mid_idx].x > 0.0 && result[mid_idx].x < 1.0,
+        "middle point should be between from and to, got {}", result[mid_idx].x);
 }
 
 #[test]
 fn test_default_transition_same_point_still_produces_points() {
     let p = make_point(0.5, -0.3);
     let result = default_transition(&p, &p);
-    assert_eq!(result.len(), 15); // minimum count for zero distance
+    assert!(result.len() >= 10, "should have dwell points even for zero distance");
     for point in &result {
         assert!((point.x - 0.5).abs() < 1e-6);
         assert!((point.y - (-0.3)).abs() < 1e-6);
         assert_eq!(point.r, 0);
     }
-}
-
-#[test]
-fn test_default_transition_endpoints_not_included() {
-    // The transition points should NOT include the exact from/to positions
-    let from = make_point(0.0, 0.0);
-    let to = make_point(1.0, 0.0);
-    let result = default_transition(&from, &to);
-    assert!(result[0].x > 0.0, "first point should not be at from.x");
-    let last = result.last().unwrap();
-    assert!(
-        last.x < 1.0,
-        "last point should not be at to.x, got {}",
-        last.x
-    );
 }
 
 // =========================================================================
