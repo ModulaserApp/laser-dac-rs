@@ -1,20 +1,36 @@
 //! Unified DAC backend abstraction for laser projectors.
 //!
 //! This crate provides a common interface for communicating with various
-//! laser DAC (Digital-to-Analog Converter) hardware using a streaming API
-//! that provides uniform pacing and backpressure across all device types.
+//! laser DAC (Digital-to-Analog Converter) hardware. Two API styles are
+//! available:
 //!
 //! # Getting Started
 //!
-//! The streaming API uses a zero-allocation callback approach where the library
-//! manages timing and you fill buffers with points:
+//! ## Frame Mode (recommended)
 //!
-//! ## Callback Mode
-//!
-//! Use `run()` with a producer closure for simpler code:
+//! Submit complete frames with automatic transition blanking:
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
+//! use laser_dac::{open_device, FrameSessionConfig, AuthoredFrame, LaserPoint};
+//!
+//! let device = open_device("my-device").unwrap();
+//! let config = FrameSessionConfig::new(30_000);
+//! let (session, _info) = device.start_frame_session(config).unwrap();
+//!
+//! session.control().arm().unwrap();
+//! session.send_frame(AuthoredFrame::new(vec![
+//!     LaserPoint::new(-0.5, 0.0, 65535, 0, 0, 65535),
+//!     LaserPoint::new( 0.5, 0.0, 0, 65535, 0, 65535),
+//! ]));
+//! // Frame replays automatically. Submit new frames for animation.
+//! ```
+//!
+//! ## Callback Mode (advanced)
+//!
+//! Fill point buffers via zero-allocation callback for custom timing:
+//!
+//! ```no_run
+//! use laser_dac::{open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = StreamConfig::new(30_000);
@@ -62,6 +78,7 @@
 pub mod backend;
 pub mod discovery;
 mod error;
+#[allow(deprecated)]
 mod frame_adapter;
 #[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
 mod net_utils;
@@ -109,7 +126,8 @@ pub use types::{
 pub use session::{FrameSessionHandle, ReconnectingSession, SessionControl};
 pub use stream::{Dac, Stream, StreamControl};
 
-// Frame adapters (converts point buffers to continuous streams)
+// Frame adapters (deprecated — use FrameSession and AuthoredFrame instead)
+#[allow(deprecated)]
 pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
 
 // Presentation types (frame-first API)

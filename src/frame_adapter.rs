@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 use crate::types::{ChunkRequest, ChunkResult, LaserPoint};
 
 /// A point buffer to be cycled by the adapter.
+#[deprecated(note = "Use FrameSession and AuthoredFrame instead")]
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub points: Vec<LaserPoint>,
@@ -69,31 +70,11 @@ impl From<Vec<LaserPoint>> for Frame {
 
 /// Converts a point buffer (frame) into a continuous stream.
 ///
-/// The adapter cycles through the frame's points, filling buffers via
-/// the `fill_chunk()` method for use with `Stream::run()`.
+/// # Deprecated
 ///
-/// # Update semantics
-///
-/// - `update()` sets the pending frame (latest-wins if called multiple times)
-/// - When the current frame ends, any pending frame becomes current immediately
-///   (even mid-chunk), ensuring clean frame-to-frame transitions
-///
-/// # Example
-///
-/// ```ignore
-/// use laser_dac::{Frame, FrameAdapter, LaserPoint};
-///
-/// let mut adapter = FrameAdapter::new();
-/// adapter.update(Frame::new(vec![
-///     LaserPoint::new(0.5, 0.0, 65535, 0, 0, 65535),
-/// ]));
-/// let shared = adapter.shared();
-///
-/// stream.run(
-///     |req, buffer| shared.fill_chunk(req, buffer),
-///     |err| eprintln!("Error: {}", err),
-/// )?;
-/// ```
+/// Use [`FrameSession`](crate::FrameSession) and [`AuthoredFrame`](crate::AuthoredFrame)
+/// instead for frame-first output with automatic transition blanking.
+#[deprecated(note = "Use FrameSession and AuthoredFrame instead")]
 pub struct FrameAdapter {
     current: Frame,
     pending: Option<Frame>,
@@ -191,6 +172,7 @@ impl Default for FrameAdapter {
 }
 
 /// Thread-safe handle for updating frames from another thread.
+#[deprecated(note = "Use FrameSession and AuthoredFrame instead")]
 #[derive(Clone)]
 pub struct SharedFrameAdapter {
     inner: Arc<Mutex<FrameAdapter>>,
