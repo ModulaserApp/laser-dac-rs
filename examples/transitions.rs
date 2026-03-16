@@ -152,30 +152,33 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        // Static: two shapes far apart — transition between them on self-loop
-        // Build one frame with a triangle on the left and a circle on the right,
-        // with a gap between them. The self-loop transition goes from the last
-        // point (right side) back to the first point (left side).
-        let mut points = Vec::with_capacity(n * 2);
+        // Two separate frames at different positions — alternates every 2 seconds.
+        // The inter-frame transition blanking is what we're testing.
+        let frame_left = AuthoredFrame::new(make_triangle(n, -0.5, 0.0, 0.4));
+        let frame_right = make_circle(n, 0.5, 0.0, 0.2, 0, 65535, 0);
 
-        // Left: red triangle centered at (-0.5, 0.0), scale 0.4
-        points.extend(make_triangle(n, -0.5, 0.0, 0.4));
-
-        // Right: green circle centered at (0.5, 0.0), radius 0.2
-        points.extend(make_circle_points(n, 0.5, 0.0, 0.2, 0, 65535, 0));
-
-        println!("  Left: red triangle  |  Right: green circle");
-        println!("  Watch the transition between them (right→left wrap).\n");
+        println!("  Alternating: red triangle (left) ↔ green circle (right)");
+        println!("  Watch the transition blanking when shapes swap every 2 seconds.\n");
 
         if matches!(args.mode, Mode::None) {
-            println!("  !! Mode=none: you SHOULD see a bright line between the shapes.\n");
+            println!("  !! Mode=none: you SHOULD see a bright line during swaps.\n");
         }
 
-        session.send_frame(AuthoredFrame::new(points));
+        let frames = [frame_left, frame_right];
+        let mut idx = 0;
+        loop {
+            session.send_frame(frames[idx].clone());
+            idx = (idx + 1) % frames.len();
 
-        // Block until stopped
-        let exit = session.join()?;
-        println!("\nSession ended: {:?}", exit);
+            for _ in 0..40 {
+                thread::sleep(Duration::from_millis(50));
+                if session.control().is_stop_requested() {
+                    let exit = session.join()?;
+                    println!("\nSession ended: {:?}", exit);
+                    return Ok(());
+                }
+            }
+        }
     }
 
     Ok(())

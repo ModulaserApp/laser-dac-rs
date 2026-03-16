@@ -571,19 +571,29 @@ impl FrameSession {
             // Apply color delay
             Self::apply_color_delay(&mut chunk_buffer[..n], config.color_delay_points);
 
-            // 9. Write to backend
-            match backend.try_write(config.pps, &chunk_buffer[..n]) {
-                Ok(WriteOutcome::Written) => {
-                    scheduled_ahead += n as u64;
-                }
-                Ok(WriteOutcome::WouldBlock) => {
-                    std::thread::yield_now();
-                }
-                Err(e) if e.is_disconnected() => {
-                    return Ok(RunExit::Disconnected);
-                }
-                Err(_) => {
-                    // Backend error — continue
+            // 9. Write to backend with retry on WouldBlock
+            //
+            // The engine cursor has already advanced past these points.
+            // If we don't retry, they're lost and the output glitches.
+            loop {
+                match backend.try_write(config.pps, &chunk_buffer[..n]) {
+                    Ok(WriteOutcome::Written) => {
+                        scheduled_ahead += n as u64;
+                        break;
+                    }
+                    Ok(WriteOutcome::WouldBlock) => {
+                        std::thread::yield_now();
+                        if control.is_stop_requested() {
+                            return Ok(RunExit::Stopped);
+                        }
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
+                    Err(e) if e.is_disconnected() => {
+                        return Ok(RunExit::Disconnected);
+                    }
+                    Err(_) => {
+                        break; // Backend error — drop chunk, continue
+                    }
                 }
             }
         }
