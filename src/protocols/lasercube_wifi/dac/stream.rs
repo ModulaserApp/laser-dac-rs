@@ -227,6 +227,11 @@ impl Stream {
             .estimated_buffer_fullness(Instant::now())
     }
 
+    /// Whether the device buffer has room for at least one packet.
+    pub fn can_send(&self) -> bool {
+        self.buffer_estimator.can_send(Instant::now())
+    }
+
     /// Get the current playback rate in Hz.
     pub fn point_rate(&self) -> u32 {
         self.current_rate

@@ -81,6 +81,14 @@ impl FifoBackend for LasercubeWifiBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
+        // Check if the device buffer has room before sending.
+        // Without this, sending max_points (6000 = full ringbuffer) when
+        // points remain from a previous write overflows the device buffer,
+        // causing random point jumps.
+        if !stream.can_send() {
+            return Ok(WriteOutcome::WouldBlock);
+        }
+
         self.point_buffer.clear();
         self.point_buffer
             .extend(points.iter().map(LasercubePoint::from));
