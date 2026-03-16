@@ -484,7 +484,8 @@ impl FrameSession {
 
         let pps = config.pps as f64;
         let max_points = backend.caps().max_points_per_chunk;
-        let target_buffer_secs = 0.020_f64; // 20ms
+        let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
+        let target_buffer_secs = if is_udp_timed { 0.050_f64 } else { 0.020_f64 };
         let target_buffer_points = (target_buffer_secs * pps) as u64;
 
         let mut engine = PresentationEngine::new(config.transition_fn);
@@ -528,11 +529,15 @@ impl FrameSession {
                 scheduled_ahead
             };
 
-            // 4. Sleep if buffer healthy
+            // 4. Sleep if buffer healthy (use high-precision for UdpTimed)
             if buffered > target_buffer_points {
                 let excess = buffered - target_buffer_points;
                 let sleep_time = Duration::from_secs_f64(excess as f64 / pps);
-                Self::sleep_with_control_check(&control, &control_rx, sleep_time, &mut shutter_open, &mut backend)?;
+                if is_udp_timed {
+                    Self::sleep_until_precise(&control, &control_rx, Instant::now() + sleep_time, &mut shutter_open, &mut backend)?;
+                } else {
+                    Self::sleep_with_control_check(&control, &control_rx, sleep_time, &mut shutter_open, &mut backend)?;
+                }
                 continue;
             }
 
@@ -563,8 +568,14 @@ impl FrameSession {
             last_armed = is_armed;
 
             // 8. Fill chunk from engine
-            let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
-            let target_points = ((deficit * pps).ceil() as usize).min(max_points);
+            // UdpTimed: always fill max_points for constant packet cadence.
+            // Other FIFO: fill the deficit to reach target buffer level.
+            let target_points = if is_udp_timed {
+                max_points
+            } else {
+                let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
+                ((deficit * pps).ceil() as usize).min(max_points)
+            };
             if target_points == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
@@ -823,6 +834,41 @@ impl FrameSession {
             Self::process_control_messages(control_rx, shutter_open, backend);
         }
         Ok(())
+    }
+
+    /// High-precision sleep for UdpTimed backends.
+    ///
+    /// Uses coarse sleeps first, then busy-waits near the deadline to
+    /// minimize wake-up jitter. Matches `Stream::sleep_until_with_control_check`.
+    fn sleep_until_precise(
+        control: &StreamControl,
+        control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,
+        deadline: std::time::Instant,
+        shutter_open: &mut bool,
+        backend: &mut BackendKind,
+    ) -> Result<()> {
+        const BUSY_WAIT_THRESHOLD: std::time::Duration = std::time::Duration::from_micros(500);
+        const SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
+
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+
+            let remaining = deadline.duration_since(now);
+            if remaining > BUSY_WAIT_THRESHOLD {
+                let slice = remaining.saturating_sub(BUSY_WAIT_THRESHOLD).min(SLEEP_SLICE);
+                std::thread::sleep(slice);
+            } else {
+                std::thread::yield_now();
+            }
+
+            if control.is_stop_requested() {
+                return Err(Error::Stopped);
+            }
+            Self::process_control_messages(control_rx, shutter_open, backend);
+        }
     }
 }
 
