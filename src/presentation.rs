@@ -397,6 +397,11 @@ impl FrameSession {
         let _ = self.frame_tx.send(frame);
     }
 
+    /// Returns true if the scheduler thread has finished.
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_some_and(|h| h.is_finished())
+    }
+
     /// Wait for the session thread to finish and return the exit reason.
     pub fn join(mut self) -> Result<RunExit> {
         if let Some(handle) = self.thread.take() {

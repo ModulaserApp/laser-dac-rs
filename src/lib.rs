@@ -106,7 +106,7 @@ pub use types::{
 };
 
 // Stream and Dac types
-pub use session::{ReconnectingSession, SessionControl};
+pub use session::{FrameSessionHandle, ReconnectingSession, SessionControl};
 pub use stream::{Dac, Stream, StreamControl};
 
 // Frame adapters (converts point buffers to continuous streams)

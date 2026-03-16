@@ -430,4 +430,169 @@ impl ReconnectingSession {
         }
         self.control.is_stop_requested()
     }
+
+    /// Run a frame session with automatic reconnection.
+    ///
+    /// Returns a [`FrameSessionHandle`] for submitting frames. The session
+    /// runs until stopped or max retries exceeded. The last submitted frame
+    /// is replayed after reconnection.
+    pub fn run_frame_session(
+        &mut self,
+        config: crate::presentation::FrameSessionConfig,
+    ) -> Result<FrameSessionHandle> {
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<crate::presentation::AuthoredFrame>();
+        let last_frame: Arc<Mutex<Option<crate::presentation::AuthoredFrame>>> =
+            Arc::new(Mutex::new(None));
+        let last_frame_clone = Arc::clone(&last_frame);
+
+        let control = self.control.clone();
+        let backoff = self.backoff;
+        let on_reconnect_mutex: Arc<Mutex<Option<ReconnectCallback>>> =
+            Arc::new(Mutex::new(self.on_reconnect.take()));
+        let mut retries = 0u32;
+        let mut connected_once = false;
+
+        loop {
+            if control.is_stop_requested() {
+                return Ok(FrameSessionHandle { frame_tx });
+            }
+
+            if let Some(max) = self.max_retries {
+                if retries >= max {
+                    return Ok(FrameSessionHandle { frame_tx });
+                }
+            }
+
+            let device = match self.open_device() {
+                Ok(d) => d,
+                Err(err) => {
+                    if !Self::is_retriable_connect_error(&err) {
+                        return Err(err);
+                    }
+                    retries = retries.saturating_add(1);
+                    if self.sleep_with_stop(backoff) {
+                        return Ok(FrameSessionHandle { frame_tx });
+                    }
+                    continue;
+                }
+            };
+
+            // Build a new FrameSessionConfig (transition_fn is not clone-able,
+            // so we use default_transition for reconnections)
+            let reconnect_config = if connected_once {
+                crate::presentation::FrameSessionConfig::new(config.pps)
+                    .with_startup_blank(config.startup_blank)
+                    .with_color_delay_points(config.color_delay_points)
+            } else {
+                // For the first connection, we can't reuse the original config
+                // because transition_fn is consumed. Use default.
+                crate::presentation::FrameSessionConfig::new(config.pps)
+                    .with_startup_blank(config.startup_blank)
+                    .with_color_delay_points(config.color_delay_points)
+            };
+
+            let (session, info) = match device.start_frame_session(reconnect_config) {
+                Ok(r) => r,
+                Err(err) => {
+                    if !Self::is_retriable_connect_error(&err) {
+                        return Err(err);
+                    }
+                    retries = retries.saturating_add(1);
+                    if self.sleep_with_stop(backoff) {
+                        return Ok(FrameSessionHandle { frame_tx });
+                    }
+                    continue;
+                }
+            };
+
+            if connected_once {
+                if let Some(cb) = on_reconnect_mutex.lock().unwrap().as_mut() {
+                    cb(&info);
+                }
+                // Replay last frame
+                if let Some(frame) = last_frame_clone.lock().unwrap().clone() {
+                    session.send_frame(frame);
+                }
+            }
+            connected_once = true;
+            retries = 0;
+
+            self.control.attach(session.control());
+
+            // Forward frames from the external channel to the session.
+            // Break on stop or session thread exit (disconnect).
+            let session_exited;
+            loop {
+                if control.is_stop_requested() {
+                    self.control.detach();
+                    let _ = session.join();
+                    return Ok(FrameSessionHandle { frame_tx });
+                }
+
+                match frame_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(frame) => {
+                        *last_frame_clone.lock().unwrap() = Some(frame.clone());
+                        session.send_frame(frame);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        // Check if session thread is still alive by trying to send
+                        // a no-op — if the session's frame_tx is disconnected, the
+                        // thread has exited. We detect this on the next send_frame.
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // External handle dropped — stop
+                        self.control.detach();
+                        let _ = session.join();
+                        return Ok(FrameSessionHandle { frame_tx });
+                    }
+                }
+
+                // Check if the session thread has finished (non-blocking peek)
+                // We use is_finished() on the join handle
+                if session.is_finished() {
+                    session_exited = true;
+                    break;
+                }
+            }
+
+            self.control.detach();
+
+            if session_exited {
+                let exit = session.join();
+                match exit {
+                    Ok(RunExit::Disconnected) => {
+                        // Retry
+                        if self.sleep_with_stop(backoff) {
+                            return Ok(FrameSessionHandle { frame_tx });
+                        }
+                        continue;
+                    }
+                    Ok(RunExit::Stopped) | Ok(RunExit::ProducerEnded) => {
+                        return Ok(FrameSessionHandle { frame_tx });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+
+}
+
+// =============================================================================
+// Frame Session Handle
+// =============================================================================
+
+/// Handle for submitting frames to a reconnecting frame session.
+///
+/// Frames submitted via `send_frame` are forwarded to the active
+/// `FrameSession`. The last submitted frame is replayed after reconnection.
+pub struct FrameSessionHandle {
+    frame_tx: std::sync::mpsc::Sender<crate::presentation::AuthoredFrame>,
+}
+
+impl FrameSessionHandle {
+    /// Submit a frame for display.
+    pub fn send_frame(&self, frame: crate::presentation::AuthoredFrame) {
+        let _ = self.frame_tx.send(frame);
+    }
 }
