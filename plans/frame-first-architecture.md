@@ -235,7 +235,7 @@ pub trait FifoBackend: DacBackend {
     }
 }
 
-/// Frame-swap backend: accepts complete, fixed-size frames.
+/// Frame-swap backend: accepts complete frames up to a maximum size.
 ///
 /// Used by Helios (and future ShowNET).
 pub trait FrameSwapBackend: DacBackend {
@@ -554,18 +554,17 @@ A different cadence:
    a. Drain pending frames from the channel
    b. Ask the `PresentationEngine` to compose a hardware frame
       (this computes the correct ending based on current pending state)
-   c. Pad to `backend.frame_capacity()` if needed
-   d. Apply arm/blank post-processing
-   e. Call `backend.write_frame()`
+   c. Apply arm/blank post-processing
+   d. Call `backend.write_frame()`
 
 The hardware frame is composed at the moment of sending — not precomputed at submission time. This ensures the ending (self-loop or transition) always reflects the actual pending state, regardless of timing mismatches between the application's frame rate and the DAC's playback rate.
 
-Padding to `frame_capacity()`: when the composed drawable (base + ending) is shorter than the device's frame capacity, the remaining space is filled. For blanking endings, the last blank lands at the target position, so the drawable can be cycled to fill the frame. For SamePoint endings, pad with blanked points held at the ending position to avoid introducing jumps.
+Frame sizing: the composed drawable (base + ending) is sent at its natural length. `frame_capacity()` is a maximum, not a target. Padding to capacity would change display time from `points.len() / pps` to `frame_capacity() / pps`, making short frames unacceptably slow. The hardware loops the frame at the given size.
 
-For streaming mode on a frame-swap backend (quantized streaming):
-- The scheduler calls the user callback with `target_points == frame_capacity()`
-- The callback fills exactly one frame's worth of points
-- The scheduler sends it via `write_frame()`
+For streaming mode on a frame-swap backend:
+- The scheduler calls the user callback with `target_points` up to `frame_capacity()`
+- The callback fills points as usual (partial fills are accepted)
+- The scheduler sends whatever was produced via `write_frame()`
 
 ---
 
@@ -661,7 +660,7 @@ stream.control().arm()?;
 let exit = stream.run(
     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
         // For FIFO backends: target_points varies based on buffer state
-        // For frame-swap backends: target_points == frame_capacity (quantized)
+        // For frame-swap backends: target_points up to frame_capacity
         let n = req.target_points;
         for i in 0..n {
             buffer[i] = generate_point(req.start + i as u64, req.pps);
@@ -672,11 +671,10 @@ let exit = stream.run(
 )?;
 ```
 
-When `start_stream()` is used with a frame-swap backend, the scheduler transparently quantizes:
-- `ChunkRequest::target_points` is always `frame_capacity()`
-- `ChunkRequest::min_points` is always `frame_capacity()`
-- The callback must produce exactly that many points
-- This is documented as "quantized streaming" behavior
+When `start_stream()` is used with a frame-swap backend:
+- `ChunkRequest::target_points` is set up to `frame_capacity()` (the maximum the device accepts)
+- The callback fills points as usual — partial fills are accepted, `Starved` and `End` work normally
+- The scheduler sends whatever the callback produced via `write_frame()`, respecting the existing `ChunkResult` contract
 
 ### Both modes from one Dac
 
@@ -691,7 +689,7 @@ impl Dac {
     /// Start a low-level streaming session (expert).
     ///
     /// Works with all backend types. For frame-swap backends,
-    /// streaming is quantized to frame_capacity()-sized chunks.
+    /// For frame-swap backends, target_points is up to frame_capacity().
     pub fn start_stream(self, config: StreamConfig) -> Result<(Stream, DacInfo)> { ... }
 }
 ```
@@ -734,7 +732,6 @@ loop:
     3. if backend.is_ready_for_frame():
         points = engine.compose_hardware_frame()
         apply arm/blank
-        pad to frame_capacity() if needed
         backend.write_frame(points)
     4. else: sleep 1ms
 ```
@@ -812,7 +809,7 @@ All scenarios call `transition_fn(from, to)`. The only variables are the target 
 | Scenario | DAC type | transition_fn call | What happens |
 |---|---|---|---|
 | A→A (self-loop) | FIFO | `(A.last, A.first)` | Result appended at cursor wrap, cursor resets |
-| A→A (self-loop) | Frame-swap | `(A.last, A.first)` | Result appended, cycled to fill frame |
+| A→A (self-loop) | Frame-swap | `(A.last, A.first)` | Result appended, sent at natural size |
 | A→B (transition) | FIFO | `(A.last, B.first)` | Result stitched at cursor wrap, B promoted |
 | A→B (transition) | Frame-swap | `(A.last, B.first)` | Transition frame composed, B promoted, next frame is B self-loop |
 | A→C (frame skip) | FIFO | `(A.last, C.first)` | B overwritten by `set_pending()`, transition goes A→C directly |
@@ -847,7 +844,7 @@ All scenarios call `transition_fn(from, to)`. The only variables are the target 
 2. `Dac::start_stream(config)` → `Stream`
 3. `Stream::run(callback)` — same callback API as today
 4. FIFO backends: unchanged behavior, variable chunk sizes
-5. Frame-swap backends: quantized streaming — `target_points == frame_capacity()`, callback fills one frame's worth, sent via `write_frame()`
+5. Frame-swap backends: `target_points` up to `frame_capacity()`, callback fills as usual, sent via `write_frame()`
 
 ### What changes for backend implementors
 
@@ -965,7 +962,7 @@ fn modulaser_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
 
 - `FrameSwapBackend` mock that verifies:
   - `write_frame` is never called when `is_ready_for_frame()` returns false
-  - scheduler always sends `frame_capacity()`-sized frames
+  - scheduler sends frames at natural size (not padded to capacity)
 - `FifoBackend` mock that verifies variable-size writes and `WouldBlock` backpressure
 - Existing `stream.rs` tests continue to pass
 
@@ -984,7 +981,7 @@ fn modulaser_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
   - self-loop: transition_fn called when no pending
   - transition: transition_fn called when pending exists
   - pending replaced mid-play (frame skip) calls transition_fn for new pending
-  - composed frame respects frame_capacity padding
+  - composed frame does not exceed frame_capacity
 
 ### Frame session
 
