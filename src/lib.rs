@@ -113,7 +113,9 @@ pub use stream::{Dac, Stream, StreamControl};
 pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
 
 // Presentation types (frame-first API)
-pub use presentation::{default_transition, AuthoredFrame, TransitionFn};
+pub use presentation::{
+    default_transition, AuthoredFrame, FrameSession, FrameSessionConfig, TransitionFn,
+};
 
 // Conditional exports based on features
 

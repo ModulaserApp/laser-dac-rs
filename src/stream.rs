@@ -48,7 +48,7 @@ use crate::types::{
 /// These messages allow out-of-band control actions to take effect immediately,
 /// even when the stream is waiting (pacing, backpressure, etc.).
 #[derive(Debug, Clone, Copy)]
-enum ControlMsg {
+pub(crate) enum ControlMsg {
     /// Arm the output (opens hardware shutter).
     Arm,
     /// Disarm the output (closes hardware shutter).
@@ -82,7 +82,7 @@ struct StreamControlInner {
 }
 
 impl StreamControl {
-    fn new(control_tx: Sender<ControlMsg>, color_delay: Duration) -> Self {
+    pub(crate) fn new(control_tx: Sender<ControlMsg>, color_delay: Duration) -> Self {
         Self {
             inner: Arc::new(StreamControlInner {
                 armed: AtomicBool::new(false),
@@ -1230,6 +1230,34 @@ impl Dac {
         }
 
         Ok(())
+    }
+
+    /// Starts a frame-mode session, consuming the device.
+    ///
+    /// Similar to [`start_stream`](Self::start_stream) but uses the frame-first
+    /// API where you submit complete [`AuthoredFrame`]s instead of filling
+    /// point buffers via callback.
+    ///
+    /// Returns a [`FrameSession`] that owns the scheduler thread and a
+    /// [`DacInfo`] with device metadata.
+    pub fn start_frame_session(
+        mut self,
+        config: crate::presentation::FrameSessionConfig,
+    ) -> Result<(crate::presentation::FrameSession, DacInfo)> {
+        let backend = self.backend.take().ok_or_else(|| {
+            Error::invalid_config("device backend has already been used for a session")
+        })?;
+
+        let caps = backend.caps();
+        if config.pps < caps.pps_min || config.pps > caps.pps_max {
+            return Err(Error::invalid_config(format!(
+                "PPS {} is outside device range [{}, {}]",
+                config.pps, caps.pps_min, caps.pps_max
+            )));
+        }
+
+        let session = crate::presentation::FrameSession::start(backend, config)?;
+        Ok((session, self.info))
     }
 }
 
