@@ -270,7 +270,7 @@ impl ColorDelayLine {
 
         // Apply delay: for the first `delay` points, use the carry buffer;
         // for the rest, use colors from earlier in this chunk.
-        for i in 0..points.len() {
+        for (i, point) in points.iter_mut().enumerate() {
             let (r, g, b, intensity) = if i < self.delay {
                 // Use carried colors from previous chunk
                 let carry_idx = self.carry.len() - self.delay + i;
@@ -278,10 +278,10 @@ impl ColorDelayLine {
             } else {
                 self.scratch[i - self.delay]
             };
-            points[i].r = r;
-            points[i].g = g;
-            points[i].b = b;
-            points[i].intensity = intensity;
+            point.r = r;
+            point.g = g;
+            point.b = b;
+            point.intensity = intensity;
         }
 
         // Update carry buffer: keep the last `delay` colors from this chunk
