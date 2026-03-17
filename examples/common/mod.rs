@@ -33,7 +33,7 @@ pub enum Shape {
 }
 
 impl Shape {
-    #[allow(dead_code)] // Used by stream/callback/frame_adapter examples, not audio
+    #[allow(dead_code)] // Used by stream/callback/frame_session examples, not audio
     pub fn name(&self) -> &'static str {
         match self {
             Shape::Triangle => "triangle",

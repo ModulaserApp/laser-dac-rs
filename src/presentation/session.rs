@@ -78,6 +78,15 @@ impl FrameSessionConfig {
         self.reconnect = Some(config);
         self
     }
+
+    /// Compute the number of startup blank points for this config.
+    fn startup_blank_points(&self) -> usize {
+        if self.startup_blank.is_zero() {
+            0
+        } else {
+            (self.startup_blank.as_secs_f64() * self.pps as f64).ceil() as usize
+        }
+    }
 }
 
 // =============================================================================
@@ -96,7 +105,7 @@ impl FrameSessionConfig {
 ///
 /// let device = open_device("my-device")?;
 /// let config = FrameSessionConfig::new(30_000);
-/// let session = device.start_frame_session(config)?;
+/// let (session, _info) = device.start_frame_session(config)?;
 ///
 /// session.control().arm()?;
 /// session.send_frame(Frame::new(vec![
@@ -236,6 +245,7 @@ impl FrameSession {
 
         let pps = config.pps;
         let pps_f64 = pps as f64;
+        let startup_blank_points = config.startup_blank_points();
         // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
         // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
         let mut chunk_points =
@@ -247,11 +257,6 @@ impl FrameSession {
         let mut color_delay = ColorDelayLine::new(config.color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
-        let startup_blank_points = if config.startup_blank.is_zero() {
-            0
-        } else {
-            (config.startup_blank.as_secs_f64() * pps_f64).ceil() as usize
-        };
         let mut last_armed = false;
         let mut next_send = Instant::now();
         let mut last_frame: Option<Frame> = None;
@@ -397,6 +402,7 @@ impl FrameSession {
         use std::time::{Duration, Instant};
 
         let pps = config.pps as f64;
+        let startup_blank_points = config.startup_blank_points();
         let mut max_points = backend.caps().max_points_per_chunk;
         let target_buffer_secs = 0.020_f64;
         let target_buffer_points = (target_buffer_secs * pps) as u64;
@@ -409,11 +415,6 @@ impl FrameSession {
         let mut color_delay = ColorDelayLine::new(config.color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
-        let startup_blank_points = if config.startup_blank.is_zero() {
-            0
-        } else {
-            (config.startup_blank.as_secs_f64() * pps).ceil() as usize
-        };
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
 
@@ -591,15 +592,10 @@ impl FrameSession {
     ) -> Result<RunExit> {
         use std::time::Duration;
 
+        let startup_blank_points = config.startup_blank_points();
         let mut engine = PresentationEngine::new(config.transition_fn);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
-        let pps = config.pps as f64;
-        let startup_blank_points = if config.startup_blank.is_zero() {
-            0
-        } else {
-            (config.startup_blank.as_secs_f64() * pps).ceil() as usize
-        };
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
         let mut frame_buf: Vec<LaserPoint> = Vec::new();

@@ -239,6 +239,8 @@ pub(crate) struct ColorDelayLine {
     delay: usize,
     /// Ring buffer of the last `delay` colors from the previous chunk.
     carry: Vec<(u16, u16, u16, u16)>,
+    /// Pre-allocated buffer for current chunk colors (avoids per-chunk allocation).
+    scratch: Vec<(u16, u16, u16, u16)>,
 }
 
 impl ColorDelayLine {
@@ -246,6 +248,7 @@ impl ColorDelayLine {
         Self {
             delay,
             carry: vec![(0, 0, 0, 0); delay],
+            scratch: Vec::new(),
         }
     }
 
@@ -260,11 +263,10 @@ impl ColorDelayLine {
             return;
         }
 
-        // Collect current colors before mutating
-        let colors: Vec<(u16, u16, u16, u16)> = points
-            .iter()
-            .map(|p| (p.r, p.g, p.b, p.intensity))
-            .collect();
+        // Collect current colors into pre-allocated scratch buffer
+        self.scratch.clear();
+        self.scratch
+            .extend(points.iter().map(|p| (p.r, p.g, p.b, p.intensity)));
 
         // Apply delay: for the first `delay` points, use the carry buffer;
         // for the rest, use colors from earlier in this chunk.
@@ -274,7 +276,7 @@ impl ColorDelayLine {
                 let carry_idx = self.carry.len() - self.delay + i;
                 self.carry[carry_idx]
             } else {
-                colors[i - self.delay]
+                self.scratch[i - self.delay]
             };
             points[i].r = r;
             points[i].g = g;
@@ -283,16 +285,15 @@ impl ColorDelayLine {
         }
 
         // Update carry buffer: keep the last `delay` colors from this chunk
-        let n = colors.len();
+        let n = self.scratch.len();
         if n >= self.delay {
             self.carry.clear();
-            self.carry.extend_from_slice(&colors[n - self.delay..]);
+            self.carry.extend_from_slice(&self.scratch[n - self.delay..]);
         } else {
             // Chunk smaller than delay: shift carry and append
-            let keep = self.delay - n;
             self.carry.drain(..n);
-            self.carry.extend_from_slice(&colors);
-            debug_assert_eq!(self.carry.len(), keep + n);
+            self.carry.extend_from_slice(&self.scratch);
+            debug_assert_eq!(self.carry.len(), self.delay);
         }
     }
 }
