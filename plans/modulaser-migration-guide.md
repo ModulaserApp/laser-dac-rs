@@ -10,13 +10,14 @@ This guide covers migrating Modulaser-v2 to the frame-first architecture changes
 | `try_write_chunk()` | method on `StreamBackend` | `try_write_points()` on `FifoBackend`, `write_frame()` on `FrameSwapBackend` |
 | `ExternalDiscoverer::connect()` | returns `Box<dyn StreamBackend>` | returns `Box<dyn FifoBackend>` |
 | `Dac::new()` | takes `Box<dyn StreamBackend>` | takes `BackendKind` |
-| `Frame`, `FrameAdapter`, `SharedFrameAdapter` | public types | **removed** |
+| `FrameAdapter`, `SharedFrameAdapter` | public types | **removed** (replaced by `FrameSession` + `Frame`) |
 | `StreamBackend` re-export | `pub use StreamBackend` | gone — use `DacBackend`, `FifoBackend`, `FrameSwapBackend` |
+| `ReconnectingSession` | separate reconnection wrapper | gone — use `StreamConfig::with_reconnect()` or `FrameSessionConfig::with_reconnect()` |
+| `SessionControl` | control handle type | renamed to `StreamControl` |
 
 ## What does NOT change
 
-- **`ReconnectingSession`** — same API, same behavior
-- **`SessionControl`** — arm/disarm/stop/color_delay unchanged
+- **`StreamControl`** — arm/disarm/stop/color_delay unchanged (note: was previously called `SessionControl`)
 - **`StreamConfig`** — unchanged
 - **`ChunkRequest` / `ChunkResult`** — unchanged
 - **`LaserPoint`** — unchanged
@@ -24,7 +25,14 @@ This guide covers migrating Modulaser-v2 to the frame-first architecture changes
 - **`list_devices()` / `open_device()`** — unchanged
 - **Callback streaming** — `Stream::run()` works exactly as before
 
-Modulaser's `connection.rs` uses `ReconnectingSession` with callback streaming. **This code needs zero changes.**
+### Reconnection changes
+
+`ReconnectingSession` has been removed. Reconnection is now configured directly on the config:
+
+- **Streaming**: `StreamConfig::new(pps).with_reconnect(ReconnectConfig::new())`
+- **Frame mode**: `FrameSessionConfig::new(pps).with_reconnect(ReconnectConfig::new())`
+
+Modulaser's `connection.rs` uses `ReconnectingSession` with callback streaming. **This will need to be updated** to use `StreamConfig::with_reconnect()` instead.
 
 ## Required changes
 
@@ -139,24 +147,26 @@ impl ExternalDiscoverer for ShowNetSource {
 
 ### 3. Import updates across Modulaser
 
-Search for `use laser_dac::StreamBackend` and `use laser_dac::Frame` — these no longer exist.
+Search for `use laser_dac::StreamBackend`, `use laser_dac::ReconnectingSession`, and `use laser_dac::SessionControl` — these no longer exist.
 
 | File | Old import | New import |
 |---|---|---|
 | `shownet/backend.rs` | `StreamBackend` | `DacBackend, FrameSwapBackend` |
 | `shownet/discovery.rs` | `StreamBackend` | `BackendKind` |
+| `connection.rs` | `ReconnectingSession` | `Stream` + `StreamConfig::with_reconnect()` |
+| `connection.rs` | `SessionControl` | `StreamControl` |
 
-No other Modulaser files import these types.
+`Frame` is still exported (it's the new `Frame` type used with `FrameSession`).
 
 ## Optional: migrate to frame-first API
 
-Modulaser currently renders chunks on-demand via `ReconnectingSession::run()` with a callback that calls `render_chunk_from_state()`. This works and doesn't need to change.
+Modulaser currently renders chunks on-demand via `Stream::run()` with a callback that calls `render_chunk_from_state()`. This works and doesn't need to change.
 
-However, the new frame-first API (`FrameSession` + `AuthoredFrame`) could simplify the pipeline for DACs where Modulaser already computes full frames (the `LaserFrame` → snapshot → cursor traversal → chunk rendering path). Benefits:
+However, the new frame-first API (`FrameSession` + `Frame`) could simplify the pipeline for DACs where Modulaser already computes full frames (the `LaserFrame` → snapshot → cursor traversal → chunk rendering path). Benefits:
 
 - **Automatic transition blanking** between frames (no manual inter-chunk transitions)
 - **Correct frame-swap behavior** for Helios and ShowNET (full frames sent atomically)
-- **Simpler reconnection** via `ReconnectingSession::run_frame_session()` with last-frame replay
+- **Simpler reconnection** via `FrameSessionConfig::with_reconnect()` with last-frame replay
 
 This is a larger refactor and can be done incrementally after the breaking changes above are resolved.
 
@@ -164,18 +174,21 @@ This is a larger refactor and can be done incrementally after the breaking chang
 
 ```rust
 // Instead of:
-session.run(
+let (stream, info) = device.start_stream(config)?;
+stream.run(
     |req, buffer| render_chunk_from_state(&stream_state, req, buffer),
     |err| log::error!("Stream error: {}", err),
 )?;
 
 // Frame mode:
-let handle = session.run_frame_session(FrameSessionConfig::new(pps))?;
+let config = FrameSessionConfig::new(pps);
+let (session, info) = device.start_frame_session(config)?;
+session.control().arm()?;
 // Then from the pipeline thread:
-handle.send_frame(AuthoredFrame::new(frame_points));
+session.send_frame(Frame::new(frame_points));
 ```
 
-The pipeline would submit `AuthoredFrame`s whenever the content changes, and the `FrameSession` handles cycling, transitions, and pacing internally.
+The pipeline would submit `Frame`s whenever the content changes, and the `FrameSession` handles cycling, transitions, and pacing internally.
 
 ## New types available (for reference)
 
@@ -185,12 +198,11 @@ The pipeline would submit `AuthoredFrame`s whenever the content changes, and the
 | `FifoBackend` | Queue DACs: `try_write_points()`, `queued_points()` |
 | `FrameSwapBackend` | Frame DACs: `write_frame()`, `is_ready_for_frame()`, `frame_capacity()` |
 | `BackendKind` | Enum wrapping either backend kind |
-| `AuthoredFrame` | Immutable frame (Arc-backed, cheap clone) |
+| `Frame` | Immutable frame (Arc-backed, cheap clone) |
 | `FrameSession` | Frame-mode session with scheduler thread |
 | `FrameSessionConfig` | Config: pps, transition_fn, startup_blank, color_delay_points |
 | `TransitionFn` | Callback generating blanking points between frames |
-| `default_transition()` | 8-point linear blanking transition |
-| `FrameSessionHandle` | Submit frames to a reconnecting frame session |
+| `default_transition()` | Distance-scaled dwell-travel-dwell blanking transition |
 
 ## Migration order
 
