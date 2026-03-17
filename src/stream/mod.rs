@@ -1430,10 +1430,10 @@ impl Dac {
     /// Starts a frame-mode session, consuming the device.
     ///
     /// Similar to [`start_stream`](Self::start_stream) but uses the frame-first
-    /// API where you submit complete [`Frame`]s instead of filling
+    /// API where you submit complete [`crate::presentation::Frame`]s instead of filling
     /// point buffers via callback.
     ///
-    /// Returns a [`FrameSession`] that owns the scheduler thread and a
+    /// Returns a [`crate::presentation::FrameSession`] that owns the scheduler thread and a
     /// [`DacInfo`] with device metadata.
     pub fn start_frame_session(
         mut self,

@@ -3,7 +3,7 @@
 //! This module provides:
 //! - [`Frame`]: immutable frame type for submission
 //! - [`TransitionFn`] / [`default_transition`]: blanking between frames
-//! - [`PresentationEngine`]: core frame lifecycle manager (internal)
+//! - `PresentationEngine`: core frame lifecycle manager (internal)
 //! - [`FrameSession`] / [`FrameSessionConfig`]: public frame-mode API
 
 mod engine;
