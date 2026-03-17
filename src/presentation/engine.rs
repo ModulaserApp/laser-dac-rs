@@ -288,7 +288,8 @@ impl ColorDelayLine {
         let n = self.scratch.len();
         if n >= self.delay {
             self.carry.clear();
-            self.carry.extend_from_slice(&self.scratch[n - self.delay..]);
+            self.carry
+                .extend_from_slice(&self.scratch[n - self.delay..]);
         } else {
             // Chunk smaller than delay: shift carry and append
             self.carry.drain(..n);
