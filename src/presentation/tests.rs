@@ -447,6 +447,7 @@ fn test_engine_fill_chunk_multiple_wraps_in_single_call() {
 
 use crate::backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend};
 use crate::error::Result as DacResult;
+use crate::types::RunExit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Minimal FIFO test backend for FrameSession tests.
