@@ -38,6 +38,9 @@ pub(crate) struct PresentationEngine {
     transition_cursor: usize,
     /// Length of the transition prefix in the last composed frame-swap drawable.
     frame_swap_transition_len: usize,
+    /// Maximum hardware frame capacity (frame-swap only). When set, composed
+    /// frames are clamped by truncating the transition prefix.
+    frame_capacity: Option<usize>,
 }
 
 impl PresentationEngine {
@@ -53,10 +56,16 @@ impl PresentationEngine {
             transition_buf: Vec::new(),
             transition_cursor: 0,
             frame_swap_transition_len: 0,
+            frame_capacity: None,
         }
     }
 
-    /// Reset all runtime state. Preserves the transition_fn.
+    /// Set the maximum hardware frame capacity for frame-swap clamping.
+    pub fn set_frame_capacity(&mut self, cap: Option<usize>) {
+        self.frame_capacity = cap;
+    }
+
+    /// Reset all runtime state. Preserves the transition_fn and frame_capacity.
     pub fn reset(&mut self) {
         self.current_base = None;
         self.pending_base = None;
@@ -178,6 +187,13 @@ impl PresentationEngine {
             self.drawable.extend_from_slice(&transition);
             self.drawable.extend_from_slice(pending.points());
 
+            // Empty frame submitted: send a blanked point to clear the display
+            if self.drawable.is_empty() {
+                self.drawable.push(LaserPoint::blanked(0.0, 0.0));
+            }
+
+            self.clamp_to_capacity();
+
             // Promote B to current. Mark dirty so next call builds self-loop.
             self.current_base = Some(pending);
             self.drawable_dirty = true;
@@ -210,6 +226,7 @@ impl PresentationEngine {
 
         if current.is_empty() {
             self.frame_swap_transition_len = 0;
+            self.drawable.push(LaserPoint::blanked(0.0, 0.0));
             return;
         }
 
@@ -220,6 +237,20 @@ impl PresentationEngine {
         self.frame_swap_transition_len = transition.len();
         self.drawable.extend_from_slice(&transition);
         self.drawable.extend_from_slice(points);
+        self.clamp_to_capacity();
+    }
+
+    /// Truncate the transition prefix so the drawable fits within frame_capacity.
+    /// Never removes authored frame points — only the leading transition.
+    fn clamp_to_capacity(&mut self) {
+        if let Some(cap) = self.frame_capacity {
+            if self.drawable.len() > cap {
+                let excess = self.drawable.len() - cap;
+                let trim = excess.min(self.frame_swap_transition_len);
+                self.drawable.drain(..trim);
+                self.frame_swap_transition_len -= trim;
+            }
+        }
     }
 
     /// Rebuild the drawable from the current base frame.

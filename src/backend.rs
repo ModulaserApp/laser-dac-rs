@@ -224,6 +224,14 @@ impl BackendKind {
     pub fn is_frame_swap(&self) -> bool {
         matches!(self, BackendKind::FrameSwap(_))
     }
+
+    /// Returns the frame capacity for frame-swap backends, or `None` for FIFO.
+    pub fn frame_capacity(&self) -> Option<usize> {
+        match self {
+            BackendKind::Fifo(_) => None,
+            BackendKind::FrameSwap(b) => Some(b.frame_capacity()),
+        }
+    }
 }
 
 // =============================================================================
