@@ -7,12 +7,11 @@
 //! - **Fail**: bright line or flash connecting the two shapes
 //!
 //! Modes:
-//! - `default`  — 8 blanked points (0.27ms at 30kpps — only enough for nearby shapes)
-//! - `safe`     — 150 blanked points (5ms at 30kpps — enough for full-range galvo travel)
+//! - `default`  — distance-scaled dwell→travel→dwell transition
 //! - `none`     — zero transition points (expect bright flash + galvo stress!)
-//! - `animated` — 3 shapes cycling every 2 seconds with safe transition
+//! - `animated` — 3 shapes cycling every 2 seconds
 //!
-//! Run with: `cargo run --example transitions -- [default|safe|none|animated]`
+//! Run with: `cargo run --example transitions -- [default|none|animated]`
 
 mod common;
 
@@ -29,7 +28,7 @@ use std::time::Duration;
 #[command(about = "Test transition blanking between frames")]
 struct Args {
     /// Transition mode
-    #[arg(value_enum, default_value_t = Mode::Safe)]
+    #[arg(value_enum, default_value_t = Mode::Default)]
     mode: Mode,
 
     /// Points per shape
@@ -39,27 +38,12 @@ struct Args {
 
 #[derive(Copy, Clone, clap::ValueEnum)]
 enum Mode {
-    /// Default 8-point blanked transition (short — for nearby shapes)
+    /// Distance-scaled dwell→travel→dwell transition (recommended)
     Default,
-    /// 150-point blanked transition (5ms at 30kpps — full-range galvo safe)
-    Safe,
     /// No transition points (expect bright flash and galvo stress!)
     None,
-    /// Animated: cycle through 3 frames every 2 seconds with safe transition
+    /// Animated: cycle through 3 frames every 2 seconds
     Animated,
-}
-
-/// Generate N linearly-interpolated blanked points between two positions.
-fn blanked_transition(n: usize, from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
-    if n == 0 {
-        return vec![];
-    }
-    (0..n)
-        .map(|i| {
-            let t = (i + 1) as f32 / (n + 1) as f32;
-            LaserPoint::blanked(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
-        })
-        .collect()
 }
 
 fn main() -> Result<()> {
@@ -90,10 +74,7 @@ fn main() -> Result<()> {
     let device = open_device(&device_info.id)?;
 
     let transition_fn: TransitionFn = match args.mode {
-        Mode::Default => Box::new(default_transition),
-        Mode::Safe | Mode::Animated => {
-            Box::new(|from: &LaserPoint, to: &LaserPoint| blanked_transition(150, from, to))
-        }
+        Mode::Default | Mode::Animated => Box::new(default_transition),
         Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]),
     };
 
@@ -104,10 +85,9 @@ fn main() -> Result<()> {
     let (session, info) = device.start_frame_session(config)?;
 
     let mode_name = match args.mode {
-        Mode::Default => "default (8 points, 0.27ms — may show flash for distant shapes)",
-        Mode::Safe => "safe (150 points, 5ms — clean for any distance)",
+        Mode::Default => "default (distance-scaled dwell→travel→dwell)",
         Mode::None => "none (expect bright flash + galvo stress!)",
-        Mode::Animated => "animated (3 shapes cycling, 150-point transition)",
+        Mode::Animated => "animated (3 shapes cycling)",
     };
     println!(
         "\nTransition test [{}] on {}... Press Ctrl+C to stop\n",

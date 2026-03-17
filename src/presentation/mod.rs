@@ -321,6 +321,73 @@ impl PresentationEngine {
 }
 
 // =============================================================================
+// ColorDelayLine
+// =============================================================================
+
+/// Stateful color delay that carries across chunk boundaries.
+///
+/// For FIFO DACs, color delay is applied per-chunk. Without carry-over state,
+/// the first `delay` points of every chunk get blanked, causing periodic
+/// micro-brightness drops at chunk boundaries. This struct maintains a ring
+/// buffer of the last `delay` color values so they carry into the next chunk.
+struct ColorDelayLine {
+    delay: usize,
+    /// Ring buffer of the last `delay` colors from the previous chunk.
+    carry: Vec<(u16, u16, u16, u16)>,
+}
+
+impl ColorDelayLine {
+    fn new(delay: usize) -> Self {
+        Self {
+            delay,
+            carry: vec![(0, 0, 0, 0); delay],
+        }
+    }
+
+    /// Apply color delay to a chunk, using carried state from the previous chunk.
+    fn apply(&mut self, points: &mut [LaserPoint]) {
+        if self.delay == 0 || points.is_empty() {
+            return;
+        }
+
+        // Collect current colors before mutating
+        let colors: Vec<(u16, u16, u16, u16)> = points
+            .iter()
+            .map(|p| (p.r, p.g, p.b, p.intensity))
+            .collect();
+
+        // Apply delay: for the first `delay` points, use the carry buffer;
+        // for the rest, use colors from earlier in this chunk.
+        for i in 0..points.len() {
+            let (r, g, b, intensity) = if i < self.delay {
+                // Use carried colors from previous chunk
+                let carry_idx = self.carry.len() - self.delay + i;
+                self.carry[carry_idx]
+            } else {
+                colors[i - self.delay]
+            };
+            points[i].r = r;
+            points[i].g = g;
+            points[i].b = b;
+            points[i].intensity = intensity;
+        }
+
+        // Update carry buffer: keep the last `delay` colors from this chunk
+        let n = colors.len();
+        if n >= self.delay {
+            self.carry.clear();
+            self.carry.extend_from_slice(&colors[n - self.delay..]);
+        } else {
+            // Chunk smaller than delay: shift carry and append
+            let keep = self.delay - n;
+            self.carry.drain(..n);
+            self.carry.extend_from_slice(&colors);
+            debug_assert_eq!(self.carry.len(), keep + n);
+        }
+    }
+}
+
+// =============================================================================
 // FrameSessionConfig
 // =============================================================================
 
@@ -512,6 +579,7 @@ impl FrameSession {
 
         let mut engine = PresentationEngine::new(config.transition_fn);
         let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
+        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let startup_blank_points = if config.startup_blank.is_zero() {
@@ -594,8 +662,8 @@ impl FrameSession {
                 startup_blank_remaining -= blank_count;
             }
 
-            // Apply color delay
-            Self::apply_color_delay(&mut chunk_buffer[..n], config.color_delay_points);
+            // Apply color delay (stateful — carries across chunks)
+            color_delay.apply(&mut chunk_buffer[..n]);
 
             // 8. Write (no retry — if device is busy, skip this cycle
             // and catch up next time. Retrying stalls the fixed-rate loop.)
@@ -632,6 +700,7 @@ impl FrameSession {
         let mut fractional_consumed: f64 = 0.0;
         let mut last_iteration = Instant::now();
         let mut chunk_buffer = vec![LaserPoint::default(); max_points];
+        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let startup_blank_points = if config.startup_blank.is_zero() {
@@ -735,8 +804,8 @@ impl FrameSession {
                 startup_blank_remaining -= blank_count;
             }
 
-            // Apply color delay
-            Self::apply_color_delay(&mut chunk_buffer[..n], config.color_delay_points);
+            // Apply color delay (stateful — carries across chunks)
+            color_delay.apply(&mut chunk_buffer[..n]);
 
             // 9. Write to backend with retry on WouldBlock
             loop {
@@ -864,8 +933,8 @@ impl FrameSession {
                 startup_blank_remaining -= blank_count;
             }
 
-            // Apply color delay
-            Self::apply_color_delay(&mut frame_buf, config.color_delay_points);
+            // Apply color delay (stateless — each frame is self-contained)
+            Self::apply_color_delay_stateless(&mut frame_buf, config.color_delay_points);
 
             // 8. Write frame
             match backend.try_write(config.pps, &frame_buf) {
@@ -885,17 +954,18 @@ impl FrameSession {
     // Shared helpers
     // =========================================================================
 
-    /// Apply static color delay by shifting RGB+intensity relative to XY.
-    fn apply_color_delay(points: &mut [LaserPoint], delay: usize) {
+    /// Apply static color delay to a self-contained buffer (frame-swap path).
+    ///
+    /// The first `delay` points are blanked since there are no prior colors.
+    /// This is correct for frame-swap DACs where each frame is independent.
+    fn apply_color_delay_stateless(points: &mut [LaserPoint], delay: usize) {
         if delay == 0 || points.len() <= delay {
             return;
         }
-        // Collect delayed colors
         let colors: Vec<(u16, u16, u16, u16)> = points
             .iter()
             .map(|p| (p.r, p.g, p.b, p.intensity))
             .collect();
-        // Shift: point[i] gets colors from point[i - delay]
         for i in 0..points.len() {
             if i < delay {
                 points[i].r = 0;

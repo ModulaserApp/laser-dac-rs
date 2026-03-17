@@ -605,15 +605,15 @@ fn test_frame_session_stop() {
 }
 
 #[test]
-fn test_frame_session_color_delay() {
-    // Test that color delay shifts RGB relative to XY
+fn test_frame_session_color_delay_stateless() {
+    // Test that stateless color delay shifts RGB relative to XY (frame-swap path)
     let mut points = vec![
         LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
         LaserPoint::new(1.0, 0.0, 500, 600, 700, 800),
         LaserPoint::new(2.0, 0.0, 900, 1000, 1100, 1200),
     ];
 
-    FrameSession::apply_color_delay(&mut points, 1);
+    FrameSession::apply_color_delay_stateless(&mut points, 1);
 
     // First point should have blanked colors (delay = 1)
     assert_eq!(points[0].r, 0);
@@ -629,6 +629,57 @@ fn test_frame_session_color_delay() {
     assert_eq!(points[0].x, 0.0);
     assert_eq!(points[1].x, 1.0);
     assert_eq!(points[2].x, 2.0);
+}
+
+#[test]
+fn test_color_delay_line_carries_across_chunks() {
+    use super::ColorDelayLine;
+
+    let mut delay_line = ColorDelayLine::new(1);
+
+    // First chunk: [A, B, C]
+    let mut chunk1 = vec![
+        LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
+        LaserPoint::new(1.0, 0.0, 500, 600, 700, 800),
+        LaserPoint::new(2.0, 0.0, 900, 1000, 1100, 1200),
+    ];
+    delay_line.apply(&mut chunk1);
+
+    // First point blanked (no prior), rest shifted by 1
+    assert_eq!(chunk1[0].r, 0);
+    assert_eq!(chunk1[1].r, 100);
+    assert_eq!(chunk1[2].r, 500);
+
+    // Second chunk: [D, E] — first point should get C's colors (carried over)
+    let mut chunk2 = vec![
+        LaserPoint::new(3.0, 0.0, 1300, 1400, 1500, 1600),
+        LaserPoint::new(4.0, 0.0, 1700, 1800, 1900, 2000),
+    ];
+    delay_line.apply(&mut chunk2);
+
+    // First point gets C's original colors (900, 1000, 1100, 1200) — NOT blanked!
+    assert_eq!(chunk2[0].r, 900);
+    assert_eq!(chunk2[0].g, 1000);
+    assert_eq!(chunk2[0].b, 1100);
+    assert_eq!(chunk2[0].intensity, 1200);
+    // Second point gets D's original colors
+    assert_eq!(chunk2[1].r, 1300);
+
+    // XY unchanged
+    assert_eq!(chunk2[0].x, 3.0);
+    assert_eq!(chunk2[1].x, 4.0);
+}
+
+#[test]
+fn test_color_delay_line_zero_delay_is_noop() {
+    use super::ColorDelayLine;
+
+    let mut delay_line = ColorDelayLine::new(0);
+    let mut points = vec![LaserPoint::new(0.0, 0.0, 100, 200, 300, 400)];
+    delay_line.apply(&mut points);
+
+    assert_eq!(points[0].r, 100);
+    assert_eq!(points[0].g, 200);
 }
 
 #[test]
