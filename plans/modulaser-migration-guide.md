@@ -8,23 +8,20 @@ This guide covers migrating Modulaser-v2 to the frame-first architecture changes
 |---|---|---|
 | Backend trait | `StreamBackend` (single trait) | `DacBackend` + `FifoBackend` or `FrameSwapBackend` |
 | `try_write_chunk()` | method on `StreamBackend` | `try_write_points()` on `FifoBackend`, `write_frame()` on `FrameSwapBackend` |
-| `ExternalDiscoverer::connect()` | returns `Box<dyn StreamBackend>` | returns `Box<dyn FifoBackend>` |
+| `ExternalDiscoverer::connect()` | returns `Box<dyn StreamBackend>` | returns `BackendKind` |
 | `Dac::new()` | takes `Box<dyn StreamBackend>` | takes `BackendKind` |
 | `Frame`, `FrameAdapter`, `SharedFrameAdapter` | public types | **removed** |
 | `StreamBackend` re-export | `pub use StreamBackend` | gone — use `DacBackend`, `FifoBackend`, `FrameSwapBackend` |
 
 ## What does NOT change
 
-- **`ReconnectingSession`** — same API, same behavior
-- **`SessionControl`** — arm/disarm/stop/color_delay unchanged
+- **`StreamControl`** — arm/disarm/stop/color_delay unchanged
 - **`StreamConfig`** — unchanged
 - **`ChunkRequest` / `ChunkResult`** — unchanged
 - **`LaserPoint`** — unchanged
 - **`DacDiscovery`** — `scan()`, `register()`, `open_by_id()` all unchanged
 - **`list_devices()` / `open_device()`** — unchanged
 - **Callback streaming** — `Stream::run()` works exactly as before
-
-Modulaser's `connection.rs` uses `ReconnectingSession` with callback streaming. **This code needs zero changes.**
 
 ## Required changes
 
@@ -93,30 +90,7 @@ impl FrameSwapBackend for ShowNetBackend {
 
 ### 2. ShowNET discovery: `ExternalDiscoverer::connect()` return type
 
-`ExternalDiscoverer::connect()` now returns `Box<dyn FifoBackend>`, not `Box<dyn StreamBackend>`. But ShowNET is a `FrameSwapBackend`, not a `FifoBackend`.
-
-**Two options:**
-
-**Option A (recommended): Register ShowNET directly with `DacDiscovery`**
-
-Instead of using `ExternalDiscoverer`, add a `register_frame_swap()` method or wrap at the discovery level. The simplest approach: have `ShowNetSource::connect()` return `Box<dyn FifoBackend>` by wrapping ShowNET in a thin FIFO adapter. But this defeats the purpose.
-
-**Option B: Expand `ExternalDiscoverer` to support both backend kinds**
-
-Change the trait to return `BackendKind`:
-
-```rust
-// In laser-dac-rs discovery.rs:
-pub trait ExternalDiscoverer: Send {
-    fn dac_type(&self) -> DacType;
-    fn scan(&mut self) -> Vec<ExternalDevice>;
-    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind>;
-}
-```
-
-This is a cleaner solution since it lets external discoverers provide either backend kind. **This requires a change in laser-dac-rs itself** (one line in the trait + wrapping at the call site in `DacDiscovery::connect()`).
-
-**For now:** Choose Option B — update `ExternalDiscoverer` in laser-dac-rs to return `BackendKind`, then update `ShowNetSource`:
+`ExternalDiscoverer::connect()` now returns `BackendKind`. ShowNET is a `FrameSwapBackend`, so return `BackendKind::FrameSwap(...)`:
 
 ```rust
 // src/dac/shownet/discovery.rs
@@ -150,13 +124,13 @@ No other Modulaser files import these types.
 
 ## Optional: migrate to frame-first API
 
-Modulaser currently renders chunks on-demand via `ReconnectingSession::run()` with a callback that calls `render_chunk_from_state()`. This works and doesn't need to change.
+Modulaser currently renders chunks on-demand via `Stream::run()` with a callback that calls `render_chunk_from_state()`. This works and doesn't need to change.
 
-However, the new frame-first API (`FrameSession` + `AuthoredFrame`) could simplify the pipeline for DACs where Modulaser already computes full frames (the `LaserFrame` → snapshot → cursor traversal → chunk rendering path). Benefits:
+However, the new frame-first API (`FrameSession` + `Frame`) could simplify the pipeline for DACs where Modulaser already computes full frames (the `LaserFrame` → snapshot → cursor traversal → chunk rendering path). Benefits:
 
-- **Automatic transition blanking** between frames (no manual inter-chunk transitions)
+- **Automatic transition blanking** between frames (distance-scaled dwell-travel-dwell, 3-164 points)
 - **Correct frame-swap behavior** for Helios and ShowNET (full frames sent atomically)
-- **Simpler reconnection** via `ReconnectingSession::run_frame_session()` with last-frame replay
+- **Simpler reconnection** via `ReconnectConfig` on `FrameSessionConfig`
 
 This is a larger refactor and can be done incrementally after the breaking changes above are resolved.
 
@@ -164,18 +138,20 @@ This is a larger refactor and can be done incrementally after the breaking chang
 
 ```rust
 // Instead of:
-session.run(
+stream.run(
     |req, buffer| render_chunk_from_state(&stream_state, req, buffer),
     |err| log::error!("Stream error: {}", err),
 )?;
 
 // Frame mode:
-let handle = session.run_frame_session(FrameSessionConfig::new(pps))?;
-// Then from the pipeline thread:
-handle.send_frame(AuthoredFrame::new(frame_points));
+let (session, _info) = device.start_frame_session(
+    FrameSessionConfig::new(pps)
+)?;
+session.control().arm()?;
+session.send_frame(Frame::new(frame_points));
 ```
 
-The pipeline would submit `AuthoredFrame`s whenever the content changes, and the `FrameSession` handles cycling, transitions, and pacing internally.
+The pipeline would submit `Frame`s whenever the content changes, and the `FrameSession` handles cycling, transitions, and pacing internally.
 
 ## New types available (for reference)
 
@@ -185,19 +161,17 @@ The pipeline would submit `AuthoredFrame`s whenever the content changes, and the
 | `FifoBackend` | Queue DACs: `try_write_points()`, `queued_points()` |
 | `FrameSwapBackend` | Frame DACs: `write_frame()`, `is_ready_for_frame()`, `frame_capacity()` |
 | `BackendKind` | Enum wrapping either backend kind |
-| `AuthoredFrame` | Immutable frame (Arc-backed, cheap clone) |
+| `Frame` | Immutable frame (Arc-backed, cheap clone) |
 | `FrameSession` | Frame-mode session with scheduler thread |
 | `FrameSessionConfig` | Config: pps, transition_fn, startup_blank, color_delay_points |
 | `TransitionFn` | Callback generating blanking points between frames |
-| `default_transition()` | 8-point linear blanking transition |
-| `FrameSessionHandle` | Submit frames to a reconnecting frame session |
+| `default_transition()` | Distance-scaled dwell-travel-dwell blanking transition (3-164 points) |
 
 ## Migration order
 
 1. **Update laser-dac-rs dependency** to the `frame-first-architecture` branch
-2. **(In laser-dac-rs)** If going with Option B: change `ExternalDiscoverer::connect()` to return `BackendKind`
-3. **Split ShowNetBackend** into `DacBackend` + `FrameSwapBackend` impls
-4. **Update ShowNetSource** discovery return type
-5. **Fix imports** — `StreamBackend` → new trait names
-6. **Run tests** — Modulaser's ShowNET mock tests should pass with renamed methods
-7. **(Optional, later)** Migrate pipeline to frame-mode API
+2. **Split ShowNetBackend** into `DacBackend` + `FrameSwapBackend` impls
+3. **Update ShowNetSource** discovery return type (now returns `BackendKind`)
+4. **Fix imports** — `StreamBackend` → new trait names
+5. **Run tests** — Modulaser's ShowNET mock tests should pass with renamed methods
+6. **(Optional, later)** Migrate pipeline to frame-mode API

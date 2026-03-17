@@ -77,13 +77,20 @@ session.send_frame(Frame::new(vec![
     LaserPoint::new( 0.0,  0.5, 0, 0, 65535, 65535),
 ]));
 
-// Update content at any time — latest frame wins
+// Update content at any time — submission is zero-copy latest-wins:
+// if the engine hasn't consumed the previous frame yet, the new one
+// replaces it with no buffering or memory growth.
 loop {
     let frame = generate_next_frame();
     session.send_frame(Frame::new(frame));
     std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
 }
 ```
+
+### Empty Frames
+
+Submitting `Frame::new(vec![])` blanks the output (sends a single blanked point at origin).
+This is useful for intentionally clearing the display.
 
 ### Transition Blanking
 
@@ -108,6 +115,10 @@ let config = FrameSessionConfig::new(30_000)
         }).collect()
     }));
 ```
+
+For frame-swap DACs, if the authored frame plus transition points would exceed
+the hardware capacity (e.g. Helios 4095 points), the transition prefix is
+automatically truncated. Authored frame content is never dropped.
 
 Or disable transition blanking entirely by returning an empty vec:
 

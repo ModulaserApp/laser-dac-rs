@@ -10,7 +10,7 @@ use std::net::IpAddr;
 #[cfg(any(feature = "ether-dream", feature = "idn", feature = "lasercube-wifi"))]
 use std::time::Duration;
 
-use crate::backend::{BackendKind, Error, FifoBackend, Result};
+use crate::backend::{BackendKind, Error, Result};
 use crate::types::{DacType, EnabledDacTypes};
 
 // =============================================================================
@@ -27,7 +27,7 @@ use crate::types::{DacType, EnabledDacTypes};
 /// ```ignore
 /// use laser_dac::{
 ///     DacDiscovery, ExternalDiscoverer, ExternalDevice,
-///     FifoBackend, DacType, EnabledDacTypes, Result,
+///     BackendKind, DacType, EnabledDacTypes, Result,
 /// };
 /// use std::any::Any;
 ///
@@ -43,7 +43,7 @@ use crate::types::{DacType, EnabledDacTypes};
 ///         vec![]
 ///     }
 ///
-///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>> {
+///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind> {
 ///         // Your connection logic here
 ///         todo!()
 ///     }
@@ -58,7 +58,7 @@ pub trait ExternalDiscoverer: Send {
 
     /// Connect to a previously discovered device.
     /// The `opaque_data` is the same data returned in `ExternalDevice`.
-    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>>;
+    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind>;
 }
 
 /// Device info returned by external discoverers.
@@ -1016,12 +1016,12 @@ impl DacDiscovery {
             opaque_data,
         } = device.inner
         {
-            let backend = self
+            let backend_kind = self
                 .external
                 .get_mut(discoverer_index)
                 .ok_or_else(|| Error::invalid_config("External discoverer not found"))?
                 .connect(opaque_data)?;
-            return Ok(BackendKind::Fifo(backend));
+            return Ok(backend_kind);
         }
 
         // Handle built-in DAC types
@@ -1175,7 +1175,7 @@ mod tests {
     // External Discoverer Tests
     // =========================================================================
 
-    use crate::backend::{DacBackend, FifoBackend};
+    use crate::backend::{BackendKind, DacBackend, FifoBackend};
     use crate::types::{DacCapabilities, LaserPoint};
     use crate::WriteOutcome;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1271,12 +1271,12 @@ mod tests {
                 .collect()
         }
 
-        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<Box<dyn FifoBackend>> {
+        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind> {
             self.connect_called.store(true, Ordering::SeqCst);
             let _info = opaque_data
                 .downcast::<MockConnectionInfo>()
                 .map_err(|_| Error::invalid_config("wrong device type"))?;
-            Ok(Box::new(MockBackend { connected: false }))
+            Ok(BackendKind::Fifo(Box::new(MockBackend { connected: false })))
         }
     }
 
