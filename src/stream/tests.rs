@@ -2756,81 +2756,32 @@
     }
 
     // =========================================================================
-    // OutputModel coverage: UsbFrameSwap vs NetworkFifo scheduled_ahead
+    // OutputModel coverage: scheduled_ahead accumulation
     // =========================================================================
 
     #[test]
-    fn test_usb_frame_swap_replaces_scheduled_ahead() {
+    fn test_device_start_stream_rejects_frame_swap_backend() {
         let backend = FrameSwapTestBackend::new();
-        let mut backend_box = BackendKind::FrameSwap(Box::new(backend));
-        backend_box.connect().unwrap();
-
+        let caps = backend.inner.caps.clone();
         let info = DacInfo {
             id: "test".to_string(),
             name: "Test Device".to_string(),
             kind: DacType::Custom("Test".to_string()),
-            caps: backend_box.caps().clone(),
+            caps,
         };
+        let device = Dac::new(info, BackendKind::FrameSwap(Box::new(backend)));
 
-        let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
-        let mut stream = Stream::with_backend(info, backend_box, cfg);
-
-        // Arm and write two chunks of 50 points each
-        stream.control.arm().unwrap();
-        stream.process_control_messages();
-
-        let n = 50;
-        for _ in 0..2 {
-            for i in 0..n {
-                stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
+        let result = device.start_stream(StreamConfig::new(30_000));
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("frame-swap"),
+                    "error should mention frame-swap: {err_msg}"
+                );
             }
-            let mut on_error = |_: Error| {};
-            stream.write_fill_points(n, &mut on_error).unwrap();
+            Ok(_) => panic!("expected start_stream to reject frame-swap backend"),
         }
-
-        // UsbFrameSwap: scheduled_ahead should be SET to n, not accumulated to 2n
-        assert_eq!(stream.state.scheduled_ahead, n as u64);
-        assert_eq!(stream.state.stats.chunks_written, 2);
-        assert_eq!(stream.state.stats.points_written, 2 * n as u64);
-    }
-
-    #[test]
-    fn test_usb_frame_swap_no_queue_reporting() {
-        let backend = FrameSwapTestBackend::new();
-        let mut backend_box = BackendKind::FrameSwap(Box::new(backend));
-        backend_box.connect().unwrap();
-
-        let info = DacInfo {
-            id: "test".to_string(),
-            name: "Test Device".to_string(),
-            kind: DacType::Custom("Test".to_string()),
-            caps: backend_box.caps().clone(),
-        };
-
-        let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
-        let mut stream = Stream::with_backend(info, backend_box, cfg);
-
-        // Arm and write two chunks
-        stream.control.arm().unwrap();
-        stream.process_control_messages();
-
-        let n = 50;
-        for _ in 0..2 {
-            for i in 0..n {
-                stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
-            }
-            let mut on_error = |_: Error| {};
-            stream.write_fill_points(n, &mut on_error).unwrap();
-        }
-
-        // UsbFrameSwap + no queue reporting (like real Helios):
-        // scheduled_ahead should be SET, not accumulated
-        assert_eq!(stream.state.scheduled_ahead, n as u64);
-
-        // Buffer estimation should use software-only path (queued_points returns None)
-        let est = stream.estimate_buffer_points();
-        // Software estimate equals scheduled_ahead = n (SET, not accumulated)
-        assert_eq!(est, n as u64);
     }
 
     #[test]

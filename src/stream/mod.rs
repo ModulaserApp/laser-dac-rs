@@ -837,10 +837,6 @@ impl Stream {
     }
 
     /// Record a successful write: update last_chunk, timebase, and stats.
-    ///
-    /// Handles `UsbFrameSwap` output model (Helios-style double-buffering) by
-    /// **replacing** `scheduled_ahead` instead of accumulating, since the device
-    /// holds at most one frame at a time.
     fn record_write(&mut self, n: usize, is_armed: bool) {
         if is_armed {
             debug_assert!(
@@ -853,13 +849,7 @@ impl Stream {
             self.state.last_chunk_len = n;
         }
         self.state.current_instant += n as u64;
-        if self.backend.as_ref().is_some_and(|b| b.is_frame_swap()) {
-            // Double-buffered devices (e.g. Helios) hold at most one frame.
-            // Replace rather than accumulate to reflect the actual queue depth.
-            self.state.scheduled_ahead = n as u64;
-        } else {
-            self.state.scheduled_ahead += n as u64;
-        }
+        self.state.scheduled_ahead += n as u64;
         self.state.stats.chunks_written += 1;
         self.state.stats.points_written += n as u64;
     }
@@ -1191,6 +1181,13 @@ impl Dac {
         let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
+
+        if backend.is_frame_swap() {
+            return Err(Error::invalid_config(
+                "streaming is not supported on frame-swap DACs (e.g. Helios); \
+                 use start_frame_session() instead",
+            ));
+        }
 
         let cfg = Self::apply_backend_buffer_defaults(&self.info.caps, cfg);
 
