@@ -1,5 +1,11 @@
 # Frame-First Architecture
 
+> **Status (2026-03-17):** Fully implemented on branch `frame-first-architecture`.
+> Post-implementation cleanup completed: streaming blocked on frame-swap backends,
+> `AuthoredFrame` renamed to `Frame`, `presentation/mod.rs` split into sub-modules,
+> documentation updated. Code samples below may use the old `AuthoredFrame` name
+> in places — the implementation uses `Frame` everywhere.
+
 ## Why this exists
 
 `laser-dac-rs` currently centers its public model around chunk streaming:
@@ -309,9 +315,10 @@ src/
         fill.rs                     # write_fill_points, underrun handling, color delay
 
     presentation/
-        mod.rs                      # PresentationEngine, public frame session API
-        frame.rs                    # AuthoredFrame
-        transition.rs               # TransitionFn type alias, default_transition() helper
+        mod.rs                      # Frame, TransitionFn, default_transition, re-exports
+        engine.rs                   # PresentationEngine, ColorDelayLine
+        session.rs                  # FrameSession, FrameSessionConfig, scheduler loops
+        tests.rs                    # presentation module tests
 
     session.rs                      # ReconnectingSession (updated for both modes)
 
@@ -360,9 +367,9 @@ The core tension: for frame-swap DACs, the entire frame is committed to hardware
 
 The solution: compose the complete hardware frame at the moment of sending, when we know exactly what's pending.
 
-### AuthoredFrame
+### Frame (formerly AuthoredFrame)
 
-The user-facing frame type. Contains only the visible authored points — no blanking, no seam handling.
+The user-facing frame type. Contains only the visible authored points — no blanking, no seam handling. Renamed from `AuthoredFrame` to `Frame` (no collision with `std`).
 
 ```rust
 /// A frame of authored laser content.
@@ -370,8 +377,8 @@ The user-facing frame type. Contains only the visible authored points — no bla
 /// Contains only the visible points the user intends to draw.
 /// The library handles loop seams, transitions, and blanking automatically
 /// when this frame is submitted to a session.
-pub struct AuthoredFrame {
-    points: Vec<LaserPoint>,
+pub struct Frame {
+    points: Arc<Vec<LaserPoint>>,
 }
 
 impl AuthoredFrame {
@@ -561,10 +568,9 @@ The hardware frame is composed at the moment of sending — not precomputed at s
 
 Frame sizing: the composed drawable (base + ending) is sent at its natural length. `frame_capacity()` is a maximum, not a target. Padding to capacity would change display time from `points.len() / pps` to `frame_capacity() / pps`, making short frames unacceptably slow. The hardware loops the frame at the given size.
 
-For streaming mode on a frame-swap backend:
-- The scheduler calls the user callback with `target_points` up to `frame_capacity()`
-- The callback fills points as usual (partial fills are accepted)
-- The scheduler sends whatever was produced via `write_frame()`
+**Note (implemented):** Streaming mode is now blocked on frame-swap backends.
+`start_stream()` returns an error for `BackendKind::FrameSwap`. Frame-swap DACs
+must use `start_frame_session()` exclusively.
 
 ---
 
@@ -644,9 +650,9 @@ impl FrameSession {
 }
 ```
 
-### Streaming mode (expert/FIFO path)
+### Streaming mode (expert, FIFO backends only)
 
-The existing API stays, with the scheduler internally using the correct backend trait.
+The streaming API is available for FIFO backends only. `start_stream()` returns an error for frame-swap backends (Helios). Frame-swap DACs must use `start_frame_session()`.
 
 ```rust
 use laser_dac::{open_device, StreamConfig, ChunkRequest, ChunkResult, LaserPoint};
@@ -659,8 +665,6 @@ stream.control().arm()?;
 
 let exit = stream.run(
     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
-        // For FIFO backends: target_points varies based on buffer state
-        // For frame-swap backends: target_points up to frame_capacity
         let n = req.target_points;
         for i in 0..n {
             buffer[i] = generate_point(req.start + i as u64, req.pps);
@@ -670,11 +674,6 @@ let exit = stream.run(
     |err| log::error!("Stream error: {}", err),
 )?;
 ```
-
-When `start_stream()` is used with a frame-swap backend:
-- `ChunkRequest::target_points` is set up to `frame_capacity()` (the maximum the device accepts)
-- The callback fills points as usual — partial fills are accepted, `Starved` and `End` work normally
-- The scheduler sends whatever the callback produced via `write_frame()`, respecting the existing `ChunkResult` contract
 
 ### Both modes from one Dac
 
@@ -686,10 +685,9 @@ impl Dac {
     /// differences internally.
     pub fn start_frame_session(self, config: FrameSessionConfig) -> Result<FrameSession> { ... }
 
-    /// Start a low-level streaming session (expert).
+    /// Start a low-level streaming session (FIFO backends only).
     ///
-    /// Works with all backend types. For frame-swap backends,
-    /// For frame-swap backends, target_points is up to frame_capacity().
+    /// Returns an error for frame-swap backends (Helios).
     pub fn start_stream(self, config: StreamConfig) -> Result<(Stream, DacInfo)> { ... }
 }
 ```
@@ -838,13 +836,12 @@ All scenarios call `transition_fn(from, to)`. The only variables are the target 
 5. Frame-swap backends: scheduler calls `compose_hardware_frame()` when device is ready, which calls `transition_fn` just-in-time, then sends via `write_frame()`
 6. FIFO backends: scheduler calls `fill_chunk()` which traverses the drawable with cursor-based delivery, calling `transition_fn` at frame boundaries
 
-### Proposed pipeline (streaming mode — expert)
+### Proposed pipeline (streaming mode — expert, FIFO only)
 
 1. `open_device()` → `Dac`
-2. `Dac::start_stream(config)` → `Stream`
+2. `Dac::start_stream(config)` → `Stream` (returns error for frame-swap backends)
 3. `Stream::run(callback)` — same callback API as today
 4. FIFO backends: unchanged behavior, variable chunk sizes
-5. Frame-swap backends: `target_points` up to `frame_capacity()`, callback fills as usual, sent via `write_frame()`
 
 ### What changes for backend implementors
 
