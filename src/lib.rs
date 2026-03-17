@@ -11,14 +11,14 @@
 //! Submit complete frames with automatic transition blanking:
 //!
 //! ```no_run
-//! use laser_dac::{open_device, FrameSessionConfig, AuthoredFrame, LaserPoint};
+//! use laser_dac::{open_device, FrameSessionConfig, Frame, LaserPoint};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = FrameSessionConfig::new(30_000);
 //! let (session, _info) = device.start_frame_session(config).unwrap();
 //!
 //! session.control().arm().unwrap();
-//! session.send_frame(AuthoredFrame::new(vec![
+//! session.send_frame(Frame::new(vec![
 //!     LaserPoint::new(-0.5, 0.0, 65535, 0, 0, 65535),
 //!     LaserPoint::new( 0.5, 0.0, 0, 65535, 0, 65535),
 //! ]));
@@ -126,7 +126,7 @@ pub use stream::{Dac, Stream, StreamControl};
 
 // Presentation types (frame-first API)
 pub use presentation::{
-    default_transition, AuthoredFrame, FrameSession, FrameSessionConfig, TransitionFn,
+    default_transition, Frame, FrameSession, FrameSessionConfig, TransitionFn,
 };
 
 // Conditional exports based on features

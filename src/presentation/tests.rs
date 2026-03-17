@@ -5,13 +5,13 @@ fn make_point(x: f32, y: f32) -> LaserPoint {
 }
 
 // =========================================================================
-// AuthoredFrame tests
+// Frame tests
 // =========================================================================
 
 #[test]
 fn test_authored_frame_new_and_points() {
     let pts = vec![make_point(0.0, 0.0), make_point(1.0, 1.0)];
-    let frame = AuthoredFrame::new(pts.clone());
+    let frame = Frame::new(pts.clone());
     assert_eq!(frame.points().len(), 2);
     assert_eq!(frame.points()[0].x, 0.0);
     assert_eq!(frame.points()[1].x, 1.0);
@@ -19,7 +19,7 @@ fn test_authored_frame_new_and_points() {
 
 #[test]
 fn test_authored_frame_first_last_point() {
-    let frame = AuthoredFrame::new(vec![
+    let frame = Frame::new(vec![
         make_point(-1.0, -1.0),
         make_point(0.0, 0.0),
         make_point(1.0, 1.0),
@@ -30,7 +30,7 @@ fn test_authored_frame_first_last_point() {
 
 #[test]
 fn test_authored_frame_empty() {
-    let frame = AuthoredFrame::new(vec![]);
+    let frame = Frame::new(vec![]);
     assert!(frame.is_empty());
     assert_eq!(frame.len(), 0);
     assert!(frame.first_point().is_none());
@@ -39,7 +39,7 @@ fn test_authored_frame_empty() {
 
 #[test]
 fn test_authored_frame_len() {
-    let frame = AuthoredFrame::new(vec![make_point(0.0, 0.0); 42]);
+    let frame = Frame::new(vec![make_point(0.0, 0.0); 42]);
     assert_eq!(frame.len(), 42);
     assert!(!frame.is_empty());
 }
@@ -47,14 +47,14 @@ fn test_authored_frame_len() {
 #[test]
 fn test_authored_frame_from_vec() {
     let pts = vec![make_point(0.5, 0.5)];
-    let frame: AuthoredFrame = pts.into();
+    let frame: Frame = pts.into();
     assert_eq!(frame.len(), 1);
     assert_eq!(frame.points()[0].x, 0.5);
 }
 
 #[test]
 fn test_authored_frame_clone_shares_data() {
-    let frame = AuthoredFrame::new(vec![make_point(0.0, 0.0)]);
+    let frame = Frame::new(vec![make_point(0.0, 0.0)]);
     let clone = frame.clone();
     // Both should point to the same Arc data
     assert_eq!(frame.len(), clone.len());
@@ -149,8 +149,8 @@ fn make_engine_no_transition() -> PresentationEngine {
     PresentationEngine::new(Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]))
 }
 
-fn make_frame(points: Vec<LaserPoint>) -> Arc<AuthoredFrame> {
-    Arc::new(AuthoredFrame::new(points))
+fn make_frame(points: Vec<LaserPoint>) -> Arc<Frame> {
+    Arc::new(Frame::new(points))
 }
 
 #[test]
@@ -598,7 +598,7 @@ fn test_frame_session_fifo_submit_frame_writes_points() {
     let session = FrameSession::start(backend_kind, config).unwrap();
 
     session.control().arm().unwrap();
-    session.send_frame(AuthoredFrame::new(vec![
+    session.send_frame(Frame::new(vec![
         LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
         LaserPoint::new(1.0, 0.0, 0, 65535, 0, 65535),
     ]));
@@ -628,7 +628,7 @@ fn test_frame_session_frame_swap_writes_frames() {
     let session = FrameSession::start(backend_kind, config).unwrap();
 
     session.control().arm().unwrap();
-    session.send_frame(AuthoredFrame::new(vec![
+    session.send_frame(Frame::new(vec![
         LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
         LaserPoint::new(1.0, 0.0, 0, 65535, 0, 65535),
     ]));

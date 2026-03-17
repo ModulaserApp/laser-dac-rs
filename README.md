@@ -11,47 +11,144 @@ Unified DAC backend abstraction for laser projectors.
 This crate provides a complete solution for communicating with various laser DAC hardware:
 
 - **Discovery**: Automatically find connected DAC devices (USB and network)
-- **Streaming**: Zero-allocation callback API with buffer-driven timing
-- **Backends**: Unified interface for all DAC types
+- **Frame API**: Submit complete frames with automatic transition blanking and looping
+- **Streaming API**: Zero-allocation callback API with buffer-driven timing
+- **Backends**: Unified interface across FIFO and frame-swap DAC types
 
-This crate does not apply any additional processing on points (like blanking), except to make it compatible with the target DAC.
-
-⚠️ **Warning**: use at your own risk! Laser projectors can be dangerous.
+The library handles transport differences internally — frame-swap DACs (Helios) receive
+atomic frames, while FIFO DACs (Ether Dream, LaserCube, IDN) receive continuous point
+streams. Your code stays the same regardless of which DAC is connected.
 
 ## Supported DACs
 
-| DAC                        | Connection | Verified | Notes                                                                                                  |
-| -------------------------- | ---------- | -------- | ------------------------------------------------------------------------------------------------------ |
-| Helios                     | USB        | ✅       |
-| Ether Dream                | Network    | ✅       |
-| IDN (ILDA Digital Network) | Network    | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
-| LaserCube WiFi             | Network    | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
-| LaserCube USB / Laserdock  | USB        | ✅       |
-| AVB Audio Device           | Network    | ✅       | Uses CoreAudio (macOS), ASIO (Windows), ALSA. Tested with [LaserAnimation Sollinger](https://laseranimation.com). (Linux)                                                   |
+| DAC                        | Connection | Backend      | Verified | Notes                                                                                                  |
+| -------------------------- | ---------- | ------------ | -------- | ------------------------------------------------------------------------------------------------------ |
+| Helios                     | USB        | Frame-swap   | ✅       |
+| Ether Dream                | Network    | FIFO         | ✅       |
+| IDN (ILDA Digital Network) | Network    | FIFO         | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
+| LaserCube WiFi             | Network    | FIFO         | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
+| LaserCube USB / Laserdock  | USB        | FIFO         | ✅       |
+| AVB Audio Device           | Network    | FIFO         | ✅       | Uses CoreAudio (macOS), ASIO (Windows), ALSA (Linux). Tested with [LaserAnimation Sollinger](https://laseranimation.com). |
 
 All DACs have been manually verified to work.
 
 ## Quick Start
 
-Connect your laser DAC and run an example. For full API details, see the [documentation](https://docs.rs/laser-dac).
+Connect your laser DAC and run an example:
 
 ```bash
+# Frame API (recommended)
+cargo run --example frame_session -- circle
+cargo run --example frame_session -- triangle
+cargo run --example transitions -- default     # transition blanking between shapes
+cargo run --example transitions -- animated    # 3 shapes cycling with transitions
+
+# Streaming API (advanced)
 cargo run --example stream -- circle
-cargo run --example stream -- triangle
-cargo run --example callback -- circle      # with progress counter
-cargo run --example frame_adapter -- circle # using FrameAdapter
-cargo run --example reconnect -- circle     # auto-reconnect on disconnect
-cargo run --example audio                   # audio-reactive (requires microphone)
-cargo run --example avb_file -- circle      # write 6ch AVB-mapped WAV for validation
+cargo run --example callback -- circle         # with progress counter
+cargo run --example reconnect -- circle        # auto-reconnect on disconnect
+
+# Other
+cargo run --example audio                      # audio-reactive (requires microphone)
+cargo run --example avb_file -- circle         # write 6ch AVB-mapped WAV for validation
 ```
 
 The examples run continuously until you press Ctrl+C.
 
-## Streaming API
+## Frame API (Recommended)
+
+Submit complete frames and let the library handle looping, transition blanking, and
+transport-appropriate delivery. This is the recommended path for most applications.
+
+```rust
+use laser_dac::{list_devices, open_device, Frame, FrameSessionConfig, LaserPoint};
+
+let devices = list_devices()?;
+let device = open_device(&devices[0].id)?;
+
+let config = FrameSessionConfig::new(30_000);
+let (session, info) = device.start_frame_session(config)?;
+
+session.control().arm()?;
+
+// Submit a frame — it loops automatically
+session.send_frame(Frame::new(vec![
+    LaserPoint::new(-0.5, -0.5, 65535, 0, 0, 65535),
+    LaserPoint::new( 0.5, -0.5, 0, 65535, 0, 65535),
+    LaserPoint::new( 0.0,  0.5, 0, 0, 65535, 65535),
+]));
+
+// Update content at any time — latest frame wins
+loop {
+    let frame = generate_next_frame();
+    session.send_frame(Frame::new(frame));
+    std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
+}
+```
+
+### Transition Blanking
+
+When frames change, the library automatically inserts blanked transition points between
+the last point of the outgoing frame and the first point of the incoming frame. The
+default transition uses distance-scaled dwell-travel-dwell blanking.
+
+You can supply your own transition function for custom blanking strategies:
+
+```rust
+use laser_dac::{FrameSessionConfig, LaserPoint};
+
+let config = FrameSessionConfig::new(30_000)
+    .with_transition_fn(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        // Custom blanking: 4 linearly interpolated blank points
+        (0..4).map(|i| {
+            let t = (i + 1) as f32 / 5.0;
+            LaserPoint::blanked(
+                from.x + (to.x - from.x) * t,
+                from.y + (to.y - from.y) * t,
+            )
+        }).collect()
+    }));
+```
+
+Or disable transition blanking entirely by returning an empty vec:
+
+```rust
+use laser_dac::{FrameSessionConfig, LaserPoint};
+
+let config = FrameSessionConfig::new(30_000)
+    .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]));
+```
+
+### Reconnecting Frame Session
+
+For automatic reconnection by device ID:
+
+```rust
+use laser_dac::{Frame, FrameSessionConfig, LaserPoint, ReconnectingSession, StreamConfig};
+use std::time::Duration;
+
+let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
+    .with_max_retries(5)
+    .with_backoff(Duration::from_secs(1))
+    .on_disconnect(|err| eprintln!("Lost connection: {}", err))
+    .on_reconnect(|info| println!("Reconnected to {}", info.name));
+
+session.control().arm()?;
+
+let config = FrameSessionConfig::new(30_000);
+let handle = session.run_frame_session(config)?;
+
+handle.send_frame(Frame::new(vec![
+    LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
+]));
+```
+
+## Streaming API (Advanced)
 
 The streaming API uses buffer-driven timing: your callback is invoked when the
 buffer needs filling. This provides automatic backpressure handling and zero
-allocations in the hot path.
+allocations in the hot path. Use this for custom timing, procedural generation,
+or audio-reactive content.
 
 ```rust
 use laser_dac::{list_devices, open_device, ChunkRequest, ChunkResult, LaserPoint, StreamConfig};
@@ -80,38 +177,6 @@ let exit = stream.run(
 
 Return `ChunkResult::Filled(n)` to continue, `ChunkResult::End` to stop gracefully.
 
-### Reconnecting Session (optional)
-
-If you want automatic reconnection by device ID, use `ReconnectingSession`:
-
-```rust
-use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, ReconnectingSession, StreamConfig};
-use std::time::Duration;
-
-let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
-    .with_max_retries(5)
-    .with_backoff(Duration::from_secs(1))
-    .on_disconnect(|err| eprintln!("Lost connection: {}", err))
-    .on_reconnect(|info| println!("Reconnected to {}", info.name));
-
-// Arm output as usual (this persists across reconnects)
-session.control().arm()?;
-
-let exit = session.run(
-    |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
-        let n = req.target_points;
-        for i in 0..n {
-            buffer[i] = generate_point(i);
-        }
-        ChunkResult::Filled(n)
-    },
-    |err| eprintln!("Stream error: {}", err),
-)?;
-```
-
-Note: `ReconnectingSession` uses `open_device()` internally, so it won't include
-external discoverers registered on a custom `DacDiscovery`.
-
 ## Coordinate System
 
 All backends use normalized coordinates:
@@ -126,10 +191,14 @@ Each backend handles conversion to its native format internally.
 
 | Type                  | Description                                             |
 | --------------------- | ------------------------------------------------------- |
+| `Frame`       | Immutable frame of laser points for frame-mode output   |
+| `FrameSession`        | Active frame-mode session with automatic looping        |
+| `FrameSessionConfig`  | Frame session settings (PPS, transition fn, color delay) |
+| `TransitionFn`        | Callback for computing blanking between frames          |
 | `DacInfo`             | DAC metadata (name, type, capabilities)                 |
 | `Dac`                 | Opened DAC ready for streaming                          |
-| `Stream`              | Active streaming session                                |
-| `ReconnectingSession` | Stream wrapper with automatic reconnect                 |
+| `Stream`              | Active streaming session (callback mode)                |
+| `ReconnectingSession` | Session wrapper with automatic reconnect                |
 | `StreamConfig`        | Stream settings (PPS, buffering, color delay, blanking) |
 | `ChunkRequest`        | Request info for filling point buffer                   |
 | `LaserPoint`          | Single point with position (f32) and color (u16)        |
@@ -139,20 +208,27 @@ Each backend handles conversion to its native format internally.
 
 ### Color Delay (Scanner Sync Compensation)
 
-Galvo mirrors need time to settle before the laser fires. `color_delay` shifts
+Galvo mirrors need time to settle before the laser fires. Color delay shifts
 RGB+intensity channels relative to XY coordinates so colors arrive after the
 mirrors are in position.
 
 ```rust
 use std::time::Duration;
 
+// Frame mode: set via config (applied at composition time)
+let config = FrameSessionConfig::new(30_000)
+    .with_color_delay_points(5);
+
+// Streaming mode: set via config (applied at runtime)
 let config = StreamConfig::new(30_000)
     .with_color_delay(Duration::from_micros(100));
 ```
 
-Can also be changed at runtime via `stream.control().set_color_delay(...)`.
+Frame mode enables color delay by default (150us equivalent). Streaming mode
+disables it by default. Can also be changed at runtime in streaming mode via
+`stream.control().set_color_delay(...)`.
 
-Typical values: 50–200µs depending on scanner speed. Disabled by default.
+Typical values: 50-200us depending on scanner speed.
 
 ### Startup Blanking
 
@@ -162,7 +238,7 @@ to blank, giving mirrors time to reach their initial position.
 ```rust
 use std::time::Duration;
 
-let config = StreamConfig::new(30_000)
+let config = FrameSessionConfig::new(30_000)
     .with_startup_blank(Duration::from_millis(2)); // default: 1ms
 ```
 

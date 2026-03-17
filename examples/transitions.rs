@@ -17,7 +17,7 @@ mod common;
 
 use clap::Parser;
 use laser_dac::{
-    default_transition, list_devices, open_device, AuthoredFrame, FrameSessionConfig, LaserPoint,
+    default_transition, list_devices, open_device, Frame, FrameSessionConfig, LaserPoint,
     Result, TransitionFn,
 };
 use std::f32::consts::PI;
@@ -132,7 +132,7 @@ fn main() -> Result<()> {
     } else {
         // Two shapes — alternates every 50ms (~20 swaps/second).
         // Shapes are 0.6 units apart (moderate distance).
-        let frame_left = AuthoredFrame::new(make_triangle(n, -0.3, 0.0, 0.35));
+        let frame_left = Frame::new(make_triangle(n, -0.3, 0.0, 0.35));
         let frame_right = make_circle(n, 0.3, 0.0, 0.18, 0, 65535, 0);
 
         println!("  Alternating: red triangle (left) ↔ green circle (right)");
@@ -168,8 +168,8 @@ fn make_circle(
     r: u16,
     g: u16,
     b: u16,
-) -> AuthoredFrame {
-    AuthoredFrame::new(make_circle_points(n, cx, cy, radius, r, g, b))
+) -> Frame {
+    Frame::new(make_circle_points(n, cx, cy, radius, r, g, b))
 }
 
 fn make_circle_points(

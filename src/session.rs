@@ -440,8 +440,8 @@ impl ReconnectingSession {
         &mut self,
         config: crate::presentation::FrameSessionConfig,
     ) -> Result<FrameSessionHandle> {
-        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<crate::presentation::AuthoredFrame>();
-        let last_frame: Arc<Mutex<Option<crate::presentation::AuthoredFrame>>> =
+        let (frame_tx, frame_rx) = std::sync::mpsc::channel::<crate::presentation::Frame>();
+        let last_frame: Arc<Mutex<Option<crate::presentation::Frame>>> =
             Arc::new(Mutex::new(None));
         let last_frame_clone = Arc::clone(&last_frame);
 
@@ -587,12 +587,12 @@ impl ReconnectingSession {
 /// Frames submitted via `send_frame` are forwarded to the active
 /// `FrameSession`. The last submitted frame is replayed after reconnection.
 pub struct FrameSessionHandle {
-    frame_tx: std::sync::mpsc::Sender<crate::presentation::AuthoredFrame>,
+    frame_tx: std::sync::mpsc::Sender<crate::presentation::Frame>,
 }
 
 impl FrameSessionHandle {
     /// Submit a frame for display.
-    pub fn send_frame(&self, frame: crate::presentation::AuthoredFrame) {
+    pub fn send_frame(&self, frame: crate::presentation::Frame) {
         let _ = self.frame_tx.send(frame);
     }
 }

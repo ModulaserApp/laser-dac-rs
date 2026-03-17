@@ -1,6 +1,6 @@
 //! Frame session example demonstrating frame-first streaming.
 //!
-//! This example shows how to use `FrameSession` and `AuthoredFrame` to stream
+//! This example shows how to use `FrameSession` and `Frame` to stream
 //! complete frames with automatic transition blanking between them.
 //!
 //! Run with: `cargo run --example frame_session -- [triangle|circle]`
@@ -9,7 +9,7 @@ mod common;
 
 use clap::Parser;
 use common::{generate_frame, Args};
-use laser_dac::{list_devices, open_device, AuthoredFrame, FrameSessionConfig, Result};
+use laser_dac::{list_devices, open_device, Frame, FrameSessionConfig, Result};
 use std::thread;
 use std::time::Duration;
 
@@ -55,7 +55,7 @@ fn main() -> Result<()> {
 
     // Generate and submit a frame
     let points = generate_frame(args.shape, args.points, args.scale);
-    session.send_frame(AuthoredFrame::new(points));
+    session.send_frame(Frame::new(points));
 
     // Install Ctrl+C handler
     let control = session.control();

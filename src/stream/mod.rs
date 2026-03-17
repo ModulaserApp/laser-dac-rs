@@ -1237,7 +1237,7 @@ impl Dac {
     /// Starts a frame-mode session, consuming the device.
     ///
     /// Similar to [`start_stream`](Self::start_stream) but uses the frame-first
-    /// API where you submit complete [`AuthoredFrame`]s instead of filling
+    /// API where you submit complete [`Frame`]s instead of filling
     /// point buffers via callback.
     ///
     /// Returns a [`FrameSession`] that owns the scheduler thread and a

@@ -1,7 +1,7 @@
 //! Frame-first presentation types and engine.
 //!
 //! This module provides:
-//! - [`AuthoredFrame`]: immutable frame type for submission
+//! - [`Frame`]: immutable frame type for submission
 //! - [`TransitionFn`] / [`default_transition`]: blanking between frames
 //! - [`PresentationEngine`]: core frame lifecycle manager (internal)
 //! - [`FrameSession`] / [`FrameSessionConfig`]: public frame-mode API
@@ -10,7 +10,7 @@ use crate::types::LaserPoint;
 use std::sync::Arc;
 
 // =============================================================================
-// AuthoredFrame
+// Frame
 // =============================================================================
 
 /// A complete frame of laser points authored by the application.
@@ -21,21 +21,21 @@ use std::sync::Arc;
 /// # Example
 ///
 /// ```
-/// use laser_dac::presentation::AuthoredFrame;
+/// use laser_dac::presentation::Frame;
 /// use laser_dac::LaserPoint;
 ///
-/// let frame = AuthoredFrame::new(vec![
+/// let frame = Frame::new(vec![
 ///     LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
 ///     LaserPoint::new(1.0, 0.0, 0, 65535, 0, 65535),
 /// ]);
 /// assert_eq!(frame.len(), 2);
 /// ```
 #[derive(Clone, Debug)]
-pub struct AuthoredFrame {
+pub struct Frame {
     points: Arc<Vec<LaserPoint>>,
 }
 
-impl AuthoredFrame {
+impl Frame {
     /// Create a new frame from a vector of points.
     pub fn new(points: Vec<LaserPoint>) -> Self {
         Self {
@@ -69,7 +69,7 @@ impl AuthoredFrame {
     }
 }
 
-impl From<Vec<LaserPoint>> for AuthoredFrame {
+impl From<Vec<LaserPoint>> for Frame {
     fn from(points: Vec<LaserPoint>) -> Self {
         Self::new(points)
     }
@@ -153,9 +153,9 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint>
 ///   delivery. Returns a complete composed frame with transition points.
 pub(crate) struct PresentationEngine {
     /// The currently playing frame.
-    current_base: Option<Arc<AuthoredFrame>>,
+    current_base: Option<Arc<Frame>>,
     /// The next frame to promote (latest-wins).
-    pending_base: Option<Arc<AuthoredFrame>>,
+    pending_base: Option<Arc<Frame>>,
     /// Current frame's points (no transition — just the raw frame).
     drawable: Vec<LaserPoint>,
     /// Whether the drawable needs to be rebuilt from current_base.
@@ -192,7 +192,7 @@ impl PresentationEngine {
     /// keep only the most recent frame.
     ///
     /// If no current frame exists, the pending is immediately promoted.
-    pub fn set_pending(&mut self, frame: Arc<AuthoredFrame>) {
+    pub fn set_pending(&mut self, frame: Arc<Frame>) {
         if self.current_base.is_none() {
             self.current_base = Some(frame);
             self.drawable_dirty = true;
@@ -496,21 +496,21 @@ use crate::types::RunExit;
 /// # Example
 ///
 /// ```ignore
-/// use laser_dac::{open_device, FrameSessionConfig, AuthoredFrame, LaserPoint};
+/// use laser_dac::{open_device, FrameSessionConfig, Frame, LaserPoint};
 ///
 /// let device = open_device("my-device")?;
 /// let config = FrameSessionConfig::new(30_000);
 /// let session = device.start_frame_session(config)?;
 ///
 /// session.control().arm()?;
-/// session.send_frame(AuthoredFrame::new(vec![
+/// session.send_frame(Frame::new(vec![
 ///     LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
 /// ]));
 /// ```
 pub struct FrameSession {
     control: StreamControl,
     thread: Option<JoinHandle<Result<RunExit>>>,
-    frame_tx: mpsc::Sender<AuthoredFrame>,
+    frame_tx: mpsc::Sender<Frame>,
 }
 
 impl FrameSession {
@@ -526,7 +526,7 @@ impl FrameSession {
 
         let (control_tx, control_rx) = mpsc::channel();
         let control = StreamControl::new(control_tx, std::time::Duration::ZERO);
-        let (frame_tx, frame_rx) = mpsc::channel::<AuthoredFrame>();
+        let (frame_tx, frame_rx) = mpsc::channel::<Frame>();
 
         let control_clone = control.clone();
         let is_frame_swap = backend.is_frame_swap();
@@ -553,7 +553,7 @@ impl FrameSession {
 
     /// Submit a frame for display. Latest-wins if the engine hasn't consumed
     /// the previous pending frame yet.
-    pub fn send_frame(&self, frame: AuthoredFrame) {
+    pub fn send_frame(&self, frame: Frame) {
         let _ = self.frame_tx.send(frame);
     }
 
@@ -580,7 +580,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<AuthoredFrame>,
+        frame_rx: mpsc::Receiver<Frame>,
     ) -> Result<RunExit> {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
 
@@ -601,7 +601,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<AuthoredFrame>,
+        frame_rx: mpsc::Receiver<Frame>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
@@ -721,7 +721,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<AuthoredFrame>,
+        frame_rx: mpsc::Receiver<Frame>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
@@ -876,7 +876,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<AuthoredFrame>,
+        frame_rx: mpsc::Receiver<Frame>,
     ) -> Result<RunExit> {
         use std::time::Duration;
 
