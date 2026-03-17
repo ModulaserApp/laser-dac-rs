@@ -25,9 +25,10 @@
 //! // Frame replays automatically. Submit new frames for animation.
 //! ```
 //!
-//! ## Callback Mode (advanced)
+//! ## Callback Mode (advanced, FIFO backends only)
 //!
-//! Fill point buffers via zero-allocation callback for custom timing:
+//! Fill point buffers via zero-allocation callback for custom timing.
+//! Not available for frame-swap backends (Helios) — use Frame Mode instead.
 //!
 //! ```no_run
 //! use laser_dac::{open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
@@ -52,7 +53,7 @@
 //!
 //! # Supported DACs
 //!
-//! - **Helios** - USB laser DAC (feature: `helios`)
+//! - **Helios** - USB laser DAC, Frame API only (feature: `helios`)
 //! - **Ether Dream** - Network laser DAC (feature: `ether-dream`)
 //! - **IDN** - ILDA Digital Network protocol (feature: `idn`)
 //! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)

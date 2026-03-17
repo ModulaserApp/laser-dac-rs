@@ -11,6 +11,10 @@ mod session;
 
 pub use session::{FrameSession, FrameSessionConfig};
 
+// Re-export internal types for tests (they live in sub-modules but tests use `super::*`)
+#[cfg(test)]
+pub(crate) use engine::{ColorDelayLine, PresentationEngine};
+
 use crate::types::LaserPoint;
 use std::sync::Arc;
 

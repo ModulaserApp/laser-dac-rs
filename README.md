@@ -12,18 +12,17 @@ This crate provides a complete solution for communicating with various laser DAC
 
 - **Discovery**: Automatically find connected DAC devices (USB and network)
 - **Frame API**: Submit complete frames with automatic transition blanking and looping
-- **Streaming API**: Zero-allocation callback API with buffer-driven timing
+- **Streaming API**: Zero-allocation callback API with buffer-driven timing (FIFO backends only)
 - **Backends**: Unified interface across FIFO and frame-swap DAC types
 
-The library handles transport differences internally — frame-swap DACs (Helios) receive
-atomic frames, while FIFO DACs (Ether Dream, LaserCube, IDN) receive continuous point
-streams. Your code stays the same regardless of which DAC is connected.
+Frame-swap DACs (Helios) use the Frame API exclusively. FIFO DACs (Ether Dream,
+LaserCube, IDN) work with both Frame and Streaming APIs.
 
 ## Supported DACs
 
 | DAC                        | Connection | Backend      | Verified | Notes                                                                                                  |
 | -------------------------- | ---------- | ------------ | -------- | ------------------------------------------------------------------------------------------------------ |
-| Helios                     | USB        | Frame-swap   | ✅       |
+| Helios                     | USB        | Frame-swap   | ✅       | Frame API only                                                                                         |
 | Ether Dream                | Network    | FIFO         | ✅       |
 | IDN (ILDA Digital Network) | Network    | FIFO         | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
 | LaserCube WiFi             | Network    | FIFO         | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
