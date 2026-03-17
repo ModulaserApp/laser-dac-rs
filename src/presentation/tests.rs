@@ -687,62 +687,6 @@ fn test_frame_session_stop() {
 }
 
 #[test]
-fn test_frame_swap_color_delay_circular() {
-    // Frame-swap color delay wraps circularly on the frame portion,
-    // leaving the transition prefix untouched.
-    //
-    // Layout: [T0(blank), F0, F1, F2]  with transition_len=1, delay=1
-    let mut points = vec![
-        LaserPoint::blanked(0.0, 0.0),                        // T0: transition (blank)
-        LaserPoint::new(1.0, 0.0, 100, 200, 300, 400),        // F0
-        LaserPoint::new(2.0, 0.0, 500, 600, 700, 800),        // F1
-        LaserPoint::new(3.0, 0.0, 900, 1000, 1100, 1200),     // F2
-    ];
-
-    FrameSession::apply_color_delay_frame_swap(&mut points, 1, 1);
-
-    // T0 unchanged (transition, not touched)
-    assert_eq!(points[0].r, 0);
-    assert_eq!(points[0].intensity, 0);
-
-    // F0 gets colors from F2 (circular wrap) — NOT blanked!
-    assert_eq!(points[1].r, 900);
-    assert_eq!(points[1].g, 1000);
-    assert_eq!(points[1].b, 1100);
-    assert_eq!(points[1].intensity, 1200);
-
-    // F1 gets colors from F0
-    assert_eq!(points[2].r, 100);
-    assert_eq!(points[2].g, 200);
-
-    // F2 gets colors from F1
-    assert_eq!(points[3].r, 500);
-    assert_eq!(points[3].g, 600);
-
-    // XY unchanged everywhere
-    assert_eq!(points[0].x, 0.0);
-    assert_eq!(points[1].x, 1.0);
-    assert_eq!(points[2].x, 2.0);
-    assert_eq!(points[3].x, 3.0);
-}
-
-#[test]
-fn test_frame_swap_color_delay_no_transition() {
-    // When transition_len=0, circular delay applies to entire buffer
-    let mut points = vec![
-        LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
-        LaserPoint::new(1.0, 0.0, 500, 600, 700, 800),
-    ];
-
-    FrameSession::apply_color_delay_frame_swap(&mut points, 0, 1);
-
-    // Point 0 gets colors from point 1 (circular wrap)
-    assert_eq!(points[0].r, 500);
-    // Point 1 gets colors from point 0
-    assert_eq!(points[1].r, 100);
-}
-
-#[test]
 fn test_color_delay_line_carries_across_chunks() {
     use super::ColorDelayLine;
 

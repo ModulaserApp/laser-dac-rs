@@ -195,27 +195,19 @@ fn fill_triangle_points(buffer: &mut [LaserPoint], n_points: usize) {
 }
 
 /// Fill a rainbow circle into buffer.
+///
+/// Generates a closed circle: the last point equals the first point,
+/// so the transition function produces no blanking at the loop seam.
 fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
-    const BLANK_COUNT: usize = 5;
-
-    let mut idx = 0;
-
-    for _ in 0..BLANK_COUNT.min(n_points) {
-        buffer[idx] = LaserPoint::blanked(0.5, 0.0);
-        idx += 1;
-    }
-
-    let circle_points = n_points.saturating_sub(BLANK_COUNT);
-    for i in 0..circle_points {
-        let angle = (i as f32 / circle_points as f32) * 2.0 * PI;
+    for i in 0..n_points {
+        let angle = (i as f32 / n_points as f32) * 2.0 * PI;
         let x = 0.5 * angle.cos();
         let y = 0.5 * angle.sin();
 
-        let hue = i as f32 / circle_points as f32;
+        let hue = i as f32 / n_points as f32;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        buffer[idx] = LaserPoint::new(x, y, r, g, b, 65535);
-        idx += 1;
+        buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
     }
 }
 
@@ -319,9 +311,8 @@ mod tests {
     fn generate_frame_produces_correct_point_count() {
         let frame = generate_frame(Shape::Circle, 200, 1.0);
         assert_eq!(frame.len(), 200);
-        // First 5 points are blanked (leading blank), rest have color
-        assert!(frame[..5].iter().all(|p| p.intensity == 0));
-        assert!(frame[5..].iter().any(|p| p.intensity != 0));
+        // All points have color (no leading blanks)
+        assert!(frame.iter().all(|p| p.intensity != 0));
     }
 
     #[test]

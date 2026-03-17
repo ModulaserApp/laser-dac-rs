@@ -342,11 +342,6 @@ impl PresentationEngine {
         self.drawable.extend_from_slice(points);
     }
 
-    /// Number of transition points at the start of the last composed frame-swap drawable.
-    pub fn frame_swap_transition_len(&self) -> usize {
-        self.frame_swap_transition_len
-    }
-
     /// Rebuild the drawable from the current base frame.
     fn refresh_drawable(&mut self) {
         self.drawable.clear();
@@ -581,7 +576,7 @@ impl FrameSession {
     // =========================================================================
 
     fn run_fifo_loop(
-        mut backend: BackendKind,
+        backend: BackendKind,
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
@@ -944,14 +939,13 @@ impl FrameSession {
                 continue;
             }
 
-            // 7. Compose frame and copy to mutable buffer
+            // 8. Compose frame and copy to mutable buffer
             let composed = engine.compose_hardware_frame();
             if composed.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
             let mut frame_buf: Vec<LaserPoint> = composed.to_vec();
-            let transition_len = engine.frame_swap_transition_len();
 
             // Apply blanking when disarmed
             if !is_armed {
@@ -976,7 +970,7 @@ impl FrameSession {
             // so a per-frame delay would create artifacts at the loop point.
             // Frame-swap DACs (Helios) handle modulation timing internally.
 
-            // 8. Write frame
+            // 9. Write frame
             match backend.try_write(config.pps, &frame_buf) {
                 Ok(WriteOutcome::Written) => {}
                 Ok(WriteOutcome::WouldBlock) => {
@@ -993,38 +987,6 @@ impl FrameSession {
     // =========================================================================
     // Shared helpers
     // =========================================================================
-
-    /// Apply circular color delay to the frame portion of a frame-swap buffer.
-    ///
-    /// Frame-swap DACs loop continuously, so the color delay wraps around:
-    /// the first frame points get colors from the end of the frame, not blank.
-    /// The transition prefix (blank travel points) is left untouched.
-    fn apply_color_delay_frame_swap(
-        points: &mut [LaserPoint],
-        transition_len: usize,
-        delay: usize,
-    ) {
-        if delay == 0 {
-            return;
-        }
-        let frame = &mut points[transition_len..];
-        let n = frame.len();
-        if n == 0 || delay >= n {
-            return;
-        }
-        let colors: Vec<(u16, u16, u16, u16)> = frame
-            .iter()
-            .map(|p| (p.r, p.g, p.b, p.intensity))
-            .collect();
-        for i in 0..n {
-            let src = (i + n - delay) % n;
-            let (r, g, b, intensity) = colors[src];
-            frame[i].r = r;
-            frame[i].g = g;
-            frame[i].b = b;
-            frame[i].intensity = intensity;
-        }
-    }
 
     fn process_control_messages(
         control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,
