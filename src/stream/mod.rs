@@ -318,10 +318,15 @@ impl Stream {
 
     /// Compute the software buffer target for scheduler pacing.
     ///
-    /// Even for timed-UDP backends, this target is the timestamp/lookahead
-    /// cushion against host/network jitter.
+    /// UdpTimed backends use `max_points_per_chunk` as the target to keep
+    /// the device ringbuffer continuously topped up. A lower target creates
+    /// long idle gaps between bursts, causing glitches over WiFi.
     fn scheduler_target_buffer_points(&self) -> u64 {
-        self.state.target_buffer_points
+        if self.info.caps.output_model == OutputModel::UdpTimed {
+            self.info.caps.max_points_per_chunk as u64
+        } else {
+            self.state.target_buffer_points
+        }
     }
 
     /// Returns the device info.

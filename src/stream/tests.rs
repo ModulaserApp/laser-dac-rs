@@ -2869,7 +2869,7 @@
     }
 
     #[test]
-    fn test_udp_timed_prefills_configured_lead_using_packet_chunks() {
+    fn test_udp_timed_prefills_to_max_points_per_chunk() {
         let mut backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
@@ -2886,6 +2886,8 @@
             .with_min_buffer(Duration::from_millis(100));
         let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
 
+        // UdpTimed target = max_points_per_chunk = 179
+        // One write of 179 exceeds the target → stops after 1 write
         let mut writes = 0;
         while stream.state.scheduled_ahead <= stream.scheduler_target_buffer_points() {
             let buffered = stream.estimate_buffer_points();
@@ -2896,17 +2898,13 @@
         }
 
         assert_eq!(
-            writes, 3,
-            "UdpTimed should need multiple full-packet writes to reach configured lead"
-        );
-        assert!(
-            stream.state.scheduled_ahead > stream.scheduler_target_buffer_points(),
-            "simulation should end only after target lead is exceeded"
+            writes, 2,
+            "UdpTimed target is max_points_per_chunk (179) — two writes to exceed"
         );
     }
 
     #[test]
-    fn test_udp_timed_uses_configured_target_buffer_for_lead() {
+    fn test_udp_timed_uses_max_points_per_chunk_for_lead() {
         let backend = NoQueueTestBackend::new()
             .with_output_model(OutputModel::UdpTimed)
             .with_max_points_per_chunk(179);
@@ -2922,7 +2920,8 @@
         let cfg = StreamConfig::new(30_000);
         let stream = Stream::with_backend(info, backend_box, cfg);
 
-        assert_eq!(stream.scheduler_target_buffer_points(), 600);
+        // UdpTimed target = max_points_per_chunk, not target_buffer_points
+        assert_eq!(stream.scheduler_target_buffer_points(), 179);
     }
 
     #[test]
