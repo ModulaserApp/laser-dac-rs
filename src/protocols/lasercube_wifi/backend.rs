@@ -18,10 +18,11 @@ pub struct LasercubeWifiBackend {
 
 impl LasercubeWifiBackend {
     pub fn new(addressed: Addressed) -> Self {
+        let caps = super::capabilities_for_buffer(addressed.max_buffer_space);
         Self {
             addressed,
             stream: None,
-            caps: super::default_capabilities(),
+            caps,
             point_buffer: Vec::new(),
         }
     }
@@ -81,11 +82,11 @@ impl FifoBackend for LasercubeWifiBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        // Check if the device buffer has room before sending.
-        // Without this, sending max_points (6000 = full ringbuffer) when
-        // points remain from a previous write overflows the device buffer,
-        // causing random point jumps.
-        if !stream.can_send() {
+        // Update rate before admission check so the estimator uses the correct
+        // drain rate — otherwise a PPS decrease could overestimate available space.
+        stream.set_rate(pps).map_err(Error::backend)?;
+
+        if points.len() > stream.safe_writable_points() as usize {
             return Ok(WriteOutcome::WouldBlock);
         }
 
