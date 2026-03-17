@@ -4167,7 +4167,10 @@ mod tests {
         // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
         let buffered = stream.estimate_buffer_points();
         let req = stream.build_fill_request(5700, buffered);
-        assert_eq!(req.target_points, 1500, "should request ~1500 top-up, not full 5700");
+        assert_eq!(
+            req.target_points, 1500,
+            "should request ~1500 top-up, not full 5700"
+        );
     }
 
     #[test]
