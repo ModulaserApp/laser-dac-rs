@@ -2044,6 +2044,223 @@
     }
 
     /// Build a Stream from a backend with default test config (30 kpps).
+    // =========================================================================
+    // Reconnect configuration tests
+    // =========================================================================
+
+    #[test]
+    fn test_start_stream_with_reconnect_rejects_invalid_pps() {
+        // Reconnect config should not bypass PPS validation
+        let backend = TestBackend::new(); // pps_min: 1000, pps_max: 100000
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+        device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+            device_id: "test".to_string(),
+            discovery_factory: None,
+        });
+
+        // PPS too low
+        let cfg = StreamConfig::new(500)
+            .with_reconnect(crate::types::ReconnectConfig::new());
+        let result = device.start_stream(cfg);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_start_stream_reconnect_without_target_errors() {
+        // start_stream with reconnect on a Dac created via Dac::new (no target) should error
+        let backend = TestBackend::new();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+
+        let cfg = StreamConfig::new(30_000)
+            .with_reconnect(crate::types::ReconnectConfig::new());
+        let result = device.start_stream(cfg);
+        match result {
+            Err(e) => {
+                let msg = format!("{}", e);
+                assert!(msg.contains("open_device"), "error should mention open_device: {}", msg);
+            }
+            Ok(_) => panic!("expected error for reconnect without target"),
+        }
+    }
+
+    #[test]
+    fn test_start_stream_reconnect_with_target_succeeds() {
+        let backend = TestBackend::new();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+        device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+            device_id: "test".to_string(),
+            discovery_factory: None,
+        });
+
+        let cfg = StreamConfig::new(30_000)
+            .with_reconnect(crate::types::ReconnectConfig::new());
+        let result = device.start_stream(cfg);
+        assert!(result.is_ok());
+
+        let (stream, _) = result.unwrap();
+        assert!(stream.reconnect_policy.is_some());
+    }
+
+    #[test]
+    fn test_reset_state_for_reconnect_resizes_buffers() {
+        // When reconnecting to a device with different max_points_per_chunk,
+        // buffers should be resized.
+        let backend = TestBackend::new().with_max_points_per_chunk(1000);
+        let mut stream = make_test_stream(backend);
+
+        assert_eq!(stream.state.chunk_buffer.len(), 1000);
+        assert_eq!(stream.state.last_chunk.len(), 1000);
+
+        // Simulate reconnect to a device with different capabilities
+        stream.info.caps.max_points_per_chunk = 500;
+        let mut last_iter = std::time::Instant::now();
+        stream.reset_state_for_reconnect(&mut last_iter);
+
+        assert_eq!(stream.state.chunk_buffer.len(), 500);
+        assert_eq!(stream.state.last_chunk.len(), 500);
+        assert_eq!(stream.state.last_chunk_len, 0);
+        assert_eq!(stream.state.scheduled_ahead, 0);
+        assert_eq!(stream.state.stats.reconnect_count, 1);
+    }
+
+    #[test]
+    fn test_reset_state_for_reconnect_clears_timing() {
+        let backend = TestBackend::new();
+        let mut stream = make_test_stream(backend);
+
+        // Set some state
+        stream.state.scheduled_ahead = 5000;
+        stream.state.fractional_consumed = 0.5;
+        stream.state.shutter_open = true;
+        stream.state.last_armed = true;
+        stream.state.startup_blank_remaining = 10;
+
+        let mut last_iter = std::time::Instant::now() - Duration::from_secs(10);
+        stream.reset_state_for_reconnect(&mut last_iter);
+
+        assert_eq!(stream.state.scheduled_ahead, 0);
+        assert_eq!(stream.state.fractional_consumed, 0.0);
+        assert!(!stream.state.shutter_open);
+        assert!(!stream.state.last_armed);
+        assert_eq!(stream.state.startup_blank_remaining, 0);
+        assert!(stream.state.color_delay_line.is_empty());
+        // last_iteration should be reset to approximately now
+        assert!(last_iter.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_sleep_with_stop_exits_on_stop() {
+        use crate::reconnect::ReconnectPolicy;
+        use std::sync::atomic::AtomicBool;
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_clone = stopped.clone();
+
+        // Start a background thread that sets stopped after 50ms
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            stopped_clone.store(true, Ordering::SeqCst);
+        });
+
+        // sleep_with_stop for 5 seconds should exit early
+        let start = std::time::Instant::now();
+        let was_stopped = ReconnectPolicy::sleep_with_stop(
+            Duration::from_secs(5),
+            || stopped.load(Ordering::SeqCst),
+        );
+
+        assert!(was_stopped);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_into_dac_preserves_reconnect_target() {
+        let backend = TestBackend::new();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+        device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+            device_id: "test-id".to_string(),
+            discovery_factory: None,
+        });
+
+        let cfg = StreamConfig::new(30_000)
+            .with_reconnect(crate::types::ReconnectConfig::new());
+        let (stream, _) = device.start_stream(cfg).unwrap();
+
+        // into_dac should extract the reconnect target from the policy
+        let (dac, stats) = stream.into_dac();
+        assert!(dac.reconnect_target.is_some());
+        assert_eq!(dac.reconnect_target.as_ref().unwrap().device_id, "test-id");
+        assert_eq!(stats.reconnect_count, 0);
+    }
+
+    #[test]
+    fn test_into_dac_preserves_target_without_reconnect() {
+        // into_dac should preserve the reopen target even when reconnect was NOT enabled.
+        // This allows: open_device -> start_stream(no reconnect) -> into_dac -> start_stream(with reconnect)
+        let backend = TestBackend::new();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+        device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+            device_id: "test-id".to_string(),
+            discovery_factory: None,
+        });
+
+        // Start without reconnect
+        let cfg = StreamConfig::new(30_000);
+        let (stream, _) = device.start_stream(cfg).unwrap();
+
+        // Verify the stream has the target stored (not in policy, since no reconnect)
+        assert!(stream.reconnect_target.is_some());
+        assert!(stream.reconnect_policy.is_none());
+
+        // into_dac should still return the target
+        let (dac, _) = stream.into_dac();
+        assert!(dac.reconnect_target.is_some());
+        assert_eq!(dac.reconnect_target.as_ref().unwrap().device_id, "test-id");
+    }
+
+    #[test]
+    fn test_dac_new_has_no_reconnect_target() {
+        let backend = TestBackend::new();
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "Test Device".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend.caps().clone(),
+        };
+        let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+        assert!(device.reconnect_target.is_none());
+    }
+
     fn make_test_stream(mut backend: impl FifoBackend + 'static) -> Stream {
         backend.connect().unwrap();
         let info = DacInfo {

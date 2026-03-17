@@ -596,7 +596,7 @@ fn test_frame_session_fifo_submit_frame_writes_points() {
 
     let config = FrameSessionConfig::new(30000)
         .with_startup_blank(std::time::Duration::ZERO);
-    let session = FrameSession::start(backend_kind, config).unwrap();
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().arm().unwrap();
     session.send_frame(Frame::new(vec![
@@ -626,7 +626,7 @@ fn test_frame_session_frame_swap_writes_frames() {
 
     let config = FrameSessionConfig::new(30000)
         .with_startup_blank(std::time::Duration::ZERO);
-    let session = FrameSession::start(backend_kind, config).unwrap();
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().arm().unwrap();
     session.send_frame(Frame::new(vec![
@@ -658,7 +658,7 @@ fn test_frame_session_arm_disarm() {
     let backend_kind = BackendKind::Fifo(Box::new(backend));
 
     let config = FrameSessionConfig::new(30000);
-    let session = FrameSession::start(backend_kind, config).unwrap();
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     assert!(!session.control().is_armed());
 
@@ -680,7 +680,7 @@ fn test_frame_session_stop() {
     let backend_kind = BackendKind::Fifo(Box::new(backend));
 
     let config = FrameSessionConfig::new(30000);
-    let session = FrameSession::start(backend_kind, config).unwrap();
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().stop().unwrap();
     let exit = session.join().unwrap();
@@ -751,4 +751,150 @@ fn test_engine_empty_transition_result() {
     assert_eq!(buffer[1].x, 2.0);
     assert_eq!(buffer[2].x, 1.0);
     assert_eq!(buffer[3].x, 2.0);
+}
+
+// =========================================================================
+// Reconnect-related tests
+// =========================================================================
+
+#[test]
+fn test_engine_reset_clears_state() {
+    use super::engine::PresentationEngine;
+
+    let mut engine = PresentationEngine::new(Box::new(default_transition));
+
+    // Set a frame and advance cursor
+    let frame = Arc::new(Frame::new(vec![
+        make_point(1.0, 0.0),
+        make_point(2.0, 0.0),
+    ]));
+    engine.set_pending(frame);
+
+    let mut buffer = vec![LaserPoint::default(); 3];
+    engine.fill_chunk(&mut buffer, 3);
+
+    // Engine should have state now
+    assert!(engine.current_base.is_some());
+
+    // Reset should clear everything
+    engine.reset();
+    assert!(engine.current_base.is_none());
+    assert!(engine.pending_base.is_none());
+
+    // After reset, fill_chunk should return blanks at origin
+    let mut buffer2 = vec![LaserPoint::default(); 2];
+    let n = engine.fill_chunk(&mut buffer2, 2);
+    assert_eq!(n, 2);
+    assert_eq!(buffer2[0].r, 0);
+    assert_eq!(buffer2[0].g, 0);
+}
+
+#[test]
+fn test_engine_reset_then_replay_frame() {
+    use super::engine::PresentationEngine;
+
+    let mut engine = PresentationEngine::new(Box::new(|_, _| vec![]));
+
+    // Play a frame
+    let frame = Arc::new(Frame::new(vec![make_point(1.0, 0.0)]));
+    engine.set_pending(frame.clone());
+    let mut buffer = vec![LaserPoint::default(); 2];
+    engine.fill_chunk(&mut buffer, 2);
+
+    // Reset then replay same frame
+    engine.reset();
+    engine.set_pending(frame);
+
+    let mut buffer2 = vec![LaserPoint::default(); 2];
+    let n = engine.fill_chunk(&mut buffer2, 2);
+    assert_eq!(n, 2);
+    assert_eq!(buffer2[0].x, 1.0);
+}
+
+#[test]
+fn test_color_delay_reset_clears_carry() {
+    use super::engine::ColorDelayLine;
+
+    let mut delay = ColorDelayLine::new(3);
+
+    // Apply some points so carry buffer has non-zero values
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
+        LaserPoint::new(0.1, 0.0, 32000, 0, 0, 32000),
+        LaserPoint::new(0.2, 0.0, 16000, 0, 0, 16000),
+    ];
+    delay.apply(&mut points);
+
+    // Carry buffer should now have color values from the chunk
+    // Reset should clear it back to zeros
+    delay.reset();
+
+    // Apply new points — first 3 should get zero colors from the reset carry
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
+        LaserPoint::new(0.1, 0.0, 65535, 0, 0, 65535),
+        LaserPoint::new(0.2, 0.0, 65535, 0, 0, 65535),
+    ];
+    delay.apply(&mut points2);
+
+    // After reset, the first 3 points should have zero colors (from the zeroed carry)
+    assert_eq!(points2[0].r, 0);
+    assert_eq!(points2[0].intensity, 0);
+    assert_eq!(points2[1].r, 0);
+    assert_eq!(points2[2].r, 0);
+}
+
+#[test]
+fn test_frame_session_config_with_reconnect() {
+    let config = FrameSessionConfig::new(30_000)
+        .with_reconnect(crate::types::ReconnectConfig::new().max_retries(3));
+
+    assert!(config.reconnect.is_some());
+    assert_eq!(config.reconnect.as_ref().unwrap().max_retries, Some(3));
+}
+
+#[test]
+fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
+    use crate::backend::BackendKind;
+    use crate::stream::Dac;
+    use crate::types::{DacCapabilities, DacInfo, DacType, OutputModel};
+
+    // Create a Dac with reconnect target
+    let caps = DacCapabilities {
+        pps_min: 1000,
+        pps_max: 100_000,
+        max_points_per_chunk: 1000,
+        output_model: OutputModel::NetworkFifo,
+    };
+
+    struct MinimalBackend { caps: DacCapabilities, connected: bool }
+    impl crate::backend::DacBackend for MinimalBackend {
+        fn dac_type(&self) -> DacType { DacType::Custom("Test".into()) }
+        fn caps(&self) -> &DacCapabilities { &self.caps }
+        fn connect(&mut self) -> crate::backend::Result<()> { self.connected = true; Ok(()) }
+        fn disconnect(&mut self) -> crate::backend::Result<()> { Ok(()) }
+        fn is_connected(&self) -> bool { self.connected }
+        fn stop(&mut self) -> crate::backend::Result<()> { Ok(()) }
+        fn set_shutter(&mut self, _: bool) -> crate::backend::Result<()> { Ok(()) }
+    }
+    impl crate::backend::FifoBackend for MinimalBackend {
+        fn try_write_points(&mut self, _: u32, _: &[LaserPoint]) -> crate::backend::Result<crate::backend::WriteOutcome> {
+            Ok(crate::backend::WriteOutcome::Written)
+        }
+        fn queued_points(&self) -> Option<u64> { None }
+    }
+
+    let backend = MinimalBackend { caps: caps.clone(), connected: false };
+    let info = DacInfo::new("test", "Test", DacType::Custom("Test".into()), caps);
+    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+        device_id: "test".to_string(),
+        discovery_factory: None,
+    });
+
+    // PPS 500 is below pps_min=1000 — should be rejected even with reconnect
+    let config = FrameSessionConfig::new(500)
+        .with_reconnect(crate::types::ReconnectConfig::new());
+    let result = device.start_frame_session(config);
+    assert!(result.is_err());
 }

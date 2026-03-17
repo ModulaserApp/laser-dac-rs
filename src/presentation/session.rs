@@ -6,8 +6,9 @@ use std::thread::JoinHandle;
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::error::{Error, Result};
+use crate::reconnect::ReconnectPolicy;
 use crate::stream::StreamControl;
-use crate::types::{LaserPoint, RunExit};
+use crate::types::{DacInfo, LaserPoint, RunExit};
 
 use super::engine::{ColorDelayLine, PresentationEngine};
 use super::{Frame, TransitionFn, default_transition};
@@ -30,6 +31,11 @@ pub struct FrameSessionConfig {
     /// the difference in galvo mirror and laser modulation response times.
     /// Applied at composition time. Set to 0 to disable.
     pub color_delay_points: usize,
+    /// Reconnection configuration (default: disabled).
+    ///
+    /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
+    /// reconnection when the device disconnects.
+    pub reconnect: Option<crate::types::ReconnectConfig>,
 }
 
 impl FrameSessionConfig {
@@ -44,6 +50,7 @@ impl FrameSessionConfig {
             transition_fn: Box::new(default_transition),
             startup_blank: std::time::Duration::from_millis(1),
             color_delay_points,
+            reconnect: None,
         }
     }
 
@@ -62,6 +69,14 @@ impl FrameSessionConfig {
     /// Set the color delay in points (builder pattern).
     pub fn with_color_delay_points(mut self, n: usize) -> Self {
         self.color_delay_points = n;
+        self
+    }
+
+    /// Enable automatic reconnection (builder pattern).
+    ///
+    /// Requires the device to have been opened via [`open_device`](crate::open_device).
+    pub fn with_reconnect(mut self, config: crate::types::ReconnectConfig) -> Self {
+        self.reconnect = Some(config);
         self
     }
 }
@@ -100,6 +115,7 @@ impl FrameSession {
     pub(crate) fn start(
         mut backend: BackendKind,
         config: FrameSessionConfig,
+        reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<Self> {
         // Connect if needed
         if !backend.is_connected() {
@@ -115,9 +131,9 @@ impl FrameSession {
 
         let thread = std::thread::spawn(move || {
             if is_frame_swap {
-                Self::run_frame_swap_loop(backend, config, control_clone, control_rx, frame_rx)
+                Self::run_frame_swap_loop(backend, config, control_clone, control_rx, frame_rx, reconnect_policy)
             } else {
-                Self::run_fifo_loop(backend, config, control_clone, control_rx, frame_rx)
+                Self::run_fifo_loop(backend, config, control_clone, control_rx, frame_rx, reconnect_policy)
             }
         });
 
@@ -163,13 +179,14 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_rx: mpsc::Receiver<Frame>,
+        reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
 
         if is_udp_timed {
-            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_rx)
+            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_rx, reconnect_policy)
         } else {
-            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_rx)
+            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_rx, reconnect_policy)
         }
     }
 
@@ -184,6 +201,7 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_rx: mpsc::Receiver<Frame>,
+        reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
@@ -191,8 +209,8 @@ impl FrameSession {
         let pps_f64 = pps as f64;
         // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
         // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
-        let chunk_points = ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
-        let chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+        let mut chunk_points = ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
+        let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
 
         let mut engine = PresentationEngine::new(config.transition_fn);
         let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
@@ -206,6 +224,7 @@ impl FrameSession {
         };
         let mut last_armed = false;
         let mut next_send = Instant::now();
+        let mut last_frame: Option<Frame> = None;
 
         loop {
             // 1. High-precision wait until next send time
@@ -225,11 +244,30 @@ impl FrameSession {
 
             // 3. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
+                last_frame = Some(frame.clone());
                 engine.set_pending(Arc::new(frame));
             }
 
             // 4. Check connection
             if !backend.is_connected() {
+                if let Some(ref policy) = reconnect_policy {
+                    match Self::try_reconnect(
+                        &mut backend, policy, &control,
+                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                        pps, false,
+                    ) {
+                        Ok(_info) => {
+                            next_send = Instant::now();
+                            chunk_points = ((pps_f64 * 0.010).ceil() as usize)
+                                .min(backend.caps().max_points_per_chunk);
+                            chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+                            chunk_buffer.resize(chunk_points, LaserPoint::default());
+                            color_delay.reset();
+                            continue;
+                        }
+                        Err(exit) => return Ok(exit),
+                    }
+                }
                 return Ok(RunExit::Disconnected);
             }
 
@@ -290,6 +328,24 @@ impl FrameSession {
                     // Device busy — we'll catch up next cycle
                 }
                 Err(e) if e.is_disconnected() => {
+                    if let Some(ref policy) = reconnect_policy {
+                        match Self::try_reconnect(
+                            &mut backend, policy, &control,
+                            &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                            pps, false,
+                        ) {
+                            Ok(_info) => {
+                                next_send = Instant::now();
+                                chunk_points = ((pps_f64 * 0.010).ceil() as usize)
+                                    .min(backend.caps().max_points_per_chunk);
+                                chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+                                chunk_buffer.resize(chunk_points, LaserPoint::default());
+                                color_delay.reset();
+                                continue;
+                            }
+                            Err(exit) => return Ok(exit),
+                        }
+                    }
                     return Ok(RunExit::Disconnected);
                 }
                 Err(_) => {}
@@ -304,11 +360,12 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_rx: mpsc::Receiver<Frame>,
+        reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
         let pps = config.pps as f64;
-        let max_points = backend.caps().max_points_per_chunk;
+        let mut max_points = backend.caps().max_points_per_chunk;
         let target_buffer_secs = 0.020_f64;
         let target_buffer_points = (target_buffer_secs * pps) as u64;
 
@@ -326,6 +383,7 @@ impl FrameSession {
             (config.startup_blank.as_secs_f64() * pps).ceil() as usize
         };
         let mut last_armed = false;
+        let mut last_frame: Option<Frame> = None;
 
         loop {
             // 1. Check stop
@@ -344,6 +402,7 @@ impl FrameSession {
 
             // 2. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
+                last_frame = Some(frame.clone());
                 engine.set_pending(Arc::new(frame));
             }
 
@@ -364,6 +423,24 @@ impl FrameSession {
 
             // 5. Check connection
             if !backend.is_connected() {
+                if let Some(ref policy) = reconnect_policy {
+                    match Self::try_reconnect(
+                        &mut backend, policy, &control,
+                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                        config.pps, false,
+                    ) {
+                        Ok(info) => {
+                            scheduled_ahead = 0;
+                            fractional_consumed = 0.0;
+                            last_iteration = Instant::now();
+                            max_points = info.caps.max_points_per_chunk;
+                            chunk_buffer.resize(max_points, LaserPoint::default());
+                            color_delay.reset();
+                            continue;
+                        }
+                        Err(exit) => return Ok(exit),
+                    }
+                }
                 return Ok(RunExit::Disconnected);
             }
 
@@ -439,6 +516,24 @@ impl FrameSession {
                         std::thread::sleep(Duration::from_micros(100));
                     }
                     Err(e) if e.is_disconnected() => {
+                        if let Some(ref policy) = reconnect_policy {
+                            match Self::try_reconnect(
+                                &mut backend, policy, &control,
+                                &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                                config.pps, false,
+                            ) {
+                                Ok(info) => {
+                                    scheduled_ahead = 0;
+                                    fractional_consumed = 0.0;
+                                    last_iteration = Instant::now();
+                                    max_points = info.caps.max_points_per_chunk;
+                                    chunk_buffer.resize(max_points, LaserPoint::default());
+                                    color_delay.reset();
+                                    break;
+                                }
+                                Err(exit) => return Ok(exit),
+                            }
+                        }
                         return Ok(RunExit::Disconnected);
                     }
                     Err(_) => {
@@ -459,6 +554,7 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_rx: mpsc::Receiver<Frame>,
+        reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::Duration;
 
@@ -472,6 +568,7 @@ impl FrameSession {
             (config.startup_blank.as_secs_f64() * pps).ceil() as usize
         };
         let mut last_armed = false;
+        let mut last_frame: Option<Frame> = None;
 
         loop {
             // 1. Check stop
@@ -481,11 +578,22 @@ impl FrameSession {
 
             // 2. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
+                last_frame = Some(frame.clone());
                 engine.set_pending(Arc::new(frame));
             }
 
             // 3. Check connection
             if !backend.is_connected() {
+                if let Some(ref policy) = reconnect_policy {
+                    match Self::try_reconnect(
+                        &mut backend, policy, &control,
+                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                        config.pps, true,
+                    ) {
+                        Ok(_info) => continue,
+                        Err(exit) => return Ok(exit),
+                    }
+                }
                 return Ok(RunExit::Disconnected);
             }
 
@@ -559,6 +667,16 @@ impl FrameSession {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) if e.is_disconnected() => {
+                    if let Some(ref policy) = reconnect_policy {
+                        match Self::try_reconnect(
+                            &mut backend, policy, &control,
+                            &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
+                            config.pps, true,
+                        ) {
+                            Ok(_info) => continue,
+                            Err(exit) => return Ok(exit),
+                        }
+                    }
                     return Ok(RunExit::Disconnected);
                 }
                 Err(_) => {}
@@ -569,6 +687,117 @@ impl FrameSession {
     // =========================================================================
     // Shared helpers
     // =========================================================================
+
+    /// Attempt to reconnect the backend using the reconnection policy.
+    ///
+    /// On success, replaces `backend` and resets scheduler state.
+    /// Returns the new `DacInfo` on success.
+    #[allow(clippy::too_many_arguments)]
+    fn try_reconnect(
+        backend: &mut BackendKind,
+        policy: &ReconnectPolicy,
+        control: &StreamControl,
+        shutter_open: &mut bool,
+        last_armed: &mut bool,
+        engine: &mut PresentationEngine,
+        last_frame: &Option<Frame>,
+        config_pps: u32,
+        expected_frame_swap: bool,
+    ) -> std::result::Result<DacInfo, RunExit> {
+        // Fire on_disconnect
+        if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
+            cb(&Error::disconnected("backend disconnected"));
+        }
+
+        let mut retries = 0u32;
+        loop {
+            if control.is_stop_requested() {
+                return Err(RunExit::Stopped);
+            }
+            if let Some(max) = policy.max_retries {
+                if retries >= max {
+                    return Err(RunExit::Disconnected);
+                }
+            }
+
+            // Backoff
+            if ReconnectPolicy::sleep_with_stop(policy.backoff, || control.is_stop_requested()) {
+                return Err(RunExit::Stopped);
+            }
+
+            log::info!("'{}' reconnect attempt {} ...", policy.target.device_id, retries + 1);
+
+            let device = match policy.target.open_device() {
+                Ok(d) => d,
+                Err(err) => {
+                    if !ReconnectPolicy::is_retriable(&err) {
+                        return Err(RunExit::Disconnected);
+                    }
+                    log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            };
+
+            let info = device.info().clone();
+            let mut new_backend = match device.into_backend() {
+                Some(b) => b,
+                None => {
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            };
+
+            // Validate PPS against new device
+            if config_pps < info.caps.pps_min || config_pps > info.caps.pps_max {
+                log::error!(
+                    "'{}' PPS {} outside new device range [{}, {}]",
+                    policy.target.device_id, config_pps, info.caps.pps_min, info.caps.pps_max
+                );
+                return Err(RunExit::Disconnected);
+            }
+
+            // Verify backend type matches the scheduler loop
+            if new_backend.is_frame_swap() != expected_frame_swap {
+                log::error!(
+                    "'{}' reconnected device has incompatible backend type",
+                    policy.target.device_id
+                );
+                return Err(RunExit::Disconnected);
+            }
+
+            if !new_backend.is_connected() {
+                if let Err(err) = new_backend.connect() {
+                    if !ReconnectPolicy::is_retriable(&err) {
+                        return Err(RunExit::Disconnected);
+                    }
+                    log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            }
+
+            log::info!("'{}' reconnected successfully", policy.target.device_id);
+
+            // Swap backend
+            *backend = new_backend;
+            *shutter_open = false;
+            *last_armed = false;
+
+            // Reset engine and replay last frame
+            engine.reset();
+            if let Some(frame) = last_frame {
+                engine.set_pending(Arc::new(frame.clone()));
+            }
+
+            // Fire on_reconnect
+            if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
+                cb(&info);
+            }
+
+            return Ok(info);
+        }
+    }
 
     fn process_control_messages(
         control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,

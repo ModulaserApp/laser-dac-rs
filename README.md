@@ -120,24 +120,27 @@ let config = FrameSessionConfig::new(30_000)
 
 ### Reconnecting Frame Session
 
-For automatic reconnection by device ID:
+For automatic reconnection when the device disconnects:
 
 ```rust
-use laser_dac::{Frame, FrameSessionConfig, LaserPoint, ReconnectingSession, StreamConfig};
+use laser_dac::{open_device, Frame, FrameSessionConfig, LaserPoint, ReconnectConfig};
 use std::time::Duration;
 
-let mut session = ReconnectingSession::new("my-device", StreamConfig::new(30_000))
-    .with_max_retries(5)
-    .with_backoff(Duration::from_secs(1))
-    .on_disconnect(|err| eprintln!("Lost connection: {}", err))
-    .on_reconnect(|info| println!("Reconnected to {}", info.name));
+let device = open_device("my-device")?;
+let config = FrameSessionConfig::new(30_000)
+    .with_reconnect(
+        ReconnectConfig::new()
+            .max_retries(5)
+            .backoff(Duration::from_secs(1))
+            .on_disconnect(|err| eprintln!("Lost connection: {}", err))
+            .on_reconnect(|info| println!("Reconnected to {}", info.name))
+    );
+
+let (session, _info) = device.start_frame_session(config)?;
 
 session.control().arm()?;
 
-let config = FrameSessionConfig::new(30_000);
-let handle = session.run_frame_session(config)?;
-
-handle.send_frame(Frame::new(vec![
+session.send_frame(Frame::new(vec![
     LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535),
 ]));
 ```
@@ -197,7 +200,7 @@ Each backend handles conversion to its native format internally.
 | `DacInfo`             | DAC metadata (name, type, capabilities)                 |
 | `Dac`                 | Opened DAC ready for streaming                          |
 | `Stream`              | Active streaming session (callback mode)                |
-| `ReconnectingSession` | Session wrapper with automatic reconnect                |
+| `ReconnectConfig`     | Configuration for automatic reconnection                |
 | `StreamConfig`        | Stream settings (PPS, buffering, color delay, blanking) |
 | `ChunkRequest`        | Request info for filling point buffer                   |
 | `LaserPoint`          | Single point with position (f32) and color (u16)        |

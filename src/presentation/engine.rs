@@ -56,6 +56,18 @@ impl PresentationEngine {
         }
     }
 
+    /// Reset all runtime state. Preserves the transition_fn.
+    pub fn reset(&mut self) {
+        self.current_base = None;
+        self.pending_base = None;
+        self.drawable.clear();
+        self.drawable_dirty = true;
+        self.cursor = 0;
+        self.transition_buf.clear();
+        self.transition_cursor = 0;
+        self.frame_swap_transition_len = 0;
+    }
+
     /// Submit a new frame. Latest-wins: multiple calls before consumption
     /// keep only the most recent frame.
     ///
@@ -245,6 +257,11 @@ impl ColorDelayLine {
             delay,
             carry: vec![(0, 0, 0, 0); delay],
         }
+    }
+
+    /// Reset the carry buffer (e.g., after reconnect).
+    pub fn reset(&mut self) {
+        self.carry = vec![(0, 0, 0, 0); self.delay];
     }
 
     /// Apply color delay to a chunk, using carried state from the previous chunk.

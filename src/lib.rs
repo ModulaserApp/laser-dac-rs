@@ -83,7 +83,7 @@ mod error;
 mod net_utils;
 pub mod presentation;
 pub mod protocols;
-pub mod session;
+pub(crate) mod reconnect;
 pub mod stream;
 pub mod types;
 
@@ -113,6 +113,7 @@ pub use types::{
     EnabledDacTypes,
     LaserPoint,
     OutputModel,
+    ReconnectConfig,
     RunExit,
     StreamConfig,
     StreamInstant,
@@ -122,7 +123,6 @@ pub use types::{
 };
 
 // Stream and Dac types
-pub use session::{FrameSessionHandle, ReconnectingSession, SessionControl};
 pub use stream::{Dac, Stream, StreamControl};
 
 // Presentation types (frame-first API)
@@ -212,5 +212,10 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 /// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    discovery.open_by_id(id)
+    let mut dac = discovery.open_by_id(id)?;
+    dac.reconnect_target = Some(reconnect::ReconnectTarget {
+        device_id: id.to_string(),
+        discovery_factory: None,
+    });
+    Ok(dac)
 }

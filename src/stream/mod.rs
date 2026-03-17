@@ -24,7 +24,10 @@
 //!
 //! # Disconnect Behavior
 //!
-//! No automatic reconnection. On disconnect, create a new `Dac` and `Stream`.
+//! By default, streams do not reconnect — on disconnect, `run()` returns
+//! `RunExit::Disconnected`. Configure reconnection via
+//! [`StreamConfig::with_reconnect`](crate::StreamConfig::with_reconnect) or
+//! [`FrameSessionConfig::with_reconnect`](crate::FrameSessionConfig::with_reconnect).
 //! New streams always start disarmed for safety.
 
 use std::collections::VecDeque;
@@ -34,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result, WriteOutcome};
+use crate::reconnect::{ReconnectPolicy, ReconnectTarget};
 use crate::types::{
     ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
     StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
@@ -269,6 +273,10 @@ pub struct Stream {
     control_rx: Receiver<ControlMsg>,
     /// Stream state.
     state: StreamState,
+    /// Reconnection policy (None = no reconnection).
+    pub(crate) reconnect_policy: Option<ReconnectPolicy>,
+    /// Reopen identity, preserved for `into_dac()` even without reconnect enabled.
+    pub(crate) reconnect_target: Option<ReconnectTarget>,
 }
 
 impl Stream {
@@ -306,13 +314,17 @@ impl Stream {
         let max_points = info.caps.max_points_per_chunk;
         let startup_blank_points =
             Self::duration_micros_to_points(config.startup_blank.as_micros() as u64, config.pps);
+        let color_delay = config.color_delay;
+        let state = StreamState::new(max_points, startup_blank_points, &config);
         Self {
             info,
             backend: Some(backend),
-            config: config.clone(),
-            control: StreamControl::new(control_tx, config.color_delay),
+            config,
+            control: StreamControl::new(control_tx, color_delay),
             control_rx,
-            state: StreamState::new(max_points, startup_blank_points, &config),
+            state,
+            reconnect_policy: None,
+            reconnect_target: None,
         }
     }
 
@@ -448,13 +460,149 @@ impl Stream {
         // Take the backend (leaves None, so Drop won't try to stop again)
         let backend = self.backend.take();
         let stats = self.state.stats.clone();
+        let reconnect_target = self.reconnect_target.take()
+            .or_else(|| self.reconnect_policy.take().map(|p| p.target));
 
         let dac = Dac {
             info: self.info.clone(),
             backend,
+            reconnect_target,
         };
 
         (dac, stats)
+    }
+
+    /// Attempt to reconnect the backend using the reconnection policy.
+    ///
+    /// Opens a new device, connects, and swaps the backend. Resets timing
+    /// state for the new connection. Returns `Err` on non-retriable errors
+    /// or if stop is requested.
+    fn handle_reconnect(
+        &mut self,
+        last_iteration: &mut std::time::Instant,
+    ) -> std::result::Result<(), RunExit> {
+        let policy = self.reconnect_policy.as_ref().unwrap();
+
+        // Fire on_disconnect callback
+        if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
+            cb(&Error::disconnected("backend disconnected"));
+        }
+
+        let mut retries = 0u32;
+        loop {
+            if self.control.is_stop_requested() {
+                return Err(RunExit::Stopped);
+            }
+
+            if let Some(max) = policy.max_retries {
+                if retries >= max {
+                    return Err(RunExit::Disconnected);
+                }
+            }
+
+            // Backoff sleep
+            if ReconnectPolicy::sleep_with_stop(policy.backoff, || {
+                self.control.is_stop_requested()
+            }) {
+                return Err(RunExit::Stopped);
+            }
+
+            log::info!(
+                "'{}' reconnect attempt {} ...",
+                policy.target.device_id,
+                retries + 1
+            );
+
+            // Open device
+            let device = match policy.target.open_device() {
+                Ok(d) => d,
+                Err(err) => {
+                    if !ReconnectPolicy::is_retriable(&err) {
+                        log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
+                        return Err(RunExit::Disconnected);
+                    }
+                    log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            };
+
+            // Get backend from device and connect
+            let info = device.info().clone();
+            let mut new_backend = match device.into_backend() {
+                Some(b) => b,
+                None => {
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            };
+
+            if !new_backend.is_connected() {
+                match new_backend.connect() {
+                    Ok(()) => {}
+                    Err(err) => {
+                        if !ReconnectPolicy::is_retriable(&err) {
+                            log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
+                            return Err(RunExit::Disconnected);
+                        }
+                        log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
+                        retries = retries.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+
+            // Reject frame-swap backends (same invariant as start_stream)
+            if new_backend.is_frame_swap() {
+                log::error!(
+                    "'{}' reconnected device is frame-swap, incompatible with streaming",
+                    policy.target.device_id
+                );
+                return Err(RunExit::Disconnected);
+            }
+
+            log::info!("'{}' reconnected successfully", policy.target.device_id);
+
+            // Swap the backend
+            self.backend = Some(new_backend);
+            self.info = info;
+
+            // Validate config against new device
+            if Dac::validate_config(&self.info.caps, &self.config).is_err() {
+                log::error!(
+                    "'{}' config invalid for new device",
+                    policy.target.device_id
+                );
+                return Err(RunExit::Disconnected);
+            }
+
+            // Reset all runtime state for the new connection
+            self.reset_state_for_reconnect(last_iteration);
+
+            // Fire on_reconnect callback
+            let policy = self.reconnect_policy.as_ref().unwrap();
+            if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
+                cb(&self.info);
+            }
+
+            return Ok(());
+        }
+    }
+
+    /// Reset all runtime state for a reconnected device.
+    fn reset_state_for_reconnect(&mut self, last_iteration: &mut std::time::Instant) {
+        let max_points = self.info.caps.max_points_per_chunk;
+        self.state.chunk_buffer.resize(max_points, LaserPoint::default());
+        self.state.last_chunk.resize(max_points, LaserPoint::default());
+        self.state.last_chunk_len = 0;
+        self.state.scheduled_ahead = 0;
+        self.state.fractional_consumed = 0.0;
+        self.state.shutter_open = false;
+        self.state.last_armed = false;
+        self.state.color_delay_line.clear();
+        self.state.startup_blank_remaining = 0;
+        self.state.stats.reconnect_count += 1;
+        *last_iteration = std::time::Instant::now();
     }
 
     /// Run the stream with the zero-allocation callback API.
@@ -505,7 +653,7 @@ impl Stream {
         use std::time::Instant;
 
         let pps = self.config.pps as f64;
-        let max_points = self.info.caps.max_points_per_chunk;
+        let mut max_points = self.info.caps.max_points_per_chunk;
 
         // Track time between iterations to decrement scheduled_ahead for backends
         // that don't report queued_points(). This prevents stalls when buffered
@@ -569,15 +717,22 @@ impl Stream {
             }
 
             // 4. Check backend connection
-            if let Some(b) = &self.backend {
-                if !b.is_connected() {
-                    log::warn!("backend.is_connected() = false, exiting with Disconnected");
-                    on_error(Error::disconnected("backend disconnected"));
-                    return Ok(RunExit::Disconnected);
+            let disconnected = match &self.backend {
+                Some(b) => !b.is_connected(),
+                None => true,
+            };
+            if disconnected {
+                if self.reconnect_policy.is_some() {
+                    match self.handle_reconnect(&mut last_iteration) {
+                        Ok(()) => {
+                            max_points = self.info.caps.max_points_per_chunk;
+                            continue;
+                        }
+                        Err(exit) => return Ok(exit),
+                    }
                 }
-            } else {
-                log::warn!("no backend, exiting with Disconnected");
-                on_error(Error::disconnected("no backend"));
+                log::warn!("backend disconnected, exiting");
+                on_error(Error::disconnected("backend disconnected"));
                 return Ok(RunExit::Disconnected);
             }
 
@@ -607,7 +762,19 @@ impl Stream {
 
                     // Write to backend if we have points
                     if n > 0 {
-                        self.write_fill_points(n, &mut on_error)?;
+                        match self.write_fill_points(n, &mut on_error) {
+                            Ok(()) => {}
+                            Err(e) if e.is_disconnected() && self.reconnect_policy.is_some() => {
+                                match self.handle_reconnect(&mut last_iteration) {
+                                    Ok(()) => {
+                                        max_points = self.info.caps.max_points_per_chunk;
+                                        continue;
+                                    }
+                                    Err(exit) => return Ok(exit),
+                                }
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
                 ChunkResult::Starved => {
@@ -1107,6 +1274,7 @@ impl Drop for Stream {
 pub struct Dac {
     info: DacInfo,
     backend: Option<BackendKind>,
+    pub(crate) reconnect_target: Option<ReconnectTarget>,
 }
 
 impl Dac {
@@ -1115,6 +1283,7 @@ impl Dac {
         Self {
             info,
             backend: Some(backend),
+            reconnect_target: None,
         }
     }
 
@@ -1148,6 +1317,11 @@ impl Dac {
         self.backend.is_some()
     }
 
+    /// Consume the Dac and return the backend, if available.
+    pub(crate) fn into_backend(mut self) -> Option<BackendKind> {
+        self.backend.take()
+    }
+
     /// Returns whether the device is connected.
     pub fn is_connected(&self) -> bool {
         self.backend.as_ref().is_some_and(|b| b.is_connected())
@@ -1177,7 +1351,10 @@ impl Dac {
     /// - The device backend has already been used for a stream.
     /// - The configuration is invalid (PPS out of range, invalid chunk size, etc.).
     /// - The backend fails to connect.
-    pub fn start_stream(mut self, cfg: StreamConfig) -> Result<(Stream, DacInfo)> {
+    pub fn start_stream(mut self, mut cfg: StreamConfig) -> Result<(Stream, DacInfo)> {
+        // Extract reconnect config before consuming cfg
+        let reconnect_config = cfg.reconnect.take();
+
         let mut backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a stream")
         })?;
@@ -1198,7 +1375,20 @@ impl Dac {
             backend.connect()?;
         }
 
-        let stream = Stream::with_backend(self.info.clone(), backend, cfg);
+        let mut stream = Stream::with_backend(self.info.clone(), backend, cfg);
+
+        // Always preserve the reopen target on the stream (for into_dac recovery)
+        stream.reconnect_target = self.reconnect_target.take();
+
+        // Wire reconnect policy if configured
+        if let Some(rc) = reconnect_config {
+            let target = stream.reconnect_target.take().ok_or_else(|| {
+                Error::invalid_config(
+                    "reconnect requires a device opened via open_device()",
+                )
+            })?;
+            stream.reconnect_policy = Some(ReconnectPolicy::new(rc, target));
+        }
 
         Ok((stream, self.info))
     }
@@ -1244,8 +1434,10 @@ impl Dac {
     /// [`DacInfo`] with device metadata.
     pub fn start_frame_session(
         mut self,
-        config: crate::presentation::FrameSessionConfig,
+        mut config: crate::presentation::FrameSessionConfig,
     ) -> Result<(crate::presentation::FrameSession, DacInfo)> {
+        let reconnect_config = config.reconnect.take();
+
         let backend = self.backend.take().ok_or_else(|| {
             Error::invalid_config("device backend has already been used for a session")
         })?;
@@ -1258,7 +1450,19 @@ impl Dac {
             )));
         }
 
-        let session = crate::presentation::FrameSession::start(backend, config)?;
+        let reconnect_policy = match reconnect_config {
+            Some(rc) => {
+                let target = self.reconnect_target.take().ok_or_else(|| {
+                    Error::invalid_config(
+                        "reconnect requires a device opened via open_device()",
+                    )
+                })?;
+                Some(ReconnectPolicy::new(rc, target))
+            }
+            None => None,
+        };
+
+        let session = crate::presentation::FrameSession::start(backend, config, reconnect_policy)?;
         Ok((session, self.info))
     }
 }
