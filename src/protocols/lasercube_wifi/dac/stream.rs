@@ -227,6 +227,12 @@ impl Stream {
             .estimated_buffer_fullness(Instant::now())
     }
 
+    /// Refresh ACK state and return the number of points that can safely be written.
+    pub fn safe_writable_points(&mut self) -> u16 {
+        self.try_receive_buffer_status();
+        self.buffer_estimator.max_points_to_add(Instant::now())
+    }
+
     /// Get the current playback rate in Hz.
     pub fn point_rate(&self) -> u32 {
         self.current_rate

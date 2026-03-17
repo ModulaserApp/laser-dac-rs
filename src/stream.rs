@@ -4140,6 +4140,62 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // NetworkFifo + LaserCube-like config scheduler tests
+    // =========================================================================
+
+    #[test]
+    fn test_network_fifo_lasercube_default_target_requests_topup() {
+        // LaserCube-like: 5700 max, 30kpps, default 50ms target buffer
+        let backend = TestBackend::new()
+            .with_output_model(OutputModel::NetworkFifo)
+            .with_max_points_per_chunk(5700);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "LaserCube Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000)
+            .with_target_buffer(Duration::from_millis(50))
+            .with_min_buffer(Duration::from_millis(20));
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
+        let buffered = stream.estimate_buffer_points();
+        let req = stream.build_fill_request(5700, buffered);
+        assert_eq!(req.target_points, 1500, "should request ~1500 top-up, not full 5700");
+    }
+
+    #[test]
+    fn test_network_fifo_lasercube_large_target_uses_more_capacity() {
+        // Explicit large target buffer can request larger chunks
+        let backend = TestBackend::new()
+            .with_output_model(OutputModel::NetworkFifo)
+            .with_max_points_per_chunk(5700);
+        let mut backend_box: Box<dyn StreamBackend> = Box::new(backend);
+        backend_box.connect().unwrap();
+
+        let info = DacInfo {
+            id: "test".to_string(),
+            name: "LaserCube Test".to_string(),
+            kind: DacType::Custom("Test".to_string()),
+            caps: backend_box.caps().clone(),
+        };
+        let cfg = StreamConfig::new(30_000)
+            .with_target_buffer(Duration::from_millis(200))
+            .with_min_buffer(Duration::from_millis(50));
+        let stream = Stream::with_backend(info, backend_box, cfg);
+
+        let buffered = stream.estimate_buffer_points();
+        let req = stream.build_fill_request(5700, buffered);
+        // At 30kpps and 200ms: ceil(0.2 * 30000) = 6000, clamped to 5700
+        assert_eq!(req.target_points, 5700);
+    }
+
     #[test]
     fn test_validate_config_rejects_pps_below_min() {
         // Helios-like caps: pps_min = 7

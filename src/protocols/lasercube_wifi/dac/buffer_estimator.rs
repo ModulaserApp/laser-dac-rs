@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Safety margin subtracted from available space to prevent overruns.
-const LATENCY_POINT_ADJUSTMENT: u16 = 300;
+pub(crate) const LATENCY_POINT_ADJUSTMENT: u16 = 300;
 
 /// Entries in the message-time map older than this are considered stale and removed.
 const STALE_ENTRY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -455,6 +455,25 @@ mod tests {
         est.set_point_rate(60000);
         // At 60000 pps, after 50ms from t: consumed = 3000, fullness = 0
         assert_eq!(est.estimated_buffer_fullness(later), 0);
+    }
+
+    #[test]
+    fn rate_decrease_reduces_writable_headroom() {
+        // Simulates the PPS-transition scenario: if the estimator still uses the
+        // old (higher) rate when checking writable space, it overestimates drain
+        // and returns too much headroom.
+        let mut est = BufferEstimator::new(6000, 30000);
+        let t = now();
+        est.record_send(0, 3000, t);
+
+        let later = t + Duration::from_millis(50);
+        // At 30000 pps: consumed = 1500, fullness = 1500, writable = 6000 - 1500 - 300 = 4200
+        assert_eq!(est.max_points_to_add(later), 4200);
+
+        // Drop to 10000 pps — buffer drains slower than the old rate assumed
+        est.set_point_rate(10000);
+        // At 10000 pps: consumed = 500, fullness = 2500, writable = 6000 - 2500 - 300 = 3200
+        assert_eq!(est.max_points_to_add(later), 3200);
     }
 
     #[test]

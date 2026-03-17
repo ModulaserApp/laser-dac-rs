@@ -37,16 +37,22 @@ pub mod protocol;
 pub use backend::LasercubeWifiBackend;
 
 use crate::types::{DacCapabilities, OutputModel};
-use protocol::{command, DeviceInfo, CMD_PORT};
+use dac::buffer_estimator::LATENCY_POINT_ADJUSTMENT;
+use protocol::{command, DeviceInfo, CMD_PORT, DEFAULT_BUFFER_CAPACITY};
 
-/// Returns the default capabilities for LaserCube WiFi DACs.
-pub fn default_capabilities() -> DacCapabilities {
+/// Returns capabilities for a LaserCube WiFi DAC with the given buffer capacity.
+pub fn capabilities_for_buffer(capacity: u16) -> DacCapabilities {
     DacCapabilities {
         pps_min: 1,
         pps_max: 30_000,
-        max_points_per_chunk: 6000,
-        output_model: OutputModel::UdpTimed,
+        max_points_per_chunk: capacity.saturating_sub(LATENCY_POINT_ADJUSTMENT) as usize,
+        output_model: OutputModel::NetworkFifo,
     }
+}
+
+/// Returns the default capabilities for LaserCube WiFi DACs.
+pub fn default_capabilities() -> DacCapabilities {
+    capabilities_for_buffer(DEFAULT_BUFFER_CAPACITY)
 }
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::HashSet;
@@ -232,5 +238,22 @@ mod tests {
         assert_eq!(blank.r, 0);
         assert_eq!(blank.g, 0);
         assert_eq!(blank.b, 0);
+    }
+
+    #[test]
+    fn default_caps_are_network_fifo_with_safety_margin() {
+        let caps = default_capabilities();
+        assert_eq!(caps.output_model, OutputModel::NetworkFifo);
+        assert_eq!(caps.max_points_per_chunk, 5700);
+    }
+
+    #[test]
+    fn caps_from_discovery_derive_from_device_buffer() {
+        let caps = capabilities_for_buffer(4000);
+        assert_eq!(
+            caps.max_points_per_chunk,
+            (4000 - LATENCY_POINT_ADJUSTMENT) as usize
+        );
+        assert_eq!(caps.output_model, OutputModel::NetworkFifo);
     }
 }
