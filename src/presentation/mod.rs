@@ -104,6 +104,13 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint>
     let dy = to.y - from.y;
     let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
 
+    // If points are nearly adjacent, no blanking needed — the galvos can
+    // handle the tiny step without visible artifacts. This prevents gaps
+    // at the loop point of closed shapes (circles, etc.) on frame-swap DACs.
+    if distance < 0.02 {
+        return vec![];
+    }
+
     let dwell = (3.0 + distance * 12.0).ceil() as usize;  // 3..~37 per end
     let travel = (5.0 + distance * 30.0).ceil() as usize;  // 5..~90
 
@@ -161,6 +168,8 @@ pub(crate) struct PresentationEngine {
     transition_buf: Vec<LaserPoint>,
     /// Read cursor within transition_buf.
     transition_cursor: usize,
+    /// Length of the transition prefix in the last composed frame-swap drawable.
+    frame_swap_transition_len: usize,
 }
 
 impl PresentationEngine {
@@ -175,6 +184,7 @@ impl PresentationEngine {
             transition_fn,
             transition_buf: Vec::new(),
             transition_cursor: 0,
+            frame_swap_transition_len: 0,
         }
     }
 
@@ -265,17 +275,37 @@ impl PresentationEngine {
 
     /// Frame-swap delivery: compose and return a complete hardware frame.
     ///
-    /// Returns the frame points for the current state. If a pending frame
-    /// exists, it is promoted first. For frame-swap DACs, the self-loop
-    /// transition (last→first of same frame) is prepended so the device
-    /// receives one atomic frame with clean blanking at the loop point.
+    /// On frame change (A→B): computes `transition_fn(A.last, B.first)`,
+    /// composes `[transition | B_points]`, then promotes B to current.
+    /// The next call without a pending frame will recompute the self-loop.
+    ///
+    /// On self-loop (no pending): computes `transition_fn(A.last, A.first)`,
+    /// composes `[transition | A_points]`.
     pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] {
-        // Promote pending if available
         if let Some(pending) = self.pending_base.take() {
+            // Frame change: A→B transition.
+            // Compute transition from current (A) to pending (B) BEFORE promoting.
+            let transition = match &self.current_base {
+                Some(current) => match (current.last_point(), pending.first_point()) {
+                    (Some(last), Some(first)) => (self.transition_fn)(last, first),
+                    _ => vec![],
+                },
+                None => vec![],
+            };
+
+            self.drawable.clear();
+            self.frame_swap_transition_len = transition.len();
+            self.drawable.extend_from_slice(&transition);
+            self.drawable.extend_from_slice(pending.points());
+
+            // Promote B to current. Mark dirty so next call builds self-loop.
             self.current_base = Some(pending);
             self.drawable_dirty = true;
+
+            return &self.drawable;
         }
 
+        // No pending: self-loop for current frame.
         if self.drawable_dirty {
             self.refresh_drawable_for_frame_swap();
         }
@@ -286,16 +316,20 @@ impl PresentationEngine {
     /// Rebuild drawable for frame-swap: includes self-loop transition.
     ///
     /// Frame-swap DACs send the entire drawable as one atomic frame, so the
-    /// transition from last→first point must be included for clean looping.
+    /// transition from last→first point is included for clean looping.
+    /// For nearly-closed shapes (circles), the transition function returns
+    /// empty, so the frame loops seamlessly.
     fn refresh_drawable_for_frame_swap(&mut self) {
         self.drawable.clear();
         self.drawable_dirty = false;
 
         let Some(current) = &self.current_base else {
+            self.frame_swap_transition_len = 0;
             return;
         };
 
         if current.is_empty() {
+            self.frame_swap_transition_len = 0;
             return;
         }
 
@@ -303,8 +337,14 @@ impl PresentationEngine {
         let last = points.last().unwrap();
         let first = points.first().unwrap();
         let transition = (self.transition_fn)(last, first);
+        self.frame_swap_transition_len = transition.len();
         self.drawable.extend_from_slice(&transition);
         self.drawable.extend_from_slice(points);
+    }
+
+    /// Number of transition points at the start of the last composed frame-swap drawable.
+    pub fn frame_swap_transition_len(&self) -> usize {
+        self.frame_swap_transition_len
     }
 
     /// Rebuild the drawable from the current base frame.
@@ -904,15 +944,14 @@ impl FrameSession {
                 continue;
             }
 
-            // 7. Compose frame
+            // 7. Compose frame and copy to mutable buffer
             let composed = engine.compose_hardware_frame();
             if composed.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
-
-            // Copy to mutable buffer for blanking/color delay
             let mut frame_buf: Vec<LaserPoint> = composed.to_vec();
+            let transition_len = engine.frame_swap_transition_len();
 
             // Apply blanking when disarmed
             if !is_armed {
@@ -933,8 +972,9 @@ impl FrameSession {
                 startup_blank_remaining -= blank_count;
             }
 
-            // Apply color delay (stateless — each frame is self-contained)
-            Self::apply_color_delay_stateless(&mut frame_buf, config.color_delay_points);
+            // Note: no color delay for frame-swap. The frame loops on hardware,
+            // so a per-frame delay would create artifacts at the loop point.
+            // Frame-swap DACs (Helios) handle modulation timing internally.
 
             // 8. Write frame
             match backend.try_write(config.pps, &frame_buf) {
@@ -954,31 +994,35 @@ impl FrameSession {
     // Shared helpers
     // =========================================================================
 
-    /// Apply static color delay to a self-contained buffer (frame-swap path).
+    /// Apply circular color delay to the frame portion of a frame-swap buffer.
     ///
-    /// The first `delay` points are blanked since there are no prior colors.
-    /// This is correct for frame-swap DACs where each frame is independent.
-    fn apply_color_delay_stateless(points: &mut [LaserPoint], delay: usize) {
-        if delay == 0 || points.len() <= delay {
+    /// Frame-swap DACs loop continuously, so the color delay wraps around:
+    /// the first frame points get colors from the end of the frame, not blank.
+    /// The transition prefix (blank travel points) is left untouched.
+    fn apply_color_delay_frame_swap(
+        points: &mut [LaserPoint],
+        transition_len: usize,
+        delay: usize,
+    ) {
+        if delay == 0 {
             return;
         }
-        let colors: Vec<(u16, u16, u16, u16)> = points
+        let frame = &mut points[transition_len..];
+        let n = frame.len();
+        if n == 0 || delay >= n {
+            return;
+        }
+        let colors: Vec<(u16, u16, u16, u16)> = frame
             .iter()
             .map(|p| (p.r, p.g, p.b, p.intensity))
             .collect();
-        for i in 0..points.len() {
-            if i < delay {
-                points[i].r = 0;
-                points[i].g = 0;
-                points[i].b = 0;
-                points[i].intensity = 0;
-            } else {
-                let (r, g, b, intensity) = colors[i - delay];
-                points[i].r = r;
-                points[i].g = g;
-                points[i].b = b;
-                points[i].intensity = intensity;
-            }
+        for i in 0..n {
+            let src = (i + n - delay) % n;
+            let (r, g, b, intensity) = colors[src];
+            frame[i].r = r;
+            frame[i].g = g;
+            frame[i].b = b;
+            frame[i].intensity = intensity;
         }
     }
 

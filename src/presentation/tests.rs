@@ -67,14 +67,25 @@ fn test_authored_frame_clone_shares_data() {
 
 #[test]
 fn test_default_transition_scales_with_distance() {
-    let near = default_transition(&make_point(0.0, 0.0), &make_point(0.0, 0.0));
+    let near = default_transition(&make_point(0.0, 0.0), &make_point(0.005, 0.0));
     let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
     let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
 
-    assert!(near.len() >= 10, "near should have dwell points, got {}", near.len());
+    // Near but above threshold (0.02) still gets minimal transition
+    assert!(near.is_empty(), "very near points should produce no transition, got {}", near.len());
     assert!(far.len() >= 100, "far should produce many points, got {}", far.len());
-    assert!(mid.len() > near.len(), "medium should be more than near");
     assert!(mid.len() < far.len(), "medium should be less than far");
+}
+
+#[test]
+fn test_default_transition_suppressed_for_tiny_distance() {
+    // Points closer than 0.02 should produce no transition
+    let result = default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
+    assert!(result.is_empty(), "tiny distance should produce empty transition");
+
+    // Points just above threshold should produce transition
+    let result = default_transition(&make_point(0.0, 0.0), &make_point(0.03, 0.0));
+    assert!(!result.is_empty(), "above-threshold distance should produce transition");
 }
 
 #[test]
@@ -113,15 +124,10 @@ fn test_default_transition_has_dwell_travel_dwell_structure() {
 }
 
 #[test]
-fn test_default_transition_same_point_still_produces_points() {
+fn test_default_transition_same_point_produces_empty() {
     let p = make_point(0.5, -0.3);
     let result = default_transition(&p, &p);
-    assert!(result.len() >= 10, "should have dwell points even for zero distance");
-    for point in &result {
-        assert!((point.x - 0.5).abs() < 1e-6);
-        assert!((point.y - (-0.3)).abs() < 1e-6);
-        assert_eq!(point.r, 0);
-    }
+    assert!(result.is_empty(), "zero distance should produce no transition");
 }
 
 // =========================================================================
@@ -312,12 +318,12 @@ fn test_engine_compose_hardware_frame_self_loop() {
     engine.set_pending(frame);
 
     let composed = engine.compose_hardware_frame();
-    // Should be: 2 transition + 2 frame = 4 points
+    // Layout: 2 transition + 2 frame = 4
     assert_eq!(composed.len(), 4);
     // Transition points are blanked
     assert_eq!(composed[0].intensity, 0);
     assert_eq!(composed[1].intensity, 0);
-    // Frame points are full intensity
+    // Frame points
     assert_eq!(composed[2].x, 0.0);
     assert_eq!(composed[3].x, 1.0);
 }
@@ -332,8 +338,9 @@ fn test_engine_compose_hardware_frame_promotes_pending() {
     engine.set_pending(frame_b);
 
     let composed = engine.compose_hardware_frame();
-    // Should be frame_b (promoted)
+    // Just 1 frame point (no transition from no_transition engine)
     assert_eq!(composed.len(), 1);
+    // Frame content is frame_b (promoted, latest-wins)
     assert_eq!(composed[0].x, 2.0);
 }
 
@@ -342,6 +349,81 @@ fn test_engine_compose_hardware_frame_empty_before_first_frame() {
     let mut engine = make_engine();
     let composed = engine.compose_hardware_frame();
     assert!(composed.is_empty());
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_a_to_b_transition() {
+    // Verify that A→B computes transition_fn(A.last, B.first), not B self-loop.
+    //
+    // Use a transition that records what it was called with by encoding
+    // from.x and to.x into the blanked transition point positions.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        vec![LaserPoint::blanked(from.x, to.x)]
+    }));
+
+    // Frame A: points at x=1.0 and x=2.0
+    let frame_a = make_frame(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]);
+    engine.set_pending(frame_a);
+    let _ = engine.compose_hardware_frame(); // promote A, self-loop
+
+    // Frame B: points at x=5.0 and x=6.0
+    let frame_b = make_frame(vec![make_point(5.0, 0.0), make_point(6.0, 0.0)]);
+    engine.set_pending(frame_b);
+    let composed = engine.compose_hardware_frame();
+
+    // First point is the transition: from=A.last(2.0), to=B.first(5.0)
+    assert_eq!(composed[0].x, 2.0, "transition 'from' should be A.last");
+    assert_eq!(composed[0].y, 5.0, "transition 'to' should be B.first");
+    // Then B's frame points
+    assert_eq!(composed[1].x, 5.0);
+    assert_eq!(composed[2].x, 6.0);
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_self_loop_after_transition() {
+    // After A→B transition, next call without pending should produce B self-loop.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        vec![LaserPoint::blanked(from.x, to.x)]
+    }));
+
+    let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
+    engine.set_pending(frame_a);
+    let _ = engine.compose_hardware_frame(); // promote A
+
+    let frame_b = make_frame(vec![make_point(5.0, 0.0), make_point(6.0, 0.0)]);
+    engine.set_pending(frame_b);
+    let _ = engine.compose_hardware_frame(); // A→B transition, promote B
+
+    // No new pending: should be B self-loop
+    let composed = engine.compose_hardware_frame();
+    // Transition: from=B.last(6.0), to=B.first(5.0)
+    assert_eq!(composed[0].x, 6.0, "self-loop 'from' should be B.last");
+    assert_eq!(composed[0].y, 5.0, "self-loop 'to' should be B.first");
+    assert_eq!(composed[1].x, 5.0);
+    assert_eq!(composed[2].x, 6.0);
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_skip() {
+    // A→C frame skip: B is overwritten before it plays.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        vec![LaserPoint::blanked(from.x, to.x)]
+    }));
+
+    let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
+    engine.set_pending(frame_a);
+    let _ = engine.compose_hardware_frame(); // promote A
+
+    let frame_b = make_frame(vec![make_point(5.0, 0.0)]);
+    engine.set_pending(frame_b);
+    let frame_c = make_frame(vec![make_point(9.0, 0.0)]);
+    engine.set_pending(frame_c); // overwrites B
+
+    let composed = engine.compose_hardware_frame();
+    // Transition: from=A.last(1.0), to=C.first(9.0) — B is skipped
+    assert_eq!(composed[0].x, 1.0, "transition 'from' should be A.last");
+    assert_eq!(composed[0].y, 9.0, "transition 'to' should be C.first (B skipped)");
+    assert_eq!(composed[1].x, 9.0);
 }
 
 #[test]
@@ -605,30 +687,59 @@ fn test_frame_session_stop() {
 }
 
 #[test]
-fn test_frame_session_color_delay_stateless() {
-    // Test that stateless color delay shifts RGB relative to XY (frame-swap path)
+fn test_frame_swap_color_delay_circular() {
+    // Frame-swap color delay wraps circularly on the frame portion,
+    // leaving the transition prefix untouched.
+    //
+    // Layout: [T0(blank), F0, F1, F2]  with transition_len=1, delay=1
     let mut points = vec![
-        LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
-        LaserPoint::new(1.0, 0.0, 500, 600, 700, 800),
-        LaserPoint::new(2.0, 0.0, 900, 1000, 1100, 1200),
+        LaserPoint::blanked(0.0, 0.0),                        // T0: transition (blank)
+        LaserPoint::new(1.0, 0.0, 100, 200, 300, 400),        // F0
+        LaserPoint::new(2.0, 0.0, 500, 600, 700, 800),        // F1
+        LaserPoint::new(3.0, 0.0, 900, 1000, 1100, 1200),     // F2
     ];
 
-    FrameSession::apply_color_delay_stateless(&mut points, 1);
+    FrameSession::apply_color_delay_frame_swap(&mut points, 1, 1);
 
-    // First point should have blanked colors (delay = 1)
+    // T0 unchanged (transition, not touched)
     assert_eq!(points[0].r, 0);
     assert_eq!(points[0].intensity, 0);
-    // Second point should have first point's original colors
-    assert_eq!(points[1].r, 100);
-    assert_eq!(points[1].g, 200);
-    assert_eq!(points[1].intensity, 400);
-    // Third point should have second point's original colors
-    assert_eq!(points[2].r, 500);
-    assert_eq!(points[2].g, 600);
-    // XY should be unchanged
+
+    // F0 gets colors from F2 (circular wrap) — NOT blanked!
+    assert_eq!(points[1].r, 900);
+    assert_eq!(points[1].g, 1000);
+    assert_eq!(points[1].b, 1100);
+    assert_eq!(points[1].intensity, 1200);
+
+    // F1 gets colors from F0
+    assert_eq!(points[2].r, 100);
+    assert_eq!(points[2].g, 200);
+
+    // F2 gets colors from F1
+    assert_eq!(points[3].r, 500);
+    assert_eq!(points[3].g, 600);
+
+    // XY unchanged everywhere
     assert_eq!(points[0].x, 0.0);
     assert_eq!(points[1].x, 1.0);
     assert_eq!(points[2].x, 2.0);
+    assert_eq!(points[3].x, 3.0);
+}
+
+#[test]
+fn test_frame_swap_color_delay_no_transition() {
+    // When transition_len=0, circular delay applies to entire buffer
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
+        LaserPoint::new(1.0, 0.0, 500, 600, 700, 800),
+    ];
+
+    FrameSession::apply_color_delay_frame_swap(&mut points, 0, 1);
+
+    // Point 0 gets colors from point 1 (circular wrap)
+    assert_eq!(points[0].r, 500);
+    // Point 1 gets colors from point 0
+    assert_eq!(points[1].r, 100);
 }
 
 #[test]
