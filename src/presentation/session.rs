@@ -1,6 +1,7 @@
 //! FrameSession and FrameSessionConfig — public frame-mode API.
 
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::backend::{BackendKind, WriteOutcome};
@@ -115,7 +116,7 @@ impl FrameSessionConfig {
 pub struct FrameSession {
     control: StreamControl,
     thread: Option<JoinHandle<Result<RunExit>>>,
-    frame_tx: mpsc::Sender<Frame>,
+    frame_slot: Arc<Mutex<Option<Frame>>>,
 }
 
 impl FrameSession {
@@ -132,37 +133,24 @@ impl FrameSession {
 
         let (control_tx, control_rx) = mpsc::channel();
         let control = StreamControl::new(control_tx, std::time::Duration::ZERO);
-        let (frame_tx, frame_rx) = mpsc::channel::<Frame>();
+        let frame_slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
 
         let control_clone = control.clone();
         let is_frame_swap = backend.is_frame_swap();
+        let slot_clone = frame_slot.clone();
 
         let thread = std::thread::spawn(move || {
             if is_frame_swap {
-                Self::run_frame_swap_loop(
-                    backend,
-                    config,
-                    control_clone,
-                    control_rx,
-                    frame_rx,
-                    reconnect_policy,
-                )
+                Self::run_frame_swap_loop(backend, config, control_clone, control_rx, slot_clone, reconnect_policy)
             } else {
-                Self::run_fifo_loop(
-                    backend,
-                    config,
-                    control_clone,
-                    control_rx,
-                    frame_rx,
-                    reconnect_policy,
-                )
+                Self::run_fifo_loop(backend, config, control_clone, control_rx, slot_clone, reconnect_policy)
             }
         });
 
         Ok(Self {
             control,
             thread: Some(thread),
-            frame_tx,
+            frame_slot,
         })
     }
 
@@ -171,10 +159,10 @@ impl FrameSession {
         self.control.clone()
     }
 
-    /// Submit a frame for display. Latest-wins if the engine hasn't consumed
-    /// the previous pending frame yet.
+    /// Submit a frame for display. Latest-wins: overwrites any unconsumed
+    /// pending frame immediately, with no buffering or memory growth.
     pub fn send_frame(&self, frame: Frame) {
-        let _ = self.frame_tx.send(frame);
+        *self.frame_slot.lock().unwrap() = Some(frame);
     }
 
     /// Returns true if the scheduler thread has finished.
@@ -202,29 +190,15 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<Frame>,
+        frame_slot: Arc<Mutex<Option<Frame>>>,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
 
         if is_udp_timed {
-            Self::run_udp_timed_loop(
-                backend,
-                config,
-                control,
-                control_rx,
-                frame_rx,
-                reconnect_policy,
-            )
+            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_slot, reconnect_policy)
         } else {
-            Self::run_fifo_estimation_loop(
-                backend,
-                config,
-                control,
-                control_rx,
-                frame_rx,
-                reconnect_policy,
-            )
+            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_slot, reconnect_policy)
         }
     }
 
@@ -238,7 +212,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<Frame>,
+        frame_slot: Arc<Mutex<Option<Frame>>>,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
@@ -283,8 +257,8 @@ impl FrameSession {
                 return Ok(RunExit::Stopped);
             }
 
-            // 3. Drain frame channel
-            while let Ok(frame) = frame_rx.try_recv() {
+            // 3. Check for new frame (latest-wins slot)
+            if let Some(frame) = frame_slot.lock().unwrap().take() {
                 last_frame = Some(frame.clone());
                 engine.set_pending(frame);
             }
@@ -396,7 +370,7 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<Frame>,
+        frame_slot: Arc<Mutex<Option<Frame>>>,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
@@ -433,8 +407,8 @@ impl FrameSession {
             scheduled_ahead = scheduled_ahead.saturating_sub(points_consumed);
             last_iteration = now;
 
-            // 2. Drain frame channel
-            while let Ok(frame) = frame_rx.try_recv() {
+            // 2. Check for new frame (latest-wins slot)
+            if let Some(frame) = frame_slot.lock().unwrap().take() {
                 last_frame = Some(frame.clone());
                 engine.set_pending(frame);
             }
@@ -587,13 +561,14 @@ impl FrameSession {
         config: FrameSessionConfig,
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_rx: mpsc::Receiver<Frame>,
+        frame_slot: Arc<Mutex<Option<Frame>>>,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         use std::time::Duration;
 
         let startup_blank_points = config.startup_blank_points();
         let mut engine = PresentationEngine::new(config.transition_fn);
+        engine.set_frame_capacity(backend.frame_capacity());
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let mut last_armed = false;
@@ -606,8 +581,8 @@ impl FrameSession {
                 return Ok(RunExit::Stopped);
             }
 
-            // 2. Drain frame channel
-            while let Ok(frame) = frame_rx.try_recv() {
+            // 2. Check for new frame (latest-wins slot)
+            if let Some(frame) = frame_slot.lock().unwrap().take() {
                 last_frame = Some(frame.clone());
                 engine.set_pending(frame);
             }
@@ -626,7 +601,10 @@ impl FrameSession {
                         config.pps,
                         true,
                     ) {
-                        Ok(_info) => continue,
+                        Ok(_info) => {
+                            engine.set_frame_capacity(backend.frame_capacity());
+                            continue;
+                        }
                         Err(exit) => return Ok(exit),
                     }
                 }
@@ -690,7 +668,10 @@ impl FrameSession {
                             config.pps,
                             true,
                         ) {
-                            Ok(_info) => continue,
+                            Ok(_info) => {
+                                engine.set_frame_capacity(backend.frame_capacity());
+                                continue;
+                            }
                             Err(exit) => return Ok(exit),
                         }
                     }

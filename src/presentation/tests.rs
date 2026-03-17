@@ -450,6 +450,121 @@ fn test_engine_compose_hardware_frame_skip() {
 }
 
 #[test]
+fn test_engine_compose_hardware_frame_empty_frame_produces_blanked_point() {
+    // Submitting an empty frame should produce a single blanked origin point,
+    // not an empty drawable that causes the scheduler to skip the write.
+    let mut engine = make_engine_no_transition();
+    let empty = make_frame(vec![]);
+    engine.set_pending(empty);
+
+    let composed = engine.compose_hardware_frame();
+    assert_eq!(composed.len(), 1, "empty frame should produce exactly 1 blanked point");
+    assert_eq!(composed[0].x, 0.0);
+    assert_eq!(composed[0].y, 0.0);
+    assert_eq!(composed[0].intensity, 0, "point should be blanked");
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_transition_to_empty_produces_blanked_point() {
+    // Transition from a non-empty frame A to an empty frame B should still
+    // produce a non-empty drawable (blanked origin), not stall on A.
+    let mut engine = make_engine_no_transition();
+    let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
+    engine.set_pending(frame_a);
+    let _ = engine.compose_hardware_frame(); // promote A
+
+    let empty = make_frame(vec![]);
+    engine.set_pending(empty);
+    let composed = engine.compose_hardware_frame();
+    assert!(!composed.is_empty(), "A→empty transition should not produce empty drawable");
+    // All points should be blanked (transition is empty since B has no first_point)
+    for p in composed {
+        assert_eq!(p.intensity, 0, "all points should be blanked");
+    }
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_self_loop_empty_produces_blanked_point() {
+    // Self-loop on an empty frame should produce a blanked point, not empty.
+    let mut engine = make_engine_no_transition();
+    let empty = make_frame(vec![]);
+    engine.set_pending(empty);
+    let _ = engine.compose_hardware_frame(); // promote empty
+
+    // Second call: self-loop on the empty frame
+    let composed = engine.compose_hardware_frame();
+    assert_eq!(composed.len(), 1, "self-loop on empty should produce 1 blanked point");
+    assert_eq!(composed[0].intensity, 0);
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_clamps_to_capacity() {
+    // When frame + transition exceeds capacity, the transition prefix is truncated.
+    // Use a transition that always produces 10 points.
+    let mut engine = PresentationEngine::new(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+        vec![LaserPoint::blanked(0.0, 0.0); 10]
+    }));
+    engine.set_frame_capacity(Some(8)); // capacity = 8
+
+    // Frame with 5 points + 10 transition = 15, should clamp to 8
+    let frame = make_frame(vec![
+        make_point(1.0, 0.0),
+        make_point(2.0, 0.0),
+        make_point(3.0, 0.0),
+        make_point(4.0, 0.0),
+        make_point(5.0, 0.0),
+    ]);
+    engine.set_pending(frame);
+
+    let composed = engine.compose_hardware_frame();
+    assert!(
+        composed.len() <= 8,
+        "composed frame should not exceed capacity, got {}",
+        composed.len()
+    );
+    // The 5 authored frame points should all be present (only transition trimmed)
+    let frame_points: Vec<f32> = composed.iter().filter(|p| p.intensity > 0).map(|p| p.x).collect();
+    assert_eq!(frame_points, vec![1.0, 2.0, 3.0, 4.0, 5.0], "authored points must be preserved");
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_no_truncation_under_capacity() {
+    // When frame + transition fits within capacity, no truncation occurs.
+    let mut engine = PresentationEngine::new(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+        vec![LaserPoint::blanked(0.0, 0.0); 3]
+    }));
+    engine.set_frame_capacity(Some(100)); // plenty of room
+
+    let frame = make_frame(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]);
+    engine.set_pending(frame);
+
+    let composed = engine.compose_hardware_frame();
+    // 3 transition + 2 frame = 5
+    assert_eq!(composed.len(), 5, "no truncation expected");
+}
+
+#[test]
+fn test_engine_compose_hardware_frame_self_loop_clamps_to_capacity() {
+    // Self-loop transition should also be clamped.
+    let mut engine = PresentationEngine::new(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+        vec![LaserPoint::blanked(0.0, 0.0); 20]
+    }));
+    engine.set_frame_capacity(Some(6));
+
+    let frame = make_frame(vec![make_point(0.0, 0.0), make_point(1.0, 0.0)]);
+    engine.set_pending(frame);
+    let _ = engine.compose_hardware_frame(); // promote, self-loop → dirty
+
+    // Self-loop: 20 transition + 2 frame = 22, should clamp to 6
+    let composed = engine.compose_hardware_frame();
+    assert!(
+        composed.len() <= 6,
+        "self-loop should clamp to capacity, got {}",
+        composed.len()
+    );
+}
+
+#[test]
 fn test_engine_fill_chunk_multiple_wraps_in_single_call() {
     let mut engine = make_engine_no_transition();
     let frame = make_frame(vec![make_point(5.0, 0.0)]);
