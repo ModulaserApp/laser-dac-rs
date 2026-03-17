@@ -73,7 +73,10 @@ impl DacBackend for HeliosBackend {
             )));
         }
 
-        let dac = dacs.remove(self.device_index).open().map_err(Self::map_err)?;
+        let dac = dacs
+            .remove(self.device_index)
+            .open()
+            .map_err(Self::map_err)?;
         self.dac = Some(dac);
         Ok(())
     }

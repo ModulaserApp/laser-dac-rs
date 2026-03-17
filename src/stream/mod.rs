@@ -305,11 +305,7 @@ impl Stream {
     }
 
     /// Create a new stream with a backend.
-    pub(crate) fn with_backend(
-        info: DacInfo,
-        backend: BackendKind,
-        config: StreamConfig,
-    ) -> Self {
+    pub(crate) fn with_backend(info: DacInfo, backend: BackendKind, config: StreamConfig) -> Self {
         let (control_tx, control_rx) = mpsc::channel();
         let max_points = info.caps.max_points_per_chunk;
         let startup_blank_points =
@@ -460,7 +456,9 @@ impl Stream {
         // Take the backend (leaves None, so Drop won't try to stop again)
         let backend = self.backend.take();
         let stats = self.state.stats.clone();
-        let reconnect_target = self.reconnect_target.take()
+        let reconnect_target = self
+            .reconnect_target
+            .take()
             .or_else(|| self.reconnect_policy.take().map(|p| p.target));
 
         let dac = Dac {
@@ -501,9 +499,8 @@ impl Stream {
             }
 
             // Backoff sleep
-            if ReconnectPolicy::sleep_with_stop(policy.backoff, || {
-                self.control.is_stop_requested()
-            }) {
+            if ReconnectPolicy::sleep_with_stop(policy.backoff, || self.control.is_stop_requested())
+            {
                 return Err(RunExit::Stopped);
             }
 
@@ -542,7 +539,11 @@ impl Stream {
                     Ok(()) => {}
                     Err(err) => {
                         if !ReconnectPolicy::is_retriable(&err) {
-                            log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
+                            log::error!(
+                                "'{}' non-retriable error: {}",
+                                policy.target.device_id,
+                                err
+                            );
                             return Err(RunExit::Disconnected);
                         }
                         log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
@@ -568,7 +569,7 @@ impl Stream {
             self.info = info;
 
             // Validate config against new device
-            if Dac::validate_config(&self.info.caps, &self.config).is_err() {
+            if Dac::validate_pps(&self.info.caps, self.config.pps).is_err() {
                 log::error!(
                     "'{}' config invalid for new device",
                     policy.target.device_id
@@ -592,8 +593,12 @@ impl Stream {
     /// Reset all runtime state for a reconnected device.
     fn reset_state_for_reconnect(&mut self, last_iteration: &mut std::time::Instant) {
         let max_points = self.info.caps.max_points_per_chunk;
-        self.state.chunk_buffer.resize(max_points, LaserPoint::default());
-        self.state.last_chunk.resize(max_points, LaserPoint::default());
+        self.state
+            .chunk_buffer
+            .resize(max_points, LaserPoint::default());
+        self.state
+            .last_chunk
+            .resize(max_points, LaserPoint::default());
         self.state.last_chunk_len = 0;
         self.state.scheduled_ahead = 0;
         self.state.fractional_consumed = 0.0;
@@ -1368,7 +1373,7 @@ impl Dac {
 
         let cfg = Self::apply_backend_buffer_defaults(&self.info.caps, cfg);
 
-        Self::validate_config(&self.info.caps, &cfg)?;
+        Self::validate_pps(&self.info.caps, cfg.pps)?;
 
         // Connect the backend if not already connected
         if !backend.is_connected() {
@@ -1383,9 +1388,7 @@ impl Dac {
         // Wire reconnect policy if configured
         if let Some(rc) = reconnect_config {
             let target = stream.reconnect_target.take().ok_or_else(|| {
-                Error::invalid_config(
-                    "reconnect requires a device opened via open_device()",
-                )
+                Error::invalid_config("reconnect requires a device opened via open_device()")
             })?;
             stream.reconnect_policy = Some(ReconnectPolicy::new(rc, target));
         }
@@ -1413,11 +1416,11 @@ impl Dac {
         cfg
     }
 
-    fn validate_config(caps: &DacCapabilities, cfg: &StreamConfig) -> Result<()> {
-        if cfg.pps < caps.pps_min || cfg.pps > caps.pps_max {
+    fn validate_pps(caps: &DacCapabilities, pps: u32) -> Result<()> {
+        if pps < caps.pps_min || pps > caps.pps_max {
             return Err(Error::invalid_config(format!(
                 "PPS {} is outside device range [{}, {}]",
-                cfg.pps, caps.pps_min, caps.pps_max
+                pps, caps.pps_min, caps.pps_max
             )));
         }
 
@@ -1442,20 +1445,12 @@ impl Dac {
             Error::invalid_config("device backend has already been used for a session")
         })?;
 
-        let caps = backend.caps();
-        if config.pps < caps.pps_min || config.pps > caps.pps_max {
-            return Err(Error::invalid_config(format!(
-                "PPS {} is outside device range [{}, {}]",
-                config.pps, caps.pps_min, caps.pps_max
-            )));
-        }
+        Self::validate_pps(backend.caps(), config.pps)?;
 
         let reconnect_policy = match reconnect_config {
             Some(rc) => {
                 let target = self.reconnect_target.take().ok_or_else(|| {
-                    Error::invalid_config(
-                        "reconnect requires a device opened via open_device()",
-                    )
+                    Error::invalid_config("reconnect requires a device opened via open_device()")
                 })?;
                 Some(ReconnectPolicy::new(rc, target))
             }

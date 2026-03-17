@@ -36,9 +36,7 @@ pub(crate) fn normalize_device_name(name: &str) -> String {
 /// Exact device names (matched case-insensitively) that are definitely *not*
 /// laser DACs, even though they may expose enough channels to pass the
 /// channel-count filter.
-const BLACKLISTED_DEVICE_NAMES: &[&str] = &[
-    "studio display speakers",
-];
+const BLACKLISTED_DEVICE_NAMES: &[&str] = &["studio display speakers"];
 
 /// Returns `true` when the device name matches a known non-laser audio device.
 pub(crate) fn is_blacklisted_device(name: &str) -> bool {

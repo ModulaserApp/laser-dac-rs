@@ -1,7 +1,6 @@
 //! FrameSession and FrameSessionConfig — public frame-mode API.
 
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::backend::{BackendKind, WriteOutcome};
@@ -11,7 +10,7 @@ use crate::stream::StreamControl;
 use crate::types::{DacInfo, LaserPoint, RunExit};
 
 use super::engine::{ColorDelayLine, PresentationEngine};
-use super::{Frame, TransitionFn, default_transition};
+use super::{default_transition, Frame, TransitionFn};
 
 // =============================================================================
 // FrameSessionConfig
@@ -131,9 +130,23 @@ impl FrameSession {
 
         let thread = std::thread::spawn(move || {
             if is_frame_swap {
-                Self::run_frame_swap_loop(backend, config, control_clone, control_rx, frame_rx, reconnect_policy)
+                Self::run_frame_swap_loop(
+                    backend,
+                    config,
+                    control_clone,
+                    control_rx,
+                    frame_rx,
+                    reconnect_policy,
+                )
             } else {
-                Self::run_fifo_loop(backend, config, control_clone, control_rx, frame_rx, reconnect_policy)
+                Self::run_fifo_loop(
+                    backend,
+                    config,
+                    control_clone,
+                    control_rx,
+                    frame_rx,
+                    reconnect_policy,
+                )
             }
         });
 
@@ -163,7 +176,9 @@ impl FrameSession {
     /// Wait for the session thread to finish and return the exit reason.
     pub fn join(mut self) -> Result<RunExit> {
         if let Some(handle) = self.thread.take() {
-            handle.join().unwrap_or(Err(Error::disconnected("thread panicked")))
+            handle
+                .join()
+                .unwrap_or(Err(Error::disconnected("thread panicked")))
         } else {
             Ok(RunExit::Stopped)
         }
@@ -184,9 +199,23 @@ impl FrameSession {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
 
         if is_udp_timed {
-            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_rx, reconnect_policy)
+            Self::run_udp_timed_loop(
+                backend,
+                config,
+                control,
+                control_rx,
+                frame_rx,
+                reconnect_policy,
+            )
         } else {
-            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_rx, reconnect_policy)
+            Self::run_fifo_estimation_loop(
+                backend,
+                config,
+                control,
+                control_rx,
+                frame_rx,
+                reconnect_policy,
+            )
         }
     }
 
@@ -209,7 +238,8 @@ impl FrameSession {
         let pps_f64 = pps as f64;
         // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
         // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
-        let mut chunk_points = ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
+        let mut chunk_points =
+            ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
         let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
 
         let mut engine = PresentationEngine::new(config.transition_fn);
@@ -228,7 +258,13 @@ impl FrameSession {
 
         loop {
             // 1. High-precision wait until next send time
-            Self::sleep_until_precise(&control, &control_rx, next_send, &mut shutter_open, &mut backend)?;
+            Self::sleep_until_precise(
+                &control,
+                &control_rx,
+                next_send,
+                &mut shutter_open,
+                &mut backend,
+            )?;
             next_send += chunk_duration;
 
             // Catch up if we fell behind (don't accumulate debt)
@@ -245,16 +281,22 @@ impl FrameSession {
             // 3. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
                 last_frame = Some(frame.clone());
-                engine.set_pending(Arc::new(frame));
+                engine.set_pending(frame);
             }
 
             // 4. Check connection
             if !backend.is_connected() {
                 if let Some(ref policy) = reconnect_policy {
                     match Self::try_reconnect(
-                        &mut backend, policy, &control,
-                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                        pps, false,
+                        &mut backend,
+                        policy,
+                        &control,
+                        &mut shutter_open,
+                        &mut last_armed,
+                        &mut engine,
+                        &last_frame,
+                        pps,
+                        false,
                     ) {
                         Ok(_info) => {
                             next_send = Instant::now();
@@ -278,19 +320,14 @@ impl FrameSession {
 
             // 6. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            if !last_armed && is_armed {
-                startup_blank_remaining = startup_blank_points;
-                if !shutter_open {
-                    let _ = backend.set_shutter(true);
-                    shutter_open = true;
-                }
-            } else if last_armed && !is_armed {
-                if shutter_open {
-                    let _ = backend.set_shutter(false);
-                    shutter_open = false;
-                }
-            }
-            last_armed = is_armed;
+            Self::handle_shutter_transition(
+                is_armed,
+                &mut last_armed,
+                &mut shutter_open,
+                &mut startup_blank_remaining,
+                startup_blank_points,
+                &mut backend,
+            );
 
             // 7. Fill chunk from engine
             let n = engine.fill_chunk(&mut chunk_buffer, chunk_points);
@@ -298,24 +335,12 @@ impl FrameSession {
                 continue;
             }
 
-            // Apply blanking when disarmed
-            if !is_armed {
-                for p in &mut chunk_buffer[..n] {
-                    *p = LaserPoint::blanked(p.x, p.y);
-                }
-            }
-
-            // Apply startup blanking
-            if is_armed && startup_blank_remaining > 0 {
-                let blank_count = n.min(startup_blank_remaining);
-                for p in &mut chunk_buffer[..blank_count] {
-                    p.r = 0;
-                    p.g = 0;
-                    p.b = 0;
-                    p.intensity = 0;
-                }
-                startup_blank_remaining -= blank_count;
-            }
+            // Apply blanking modifications
+            Self::apply_blanking(
+                is_armed,
+                &mut startup_blank_remaining,
+                &mut chunk_buffer[..n],
+            );
 
             // Apply color delay (stateful — carries across chunks)
             color_delay.apply(&mut chunk_buffer[..n]);
@@ -330,15 +355,22 @@ impl FrameSession {
                 Err(e) if e.is_disconnected() => {
                     if let Some(ref policy) = reconnect_policy {
                         match Self::try_reconnect(
-                            &mut backend, policy, &control,
-                            &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                            pps, false,
+                            &mut backend,
+                            policy,
+                            &control,
+                            &mut shutter_open,
+                            &mut last_armed,
+                            &mut engine,
+                            &last_frame,
+                            pps,
+                            false,
                         ) {
                             Ok(_info) => {
                                 next_send = Instant::now();
                                 chunk_points = ((pps_f64 * 0.010).ceil() as usize)
                                     .min(backend.caps().max_points_per_chunk);
-                                chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+                                chunk_duration =
+                                    Duration::from_secs_f64(chunk_points as f64 / pps_f64);
                                 chunk_buffer.resize(chunk_points, LaserPoint::default());
                                 color_delay.reset();
                                 continue;
@@ -403,7 +435,7 @@ impl FrameSession {
             // 2. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
                 last_frame = Some(frame.clone());
-                engine.set_pending(Arc::new(frame));
+                engine.set_pending(frame);
             }
 
             // 3. Estimate buffer
@@ -417,7 +449,13 @@ impl FrameSession {
             if buffered > target_buffer_points {
                 let excess = buffered - target_buffer_points;
                 let sleep_time = Duration::from_secs_f64(excess as f64 / pps);
-                Self::sleep_with_control_check(&control, &control_rx, sleep_time, &mut shutter_open, &mut backend)?;
+                Self::sleep_with_control_check(
+                    &control,
+                    &control_rx,
+                    sleep_time,
+                    &mut shutter_open,
+                    &mut backend,
+                )?;
                 continue;
             }
 
@@ -425,9 +463,15 @@ impl FrameSession {
             if !backend.is_connected() {
                 if let Some(ref policy) = reconnect_policy {
                     match Self::try_reconnect(
-                        &mut backend, policy, &control,
-                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                        config.pps, false,
+                        &mut backend,
+                        policy,
+                        &control,
+                        &mut shutter_open,
+                        &mut last_armed,
+                        &mut engine,
+                        &last_frame,
+                        config.pps,
+                        false,
                     ) {
                         Ok(info) => {
                             scheduled_ahead = 0;
@@ -451,19 +495,14 @@ impl FrameSession {
 
             // 7. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            if !last_armed && is_armed {
-                startup_blank_remaining = startup_blank_points;
-                if !shutter_open {
-                    let _ = backend.set_shutter(true);
-                    shutter_open = true;
-                }
-            } else if last_armed && !is_armed {
-                if shutter_open {
-                    let _ = backend.set_shutter(false);
-                    shutter_open = false;
-                }
-            }
-            last_armed = is_armed;
+            Self::handle_shutter_transition(
+                is_armed,
+                &mut last_armed,
+                &mut shutter_open,
+                &mut startup_blank_remaining,
+                startup_blank_points,
+                &mut backend,
+            );
 
             // 8. Fill chunk from engine
             let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
@@ -479,24 +518,12 @@ impl FrameSession {
                 continue;
             }
 
-            // Apply blanking when disarmed
-            if !is_armed {
-                for p in &mut chunk_buffer[..n] {
-                    *p = LaserPoint::blanked(p.x, p.y);
-                }
-            }
-
-            // Apply startup blanking
-            if is_armed && startup_blank_remaining > 0 {
-                let blank_count = n.min(startup_blank_remaining);
-                for p in &mut chunk_buffer[..blank_count] {
-                    p.r = 0;
-                    p.g = 0;
-                    p.b = 0;
-                    p.intensity = 0;
-                }
-                startup_blank_remaining -= blank_count;
-            }
+            // Apply blanking modifications
+            Self::apply_blanking(
+                is_armed,
+                &mut startup_blank_remaining,
+                &mut chunk_buffer[..n],
+            );
 
             // Apply color delay (stateful — carries across chunks)
             color_delay.apply(&mut chunk_buffer[..n]);
@@ -518,9 +545,15 @@ impl FrameSession {
                     Err(e) if e.is_disconnected() => {
                         if let Some(ref policy) = reconnect_policy {
                             match Self::try_reconnect(
-                                &mut backend, policy, &control,
-                                &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                                config.pps, false,
+                                &mut backend,
+                                policy,
+                                &control,
+                                &mut shutter_open,
+                                &mut last_armed,
+                                &mut engine,
+                                &last_frame,
+                                config.pps,
+                                false,
                             ) {
                                 Ok(info) => {
                                     scheduled_ahead = 0;
@@ -569,6 +602,7 @@ impl FrameSession {
         };
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
+        let mut frame_buf: Vec<LaserPoint> = Vec::new();
 
         loop {
             // 1. Check stop
@@ -579,16 +613,22 @@ impl FrameSession {
             // 2. Drain frame channel
             while let Ok(frame) = frame_rx.try_recv() {
                 last_frame = Some(frame.clone());
-                engine.set_pending(Arc::new(frame));
+                engine.set_pending(frame);
             }
 
             // 3. Check connection
             if !backend.is_connected() {
                 if let Some(ref policy) = reconnect_policy {
                     match Self::try_reconnect(
-                        &mut backend, policy, &control,
-                        &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                        config.pps, true,
+                        &mut backend,
+                        policy,
+                        &control,
+                        &mut shutter_open,
+                        &mut last_armed,
+                        &mut engine,
+                        &last_frame,
+                        config.pps,
+                        true,
                     ) {
                         Ok(_info) => continue,
                         Err(exit) => return Ok(exit),
@@ -604,63 +644,38 @@ impl FrameSession {
 
             // 5. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            if !last_armed && is_armed {
-                startup_blank_remaining = startup_blank_points;
-                if !shutter_open {
-                    let _ = backend.set_shutter(true);
-                    shutter_open = true;
-                }
-            } else if last_armed && !is_armed {
-                if shutter_open {
-                    let _ = backend.set_shutter(false);
-                    shutter_open = false;
-                }
-            }
-            last_armed = is_armed;
+            Self::handle_shutter_transition(
+                is_armed,
+                &mut last_armed,
+                &mut shutter_open,
+                &mut startup_blank_remaining,
+                startup_blank_points,
+                &mut backend,
+            );
 
             // 6. Check if device is ready
-            let ready = match &mut backend {
-                BackendKind::FrameSwap(b) => b.is_ready_for_frame(),
-                _ => true,
-            };
-
-            if !ready {
+            if !backend.is_ready_for_frame() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
 
-            // 8. Compose frame and copy to mutable buffer
+            // 7. Compose frame and copy to reusable buffer
             let composed = engine.compose_hardware_frame();
             if composed.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
-            let mut frame_buf: Vec<LaserPoint> = composed.to_vec();
+            frame_buf.clear();
+            frame_buf.extend_from_slice(composed);
 
-            // Apply blanking when disarmed
-            if !is_armed {
-                for p in &mut frame_buf {
-                    *p = LaserPoint::blanked(p.x, p.y);
-                }
-            }
-
-            // Apply startup blanking
-            if is_armed && startup_blank_remaining > 0 {
-                let blank_count = frame_buf.len().min(startup_blank_remaining);
-                for p in &mut frame_buf[..blank_count] {
-                    p.r = 0;
-                    p.g = 0;
-                    p.b = 0;
-                    p.intensity = 0;
-                }
-                startup_blank_remaining -= blank_count;
-            }
+            // Apply blanking modifications
+            Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
 
             // Note: no color delay for frame-swap. The frame loops on hardware,
             // so a per-frame delay would create artifacts at the loop point.
             // Frame-swap DACs (Helios) handle modulation timing internally.
 
-            // 9. Write frame
+            // 8. Write frame
             match backend.try_write(config.pps, &frame_buf) {
                 Ok(WriteOutcome::Written) => {}
                 Ok(WriteOutcome::WouldBlock) => {
@@ -669,9 +684,15 @@ impl FrameSession {
                 Err(e) if e.is_disconnected() => {
                     if let Some(ref policy) = reconnect_policy {
                         match Self::try_reconnect(
-                            &mut backend, policy, &control,
-                            &mut shutter_open, &mut last_armed, &mut engine, &last_frame,
-                            config.pps, true,
+                            &mut backend,
+                            policy,
+                            &control,
+                            &mut shutter_open,
+                            &mut last_armed,
+                            &mut engine,
+                            &last_frame,
+                            config.pps,
+                            true,
                         ) {
                             Ok(_info) => continue,
                             Err(exit) => return Ok(exit),
@@ -725,7 +746,11 @@ impl FrameSession {
                 return Err(RunExit::Stopped);
             }
 
-            log::info!("'{}' reconnect attempt {} ...", policy.target.device_id, retries + 1);
+            log::info!(
+                "'{}' reconnect attempt {} ...",
+                policy.target.device_id,
+                retries + 1
+            );
 
             let device = match policy.target.open_device() {
                 Ok(d) => d,
@@ -752,7 +777,10 @@ impl FrameSession {
             if config_pps < info.caps.pps_min || config_pps > info.caps.pps_max {
                 log::error!(
                     "'{}' PPS {} outside new device range [{}, {}]",
-                    policy.target.device_id, config_pps, info.caps.pps_min, info.caps.pps_max
+                    policy.target.device_id,
+                    config_pps,
+                    info.caps.pps_min,
+                    info.caps.pps_max
                 );
                 return Err(RunExit::Disconnected);
             }
@@ -787,7 +815,7 @@ impl FrameSession {
             // Reset engine and replay last frame
             engine.reset();
             if let Some(frame) = last_frame {
-                engine.set_pending(Arc::new(frame.clone()));
+                engine.set_pending(frame.clone());
             }
 
             // Fire on_reconnect
@@ -796,6 +824,50 @@ impl FrameSession {
             }
 
             return Ok(info);
+        }
+    }
+
+    /// Handle arm/disarm shutter transitions.
+    fn handle_shutter_transition(
+        is_armed: bool,
+        last_armed: &mut bool,
+        shutter_open: &mut bool,
+        startup_blank_remaining: &mut usize,
+        startup_blank_points: usize,
+        backend: &mut BackendKind,
+    ) {
+        if !*last_armed && is_armed {
+            *startup_blank_remaining = startup_blank_points;
+            if !*shutter_open {
+                let _ = backend.set_shutter(true);
+                *shutter_open = true;
+            }
+        } else if *last_armed && !is_armed && *shutter_open {
+            let _ = backend.set_shutter(false);
+            *shutter_open = false;
+        }
+        *last_armed = is_armed;
+    }
+
+    /// Apply disarm blanking and startup blanking to a buffer.
+    fn apply_blanking(
+        is_armed: bool,
+        startup_blank_remaining: &mut usize,
+        buffer: &mut [LaserPoint],
+    ) {
+        if !is_armed {
+            for p in buffer.iter_mut() {
+                *p = LaserPoint::blanked(p.x, p.y);
+            }
+        } else if *startup_blank_remaining > 0 {
+            let blank_count = buffer.len().min(*startup_blank_remaining);
+            for p in &mut buffer[..blank_count] {
+                p.r = 0;
+                p.g = 0;
+                p.b = 0;
+                p.intensity = 0;
+            }
+            *startup_blank_remaining -= blank_count;
         }
     }
 
@@ -871,7 +943,9 @@ impl FrameSession {
 
             let remaining = deadline.duration_since(now);
             if remaining > BUSY_WAIT_THRESHOLD {
-                let slice = remaining.saturating_sub(BUSY_WAIT_THRESHOLD).min(SLEEP_SLICE);
+                let slice = remaining
+                    .saturating_sub(BUSY_WAIT_THRESHOLD)
+                    .min(SLEEP_SLICE);
                 std::thread::sleep(slice);
             } else {
                 std::thread::yield_now();

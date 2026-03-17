@@ -567,7 +567,10 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
         .into_iter()
         .filter(|record| {
             if is_blacklisted_device(&record.name) {
-                log::debug!("AVB: skipping {:?} — blacklisted (not a laser DAC)", record.name);
+                log::debug!(
+                    "AVB: skipping {:?} — blacklisted (not a laser DAC)",
+                    record.name
+                );
                 return false;
             }
             let channel_ok = supports_required_channels(record);

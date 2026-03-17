@@ -72,8 +72,16 @@ fn test_default_transition_scales_with_distance() {
     let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
 
     // Near but above threshold (0.02) still gets minimal transition
-    assert!(near.is_empty(), "very near points should produce no transition, got {}", near.len());
-    assert!(far.len() >= 100, "far should produce many points, got {}", far.len());
+    assert!(
+        near.is_empty(),
+        "very near points should produce no transition, got {}",
+        near.len()
+    );
+    assert!(
+        far.len() >= 100,
+        "far should produce many points, got {}",
+        far.len()
+    );
     assert!(mid.len() < far.len(), "medium should be less than far");
 }
 
@@ -81,11 +89,17 @@ fn test_default_transition_scales_with_distance() {
 fn test_default_transition_suppressed_for_tiny_distance() {
     // Points closer than 0.02 should produce no transition
     let result = default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
-    assert!(result.is_empty(), "tiny distance should produce empty transition");
+    assert!(
+        result.is_empty(),
+        "tiny distance should produce empty transition"
+    );
 
     // Points just above threshold should produce transition
     let result = default_transition(&make_point(0.0, 0.0), &make_point(0.03, 0.0));
-    assert!(!result.is_empty(), "above-threshold distance should produce transition");
+    assert!(
+        !result.is_empty(),
+        "above-threshold distance should produce transition"
+    );
 }
 
 #[test]
@@ -119,15 +133,21 @@ fn test_default_transition_has_dwell_travel_dwell_structure() {
 
     // Middle points should be between from and to
     let mid_idx = result.len() / 2;
-    assert!(result[mid_idx].x > 0.0 && result[mid_idx].x < 1.0,
-        "middle point should be between from and to, got {}", result[mid_idx].x);
+    assert!(
+        result[mid_idx].x > 0.0 && result[mid_idx].x < 1.0,
+        "middle point should be between from and to, got {}",
+        result[mid_idx].x
+    );
 }
 
 #[test]
 fn test_default_transition_same_point_produces_empty() {
     let p = make_point(0.5, -0.3);
     let result = default_transition(&p, &p);
-    assert!(result.is_empty(), "zero distance should produce no transition");
+    assert!(
+        result.is_empty(),
+        "zero distance should produce no transition"
+    );
 }
 
 // =========================================================================
@@ -149,8 +169,8 @@ fn make_engine_no_transition() -> PresentationEngine {
     PresentationEngine::new(Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]))
 }
 
-fn make_frame(points: Vec<LaserPoint>) -> Arc<Frame> {
-    Arc::new(Frame::new(points))
+fn make_frame(points: Vec<LaserPoint>) -> Frame {
+    Frame::new(points)
 }
 
 #[test]
@@ -243,11 +263,11 @@ fn test_engine_fill_chunk_frame_change_inserts_transition() {
     let n = engine.fill_chunk(&mut buffer, 6);
     assert_eq!(n, 6);
 
-    assert_eq!(buffer[0].x, 0.0);        // frame_a
-    assert_eq!(buffer[1].intensity, 0);   // transition point (blanked)
-    assert_eq!(buffer[2].intensity, 0);   // transition point (blanked)
-    assert_eq!(buffer[3].x, 1.0);        // frame_b
-    assert_eq!(buffer[4].x, 1.0);        // frame_b self-loop
+    assert_eq!(buffer[0].x, 0.0); // frame_a
+    assert_eq!(buffer[1].intensity, 0); // transition point (blanked)
+    assert_eq!(buffer[2].intensity, 0); // transition point (blanked)
+    assert_eq!(buffer[3].x, 1.0); // frame_b
+    assert_eq!(buffer[4].x, 1.0); // frame_b self-loop
 }
 
 #[test]
@@ -422,7 +442,10 @@ fn test_engine_compose_hardware_frame_skip() {
     let composed = engine.compose_hardware_frame();
     // Transition: from=A.last(1.0), to=C.first(9.0) — B is skipped
     assert_eq!(composed[0].x, 1.0, "transition 'from' should be A.last");
-    assert_eq!(composed[0].y, 9.0, "transition 'to' should be C.first (B skipped)");
+    assert_eq!(
+        composed[0].y, 9.0,
+        "transition 'to' should be C.first (B skipped)"
+    );
     assert_eq!(composed[1].x, 9.0);
 }
 
@@ -582,8 +605,7 @@ impl FrameSwapBackend for FrameSwapTestBackend {
         points: &[LaserPoint],
     ) -> DacResult<crate::backend::WriteOutcome> {
         self.write_count.fetch_add(1, Ordering::SeqCst);
-        self.last_frame_size
-            .store(points.len(), Ordering::SeqCst);
+        self.last_frame_size.store(points.len(), Ordering::SeqCst);
         Ok(crate::backend::WriteOutcome::Written)
     }
 }
@@ -594,8 +616,7 @@ fn test_frame_session_fifo_submit_frame_writes_points() {
     let points_written = backend.points_written.clone();
     let backend_kind = BackendKind::Fifo(Box::new(backend));
 
-    let config = FrameSessionConfig::new(30000)
-        .with_startup_blank(std::time::Duration::ZERO);
+    let config = FrameSessionConfig::new(30000).with_startup_blank(std::time::Duration::ZERO);
     let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().arm().unwrap();
@@ -624,8 +645,7 @@ fn test_frame_session_frame_swap_writes_frames() {
     let last_frame_size = backend.last_frame_size.clone();
     let backend_kind = BackendKind::FrameSwap(Box::new(backend));
 
-    let config = FrameSessionConfig::new(30000)
-        .with_startup_blank(std::time::Duration::ZERO);
+    let config = FrameSessionConfig::new(30000).with_startup_blank(std::time::Duration::ZERO);
     let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().arm().unwrap();
@@ -754,6 +774,120 @@ fn test_engine_empty_transition_result() {
 }
 
 // =========================================================================
+// Frame-swap padding invariants
+// =========================================================================
+//
+// Hardware frame-swap DACs loop a fixed-size frame buffer. Two tempting
+// strategies for filling remaining capacity are WRONG:
+//
+//   1. Cycling [transition | frame] to fill capacity reintroduces a
+//      frame.last → transition.start galvo jump inside the hardware loop.
+//   2. Padding short frames with held blank points collapses brightness
+//      because the content duty cycle shrinks to content_len / capacity.
+//
+// The correct rule: compose_hardware_frame returns exactly
+// transition_len + frame_len points. The hardware loops at that natural
+// length.
+
+#[test]
+fn test_compose_hardware_frame_natural_length_no_padding() {
+    // A 5-point frame with a 2-point transition should produce exactly 7
+    // points — not padded to any larger capacity.
+    let mut engine = make_engine(); // 2-point transition
+    let frame = make_frame(vec![
+        make_point(0.0, 0.0),
+        make_point(0.2, 0.0),
+        make_point(0.4, 0.0),
+        make_point(0.6, 0.0),
+        make_point(0.8, 0.0),
+    ]);
+    engine.set_pending(frame);
+
+    let composed = engine.compose_hardware_frame();
+    // Self-loop: transition(last→first) + frame = 2 + 5 = 7
+    assert_eq!(
+        composed.len(),
+        7,
+        "frame should be at natural length, not padded"
+    );
+}
+
+#[test]
+fn test_compose_hardware_frame_content_not_cycled() {
+    // Verify that frame points appear exactly once — no cycling to fill
+    // capacity. If the composed frame were cycled, we'd see frame points
+    // repeating beyond position [transition_len + frame_len].
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        vec![LaserPoint::blanked(from.x, to.x)]
+    }));
+    let frame = make_frame(vec![
+        make_point(1.0, 0.0),
+        make_point(2.0, 0.0),
+        make_point(3.0, 0.0),
+    ]);
+    engine.set_pending(frame);
+
+    let composed = engine.compose_hardware_frame();
+    // 1 transition + 3 frame = 4 total, no more
+    assert_eq!(composed.len(), 4);
+    // Frame content appears exactly once
+    assert_eq!(composed[1].x, 1.0);
+    assert_eq!(composed[2].x, 2.0);
+    assert_eq!(composed[3].x, 3.0);
+}
+
+#[test]
+fn test_compose_hardware_frame_short_frame_preserves_duty_cycle() {
+    // A 2-point frame must NOT be padded with blank points. Every
+    // non-transition point should carry the authored intensity.
+    let mut engine = make_engine(); // 2-point transition
+    let frame = make_frame(vec![make_point(0.5, 0.0), make_point(-0.5, 0.0)]);
+    engine.set_pending(frame);
+
+    let composed = engine.compose_hardware_frame();
+    // 2 transition (blanked) + 2 frame (lit) = 4 total
+    assert_eq!(composed.len(), 4, "no extra padding points");
+
+    // Transition points are blanked
+    assert_eq!(composed[0].intensity, 0);
+    assert_eq!(composed[1].intensity, 0);
+    // Frame points preserve full intensity
+    assert_eq!(composed[2].intensity, 65535);
+    assert_eq!(composed[3].intensity, 65535);
+    // Content duty cycle = 2/4 = 50%, not collapsed by padding
+}
+
+#[test]
+fn test_compose_hardware_frame_a_to_b_no_cycling_artifact() {
+    // After A→B transition, the composed frame must be [transition(A→B) | B].
+    // If it were cycled to fill capacity, cycling back to transition.start
+    // would produce a B.last → A.last galvo jump (the "from" of the transition).
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        // Encode from/to into transition so we can verify no repetition
+        vec![
+            LaserPoint::blanked(from.x, from.y),
+            LaserPoint::blanked(to.x, to.y),
+        ]
+    }));
+
+    let frame_a = make_frame(vec![make_point(-1.0, 0.0)]);
+    engine.set_pending(frame_a);
+    let _ = engine.compose_hardware_frame(); // promote A
+
+    let frame_b = make_frame(vec![make_point(1.0, 0.0), make_point(1.0, 1.0)]);
+    engine.set_pending(frame_b);
+    let composed = engine.compose_hardware_frame();
+
+    // Expected: [trans_from(-1,0), trans_to(1,0), B(1,0), B(1,1)] = 4 points
+    assert_eq!(composed.len(), 4, "no cycling beyond transition + frame");
+    // Last point is B.last
+    assert_eq!(composed[3].x, 1.0);
+    assert_eq!(composed[3].y, 1.0);
+    // If cycled, there would be a 5th point jumping back to trans_from(-1,0).
+    // The length assertion above proves this doesn't happen.
+}
+
+// =========================================================================
 // Reconnect-related tests
 // =========================================================================
 
@@ -764,10 +898,7 @@ fn test_engine_reset_clears_state() {
     let mut engine = PresentationEngine::new(Box::new(default_transition));
 
     // Set a frame and advance cursor
-    let frame = Arc::new(Frame::new(vec![
-        make_point(1.0, 0.0),
-        make_point(2.0, 0.0),
-    ]));
+    let frame = Frame::new(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]);
     engine.set_pending(frame);
 
     let mut buffer = vec![LaserPoint::default(); 3];
@@ -796,7 +927,7 @@ fn test_engine_reset_then_replay_frame() {
     let mut engine = PresentationEngine::new(Box::new(|_, _| vec![]));
 
     // Play a frame
-    let frame = Arc::new(Frame::new(vec![make_point(1.0, 0.0)]));
+    let frame = Frame::new(vec![make_point(1.0, 0.0)]);
     engine.set_pending(frame.clone());
     let mut buffer = vec![LaserPoint::default(); 2];
     engine.fill_chunk(&mut buffer, 2);
@@ -867,24 +998,51 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
         output_model: OutputModel::NetworkFifo,
     };
 
-    struct MinimalBackend { caps: DacCapabilities, connected: bool }
+    struct MinimalBackend {
+        caps: DacCapabilities,
+        connected: bool,
+    }
     impl crate::backend::DacBackend for MinimalBackend {
-        fn dac_type(&self) -> DacType { DacType::Custom("Test".into()) }
-        fn caps(&self) -> &DacCapabilities { &self.caps }
-        fn connect(&mut self) -> crate::backend::Result<()> { self.connected = true; Ok(()) }
-        fn disconnect(&mut self) -> crate::backend::Result<()> { Ok(()) }
-        fn is_connected(&self) -> bool { self.connected }
-        fn stop(&mut self) -> crate::backend::Result<()> { Ok(()) }
-        fn set_shutter(&mut self, _: bool) -> crate::backend::Result<()> { Ok(()) }
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("Test".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> crate::backend::Result<()> {
+            self.connected = true;
+            Ok(())
+        }
+        fn disconnect(&mut self) -> crate::backend::Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+        fn stop(&mut self) -> crate::backend::Result<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, _: bool) -> crate::backend::Result<()> {
+            Ok(())
+        }
     }
     impl crate::backend::FifoBackend for MinimalBackend {
-        fn try_write_points(&mut self, _: u32, _: &[LaserPoint]) -> crate::backend::Result<crate::backend::WriteOutcome> {
+        fn try_write_points(
+            &mut self,
+            _: u32,
+            _: &[LaserPoint],
+        ) -> crate::backend::Result<crate::backend::WriteOutcome> {
             Ok(crate::backend::WriteOutcome::Written)
         }
-        fn queued_points(&self) -> Option<u64> { None }
+        fn queued_points(&self) -> Option<u64> {
+            None
+        }
     }
 
-    let backend = MinimalBackend { caps: caps.clone(), connected: false };
+    let backend = MinimalBackend {
+        caps: caps.clone(),
+        connected: false,
+    };
     let info = DacInfo::new("test", "Test", DacType::Custom("Test".into()), caps);
     let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
@@ -893,8 +1051,7 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
     });
 
     // PPS 500 is below pps_min=1000 — should be rejected even with reconnect
-    let config = FrameSessionConfig::new(500)
-        .with_reconnect(crate::types::ReconnectConfig::new());
+    let config = FrameSessionConfig::new(500).with_reconnect(crate::types::ReconnectConfig::new());
     let result = device.start_frame_session(config);
     assert!(result.is_err());
 }

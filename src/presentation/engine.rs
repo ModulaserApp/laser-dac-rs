@@ -1,7 +1,5 @@
 //! PresentationEngine and ColorDelayLine — core frame lifecycle internals.
 
-use std::sync::Arc;
-
 use crate::types::LaserPoint;
 
 use super::{Frame, TransitionFn};
@@ -21,9 +19,9 @@ use super::{Frame, TransitionFn};
 ///   delivery. Returns a complete composed frame with transition points.
 pub(crate) struct PresentationEngine {
     /// The currently playing frame.
-    pub(crate) current_base: Option<Arc<Frame>>,
+    pub(crate) current_base: Option<Frame>,
     /// The next frame to promote (latest-wins).
-    pub(crate) pending_base: Option<Arc<Frame>>,
+    pub(crate) pending_base: Option<Frame>,
     /// Current frame's points (no transition — just the raw frame).
     drawable: Vec<LaserPoint>,
     /// Whether the drawable needs to be rebuilt from current_base.
@@ -36,8 +34,6 @@ pub(crate) struct PresentationEngine {
     transition_buf: Vec<LaserPoint>,
     /// Read cursor within transition_buf.
     transition_cursor: usize,
-    /// Length of the transition prefix in the last composed frame-swap drawable.
-    frame_swap_transition_len: usize,
 }
 
 impl PresentationEngine {
@@ -52,7 +48,6 @@ impl PresentationEngine {
             transition_fn,
             transition_buf: Vec::new(),
             transition_cursor: 0,
-            frame_swap_transition_len: 0,
         }
     }
 
@@ -65,14 +60,13 @@ impl PresentationEngine {
         self.cursor = 0;
         self.transition_buf.clear();
         self.transition_cursor = 0;
-        self.frame_swap_transition_len = 0;
     }
 
     /// Submit a new frame. Latest-wins: multiple calls before consumption
     /// keep only the most recent frame.
     ///
     /// If no current frame exists, the pending is immediately promoted.
-    pub fn set_pending(&mut self, frame: Arc<Frame>) {
+    pub fn set_pending(&mut self, frame: Frame) {
         if self.current_base.is_none() {
             self.current_base = Some(frame);
             self.drawable_dirty = true;
@@ -174,7 +168,6 @@ impl PresentationEngine {
             };
 
             self.drawable.clear();
-            self.frame_swap_transition_len = transition.len();
             self.drawable.extend_from_slice(&transition);
             self.drawable.extend_from_slice(pending.points());
 
@@ -204,12 +197,10 @@ impl PresentationEngine {
         self.drawable_dirty = false;
 
         let Some(current) = &self.current_base else {
-            self.frame_swap_transition_len = 0;
             return;
         };
 
         if current.is_empty() {
-            self.frame_swap_transition_len = 0;
             return;
         }
 
@@ -217,7 +208,6 @@ impl PresentationEngine {
         let last = points.last().unwrap();
         let first = points.first().unwrap();
         let transition = (self.transition_fn)(last, first);
-        self.frame_swap_transition_len = transition.len();
         self.drawable.extend_from_slice(&transition);
         self.drawable.extend_from_slice(points);
     }
@@ -261,7 +251,7 @@ impl ColorDelayLine {
 
     /// Reset the carry buffer (e.g., after reconnect).
     pub fn reset(&mut self) {
-        self.carry = vec![(0, 0, 0, 0); self.delay];
+        self.carry.fill((0, 0, 0, 0));
     }
 
     /// Apply color delay to a chunk, using carried state from the previous chunk.

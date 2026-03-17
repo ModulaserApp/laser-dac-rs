@@ -120,8 +120,8 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint>
         return vec![];
     }
 
-    let dwell = (3.0 + distance * 12.0).ceil() as usize;  // 3..~37 per end
-    let travel = (5.0 + distance * 30.0).ceil() as usize;  // 5..~90
+    let dwell = (3.0 + distance * 12.0).ceil() as usize; // 3..~37 per end
+    let travel = (5.0 + distance * 30.0).ceil() as usize; // 5..~90
 
     let mut points = Vec::with_capacity(dwell * 2 + travel);
 
@@ -133,10 +133,7 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint>
     // Phase 2: linear travel
     for i in 0..travel {
         let t = (i + 1) as f32 / (travel + 1) as f32;
-        points.push(LaserPoint::blanked(
-            from.x + dx * t,
-            from.y + dy * t,
-        ));
+        points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
     }
 
     // Phase 3: dwell at destination (settle before laser fires)

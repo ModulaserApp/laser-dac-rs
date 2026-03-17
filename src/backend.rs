@@ -224,6 +224,17 @@ impl BackendKind {
     pub fn is_frame_swap(&self) -> bool {
         matches!(self, BackendKind::FrameSwap(_))
     }
+
+    /// Returns true if the device is ready to accept a new frame.
+    ///
+    /// For FIFO backends, always returns `true` (they handle backpressure via `try_write`).
+    /// For frame-swap backends, queries the device readiness.
+    pub fn is_ready_for_frame(&mut self) -> bool {
+        match self {
+            BackendKind::Fifo(_) => true,
+            BackendKind::FrameSwap(b) => b.is_ready_for_frame(),
+        }
+    }
 }
 
 // =============================================================================

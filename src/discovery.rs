@@ -441,7 +441,9 @@ impl HeliosDiscovery {
         let DiscoveredDeviceInner::Helios(dac) = device.inner else {
             return Err(Error::invalid_config("Invalid device type for Helios"));
         };
-        Ok(BackendKind::FrameSwap(Box::new(HeliosBackend::from_dac(dac))))
+        Ok(BackendKind::FrameSwap(Box::new(HeliosBackend::from_dac(
+            dac,
+        ))))
     }
 }
 
@@ -549,7 +551,9 @@ impl IdnDiscovery {
             return Err(Error::invalid_config("Invalid device type for IDN"));
         };
 
-        Ok(BackendKind::Fifo(Box::new(IdnBackend::new(server, service))))
+        Ok(BackendKind::Fifo(Box::new(IdnBackend::new(
+            server, service,
+        ))))
     }
 
     /// Scan a specific address for IDN devices.
@@ -656,7 +660,9 @@ impl LasercubeWifiDiscovery {
         };
 
         let addressed = LasercubeAddressed::from_discovery(&info, source_addr);
-        Ok(BackendKind::Fifo(Box::new(LasercubeWifiBackend::new(addressed))))
+        Ok(BackendKind::Fifo(Box::new(LasercubeWifiBackend::new(
+            addressed,
+        ))))
     }
 }
 
@@ -756,7 +762,9 @@ impl AvbDiscovery {
             return Err(Error::invalid_config("Invalid device type for AVB"));
         };
 
-        Ok(BackendKind::Fifo(Box::new(AvbBackend::from_selector(selector))))
+        Ok(BackendKind::Fifo(Box::new(AvbBackend::from_selector(
+            selector,
+        ))))
     }
 }
 

@@ -17,8 +17,8 @@ mod common;
 
 use clap::Parser;
 use laser_dac::{
-    default_transition, list_devices, open_device, Frame, FrameSessionConfig, LaserPoint,
-    Result, TransitionFn,
+    default_transition, list_devices, open_device, Frame, FrameSessionConfig, LaserPoint, Result,
+    TransitionFn,
 };
 use std::f32::consts::PI;
 use std::thread;
@@ -107,9 +107,9 @@ fn main() -> Result<()> {
 
     if matches!(args.mode, Mode::Animated) {
         let frames = vec![
-            make_circle(n, -0.4, 0.25, 0.2, 65535, 0, 0),    // red, top-left
-            make_circle(n, 0.4, 0.25, 0.2, 0, 65535, 0),      // green, top-right
-            make_circle(n, 0.0, -0.35, 0.2, 0, 0, 65535),     // blue, bottom-center
+            make_circle(n, -0.4, 0.25, 0.2, 65535, 0, 0), // red, top-left
+            make_circle(n, 0.4, 0.25, 0.2, 0, 65535, 0),  // green, top-right
+            make_circle(n, 0.0, -0.35, 0.2, 0, 0, 65535), // blue, bottom-center
         ];
 
         println!("  Cycling 3 colored circles every 2 seconds.");
@@ -160,15 +160,7 @@ fn main() -> Result<()> {
 }
 
 /// Generate a circle at an offset position.
-fn make_circle(
-    n: usize,
-    cx: f32,
-    cy: f32,
-    radius: f32,
-    r: u16,
-    g: u16,
-    b: u16,
-) -> Frame {
+fn make_circle(n: usize, cx: f32, cy: f32, radius: f32, r: u16, g: u16, b: u16) -> Frame {
     Frame::new(make_circle_points(n, cx, cy, radius, r, g, b))
 }
 
