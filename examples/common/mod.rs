@@ -28,6 +28,7 @@ pub enum Shape {
     Triangle,
     Circle,
     OrbitingCircle,
+    Orientation,
     TestPattern,
 }
 
@@ -38,6 +39,7 @@ impl Shape {
             Shape::Triangle => "triangle",
             Shape::Circle => "circle",
             Shape::OrbitingCircle => "orbiting-circle",
+            Shape::Orientation => "orientation",
             Shape::TestPattern => "test-pattern",
         }
     }
@@ -55,6 +57,7 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
     match shape {
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
         Shape::Circle => fill_circle_points(&mut frame, n_points),
+        Shape::Orientation => return fill_orientation_points(n_points, scale),
         Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
         Shape::OrbitingCircle => {
             panic!("time-based shapes don't have static frames; use make_producer()")
@@ -199,6 +202,166 @@ fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
 
         buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
     }
+}
+
+/// Build an orientation test frame: circle (left), triangle (center), line (right).
+///
+/// Each sub-shape is a closed loop. Transitions between shapes use the same
+/// blanking strategy as `default_transition`: end-dwell → eased transit → start-dwell.
+/// This keeps galvo travel smooth even though multiple shapes share one frame.
+///
+/// Returns the frame directly (handles its own scaling) so it bypasses the
+/// buffer-based fill pattern.
+///
+/// If X is flipped: shapes appear in reversed left-right order.
+/// If Y is flipped: the triangle points downward.
+fn fill_orientation_points(n_points: usize, scale: f32) -> Vec<LaserPoint> {
+    const WHITE: u16 = 65535;
+    // Blanking budget per transition
+    const END_DWELL: usize = 3;
+    const START_DWELL: usize = 12;
+
+    /// Quintic ease-in-out for smooth galvo transit.
+    fn ease(t: f32) -> f32 {
+        if t < 0.5 {
+            16.0 * t * t * t * t * t
+        } else {
+            let u = 2.0 * t - 2.0;
+            0.5 * u * u * u * u * u + 1.0
+        }
+    }
+
+    /// Generate blanked transition points between two positions.
+    fn blanked_transition(from: (f32, f32), to: (f32, f32)) -> Vec<LaserPoint> {
+        let dx = to.0 - from.0;
+        let dy = to.1 - from.1;
+        let d_inf = dx.abs().max(dy.abs());
+        let transit = (64.0 * d_inf).ceil().clamp(0.0, 128.0) as usize;
+        let total = END_DWELL + transit + START_DWELL;
+        let mut points = Vec::with_capacity(total);
+
+        // End dwell at source
+        for _ in 0..END_DWELL {
+            points.push(LaserPoint::blanked(from.0, from.1));
+        }
+        // Eased transit
+        for i in 0..transit {
+            let t = (i as f32 + 1.0) / (transit as f32 + 1.0);
+            let t = ease(t);
+            points.push(LaserPoint::blanked(from.0 + dx * t, from.1 + dy * t));
+        }
+        // Start dwell at destination
+        for _ in 0..START_DWELL {
+            points.push(LaserPoint::blanked(to.0, to.1));
+        }
+        points
+    }
+
+    // --- Build sub-shapes as closed loops ---
+    // Target ~1000 points total (~30 fps at 30kpps) for gentle galvo movement.
+
+    // Circle (left, at x=-0.4)
+    let circle_cx = -0.4_f32;
+    let circle_r = 0.2_f32;
+    let circle_n = 200;
+    let circle_segments = circle_n - 1;
+    let circle: Vec<LaserPoint> = (0..circle_n)
+        .map(|i| {
+            let angle = (i as f32 / circle_segments as f32) * TAU;
+            let x = circle_cx + circle_r * angle.cos();
+            let y = circle_r * angle.sin();
+            LaserPoint::new(x, y, WHITE, 0, 0, WHITE) // red
+        })
+        .collect();
+
+    // Triangle (center, pointing up) — with dwell at each vertex
+    let tri_size = 0.2_f32;
+    let tri_verts = [
+        (-tri_size, -tri_size * 0.7), // bottom-left
+        (tri_size, -tri_size * 0.7),  // bottom-right
+        (0.0, tri_size),              // apex (top)
+    ];
+    let pts_per_edge = 45;
+    let corner_dwell = 3;
+    let mut triangle = Vec::with_capacity(pts_per_edge * 3 + corner_dwell * 3);
+    for edge in 0..3 {
+        let (x1, y1) = tri_verts[edge];
+        let (x2, y2) = tri_verts[(edge + 1) % 3];
+        // Dwell at start vertex
+        for _ in 0..corner_dwell {
+            triangle.push(LaserPoint::new(x1, y1, 0, WHITE, 0, WHITE));
+        }
+        for i in 1..=pts_per_edge {
+            let t = i as f32 / pts_per_edge as f32;
+            triangle.push(LaserPoint::new(
+                x1 + (x2 - x1) * t,
+                y1 + (y2 - y1) * t,
+                0, WHITE, 0, WHITE, // green
+            ));
+        }
+    }
+
+    // Line (right, vertical at x=0.4, bounces top→bottom→top) — with dwell at reversals
+    let line_x = 0.4_f32;
+    let line_half = 0.25_f32;
+    let line_half_n = 25;
+    let reversal_dwell = 5;
+    let mut line = Vec::with_capacity(line_half_n * 2 + reversal_dwell * 2);
+    // Dwell at top
+    for _ in 0..reversal_dwell {
+        line.push(LaserPoint::new(line_x, line_half, 0, 0, WHITE, WHITE));
+    }
+    // Down stroke
+    for i in 0..line_half_n {
+        let t = i as f32 / line_half_n as f32;
+        let y = line_half - 2.0 * line_half * t;
+        line.push(LaserPoint::new(line_x, y, 0, 0, WHITE, WHITE)); // blue
+    }
+    // Dwell at bottom
+    for _ in 0..reversal_dwell {
+        line.push(LaserPoint::new(line_x, -line_half, 0, 0, WHITE, WHITE));
+    }
+    // Up stroke (closes back to start)
+    for i in 0..line_half_n {
+        let t = i as f32 / line_half_n as f32;
+        let y = -line_half + 2.0 * line_half * t;
+        line.push(LaserPoint::new(line_x, y, 0, 0, WHITE, WHITE)); // blue
+    }
+
+    // --- Assemble with transitions ---
+    let circle_end = (circle.last().unwrap().x, circle.last().unwrap().y);
+    let tri_start = (triangle[0].x, triangle[0].y);
+    let tri_end = (triangle.last().unwrap().x, triangle.last().unwrap().y);
+    let line_start = (line[0].x, line[0].y);
+    let line_end = (line.last().unwrap().x, line.last().unwrap().y);
+    let circle_start = (circle[0].x, circle[0].y);
+
+    let t1 = blanked_transition(circle_end, tri_start);
+    let t2 = blanked_transition(tri_end, line_start);
+    let t3 = blanked_transition(line_end, circle_start);
+
+    let mut frame = Vec::with_capacity(
+        circle.len() + t1.len() + triangle.len() + t2.len() + line.len() + t3.len(),
+    );
+    frame.extend_from_slice(&circle);
+    frame.extend_from_slice(&t1);
+    frame.extend_from_slice(&triangle);
+    frame.extend_from_slice(&t2);
+    frame.extend_from_slice(&line);
+    frame.extend_from_slice(&t3);
+
+    // Apply scale
+    if (scale - 1.0).abs() > f32::EPSILON {
+        for p in &mut frame {
+            p.x = (p.x * scale).clamp(-1.0, 1.0);
+            p.y = (p.y * scale).clamp(-1.0, 1.0);
+        }
+    }
+
+    // Ignore n_points for this shape — the point count is determined by the
+    // geometry and blanking requirements to keep galvos safe.
+    let _ = n_points;
+    frame
 }
 
 /// Fill a time-based orbiting circle with smooth continuous motion into buffer.
