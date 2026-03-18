@@ -3,7 +3,7 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, ChunkResult, Frame, FrameAdapter, LaserPoint};
+use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
 
@@ -29,18 +29,16 @@ pub enum Shape {
     Circle,
     OrbitingCircle,
     TestPattern,
-    Audio,
 }
 
 impl Shape {
-    #[allow(dead_code)] // Used by stream/callback/frame_adapter examples, not audio
+    #[allow(dead_code)] // Used by stream/frame examples, not audio
     pub fn name(&self) -> &'static str {
         match self {
             Shape::Triangle => "triangle",
             Shape::Circle => "circle",
             Shape::OrbitingCircle => "orbiting-circle",
             Shape::TestPattern => "test-pattern",
-            Shape::Audio => "audio",
         }
     }
 }
@@ -51,14 +49,14 @@ impl Shape {
 /// of the shape. This frame is then streamed continuously by wrapping around
 /// — the DAC never waits for frame boundaries.
 ///
-/// For time-based shapes (OrbitingCircle, Audio), use `make_producer` instead.
+/// For time-based shapes (OrbitingCircle), use `make_producer` instead.
 pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
     let mut frame = vec![LaserPoint::default(); n_points];
     match shape {
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
         Shape::Circle => fill_circle_points(&mut frame, n_points),
         Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
-        Shape::OrbitingCircle | Shape::Audio => {
+        Shape::OrbitingCircle => {
             panic!("time-based shapes don't have static frames; use make_producer()")
         }
     }
@@ -71,10 +69,10 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
 /// Create a producer callback for streaming any shape to a DAC.
 ///
 /// For static shapes (Triangle, Circle, TestPattern), this generates a frame
-/// once and streams it continuously using `FrameAdapter` — the cursor wraps
-/// around at the end of the frame, just like real laser software works.
+/// once and cycles through it with a cursor — the index wraps at the end,
+/// just like real laser software works.
 ///
-/// For time-based shapes (OrbitingCircle, Audio), the callback computes each
+/// For time-based shapes (OrbitingCircle), the callback computes each
 /// point from the stream timestamp, producing smooth continuous animation.
 pub fn make_producer(
     shape: Shape,
@@ -90,19 +88,20 @@ pub fn make_producer(
             }
             ChunkResult::Filled(n)
         }),
-        Shape::Audio => {
-            let audio_config = audio::AudioConfig::default();
-            Box::new(move |req, buffer| {
-                let n = req.target_points.min(buffer.len());
-                audio::fill_audio_points(req, buffer, n, &audio_config);
-                ChunkResult::Filled(n)
-            })
-        }
         _ => {
             let frame = generate_frame(shape, points, scale);
-            let mut adapter = FrameAdapter::new();
-            adapter.update(Frame::new(frame));
-            Box::new(move |req, buffer| adapter.fill_chunk(req, buffer))
+            let mut cursor = 0usize;
+            Box::new(move |req, buffer| {
+                let n = req.target_points.min(buffer.len());
+                for i in 0..n {
+                    buffer[i] = frame[cursor];
+                    cursor += 1;
+                    if cursor >= frame.len() {
+                        cursor = 0;
+                    }
+                }
+                ChunkResult::Filled(n)
+            })
         }
     }
 }
@@ -186,27 +185,19 @@ fn fill_triangle_points(buffer: &mut [LaserPoint], n_points: usize) {
 }
 
 /// Fill a rainbow circle into buffer.
+///
+/// Generates a closed circle: the last point equals the first point,
+/// so the transition function produces no blanking at the loop seam.
 fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
-    const BLANK_COUNT: usize = 5;
-
-    let mut idx = 0;
-
-    for _ in 0..BLANK_COUNT.min(n_points) {
-        buffer[idx] = LaserPoint::blanked(0.5, 0.0);
-        idx += 1;
-    }
-
-    let circle_points = n_points.saturating_sub(BLANK_COUNT);
-    for i in 0..circle_points {
-        let angle = (i as f32 / circle_points as f32) * 2.0 * PI;
+    for i in 0..n_points {
+        let angle = (i as f32 / n_points as f32) * 2.0 * PI;
         let x = 0.5 * angle.cos();
         let y = 0.5 * angle.sin();
 
-        let hue = i as f32 / circle_points as f32;
+        let hue = i as f32 / n_points as f32;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        buffer[idx] = LaserPoint::new(x, y, r, g, b, 65535);
-        idx += 1;
+        buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
     }
 }
 
@@ -310,9 +301,8 @@ mod tests {
     fn generate_frame_produces_correct_point_count() {
         let frame = generate_frame(Shape::Circle, 200, 1.0);
         assert_eq!(frame.len(), 200);
-        // First 5 points are blanked (leading blank), rest have color
-        assert!(frame[..5].iter().all(|p| p.intensity == 0));
-        assert!(frame[5..].iter().any(|p| p.intensity != 0));
+        // All points have color (no leading blanks)
+        assert!(frame.iter().all(|p| p.intensity != 0));
     }
 
     #[test]

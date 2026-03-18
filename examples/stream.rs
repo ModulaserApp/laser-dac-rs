@@ -1,9 +1,12 @@
-//! Streaming example.
+//! Streaming API example.
 //!
-//! This example demonstrates the basic streaming workflow: discover devices,
-//! open a connection, and stream points using the zero-allocation callback API.
+//! Demonstrates the streaming workflow: discover devices, open a connection,
+//! and stream points via a producer callback with buffer-driven timing.
 //!
-//! Run with: `cargo run --example stream -- [triangle|circle]`
+//! Try `orbiting-circle` for the best demo — it uses stream timestamps for
+//! smooth continuous animation, which is the streaming API's strength.
+//!
+//! Run with: `cargo run --example stream -- [orbiting-circle|triangle|circle]`
 
 mod common;
 

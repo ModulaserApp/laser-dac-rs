@@ -1,6 +1,6 @@
 //! IDN DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
 use crate::protocols::idn::protocol::PointXyrgbi;
@@ -86,7 +86,7 @@ impl IdnBackend {
     }
 }
 
-impl StreamBackend for IdnBackend {
+impl DacBackend for IdnBackend {
     fn dac_type(&self) -> DacType {
         DacType::Idn
     }
@@ -133,7 +133,20 @@ impl StreamBackend for IdnBackend {
             .unwrap_or(false)
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn stop(&mut self) -> Result<()> {
+        if let Some(runtime) = &self.runtime {
+            let _ = runtime.tx.send(WorkerCommand::Stop);
+        }
+        Ok(())
+    }
+
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for IdnBackend {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let runtime = self
             .runtime
             .as_ref()
@@ -162,17 +175,6 @@ impl StreamBackend for IdnBackend {
                 Err(Error::disconnected("IDN sender thread disconnected"))
             }
         }
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if let Some(runtime) = &self.runtime {
-            let _ = runtime.tx.send(WorkerCommand::Stop);
-        }
-        Ok(())
-    }
-
-    fn set_shutter(&mut self, _open: bool) -> Result<()> {
-        Ok(())
     }
 }
 

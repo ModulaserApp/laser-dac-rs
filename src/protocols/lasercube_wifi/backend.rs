@@ -1,6 +1,6 @@
 //! LaserCube WiFi DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::lasercube_wifi::dac::{stream, Addressed};
 use crate::protocols::lasercube_wifi::protocol::{DeviceInfo, Point as LasercubePoint};
@@ -32,7 +32,7 @@ impl LasercubeWifiBackend {
     }
 }
 
-impl StreamBackend for LasercubeWifiBackend {
+impl DacBackend for LasercubeWifiBackend {
     fn dac_type(&self) -> DacType {
         DacType::LasercubeWifi
     }
@@ -60,7 +60,23 @@ impl StreamBackend for LasercubeWifiBackend {
         self.stream.is_some()
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn stop(&mut self) -> Result<()> {
+        if let Some(stream) = &mut self.stream {
+            stream.stop().map_err(Error::backend)?;
+        }
+        Ok(())
+    }
+
+    fn set_shutter(&mut self, open: bool) -> Result<()> {
+        if let Some(stream) = &mut self.stream {
+            stream.set_output(open).map_err(Error::backend)?;
+        }
+        Ok(())
+    }
+}
+
+impl FifoBackend for LasercubeWifiBackend {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let stream = self
             .stream
             .as_mut()
@@ -83,20 +99,6 @@ impl StreamBackend for LasercubeWifiBackend {
             .map_err(Error::backend)?;
 
         Ok(WriteOutcome::Written)
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if let Some(stream) = &mut self.stream {
-            stream.stop().map_err(Error::backend)?;
-        }
-        Ok(())
-    }
-
-    fn set_shutter(&mut self, open: bool) -> Result<()> {
-        if let Some(stream) = &mut self.stream {
-            stream.set_output(open).map_err(Error::backend)?;
-        }
-        Ok(())
     }
 
     fn queued_points(&self) -> Option<u64> {

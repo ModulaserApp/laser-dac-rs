@@ -1,8 +1,8 @@
 //! AVB DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::protocols::avb::normalize_device_name;
+use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -265,7 +265,7 @@ impl AvbBackend {
     }
 }
 
-impl StreamBackend for AvbBackend {
+impl DacBackend for AvbBackend {
     fn dac_type(&self) -> DacType {
         DacType::Avb
     }
@@ -365,24 +365,6 @@ impl StreamBackend for AvbBackend {
         self.runtime.is_some() && self.worker_handle.is_some()
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or_else(|| Error::disconnected("Not connected"))?;
-
-        if points.is_empty() {
-            return Ok(WriteOutcome::Written);
-        }
-
-        // Fast path: no resampling needed when PPS matches the audio sample rate.
-        if pps == runtime.sample_rate {
-            Ok(enqueue_points(runtime, points))
-        } else {
-            Ok(enqueue_resampled(runtime, points, pps))
-        }
-    }
-
     fn stop(&mut self) -> Result<()> {
         self.desired_shutter_open = false;
         if let Some(runtime) = &self.runtime {
@@ -398,6 +380,26 @@ impl StreamBackend for AvbBackend {
             runtime.shutter_open.store(open, Ordering::Release);
         }
         Ok(())
+    }
+}
+
+impl FifoBackend for AvbBackend {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::disconnected("Not connected"))?;
+
+        if points.is_empty() {
+            return Ok(WriteOutcome::Written);
+        }
+
+        // Fast path: no resampling needed when PPS matches the audio sample rate.
+        if pps == runtime.sample_rate {
+            Ok(enqueue_points(runtime, points))
+        } else {
+            Ok(enqueue_resampled(runtime, points, pps))
+        }
     }
 
     fn queued_points(&self) -> Option<u64> {
@@ -564,6 +566,13 @@ fn collect_candidates_from_records<D>(records: Vec<DeviceRecord<D>>) -> Vec<Devi
     let mut records: Vec<DeviceRecord<D>> = records
         .into_iter()
         .filter(|record| {
+            if is_blacklisted_device(&record.name) {
+                log::debug!(
+                    "AVB: skipping {:?} — blacklisted (not a laser DAC)",
+                    record.name
+                );
+                return false;
+            }
             let channel_ok = supports_required_channels(record);
             if !channel_ok {
                 log::debug!(
@@ -729,7 +738,7 @@ fn lerp_stream_point(a: &StreamPoint, b: &StreamPoint, t: f32) -> StreamPoint {
 
 /// Resample `points` from `pps` to `sample_rate` and enqueue directly.
 ///
-/// Caller must ensure `points` is non-empty (the `try_write_chunk` fast path handles this).
+/// Caller must ensure `points` is non-empty (the `try_write_points` fast path handles this).
 fn enqueue_resampled(runtime: &RuntimeState, points: &[LaserPoint], pps: u32) -> WriteOutcome {
     debug_assert!(!points.is_empty());
     let output_len = resampled_len(points.len(), pps, runtime.sample_rate);
@@ -1060,6 +1069,7 @@ mod tests {
             make_record("Broadcom NetXtreme A", 8, 44_100, 48_000),
             make_record("Broadcom NetXtreme B", 2, 44_100, 48_000),
             make_record("Broadcom NetXtreme B", 8, 44_100, 48_000),
+            make_record("Studio Display Speakers", 6, 44_100, 48_000),
         ];
 
         let candidates = collect_candidates_from_records(records);
@@ -1278,7 +1288,7 @@ mod tests {
         backend.connect().unwrap();
         backend.set_shutter(true).unwrap();
         let points = vec![LaserPoint::new(0.25, -0.25, 65535, 0, 0, 65535)];
-        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
+        let outcome = backend.try_write_points(48_000, &points).unwrap();
         assert_eq!(outcome, WriteOutcome::Written);
 
         thread::sleep(Duration::from_millis(20));
@@ -1319,11 +1329,11 @@ mod tests {
 
         let cap = queue_capacity_for_rate(48_000);
         let fill = vec![LaserPoint::blanked(0.0, 0.0); cap];
-        let first = backend.try_write_chunk(48_000, &fill).unwrap();
+        let first = backend.try_write_points(48_000, &fill).unwrap();
         assert_eq!(first, WriteOutcome::Written);
 
         let blocked = backend
-            .try_write_chunk(48_000, &[LaserPoint::blanked(0.0, 0.0)])
+            .try_write_points(48_000, &[LaserPoint::blanked(0.0, 0.0)])
             .unwrap();
         assert_eq!(blocked, WriteOutcome::WouldBlock);
 
@@ -1331,7 +1341,7 @@ mod tests {
         thread::sleep(Duration::from_millis(25));
 
         let recovered = backend
-            .try_write_chunk(48_000, &[LaserPoint::blanked(0.0, 0.0)])
+            .try_write_points(48_000, &[LaserPoint::blanked(0.0, 0.0)])
             .unwrap();
         assert_eq!(recovered, WriteOutcome::Written);
 
@@ -1527,7 +1537,7 @@ mod tests {
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
         backend.set_shutter(true).unwrap();
-        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
+        let outcome = backend.try_write_points(48_000, &points).unwrap();
         assert_eq!(outcome, WriteOutcome::Written);
         assert_eq!(runtime.queued_points(), 4);
 
@@ -1535,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn try_write_chunk_passthrough_when_pps_matches_selected_audio_rate() {
+    fn try_write_points_passthrough_when_pps_matches_selected_audio_rate() {
         let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
         fake_engine.paused.store(true, Ordering::Release);
         fake_engine.set_frame_budget(3);
@@ -1551,7 +1561,7 @@ mod tests {
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
         assert_eq!(
-            backend.try_write_chunk(96_000, &points).unwrap(),
+            backend.try_write_points(96_000, &points).unwrap(),
             WriteOutcome::Written
         );
 
@@ -1571,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn try_write_chunk_resamples_up_to_selected_audio_rate() {
+    fn try_write_points_resamples_up_to_selected_audio_rate() {
         let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
         fake_engine.paused.store(true, Ordering::Release);
         fake_engine.set_frame_budget(4);
@@ -1586,7 +1596,7 @@ mod tests {
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
         assert_eq!(
-            backend.try_write_chunk(48_000, &points).unwrap(),
+            backend.try_write_points(48_000, &points).unwrap(),
             WriteOutcome::Written
         );
 
@@ -1607,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn try_write_chunk_resamples_down_to_selected_audio_rate() {
+    fn try_write_points_resamples_down_to_selected_audio_rate() {
         let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 48_000));
         fake_engine.paused.store(true, Ordering::Release);
         fake_engine.set_frame_budget(3);
@@ -1625,7 +1635,7 @@ mod tests {
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
         assert_eq!(
-            backend.try_write_chunk(96_000, &points).unwrap(),
+            backend.try_write_points(96_000, &points).unwrap(),
             WriteOutcome::Written
         );
 
@@ -1656,12 +1666,12 @@ mod tests {
         let cap = queue_capacity_for_rate(96_000);
         let fill = vec![LaserPoint::blanked(0.0, 0.0); cap];
         assert_eq!(
-            backend.try_write_chunk(96_000, &fill).unwrap(),
+            backend.try_write_points(96_000, &fill).unwrap(),
             WriteOutcome::Written
         );
         assert_eq!(
             backend
-                .try_write_chunk(96_000, &[LaserPoint::blanked(0.0, 0.0)])
+                .try_write_points(96_000, &[LaserPoint::blanked(0.0, 0.0)])
                 .unwrap(),
             WriteOutcome::WouldBlock
         );
@@ -1759,7 +1769,7 @@ mod tests {
         backend.connect().unwrap();
         backend.set_shutter(true).unwrap();
         let points = vec![LaserPoint::new(0.25, -0.25, 65535, 0, 0, 65535)];
-        let outcome = backend.try_write_chunk(48_000, &points).unwrap();
+        let outcome = backend.try_write_points(48_000, &points).unwrap();
         assert_eq!(outcome, WriteOutcome::Written);
 
         thread::sleep(Duration::from_millis(20));

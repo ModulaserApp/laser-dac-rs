@@ -79,12 +79,8 @@ name = "stream"
 path = "examples/stream.rs"
 
 [[example]]
-name = "callback"
-path = "examples/callback.rs"
-
-[[example]]
-name = "frame_adapter"
-path = "examples/frame_adapter.rs"
+name = "frame"
+path = "examples/frame.rs"
 
 [[example]]
 name = "audio"
@@ -93,6 +89,10 @@ path = "examples/audio.rs"
 [[example]]
 name = "reconnect"
 path = "examples/reconnect.rs"
+
+[[example]]
+name = "transitions"
+path = "examples/transitions.rs"
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

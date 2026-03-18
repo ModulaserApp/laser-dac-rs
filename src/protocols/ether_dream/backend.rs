@@ -1,6 +1,6 @@
 //! Ether Dream DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::ether_dream::dac::{stream, LightEngine, Playback, PlaybackFlags};
 use crate::protocols::ether_dream::protocol::{DacBroadcast, DacPoint};
@@ -52,7 +52,7 @@ impl EtherDreamBackend {
     }
 }
 
-impl StreamBackend for EtherDreamBackend {
+impl DacBackend for EtherDreamBackend {
     fn dac_type(&self) -> DacType {
         DacType::EtherDream
     }
@@ -81,7 +81,24 @@ impl StreamBackend for EtherDreamBackend {
         self.stream.is_some()
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn stop(&mut self) -> Result<()> {
+        if let Some(stream) = &mut self.stream {
+            stream
+                .queue_commands()
+                .stop()
+                .submit()
+                .map_err(Error::backend)?;
+        }
+        Ok(())
+    }
+
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for EtherDreamBackend {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let stream = self
             .stream
             .as_mut()
@@ -208,21 +225,6 @@ impl StreamBackend for EtherDreamBackend {
         self.last_status_time = Some(Instant::now());
         self.last_point_rate = point_rate;
         Ok(WriteOutcome::Written)
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        if let Some(stream) = &mut self.stream {
-            stream
-                .queue_commands()
-                .stop()
-                .submit()
-                .map_err(Error::backend)?;
-        }
-        Ok(())
-    }
-
-    fn set_shutter(&mut self, _open: bool) -> Result<()> {
-        Ok(())
     }
 
     fn queued_points(&self) -> Option<u64> {

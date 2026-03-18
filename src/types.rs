@@ -478,7 +478,7 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 /// for `NetworkFifo` / `UdpTimed` backends.
 ///
 /// To reduce perceived latency, reduce `target_buffer`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct StreamConfig {
     /// Points per second output rate.
@@ -514,8 +514,7 @@ pub struct StreamConfig {
     /// allowing galvo mirrors time to settle before the laser fires. The delay is
     /// implemented as a FIFO: output colors lag input colors by `ceil(color_delay * pps)` points.
     ///
-    /// Can be changed at runtime via [`crate::StreamControl::set_color_delay`] /
-    /// [`crate::SessionControl::set_color_delay`].
+    /// Can be changed at runtime via [`crate::StreamControl::set_color_delay`].
     ///
     /// Typical values: 50–200µs depending on scanner speed.
     /// `Duration::ZERO` disables the delay (default).
@@ -536,6 +535,13 @@ pub struct StreamConfig {
     /// Set to `Duration::ZERO` to disable explicit startup blanking.
     #[cfg_attr(feature = "serde", serde(with = "duration_micros"))]
     pub startup_blank: std::time::Duration,
+
+    /// Reconnection configuration (default: disabled).
+    ///
+    /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
+    /// reconnection when the device disconnects.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub reconnect: Option<ReconnectConfig>,
 }
 
 #[cfg(feature = "serde")]
@@ -579,6 +585,7 @@ impl Default for StreamConfig {
             drain_timeout: std::time::Duration::from_secs(1),
             color_delay: std::time::Duration::ZERO,
             startup_blank: std::time::Duration::from_millis(1),
+            reconnect: None,
         }
     }
 }
@@ -647,6 +654,14 @@ impl StreamConfig {
     /// Default: 1ms. Set to `Duration::ZERO` to disable.
     pub fn with_startup_blank(mut self, duration: std::time::Duration) -> Self {
         self.startup_blank = duration;
+        self
+    }
+
+    /// Enable automatic reconnection (builder pattern).
+    ///
+    /// Requires the device to have been opened via [`open_device`](crate::open_device).
+    pub fn with_reconnect(mut self, config: ReconnectConfig) -> Self {
+        self.reconnect = Some(config);
         self
     }
 }
@@ -816,6 +831,101 @@ impl DacInfo {
             kind,
             caps,
         }
+    }
+}
+
+// =============================================================================
+// Reconnect Configuration
+// =============================================================================
+
+/// Configuration for automatic reconnection behavior.
+///
+/// Used with [`StreamConfig::with_reconnect`] or
+/// [`FrameSessionConfig::with_reconnect`](crate::FrameSessionConfig::with_reconnect)
+/// to enable transparent reconnection when the device disconnects.
+///
+/// # Example
+///
+/// ```
+/// use laser_dac::ReconnectConfig;
+/// use std::time::Duration;
+///
+/// let rc = ReconnectConfig::new()
+///     .max_retries(5)
+///     .backoff(Duration::from_secs(2))
+///     .on_disconnect(|err| eprintln!("Lost connection: {}", err))
+///     .on_reconnect(|info| println!("Reconnected to {}", info.name));
+/// ```
+type DisconnectCb = Box<dyn FnMut(&crate::Error) + Send + 'static>;
+type ReconnectCb = Box<dyn FnMut(&DacInfo) + Send + 'static>;
+
+pub struct ReconnectConfig {
+    pub(crate) max_retries: Option<u32>,
+    pub(crate) backoff: std::time::Duration,
+    pub(crate) on_disconnect: Option<DisconnectCb>,
+    pub(crate) on_reconnect: Option<ReconnectCb>,
+}
+
+impl ReconnectConfig {
+    /// Create a new reconnect configuration with defaults.
+    ///
+    /// Defaults: infinite retries, 1s backoff, no callbacks.
+    pub fn new() -> Self {
+        Self {
+            max_retries: None,
+            backoff: std::time::Duration::from_secs(1),
+            on_disconnect: None,
+            on_reconnect: None,
+        }
+    }
+
+    /// Set the maximum number of consecutive reconnect attempts.
+    ///
+    /// `None` (default) retries forever. `Some(0)` disables retries.
+    pub fn max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
+
+    /// Set a fixed backoff duration between reconnect attempts.
+    pub fn backoff(mut self, backoff: std::time::Duration) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Register a callback invoked when a disconnect is detected.
+    pub fn on_disconnect<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&crate::Error) + Send + 'static,
+    {
+        self.on_disconnect = Some(Box::new(f));
+        self
+    }
+
+    /// Register a callback invoked after a successful reconnect.
+    pub fn on_reconnect<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&DacInfo) + Send + 'static,
+    {
+        self.on_reconnect = Some(Box::new(f));
+        self
+    }
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for ReconnectConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReconnectConfig")
+            .field("max_retries", &self.max_retries)
+            .field("backoff", &self.backoff)
+            .field("on_disconnect", &self.on_disconnect.as_ref().map(|_| ".."))
+            .field("on_reconnect", &self.on_reconnect.as_ref().map(|_| ".."))
+            .finish()
     }
 }
 
@@ -1020,6 +1130,7 @@ mod tests {
             drain_timeout: Duration::from_secs(2),
             color_delay: Duration::from_micros(150),
             startup_blank: Duration::from_micros(800),
+            reconnect: None,
         };
 
         // Round-trip through JSON

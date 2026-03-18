@@ -1,6 +1,6 @@
 //! LaserCube USB DAC streaming backend implementation.
 
-use crate::backend::{StreamBackend, WriteOutcome};
+use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
@@ -63,7 +63,7 @@ impl LasercubeUsbBackend {
     }
 }
 
-impl StreamBackend for LasercubeUsbBackend {
+impl DacBackend for LasercubeUsbBackend {
     fn dac_type(&self) -> DacType {
         DacType::LasercubeUsb
     }
@@ -107,22 +107,6 @@ impl StreamBackend for LasercubeUsbBackend {
         self.stream.is_some()
     }
 
-    fn try_write_chunk(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("Not connected"))?;
-
-        self.point_buffer.clear();
-        self.point_buffer
-            .extend(points.iter().map(LasercubeUsbSample::from));
-
-        match stream.write_frame(&self.point_buffer, pps) {
-            Ok(()) => Ok(WriteOutcome::Written),
-            Err(e) => self.handle_stream_error(e),
-        }
-    }
-
     fn stop(&mut self) -> Result<()> {
         let Some(stream) = &mut self.stream else {
             return Ok(());
@@ -144,6 +128,24 @@ impl StreamBackend for LasercubeUsbBackend {
         };
         match result {
             Ok(()) => Ok(()),
+            Err(e) => self.handle_stream_error(e),
+        }
+    }
+}
+
+impl FifoBackend for LasercubeUsbBackend {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| Error::disconnected("Not connected"))?;
+
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(LasercubeUsbSample::from));
+
+        match stream.write_frame(&self.point_buffer, pps) {
+            Ok(()) => Ok(WriteOutcome::Written),
             Err(e) => self.handle_stream_error(e),
         }
     }
