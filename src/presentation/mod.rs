@@ -127,11 +127,11 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> TransitionPlan 
     let dy = to.y - from.y;
     let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
 
-    // If points are nearly adjacent, coalesce them — the galvos can handle
-    // the tiny step without visible artifacts. This prevents duplicate
-    // points at the loop seam of closed shapes (circles, etc.).
+    // If points are nearly adjacent, no blanking needed — the galvos can
+    // handle the tiny step without visible artifacts. This prevents gaps
+    // at the loop point of closed shapes (circles, etc.) on frame-swap DACs.
     if distance < 0.02 {
-        return TransitionPlan::Coalesce;
+        return TransitionPlan::Transition(vec![]);
     }
 
     let dwell = (3.0 + distance * 12.0).ceil() as usize; // 3..~37 per end

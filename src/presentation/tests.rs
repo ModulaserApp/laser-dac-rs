@@ -71,10 +71,10 @@ fn test_default_transition_scales_with_distance() {
     let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
     let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
 
-    // Near points should coalesce
+    // Near points should produce empty transition (no blanking needed)
     assert!(
-        matches!(near, TransitionPlan::Coalesce),
-        "very near points should coalesce"
+        matches!(near, TransitionPlan::Transition(ref pts) if pts.is_empty()),
+        "very near points should produce empty transition"
     );
 
     let far_pts = match far {
@@ -98,19 +98,19 @@ fn test_default_transition_scales_with_distance() {
 }
 
 #[test]
-fn test_default_transition_coalesces_for_tiny_distance() {
-    // Points closer than 0.02 should coalesce
+fn test_default_transition_empty_for_tiny_distance() {
+    // Points closer than 0.02 should produce empty transition
     let result = default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
     assert!(
-        matches!(result, TransitionPlan::Coalesce),
-        "tiny distance should coalesce"
+        matches!(result, TransitionPlan::Transition(ref pts) if pts.is_empty()),
+        "tiny distance should produce empty transition"
     );
 
-    // Points just above threshold should produce transition
+    // Points just above threshold should produce non-empty transition
     let result = default_transition(&make_point(0.0, 0.0), &make_point(0.03, 0.0));
     assert!(
-        matches!(result, TransitionPlan::Transition(_)),
-        "above-threshold distance should produce transition"
+        matches!(result, TransitionPlan::Transition(ref pts) if !pts.is_empty()),
+        "above-threshold distance should produce transition points"
     );
 }
 
@@ -159,12 +159,12 @@ fn test_default_transition_has_dwell_travel_dwell_structure() {
 }
 
 #[test]
-fn test_default_transition_same_point_coalesces() {
+fn test_default_transition_same_point_produces_empty() {
     let p = make_point(0.5, -0.3);
     let result = default_transition(&p, &p);
     assert!(
-        matches!(result, TransitionPlan::Coalesce),
-        "zero distance should coalesce"
+        matches!(result, TransitionPlan::Transition(ref pts) if pts.is_empty()),
+        "zero distance should produce empty transition"
     );
 }
 
