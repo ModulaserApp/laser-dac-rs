@@ -1284,7 +1284,9 @@ mod tests {
             let _info = opaque_data
                 .downcast::<MockConnectionInfo>()
                 .map_err(|_| Error::invalid_config("wrong device type"))?;
-            Ok(BackendKind::Fifo(Box::new(MockBackend { connected: false })))
+            Ok(BackendKind::Fifo(Box::new(MockBackend {
+                connected: false,
+            })))
         }
     }
 

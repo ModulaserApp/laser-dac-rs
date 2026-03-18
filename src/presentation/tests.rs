@@ -458,7 +458,11 @@ fn test_engine_compose_hardware_frame_empty_frame_produces_blanked_point() {
     engine.set_pending(empty);
 
     let composed = engine.compose_hardware_frame();
-    assert_eq!(composed.len(), 1, "empty frame should produce exactly 1 blanked point");
+    assert_eq!(
+        composed.len(),
+        1,
+        "empty frame should produce exactly 1 blanked point"
+    );
     assert_eq!(composed[0].x, 0.0);
     assert_eq!(composed[0].y, 0.0);
     assert_eq!(composed[0].intensity, 0, "point should be blanked");
@@ -476,7 +480,10 @@ fn test_engine_compose_hardware_frame_transition_to_empty_produces_blanked_point
     let empty = make_frame(vec![]);
     engine.set_pending(empty);
     let composed = engine.compose_hardware_frame();
-    assert!(!composed.is_empty(), "A→empty transition should not produce empty drawable");
+    assert!(
+        !composed.is_empty(),
+        "A→empty transition should not produce empty drawable"
+    );
     // All points should be blanked (transition is empty since B has no first_point)
     for p in composed {
         assert_eq!(p.intensity, 0, "all points should be blanked");
@@ -493,7 +500,11 @@ fn test_engine_compose_hardware_frame_self_loop_empty_produces_blanked_point() {
 
     // Second call: self-loop on the empty frame
     let composed = engine.compose_hardware_frame();
-    assert_eq!(composed.len(), 1, "self-loop on empty should produce 1 blanked point");
+    assert_eq!(
+        composed.len(),
+        1,
+        "self-loop on empty should produce 1 blanked point"
+    );
     assert_eq!(composed[0].intensity, 0);
 }
 
@@ -523,8 +534,16 @@ fn test_engine_compose_hardware_frame_clamps_to_capacity() {
         composed.len()
     );
     // The 5 authored frame points should all be present (only transition trimmed)
-    let frame_points: Vec<f32> = composed.iter().filter(|p| p.intensity > 0).map(|p| p.x).collect();
-    assert_eq!(frame_points, vec![1.0, 2.0, 3.0, 4.0, 5.0], "authored points must be preserved");
+    let frame_points: Vec<f32> = composed
+        .iter()
+        .filter(|p| p.intensity > 0)
+        .map(|p| p.x)
+        .collect();
+    assert_eq!(
+        frame_points,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        "authored points must be preserved"
+    );
 }
 
 #[test]

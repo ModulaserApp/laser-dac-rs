@@ -141,9 +141,23 @@ impl FrameSession {
 
         let thread = std::thread::spawn(move || {
             if is_frame_swap {
-                Self::run_frame_swap_loop(backend, config, control_clone, control_rx, slot_clone, reconnect_policy)
+                Self::run_frame_swap_loop(
+                    backend,
+                    config,
+                    control_clone,
+                    control_rx,
+                    slot_clone,
+                    reconnect_policy,
+                )
             } else {
-                Self::run_fifo_loop(backend, config, control_clone, control_rx, slot_clone, reconnect_policy)
+                Self::run_fifo_loop(
+                    backend,
+                    config,
+                    control_clone,
+                    control_rx,
+                    slot_clone,
+                    reconnect_policy,
+                )
             }
         });
 
@@ -196,9 +210,23 @@ impl FrameSession {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
 
         if is_udp_timed {
-            Self::run_udp_timed_loop(backend, config, control, control_rx, frame_slot, reconnect_policy)
+            Self::run_udp_timed_loop(
+                backend,
+                config,
+                control,
+                control_rx,
+                frame_slot,
+                reconnect_policy,
+            )
         } else {
-            Self::run_fifo_estimation_loop(backend, config, control, control_rx, frame_slot, reconnect_policy)
+            Self::run_fifo_estimation_loop(
+                backend,
+                config,
+                control,
+                control_rx,
+                frame_slot,
+                reconnect_policy,
+            )
         }
     }
 
