@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result, WriteOutcome};
 use crate::reconnect::{ReconnectPolicy, ReconnectTarget};
+use crate::scheduler;
 use crate::types::{
     ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
     StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
@@ -280,9 +281,6 @@ pub struct Stream {
 }
 
 impl Stream {
-    const UDP_TIMED_SLEEP_SLICE: Duration = Duration::from_millis(1);
-    const UDP_TIMED_BUSY_WAIT_THRESHOLD: Duration = Duration::from_micros(500);
-
     /// Convert a duration in microseconds to a point count at the given PPS, rounding up.
     fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
         if micros == 0 {
@@ -293,13 +291,16 @@ impl Stream {
     }
 
     fn udp_timed_sleep_slice(remaining: Duration) -> Option<Duration> {
-        if remaining <= Self::UDP_TIMED_BUSY_WAIT_THRESHOLD {
+        const UDP_TIMED_SLEEP_SLICE: Duration = Duration::from_millis(1);
+        const UDP_TIMED_BUSY_WAIT_THRESHOLD: Duration = Duration::from_micros(500);
+
+        if remaining <= UDP_TIMED_BUSY_WAIT_THRESHOLD {
             None
         } else {
             Some(
                 remaining
-                    .saturating_sub(Self::UDP_TIMED_BUSY_WAIT_THRESHOLD)
-                    .min(Self::UDP_TIMED_SLEEP_SLICE),
+                    .saturating_sub(UDP_TIMED_BUSY_WAIT_THRESHOLD)
+                    .min(UDP_TIMED_SLEEP_SLICE),
             )
         }
     }
@@ -679,12 +680,13 @@ impl Stream {
             // loop iterations are faster than 1/pps, (elapsed * pps) as u64 rounds
             // to 0 and scheduled_ahead never decrements, causing a permanent stall.
             let now = Instant::now();
-            let elapsed = now.duration_since(last_iteration);
-            let consumed_f64 = elapsed.as_secs_f64() * pps + self.state.fractional_consumed;
-            let points_consumed = consumed_f64 as u64;
-            self.state.fractional_consumed = consumed_f64 - points_consumed as f64;
-            self.state.scheduled_ahead = self.state.scheduled_ahead.saturating_sub(points_consumed);
-            last_iteration = now;
+            scheduler::advance_scheduled_ahead(
+                &mut self.state.scheduled_ahead,
+                &mut self.state.fractional_consumed,
+                &mut last_iteration,
+                now,
+                pps,
+            );
 
             // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
@@ -806,7 +808,6 @@ impl Stream {
             std::thread::sleep(slice);
             remaining = remaining.saturating_sub(slice);
 
-            // Process control messages for immediate response
             if self.process_control_messages() {
                 return Ok(true);
             }
@@ -1042,7 +1043,6 @@ impl Stream {
         loop {
             match self.control_rx.try_recv() {
                 Ok(ControlMsg::Arm) => {
-                    // Open shutter (best-effort) if not already open
                     if !self.state.shutter_open {
                         if let Some(backend) = &mut self.backend {
                             let _ = backend.set_shutter(true);
@@ -1051,7 +1051,6 @@ impl Stream {
                     }
                 }
                 Ok(ControlMsg::Disarm) => {
-                    // Close shutter immediately for safety
                     if self.state.shutter_open {
                         if let Some(backend) = &mut self.backend {
                             let _ = backend.set_shutter(false);
@@ -1080,14 +1079,10 @@ impl Stream {
     ///
     /// The estimated number of points currently buffered (points sent but not yet played).
     fn estimate_buffer_points(&self) -> u64 {
-        let software = self.state.scheduled_ahead;
-
-        // When hardware reports queue depth, use MINIMUM of hardware and software.
-        if let Some(device_queue) = self.backend.as_ref().and_then(|b| b.queued_points()) {
-            return device_queue.min(software);
-        }
-
-        software
+        scheduler::conservative_buffered_points(
+            self.state.scheduled_ahead,
+            self.backend.as_ref().and_then(|b| b.queued_points()),
+        )
     }
 
     /// Build a ChunkRequest with calculated buffer state and point requirements.

@@ -2034,6 +2034,24 @@ fn test_color_delay_reset_clears_carry() {
 }
 
 #[test]
+fn test_frame_fifo_buffer_estimation_matches_shared_scheduler_helper() {
+    // Regression guard for the FIFO FrameSession path: its buffered-point
+    // estimate should remain the shared conservative helper.
+    assert_eq!(
+        crate::scheduler::conservative_buffered_points(500, None),
+        500
+    );
+    assert_eq!(
+        crate::scheduler::conservative_buffered_points(500, Some(250)),
+        250
+    );
+    assert_eq!(
+        crate::scheduler::conservative_buffered_points(500, Some(900)),
+        500
+    );
+}
+
+#[test]
 fn test_frame_session_config_with_reconnect() {
     let config = FrameSessionConfig::new(30_000)
         .with_reconnect(crate::types::ReconnectConfig::new().max_retries(3));

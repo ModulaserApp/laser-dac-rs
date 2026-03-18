@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
+use crate::scheduler;
 use crate::stream::StreamControl;
 use crate::types::{DacInfo, LaserPoint, RunExit};
 
@@ -439,12 +440,13 @@ impl FrameSession {
 
             // Time-based decay of scheduled_ahead
             let now = Instant::now();
-            let elapsed = now.duration_since(last_iteration);
-            let consumed_f64 = elapsed.as_secs_f64() * pps + fractional_consumed;
-            let points_consumed = consumed_f64 as u64;
-            fractional_consumed = consumed_f64 - points_consumed as f64;
-            scheduled_ahead = scheduled_ahead.saturating_sub(points_consumed);
-            last_iteration = now;
+            scheduler::advance_scheduled_ahead(
+                &mut scheduled_ahead,
+                &mut fractional_consumed,
+                &mut last_iteration,
+                now,
+                pps,
+            );
 
             // 2. Check for new frame (latest-wins slot)
             if let Some(frame) = frame_slot.lock().unwrap().take() {
@@ -453,11 +455,8 @@ impl FrameSession {
             }
 
             // 3. Estimate buffer
-            let buffered = if let Some(hw) = backend.queued_points() {
-                hw.min(scheduled_ahead)
-            } else {
-                scheduled_ahead
-            };
+            let buffered =
+                scheduler::conservative_buffered_points(scheduled_ahead, backend.queued_points());
 
             // 4. Sleep if buffer healthy
             if buffered > target_buffer_points {
