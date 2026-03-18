@@ -29,18 +29,16 @@ pub enum Shape {
     Circle,
     OrbitingCircle,
     TestPattern,
-    Audio,
 }
 
 impl Shape {
-    #[allow(dead_code)] // Used by stream/callback/frame_session examples, not audio
+    #[allow(dead_code)] // Used by stream/frame examples, not audio
     pub fn name(&self) -> &'static str {
         match self {
             Shape::Triangle => "triangle",
             Shape::Circle => "circle",
             Shape::OrbitingCircle => "orbiting-circle",
             Shape::TestPattern => "test-pattern",
-            Shape::Audio => "audio",
         }
     }
 }
@@ -51,14 +49,14 @@ impl Shape {
 /// of the shape. This frame is then streamed continuously by wrapping around
 /// — the DAC never waits for frame boundaries.
 ///
-/// For time-based shapes (OrbitingCircle, Audio), use `make_producer` instead.
+/// For time-based shapes (OrbitingCircle), use `make_producer` instead.
 pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
     let mut frame = vec![LaserPoint::default(); n_points];
     match shape {
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
         Shape::Circle => fill_circle_points(&mut frame, n_points),
         Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
-        Shape::OrbitingCircle | Shape::Audio => {
+        Shape::OrbitingCircle => {
             panic!("time-based shapes don't have static frames; use make_producer()")
         }
     }
@@ -74,7 +72,7 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
 /// once and cycles through it with a cursor — the index wraps at the end,
 /// just like real laser software works.
 ///
-/// For time-based shapes (OrbitingCircle, Audio), the callback computes each
+/// For time-based shapes (OrbitingCircle), the callback computes each
 /// point from the stream timestamp, producing smooth continuous animation.
 pub fn make_producer(
     shape: Shape,
@@ -90,14 +88,6 @@ pub fn make_producer(
             }
             ChunkResult::Filled(n)
         }),
-        Shape::Audio => {
-            let audio_config = audio::AudioConfig::default();
-            Box::new(move |req, buffer| {
-                let n = req.target_points.min(buffer.len());
-                audio::fill_audio_points(req, buffer, n, &audio_config);
-                ChunkResult::Filled(n)
-            })
-        }
         _ => {
             let frame = generate_frame(shape, points, scale);
             let mut cursor = 0usize;

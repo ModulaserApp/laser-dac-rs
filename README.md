@@ -37,14 +37,13 @@ Connect your laser DAC and run an example:
 
 ```bash
 # Frame API (recommended)
-cargo run --example frame_session -- circle
-cargo run --example frame_session -- triangle
+cargo run --example frame -- circle            # animated shape orbiting center
+cargo run --example frame -- triangle
 cargo run --example transitions -- default     # transition blanking between shapes
 cargo run --example transitions -- animated    # 3 shapes cycling with transitions
 
 # Streaming API (advanced)
 cargo run --example stream -- circle
-cargo run --example callback -- circle         # with progress counter
 cargo run --example reconnect -- circle        # auto-reconnect on disconnect
 
 # Other

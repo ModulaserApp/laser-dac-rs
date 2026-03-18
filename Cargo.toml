@@ -79,12 +79,8 @@ name = "stream"
 path = "examples/stream.rs"
 
 [[example]]
-name = "callback"
-path = "examples/callback.rs"
-
-[[example]]
-name = "frame_session"
-path = "examples/frame_session.rs"
+name = "frame"
+path = "examples/frame.rs"
 
 [[example]]
 name = "audio"
