@@ -96,9 +96,10 @@ This is useful for intentionally clearing the display.
 
 When frames change, the library automatically inserts blanked transition points between
 the last point of the outgoing frame and the first point of the incoming frame. The
-default transition uses a 3-phase blanking sequence: end dwell (100µs at source),
-quintic-eased transit (distance-scaled, 0–8 points), and start dwell (165µs at
-destination). Dwell durations are converted to point counts based on PPS.
+default transition uses a 3-phase blanking sequence: end dwell (~100µs at source),
+quintic-eased transit (distance-scaled by L-infinity distance, 0-64 points), and
+start dwell (~400µs at destination). Dwell durations are converted to point counts
+based on PPS.
 
 You can supply your own transition function for custom blanking strategies.
 The callback returns a `TransitionPlan` describing what to do at each seam:
@@ -246,7 +247,7 @@ mirrors are in position.
 ```rust
 use std::time::Duration;
 
-// Frame mode: set via config (applied at composition time)
+// Frame mode: set via config
 let config = FrameSessionConfig::new(30_000)
     .with_color_delay_points(5);
 
@@ -255,9 +256,15 @@ let config = StreamConfig::new(30_000)
     .with_color_delay(Duration::from_micros(100));
 ```
 
-Frame mode enables color delay by default (150us equivalent). Streaming mode
-disables it by default. Can also be changed at runtime in streaming mode via
-`stream.control().set_color_delay(...)`.
+Frame mode enables color delay by default (150us equivalent at the configured PPS).
+It is applied statefully to the emitted point stream:
+
+- FIFO DACs carry delay across chunks
+- Frame-swap DACs carry delay across submitted frames
+- Transition points between frames are included in the delayed stream
+
+Streaming mode disables color delay by default. It can also be changed at runtime
+via `stream.control().set_color_delay(...)`.
 
 Typical values: 50-200us depending on scanner speed.
 
