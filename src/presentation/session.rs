@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::error::{Error, Result};
-use crate::reconnect::ReconnectPolicy;
+use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
 use crate::scheduler;
 use crate::stream::StreamControl;
 use crate::types::{DacInfo, LaserPoint, RunExit};
@@ -749,106 +749,50 @@ impl FrameSession {
         config_pps: u32,
         expected_frame_swap: bool,
     ) -> std::result::Result<DacInfo, RunExit> {
-        // Fire on_disconnect
-        if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
-            cb(&Error::disconnected("backend disconnected"));
-        }
-
-        let mut retries = 0u32;
-        loop {
-            if control.is_stop_requested() {
-                return Err(RunExit::Stopped);
-            }
-            if let Some(max) = policy.max_retries {
-                if retries >= max {
+        let (info, new_backend) = reconnect_backend_with_retry(
+            policy,
+            || control.is_stop_requested(),
+            |info, new_backend| {
+                if config_pps < info.caps.pps_min || config_pps > info.caps.pps_max {
+                    log::error!(
+                        "'{}' PPS {} outside new device range [{}, {}]",
+                        policy.target.device_id,
+                        config_pps,
+                        info.caps.pps_min,
+                        info.caps.pps_max
+                    );
                     return Err(RunExit::Disconnected);
                 }
-            }
 
-            // Backoff
-            if ReconnectPolicy::sleep_with_stop(policy.backoff, || control.is_stop_requested()) {
-                return Err(RunExit::Stopped);
-            }
-
-            log::info!(
-                "'{}' reconnect attempt {} ...",
-                policy.target.device_id,
-                retries + 1
-            );
-
-            let device = match policy.target.open_device() {
-                Ok(d) => d,
-                Err(err) => {
-                    if !ReconnectPolicy::is_retriable(&err) {
-                        return Err(RunExit::Disconnected);
-                    }
-                    log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
-                    retries = retries.saturating_add(1);
-                    continue;
+                if new_backend.is_frame_swap() != expected_frame_swap {
+                    log::error!(
+                        "'{}' reconnected device has incompatible backend type",
+                        policy.target.device_id
+                    );
+                    return Err(RunExit::Disconnected);
                 }
-            };
 
-            let info = device.info().clone();
-            let mut new_backend = match device.into_backend() {
-                Some(b) => b,
-                None => {
-                    retries = retries.saturating_add(1);
-                    continue;
-                }
-            };
+                Ok(())
+            },
+        )?;
 
-            // Validate PPS against new device
-            if config_pps < info.caps.pps_min || config_pps > info.caps.pps_max {
-                log::error!(
-                    "'{}' PPS {} outside new device range [{}, {}]",
-                    policy.target.device_id,
-                    config_pps,
-                    info.caps.pps_min,
-                    info.caps.pps_max
-                );
-                return Err(RunExit::Disconnected);
-            }
+        // Swap backend
+        *backend = new_backend;
+        *shutter_open = false;
+        *last_armed = false;
 
-            // Verify backend type matches the scheduler loop
-            if new_backend.is_frame_swap() != expected_frame_swap {
-                log::error!(
-                    "'{}' reconnected device has incompatible backend type",
-                    policy.target.device_id
-                );
-                return Err(RunExit::Disconnected);
-            }
-
-            if !new_backend.is_connected() {
-                if let Err(err) = new_backend.connect() {
-                    if !ReconnectPolicy::is_retriable(&err) {
-                        return Err(RunExit::Disconnected);
-                    }
-                    log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
-                    retries = retries.saturating_add(1);
-                    continue;
-                }
-            }
-
-            log::info!("'{}' reconnected successfully", policy.target.device_id);
-
-            // Swap backend
-            *backend = new_backend;
-            *shutter_open = false;
-            *last_armed = false;
-
-            // Reset engine and replay last frame
-            engine.reset();
-            if let Some(frame) = last_frame {
-                engine.set_pending(frame.clone());
-            }
-
-            // Fire on_reconnect
-            if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
-                cb(&info);
-            }
-
-            return Ok(info);
+        // Reset engine and replay last frame
+        engine.reset();
+        if let Some(frame) = last_frame {
+            engine.set_pending(frame.clone());
         }
+
+        // Fire on_reconnect
+        if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
+            cb(&info);
+        }
+
+        Ok(info)
     }
 
     /// Handle arm/disarm shutter transitions.

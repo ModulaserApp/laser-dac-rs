@@ -11,10 +11,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{Error, Result};
+use crate::backend::{BackendKind, Error, Result};
 use crate::discovery::DacDiscovery;
 use crate::stream::Dac;
-use crate::types::{DacInfo, ReconnectConfig};
+use crate::types::{DacInfo, ReconnectConfig, RunExit};
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;
@@ -93,5 +93,88 @@ impl ReconnectPolicy {
             remaining = remaining.saturating_sub(slice);
         }
         is_stopped()
+    }
+}
+
+/// Re-open, validate, and connect a backend using the policy retry loop.
+///
+/// This is the shared reconnect scaffolding used by stream and frame schedulers.
+/// Scheduler-specific state reset and callback timing remain local to the caller.
+pub(crate) fn reconnect_backend_with_retry<FStop, FValidate>(
+    policy: &ReconnectPolicy,
+    is_stopped: FStop,
+    validate: FValidate,
+) -> std::result::Result<(DacInfo, BackendKind), RunExit>
+where
+    FStop: Fn() -> bool,
+    FValidate: Fn(&DacInfo, &BackendKind) -> std::result::Result<(), RunExit>,
+{
+    if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
+        cb(&Error::disconnected("backend disconnected"));
+    }
+
+    let mut retries = 0u32;
+    loop {
+        if is_stopped() {
+            return Err(RunExit::Stopped);
+        }
+
+        if let Some(max) = policy.max_retries {
+            if retries >= max {
+                return Err(RunExit::Disconnected);
+            }
+        }
+
+        if ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped) {
+            return Err(RunExit::Stopped);
+        }
+
+        log::info!(
+            "'{}' reconnect attempt {} ...",
+            policy.target.device_id,
+            retries + 1
+        );
+
+        let device = match policy.target.open_device() {
+            Ok(d) => d,
+            Err(err) => {
+                if !ReconnectPolicy::is_retriable(&err) {
+                    log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
+                    return Err(RunExit::Disconnected);
+                }
+                log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
+                retries = retries.saturating_add(1);
+                continue;
+            }
+        };
+
+        let info = device.info().clone();
+        let mut backend = match device.into_backend() {
+            Some(b) => b,
+            None => {
+                retries = retries.saturating_add(1);
+                continue;
+            }
+        };
+
+        validate(&info, &backend)?;
+
+        if !backend.is_connected() {
+            match backend.connect() {
+                Ok(()) => {}
+                Err(err) => {
+                    if !ReconnectPolicy::is_retriable(&err) {
+                        log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
+                        return Err(RunExit::Disconnected);
+                    }
+                    log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
+                    retries = retries.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+
+        log::info!("'{}' reconnected successfully", policy.target.device_id);
+        return Ok((info, backend));
     }
 }

@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result, WriteOutcome};
-use crate::reconnect::{ReconnectPolicy, ReconnectTarget};
+use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
 use crate::scheduler;
 use crate::types::{
     ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
@@ -482,113 +482,44 @@ impl Stream {
     ) -> std::result::Result<(), RunExit> {
         let policy = self.reconnect_policy.as_ref().unwrap();
 
-        // Fire on_disconnect callback
-        if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
-            cb(&Error::disconnected("backend disconnected"));
-        }
-
-        let mut retries = 0u32;
-        loop {
-            if self.control.is_stop_requested() {
-                return Err(RunExit::Stopped);
-            }
-
-            if let Some(max) = policy.max_retries {
-                if retries >= max {
+        let (info, new_backend) = reconnect_backend_with_retry(
+            policy,
+            || self.control.is_stop_requested(),
+            |info, new_backend| {
+                if new_backend.is_frame_swap() {
+                    log::error!(
+                        "'{}' reconnected device is frame-swap, incompatible with streaming",
+                        policy.target.device_id
+                    );
                     return Err(RunExit::Disconnected);
                 }
-            }
 
-            // Backoff sleep
-            if ReconnectPolicy::sleep_with_stop(policy.backoff, || self.control.is_stop_requested())
-            {
-                return Err(RunExit::Stopped);
-            }
-
-            log::info!(
-                "'{}' reconnect attempt {} ...",
-                policy.target.device_id,
-                retries + 1
-            );
-
-            // Open device
-            let device = match policy.target.open_device() {
-                Ok(d) => d,
-                Err(err) => {
-                    if !ReconnectPolicy::is_retriable(&err) {
-                        log::error!("'{}' non-retriable error: {}", policy.target.device_id, err);
-                        return Err(RunExit::Disconnected);
-                    }
-                    log::warn!("'{}' open_device failed: {}", policy.target.device_id, err);
-                    retries = retries.saturating_add(1);
-                    continue;
+                if Dac::validate_pps(&info.caps, self.config.pps).is_err() {
+                    log::error!(
+                        "'{}' config invalid for new device",
+                        policy.target.device_id
+                    );
+                    return Err(RunExit::Disconnected);
                 }
-            };
 
-            // Get backend from device and connect
-            let info = device.info().clone();
-            let mut new_backend = match device.into_backend() {
-                Some(b) => b,
-                None => {
-                    retries = retries.saturating_add(1);
-                    continue;
-                }
-            };
+                Ok(())
+            },
+        )?;
 
-            if !new_backend.is_connected() {
-                match new_backend.connect() {
-                    Ok(()) => {}
-                    Err(err) => {
-                        if !ReconnectPolicy::is_retriable(&err) {
-                            log::error!(
-                                "'{}' non-retriable error: {}",
-                                policy.target.device_id,
-                                err
-                            );
-                            return Err(RunExit::Disconnected);
-                        }
-                        log::warn!("'{}' connect failed: {}", policy.target.device_id, err);
-                        retries = retries.saturating_add(1);
-                        continue;
-                    }
-                }
-            }
+        // Swap the backend
+        self.backend = Some(new_backend);
+        self.info = info;
 
-            // Reject frame-swap backends (same invariant as start_stream)
-            if new_backend.is_frame_swap() {
-                log::error!(
-                    "'{}' reconnected device is frame-swap, incompatible with streaming",
-                    policy.target.device_id
-                );
-                return Err(RunExit::Disconnected);
-            }
+        // Reset all runtime state for the new connection
+        self.reset_state_for_reconnect(last_iteration);
 
-            log::info!("'{}' reconnected successfully", policy.target.device_id);
-
-            // Swap the backend
-            self.backend = Some(new_backend);
-            self.info = info;
-
-            // Validate config against new device
-            if Dac::validate_pps(&self.info.caps, self.config.pps).is_err() {
-                log::error!(
-                    "'{}' config invalid for new device",
-                    policy.target.device_id
-                );
-                return Err(RunExit::Disconnected);
-            }
-
-            // Reset all runtime state for the new connection
-            self.reset_state_for_reconnect(last_iteration);
-
-            // Fire on_reconnect callback
-            let policy = self.reconnect_policy.as_ref().unwrap();
-            if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
-                cb(&self.info);
-            }
-
-            return Ok(());
+        // Fire on_reconnect callback
+        let policy = self.reconnect_policy.as_ref().unwrap();
+        if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
+            cb(&self.info);
         }
+
+        Ok(())
     }
 
     /// Reset all runtime state for a reconnected device.
