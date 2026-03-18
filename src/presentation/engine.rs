@@ -2,7 +2,7 @@
 
 use crate::types::LaserPoint;
 
-use super::{Frame, TransitionFn};
+use super::{Frame, TransitionFn, TransitionPlan};
 
 // =============================================================================
 // PresentationEngine
@@ -92,10 +92,12 @@ impl PresentationEngine {
 
     /// FIFO delivery: fill `buffer[..max_points]` from the current frame.
     ///
-    /// Traverses the current frame cyclically. On self-loop, the cursor
-    /// wraps without inserting transition points. When a pending frame is
-    /// promoted, transition points are injected between the old frame's
-    /// last point and the new frame's first point.
+    /// Traverses the drawable cyclically. The drawable includes self-loop
+    /// transition points as a suffix, so every seam (including A→A) runs
+    /// through the transition function.
+    ///
+    /// When a pending frame is promoted, transition points are injected
+    /// between the old frame's last point and the new frame's first point.
     ///
     /// Returns the number of points written (always `max_points` if a
     /// frame is available, 0 if no frame has been submitted).
@@ -137,21 +139,48 @@ impl PresentationEngine {
             written += 1;
             self.cursor += 1;
 
-            // Check if we've completed the frame
+            // Check if we've completed the drawable
             if self.cursor >= self.drawable.len() {
                 if let Some(pending) = self.pending_base.take() {
-                    // Frame change: inject transition, then promote
-                    let last = self.drawable.last().unwrap();
+                    // Frame change: compute transition from current base's
+                    // real last point to the new frame's first point.
+                    let outgoing_last = self
+                        .current_base
+                        .as_ref()
+                        .and_then(|f| f.last_point())
+                        .copied();
                     let new_frame = pending;
-                    if let Some(first) = new_frame.first_point() {
-                        self.transition_buf = (self.transition_fn)(last, first);
-                        self.transition_cursor = 0;
+                    let mut coalesce = false;
+
+                    if let (Some(last), Some(first)) =
+                        (outgoing_last.as_ref(), new_frame.first_point())
+                    {
+                        match (self.transition_fn)(last, first) {
+                            TransitionPlan::Transition(points) => {
+                                self.transition_buf = points;
+                                self.transition_cursor = 0;
+                            }
+                            TransitionPlan::Coalesce => {
+                                self.transition_buf.clear();
+                                coalesce = true;
+                            }
+                        }
                     }
+
                     self.current_base = Some(new_frame);
                     self.refresh_drawable();
-                    self.cursor = 0;
+
+                    if coalesce {
+                        // Skip the incoming first point (it's the same
+                        // logical point as the outgoing last). Bound by
+                        // drawable length in case self-loop also coalesced.
+                        self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
+                    } else {
+                        self.cursor = 0;
+                    }
                 } else {
-                    // Self-loop: just wrap the cursor, no transition
+                    // Self-loop: the drawable already contains the seam
+                    // (transition suffix or coalesced base), just wrap.
                     self.cursor = 0;
                 }
             }
@@ -167,23 +196,31 @@ impl PresentationEngine {
     /// The next call without a pending frame will recompute the self-loop.
     ///
     /// On self-loop (no pending): computes `transition_fn(A.last, A.first)`,
-    /// composes `[transition | A_points]`.
+    /// composes `[transition | A_points]` (or coalesced).
     pub fn compose_hardware_frame(&mut self) -> &[LaserPoint] {
         if let Some(pending) = self.pending_base.take() {
             // Frame change: A→B transition.
             // Compute transition from current (A) to pending (B) BEFORE promoting.
-            let transition = match &self.current_base {
+            let plan = match &self.current_base {
                 Some(current) => match (current.last_point(), pending.first_point()) {
                     (Some(last), Some(first)) => (self.transition_fn)(last, first),
-                    _ => vec![],
+                    _ => TransitionPlan::Transition(vec![]),
                 },
-                None => vec![],
+                None => TransitionPlan::Transition(vec![]),
             };
 
             self.drawable.clear();
-            self.frame_swap_transition_len = transition.len();
-            self.drawable.extend_from_slice(&transition);
-            self.drawable.extend_from_slice(pending.points());
+            match plan {
+                TransitionPlan::Transition(transition) => {
+                    self.frame_swap_transition_len = transition.len();
+                    self.drawable.extend_from_slice(&transition);
+                    self.drawable.extend_from_slice(pending.points());
+                }
+                TransitionPlan::Coalesce => {
+                    self.frame_swap_transition_len = 0;
+                    self.drawable.extend_from_slice(pending.points());
+                }
+            }
 
             // Empty frame submitted: send a blanked point to clear the display
             if self.drawable.is_empty() {
@@ -211,8 +248,8 @@ impl PresentationEngine {
     ///
     /// Frame-swap DACs send the entire drawable as one atomic frame, so the
     /// transition from last→first point is included for clean looping.
-    /// For nearly-closed shapes (circles), the transition function returns
-    /// empty, so the frame loops seamlessly.
+    /// For nearly-closed shapes (circles), `Coalesce` omits the last base
+    /// point so the frame loops seamlessly without a duplicate seam point.
     fn refresh_drawable_for_frame_swap(&mut self) {
         self.drawable.clear();
         self.drawable_dirty = false;
@@ -229,12 +266,8 @@ impl PresentationEngine {
         }
 
         let points = current.points();
-        let last = points.last().unwrap();
-        let first = points.first().unwrap();
-        let transition = (self.transition_fn)(last, first);
-        self.frame_swap_transition_len = transition.len();
-        self.drawable.extend_from_slice(&transition);
-        self.drawable.extend_from_slice(points);
+        self.frame_swap_transition_len =
+            build_self_loop_drawable(&self.transition_fn, points, &mut self.drawable, true);
         self.clamp_to_capacity();
     }
 
@@ -251,7 +284,10 @@ impl PresentationEngine {
         }
     }
 
-    /// Rebuild the drawable from the current base frame.
+    /// Rebuild the FIFO drawable from the current base frame.
+    ///
+    /// The drawable is `[base (coalesce-adjusted) | transition_suffix]`,
+    /// so self-loops traverse transition points on every cycle.
     fn refresh_drawable(&mut self) {
         self.drawable.clear();
         self.drawable_dirty = false;
@@ -260,7 +296,57 @@ impl PresentationEngine {
             return;
         };
 
-        self.drawable.extend_from_slice(current.points());
+        if current.is_empty() {
+            return;
+        }
+
+        let points = current.points();
+        build_self_loop_drawable(&self.transition_fn, points, &mut self.drawable, false);
+    }
+}
+
+/// Build a seam-adjusted drawable for a self-loop, applying the transition
+/// function to the seam between the frame's last and first points.
+///
+/// For `Transition(points)`: places transition as prefix (frame-swap) or
+/// suffix (FIFO) depending on `prefix_mode`.
+///
+/// For `Coalesce`: omits the last base point so the loop represents the
+/// seam point once. Single-point frames are kept unchanged.
+///
+/// Returns the number of transition points in the drawable.
+fn build_self_loop_drawable(
+    transition_fn: &TransitionFn,
+    base: &[LaserPoint],
+    drawable: &mut Vec<LaserPoint>,
+    prefix_mode: bool,
+) -> usize {
+    let last = base.last().unwrap();
+    let first = base.first().unwrap();
+    let plan = transition_fn(last, first);
+
+    match plan {
+        TransitionPlan::Transition(pts) => {
+            let transition_len = pts.len();
+            if prefix_mode {
+                drawable.extend_from_slice(&pts);
+                drawable.extend_from_slice(base);
+            } else {
+                drawable.extend_from_slice(base);
+                drawable.extend_from_slice(&pts);
+            }
+            transition_len
+        }
+        TransitionPlan::Coalesce => {
+            if base.len() > 1 {
+                // Omit the last base point — on wrap, cursor returns to
+                // first which is the same logical point.
+                drawable.extend_from_slice(&base[..base.len() - 1]);
+            } else {
+                drawable.extend_from_slice(base);
+            }
+            0
+        }
     }
 }
 

@@ -98,35 +98,50 @@ When frames change, the library automatically inserts blanked transition points 
 the last point of the outgoing frame and the first point of the incoming frame. The
 default transition uses distance-scaled dwell-travel-dwell blanking.
 
-You can supply your own transition function for custom blanking strategies:
+You can supply your own transition function for custom blanking strategies.
+The callback returns a `TransitionPlan` describing what to do at each seam:
 
 ```rust
-use laser_dac::{FrameSessionConfig, LaserPoint};
+use laser_dac::{FrameSessionConfig, LaserPoint, TransitionPlan};
 
 let config = FrameSessionConfig::new(30_000)
     .with_transition_fn(Box::new(|from: &LaserPoint, to: &LaserPoint| {
         // Custom blanking: 4 linearly interpolated blank points
-        (0..4).map(|i| {
-            let t = (i + 1) as f32 / 5.0;
-            LaserPoint::blanked(
-                from.x + (to.x - from.x) * t,
-                from.y + (to.y - from.y) * t,
-            )
-        }).collect()
+        TransitionPlan::Transition(
+            (0..4).map(|i| {
+                let t = (i + 1) as f32 / 5.0;
+                LaserPoint::blanked(
+                    from.x + (to.x - from.x) * t,
+                    from.y + (to.y - from.y) * t,
+                )
+            }).collect()
+        )
     }));
 ```
+
+`TransitionPlan` has two variants:
+
+- **`Transition(points)`** — keep both seam endpoints, insert `points` between them.
+  `Transition(vec![])` keeps both endpoints with nothing in between.
+- **`Coalesce`** — the two seam endpoints are the same logical point; emit only one
+  copy. Use this for closed shapes (circles) to avoid a duplicate point at the seam.
+
+Self-loops (A→A) also run through the transition callback, so seam planning is
+consistent regardless of whether the frame changed.
 
 For frame-swap DACs, if the authored frame plus transition points would exceed
 the hardware capacity (e.g. Helios 4095 points), the transition prefix is
 automatically truncated. Authored frame content is never dropped.
 
-Or disable transition blanking entirely by returning an empty vec:
+Or disable transition blanking entirely:
 
 ```rust
-use laser_dac::{FrameSessionConfig, LaserPoint};
+use laser_dac::{FrameSessionConfig, LaserPoint, TransitionPlan};
 
 let config = FrameSessionConfig::new(30_000)
-    .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]));
+    .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+        TransitionPlan::Transition(vec![])
+    }));
 ```
 
 ### Reconnecting Frame Session
@@ -207,7 +222,8 @@ Each backend handles conversion to its native format internally.
 | `Frame`       | Immutable frame of laser points for frame-mode output   |
 | `FrameSession`        | Active frame-mode session with automatic looping        |
 | `FrameSessionConfig`  | Frame session settings (PPS, transition fn, color delay) |
-| `TransitionFn`        | Callback for computing blanking between frames          |
+| `TransitionFn`        | Callback for computing transition plan between frames   |
+| `TransitionPlan`      | Enum: `Transition(points)` or `Coalesce` at seams       |
 | `DacInfo`             | DAC metadata (name, type, capabilities)                 |
 | `Dac`                 | Opened DAC ready for streaming                          |
 | `Stream`              | Active streaming session (callback mode)                |

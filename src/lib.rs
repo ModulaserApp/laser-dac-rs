@@ -126,7 +126,9 @@ pub use types::{
 pub use stream::{Dac, Stream, StreamControl};
 
 // Presentation types (frame-first API)
-pub use presentation::{default_transition, Frame, FrameSession, FrameSessionConfig, TransitionFn};
+pub use presentation::{
+    default_transition, Frame, FrameSession, FrameSessionConfig, TransitionFn, TransitionPlan,
+};
 
 // Conditional exports based on features
 

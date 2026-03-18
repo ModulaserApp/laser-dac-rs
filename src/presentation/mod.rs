@@ -88,15 +88,29 @@ impl From<Vec<LaserPoint>> for Frame {
 // TransitionFn
 // =============================================================================
 
-/// Callback that generates transition (blanking) points between frames.
+/// Describes how to handle the seam between two adjacent frame endpoints.
+///
+/// Returned by [`TransitionFn`] to tell the engine what to do at each seam —
+/// including self-loops (A→A) and frame changes (A→B).
+#[derive(Clone, Debug)]
+pub enum TransitionPlan {
+    /// Keep both seam endpoints and insert these points between them.
+    /// An empty vec keeps both endpoints with nothing in between.
+    Transition(Vec<LaserPoint>),
+    /// The two seam endpoints are the same logical point — coalesce them
+    /// so only one copy appears in the output.
+    Coalesce,
+}
+
+/// Callback that generates a transition plan between frames.
 ///
 /// Called with the last point of the outgoing frame and the first point of
-/// the incoming frame. Returns a vector of blanked/interpolated points to
-/// insert between them.
+/// the incoming frame. Returns a [`TransitionPlan`] describing how to handle
+/// the seam.
 ///
-/// The returned points are inserted between the two frames in the output
-/// stream. Return an empty vec to skip transition points entirely.
-pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> Vec<LaserPoint> + Send>;
+/// Self-loops (A→A) also run through this callback, so transition planning
+/// is consistent regardless of whether the frame changed.
+pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> TransitionPlan + Send>;
 
 /// Default transition: dwell → travel → dwell, all blanked, scaled by distance.
 ///
@@ -108,16 +122,16 @@ pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> Vec<LaserPoint> 
 /// All point counts scale with the distance between `from` and `to`.
 /// At 30kpps, a full-range diagonal jump gets ~5ms total blanking.
 /// Nearby points get a minimal ~0.5ms pause.
-pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint> {
+pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> TransitionPlan {
     let dx = to.x - from.x;
     let dy = to.y - from.y;
     let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
 
-    // If points are nearly adjacent, no blanking needed — the galvos can
-    // handle the tiny step without visible artifacts. This prevents gaps
-    // at the loop point of closed shapes (circles, etc.) on frame-swap DACs.
+    // If points are nearly adjacent, coalesce them — the galvos can handle
+    // the tiny step without visible artifacts. This prevents duplicate
+    // points at the loop seam of closed shapes (circles, etc.).
     if distance < 0.02 {
-        return vec![];
+        return TransitionPlan::Coalesce;
     }
 
     let dwell = (3.0 + distance * 12.0).ceil() as usize; // 3..~37 per end
@@ -141,7 +155,7 @@ pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> Vec<LaserPoint>
         points.push(LaserPoint::blanked(to.x, to.y));
     }
 
-    points
+    TransitionPlan::Transition(points)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ mod common;
 use clap::Parser;
 use laser_dac::{
     default_transition, list_devices, open_device, Frame, FrameSessionConfig, LaserPoint, Result,
-    TransitionFn,
+    TransitionFn, TransitionPlan,
 };
 use std::f32::consts::PI;
 use std::thread;
@@ -75,7 +75,7 @@ fn main() -> Result<()> {
 
     let transition_fn: TransitionFn = match args.mode {
         Mode::Default | Mode::Animated => Box::new(default_transition),
-        Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| vec![]),
+        Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| TransitionPlan::Transition(vec![])),
     };
 
     let config = FrameSessionConfig::new(30_000)
