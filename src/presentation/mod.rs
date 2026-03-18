@@ -112,48 +112,30 @@ pub enum TransitionPlan {
 /// is consistent regardless of whether the frame changed.
 pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> TransitionPlan + Send>;
 
-/// Default transition: dwell → travel → dwell, all blanked, scaled by distance.
+/// Default transition: blank at source → linear travel → blank at destination.
 ///
-/// Produces three phases of blanked points:
-/// 1. **Dwell at source** — stationary at `from`, gives galvos time to decelerate
-/// 2. **Linear travel** — interpolated from `from` to `to`
-/// 3. **Dwell at destination** — stationary at `to`, lets galvos settle before laser fires
-///
-/// All point counts scale with the distance between `from` and `to`.
-/// At 30kpps, a full-range diagonal jump gets ~5ms total blanking.
-/// Nearby points get a minimal ~0.5ms pause.
+/// Always inserts blanking, even for nearby points. The number of travel
+/// steps scales with the distance between `from` and `to` (minimum 1).
 pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> TransitionPlan {
     let dx = to.x - from.x;
     let dy = to.y - from.y;
     let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
 
-    // If points are nearly adjacent, no blanking needed — the galvos can
-    // handle the tiny step without visible artifacts. This prevents gaps
-    // at the loop point of closed shapes (circles, etc.) on frame-swap DACs.
-    if distance < 0.02 {
-        return TransitionPlan::Transition(vec![]);
-    }
+    let travel = (distance * 30.0).ceil().max(1.0) as usize; // 1..~85
 
-    let dwell = (3.0 + distance * 12.0).ceil() as usize; // 3..~37 per end
-    let travel = (5.0 + distance * 30.0).ceil() as usize; // 5..~90
+    let mut points = Vec::with_capacity(travel + 2);
 
-    let mut points = Vec::with_capacity(dwell * 2 + travel);
+    // Blank at source
+    points.push(LaserPoint::blanked(from.x, from.y));
 
-    // Phase 1: dwell at source (decelerate, laser already off)
-    for _ in 0..dwell {
-        points.push(LaserPoint::blanked(from.x, from.y));
-    }
-
-    // Phase 2: linear travel
+    // Linear travel
     for i in 0..travel {
         let t = (i + 1) as f32 / (travel + 1) as f32;
         points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
     }
 
-    // Phase 3: dwell at destination (settle before laser fires)
-    for _ in 0..dwell {
-        points.push(LaserPoint::blanked(to.x, to.y));
-    }
+    // Blank at destination
+    points.push(LaserPoint::blanked(to.x, to.y));
 
     TransitionPlan::Transition(points)
 }

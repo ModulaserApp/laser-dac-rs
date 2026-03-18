@@ -71,12 +71,10 @@ fn test_default_transition_scales_with_distance() {
     let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
     let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
 
-    // Near points should produce empty transition (no blanking needed)
-    assert!(
-        matches!(near, TransitionPlan::Transition(ref pts) if pts.is_empty()),
-        "very near points should produce empty transition"
-    );
-
+    let near_pts = match near {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("near should produce Transition"),
+    };
     let far_pts = match far {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("far should produce Transition"),
@@ -86,32 +84,43 @@ fn test_default_transition_scales_with_distance() {
         _ => panic!("mid should produce Transition"),
     };
 
+    // Near points still get blanking (at least blank-at-source + travel + blank-at-dest)
     assert!(
-        far_pts.len() >= 100,
-        "far should produce many points, got {}",
-        far_pts.len()
+        near_pts.len() >= 3,
+        "near should still produce blanking, got {}",
+        near_pts.len()
     );
     assert!(
-        mid_pts.len() < far_pts.len(),
-        "medium should be less than far"
+        far_pts.len() > mid_pts.len(),
+        "far should produce more points than medium"
+    );
+    assert!(
+        mid_pts.len() > near_pts.len(),
+        "medium should produce more points than near"
     );
 }
 
 #[test]
-fn test_default_transition_empty_for_tiny_distance() {
-    // Points closer than 0.02 should produce empty transition
+fn test_default_transition_always_blanks() {
+    // Even very close points get blanking
     let result = default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
+    let pts = match result {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("should produce Transition"),
+    };
     assert!(
-        matches!(result, TransitionPlan::Transition(ref pts) if pts.is_empty()),
-        "tiny distance should produce empty transition"
+        pts.len() >= 3,
+        "even tiny distance should produce blanking, got {}",
+        pts.len()
     );
 
-    // Points just above threshold should produce non-empty transition
-    let result = default_transition(&make_point(0.0, 0.0), &make_point(0.03, 0.0));
-    assert!(
-        matches!(result, TransitionPlan::Transition(ref pts) if !pts.is_empty()),
-        "above-threshold distance should produce transition points"
-    );
+    // Farther points get more
+    let result = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
+    let pts2 = match result {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("should produce Transition"),
+    };
+    assert!(pts2.len() > pts.len());
 }
 
 #[test]
@@ -120,7 +129,7 @@ fn test_default_transition_all_blanked() {
     let to = make_point(1.0, 1.0);
     let result = match default_transition(&from, &to) {
         TransitionPlan::Transition(pts) => pts,
-        _ => panic!("expected Transition for distant points"),
+        _ => panic!("expected Transition"),
     };
     for p in &result {
         assert_eq!(p.r, 0, "r should be 0");
@@ -131,7 +140,7 @@ fn test_default_transition_all_blanked() {
 }
 
 #[test]
-fn test_default_transition_has_dwell_travel_dwell_structure() {
+fn test_default_transition_has_blank_travel_blank_structure() {
     let from = make_point(0.0, 0.0);
     let to = make_point(1.0, 0.0);
     let result = match default_transition(&from, &to) {
@@ -139,15 +148,14 @@ fn test_default_transition_has_dwell_travel_dwell_structure() {
         _ => panic!("expected Transition"),
     };
 
-    // First points should dwell at `from`
-    assert_eq!(result[0].x, 0.0, "should start dwelling at from");
-    assert_eq!(result[1].x, 0.0, "should still be dwelling at from");
+    // First point: blank at source
+    assert_eq!(result[0].x, 0.0, "should start blanked at from");
+    assert_eq!(result[0].intensity, 0);
 
-    // Last points should dwell at `to`
+    // Last point: blank at destination
     let last = result.last().unwrap();
-    assert_eq!(last.x, 1.0, "should end dwelling at to");
-    let second_last = &result[result.len() - 2];
-    assert_eq!(second_last.x, 1.0, "should still be dwelling at to");
+    assert_eq!(last.x, 1.0, "should end blanked at to");
+    assert_eq!(last.intensity, 0);
 
     // Middle points should be between from and to
     let mid_idx = result.len() / 2;
@@ -159,13 +167,21 @@ fn test_default_transition_has_dwell_travel_dwell_structure() {
 }
 
 #[test]
-fn test_default_transition_same_point_produces_empty() {
+fn test_default_transition_same_point_still_blanks() {
     let p = make_point(0.5, -0.3);
-    let result = default_transition(&p, &p);
+    let result = match default_transition(&p, &p) {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("expected Transition"),
+    };
+    // Even same point gets blanking (blank at source + travel + blank at dest)
     assert!(
-        matches!(result, TransitionPlan::Transition(ref pts) if pts.is_empty()),
-        "zero distance should produce empty transition"
+        result.len() >= 3,
+        "same point should still produce blanking, got {}",
+        result.len()
     );
+    for pt in &result {
+        assert_eq!(pt.intensity, 0);
+    }
 }
 
 // =========================================================================
