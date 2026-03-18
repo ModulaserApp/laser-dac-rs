@@ -296,7 +296,10 @@ fn fill_orientation_points(n_points: usize, scale: f32) -> Vec<LaserPoint> {
             triangle.push(LaserPoint::new(
                 x1 + (x2 - x1) * t,
                 y1 + (y2 - y1) * t,
-                0, WHITE, 0, WHITE, // green
+                0,
+                WHITE,
+                0,
+                WHITE, // green
             ));
         }
     }
