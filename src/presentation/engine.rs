@@ -72,6 +72,7 @@ impl PresentationEngine {
         self.cursor = 0;
         self.transition_buf.clear();
         self.transition_cursor = 0;
+        self.frame_swap_transition_len = 0;
     }
 
     /// Submit a new frame. Latest-wins: multiple calls before consumption
@@ -180,6 +181,7 @@ impl PresentationEngine {
             };
 
             self.drawable.clear();
+            self.frame_swap_transition_len = transition.len();
             self.drawable.extend_from_slice(&transition);
             self.drawable.extend_from_slice(pending.points());
 
@@ -216,6 +218,7 @@ impl PresentationEngine {
         self.drawable_dirty = false;
 
         let Some(current) = &self.current_base else {
+            self.frame_swap_transition_len = 0;
             return;
         };
 
@@ -229,6 +232,7 @@ impl PresentationEngine {
         let last = points.last().unwrap();
         let first = points.first().unwrap();
         let transition = (self.transition_fn)(last, first);
+        self.frame_swap_transition_len = transition.len();
         self.drawable.extend_from_slice(&transition);
         self.drawable.extend_from_slice(points);
         self.clamp_to_capacity();
