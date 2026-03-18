@@ -7,7 +7,7 @@
 //! The library handles looping (each frame repeats until replaced),
 //! transition blanking, and transport-appropriate delivery.
 //!
-//! Run with: `cargo run --example frame -- [triangle|circle|test-pattern]`
+//! Run with: `cargo run --example frame -- [triangle|circle|orientation|test-pattern]`
 
 mod common;
 
