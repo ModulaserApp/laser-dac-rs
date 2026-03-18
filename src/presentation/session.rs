@@ -262,6 +262,7 @@ impl FrameSession {
         let mut last_armed = false;
         let mut next_send = Instant::now();
         let mut last_frame: Option<Frame> = None;
+        let mut retry_points: Option<usize> = None;
 
         loop {
             // 1. High-precision wait until next send time
@@ -312,6 +313,7 @@ impl FrameSession {
                             chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
                             chunk_buffer.resize(chunk_points, LaserPoint::default());
                             color_delay.reset();
+                            retry_points = None;
                             continue;
                         }
                         Err(exit) => return Ok(exit),
@@ -337,27 +339,35 @@ impl FrameSession {
             );
 
             // 7. Fill chunk from engine
-            let n = engine.fill_chunk(&mut chunk_buffer, chunk_points);
-            if n == 0 {
-                continue;
-            }
+            let n = if let Some(n) = retry_points {
+                n
+            } else {
+                let n = engine.fill_chunk(&mut chunk_buffer, chunk_points);
+                if n == 0 {
+                    continue;
+                }
 
-            // Apply blanking modifications
-            Self::apply_blanking(
-                is_armed,
-                &mut startup_blank_remaining,
-                &mut chunk_buffer[..n],
-            );
+                // Apply blanking modifications
+                Self::apply_blanking(
+                    is_armed,
+                    &mut startup_blank_remaining,
+                    &mut chunk_buffer[..n],
+                );
 
-            // Apply color delay (stateful — carries across chunks)
-            color_delay.apply(&mut chunk_buffer[..n]);
+                // Apply color delay (stateful — carries across chunks)
+                color_delay.apply(&mut chunk_buffer[..n]);
+                retry_points = Some(n);
+                n
+            };
 
-            // 8. Write (no retry — if device is busy, skip this cycle
-            // and catch up next time. Retrying stalls the fixed-rate loop.)
+            // 8. Write. On backpressure, retry the exact same transmit
+            // buffer next cycle instead of advancing frame state.
             match backend.try_write(pps, &chunk_buffer[..n]) {
-                Ok(WriteOutcome::Written) => {}
+                Ok(WriteOutcome::Written) => {
+                    retry_points = None;
+                }
                 Ok(WriteOutcome::WouldBlock) => {
-                    // Device busy — we'll catch up next cycle
+                    // Device busy — keep retry_points set and retry next cycle
                 }
                 Err(e) if e.is_disconnected() => {
                     if let Some(ref policy) = reconnect_policy {
@@ -380,6 +390,7 @@ impl FrameSession {
                                     Duration::from_secs_f64(chunk_points as f64 / pps_f64);
                                 chunk_buffer.resize(chunk_points, LaserPoint::default());
                                 color_delay.reset();
+                                retry_points = None;
                                 continue;
                             }
                             Err(exit) => return Ok(exit),
@@ -603,6 +614,7 @@ impl FrameSession {
         let mut last_frame: Option<Frame> = None;
         let mut frame_buf: Vec<LaserPoint> = Vec::new();
         let mut color_delay = ColorDelayLine::new(config.color_delay_points);
+        let mut write_pending = false;
 
         loop {
             // 1. Check stop
@@ -633,6 +645,7 @@ impl FrameSession {
                         Ok(_info) => {
                             engine.set_frame_capacity(backend.frame_capacity());
                             color_delay.reset();
+                            write_pending = false;
                             continue;
                         }
                         Err(exit) => return Ok(exit),
@@ -658,29 +671,34 @@ impl FrameSession {
             );
 
             // 6. Check if device is ready
-            if !backend.is_ready_for_frame() {
+            if !write_pending && !backend.is_ready_for_frame() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
             }
 
             // 7. Compose frame and copy to reusable buffer
-            let composed = engine.compose_hardware_frame();
-            if composed.is_empty() {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
+            if !write_pending {
+                let composed = engine.compose_hardware_frame();
+                if composed.is_empty() {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                frame_buf.clear();
+                frame_buf.extend_from_slice(composed);
+
+                // Apply blanking modifications
+                Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
+
+                color_delay.apply(&mut frame_buf);
             }
-            frame_buf.clear();
-            frame_buf.extend_from_slice(composed);
-
-            // Apply blanking modifications
-            Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
-
-            color_delay.apply(&mut frame_buf);
 
             // 8. Write frame
             match backend.try_write(config.pps, &frame_buf) {
-                Ok(WriteOutcome::Written) => {}
+                Ok(WriteOutcome::Written) => {
+                    write_pending = false;
+                }
                 Ok(WriteOutcome::WouldBlock) => {
+                    write_pending = true;
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(e) if e.is_disconnected() => {
@@ -699,6 +717,7 @@ impl FrameSession {
                             Ok(_info) => {
                                 engine.set_frame_capacity(backend.frame_capacity());
                                 color_delay.reset();
+                                write_pending = false;
                                 continue;
                             }
                             Err(exit) => return Ok(exit),

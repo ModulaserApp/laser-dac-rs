@@ -86,6 +86,11 @@ loop {
 }
 ```
 
+For FIFO DACs, switching happens only at frame boundaries: the current frame is
+always finished before the next frame is chosen. Latest-wins applies until the
+next seam/chunk/frame has been materialized for transmission; once composed, that
+output is retried verbatim until the DAC accepts it.
+
 ### Empty Frames
 
 Submitting `Frame::new(vec![])` blanks the output (sends a single blanked point at origin).
@@ -130,6 +135,9 @@ let config = FrameSessionConfig::new(30_000)
 
 Self-loops (A→A) also run through the transition callback, so seam planning is
 consistent regardless of whether the frame changed.
+
+For perfect loops where the seam endpoints are the same logical point, return
+`Coalesce` to emit that seam point only once and avoid a visible halt.
 
 For frame-swap DACs, if the authored frame plus transition points would exceed
 the hardware capacity (e.g. Helios 4095 points), the transition prefix is

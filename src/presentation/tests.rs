@@ -1178,6 +1178,7 @@ use crate::backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend};
 use crate::error::Result as DacResult;
 use crate::types::RunExit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Minimal FIFO test backend for FrameSession tests.
 struct FifoTestBackend {
@@ -1316,6 +1317,190 @@ impl FrameSwapBackend for FrameSwapTestBackend {
     }
 }
 
+struct RetryFrameSwapTestBackend {
+    connected: bool,
+    caps: crate::types::DacCapabilities,
+    shutter_open: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    block_next_writes: Arc<AtomicUsize>,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+}
+
+impl RetryFrameSwapTestBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            caps: crate::types::DacCapabilities {
+                pps_min: 1000,
+                pps_max: 100000,
+                max_points_per_chunk: 4095,
+                output_model: crate::types::OutputModel::UsbFrameSwap,
+            },
+            shutter_open: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicBool::new(true)),
+            block_next_writes: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl DacBackend for RetryFrameSwapTestBackend {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("RetryFrameSwapTest".into())
+    }
+    fn caps(&self) -> &crate::types::DacCapabilities {
+        &self.caps
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, open: bool) -> DacResult<()> {
+        self.shutter_open.store(open, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FrameSwapBackend for RetryFrameSwapTestBackend {
+    fn frame_capacity(&self) -> usize {
+        self.caps.max_points_per_chunk
+    }
+    fn is_ready_for_frame(&mut self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+    fn write_frame(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
+        let remaining = self.block_next_writes.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.block_next_writes
+                .store(remaining - 1, Ordering::SeqCst);
+            return Ok(crate::backend::WriteOutcome::WouldBlock);
+        }
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+}
+
+struct RetryUdpTimedTestBackend {
+    connected: bool,
+    caps: crate::types::DacCapabilities,
+    shutter_open: Arc<AtomicBool>,
+    block_next_writes: Arc<AtomicUsize>,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+}
+
+impl RetryUdpTimedTestBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            caps: crate::types::DacCapabilities {
+                pps_min: 1000,
+                pps_max: 100000,
+                max_points_per_chunk: 3,
+                output_model: crate::types::OutputModel::UdpTimed,
+            },
+            shutter_open: Arc::new(AtomicBool::new(false)),
+            block_next_writes: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl DacBackend for RetryUdpTimedTestBackend {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("RetryUdpTimedTest".into())
+    }
+    fn caps(&self) -> &crate::types::DacCapabilities {
+        &self.caps
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, open: bool) -> DacResult<()> {
+        self.shutter_open.store(open, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FifoBackend for RetryUdpTimedTestBackend {
+    fn try_write_points(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
+        let remaining = self.block_next_writes.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.block_next_writes
+                .store(remaining - 1, Ordering::SeqCst);
+            return Ok(crate::backend::WriteOutcome::WouldBlock);
+        }
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+}
+
+fn wait_for_writes(
+    writes: &Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    min_len: usize,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if writes.lock().unwrap().len() >= min_len {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!(
+        "timed out waiting for {} writes, got {}",
+        min_len,
+        writes.lock().unwrap().len()
+    );
+}
+
+fn encode_transition() -> TransitionFn {
+    Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        TransitionPlan::Transition(vec![LaserPoint::blanked(from.x, to.x)])
+    })
+}
+
+fn is_encoded_frame_swap_transition(points: &[LaserPoint], from_x: f32, to_x: f32) -> bool {
+    points.len() == 2
+        && points[0].x == from_x
+        && points[0].y == to_x
+        && points[0].intensity == 0
+        && points[1].x == to_x
+        && points[1].intensity == 65535
+}
+
+fn is_transition_bearing_udp_chunk(points: &[LaserPoint]) -> bool {
+    points.iter().any(|p| p.intensity == 0) && points.iter().any(|p| p.intensity != 0)
+}
+
 #[test]
 fn test_frame_session_fifo_submit_frame_writes_points() {
     let backend = FifoTestBackend::new();
@@ -1375,6 +1560,171 @@ fn test_frame_session_frame_swap_writes_frames() {
     session.control().stop().unwrap();
     let exit = session.join().unwrap();
     assert_eq!(exit, RunExit::Stopped);
+}
+
+#[test]
+fn test_frame_session_frame_swap_retries_same_inflight_frame_on_wouldblock() {
+    let backend = RetryFrameSwapTestBackend::new();
+    let writes = backend.writes.clone();
+    let ready = backend.ready.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(encode_transition())
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
+
+    ready.store(false, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let before = writes.lock().unwrap().len();
+    block_next_writes.store(1, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
+    ready.store(true, Ordering::SeqCst);
+    wait_for_writes(&writes, before + 2, std::time::Duration::from_millis(200));
+
+    let writes = writes.lock().unwrap();
+    let first = &writes[before];
+    let second = &writes[before + 1];
+    assert_eq!(
+        first, second,
+        "inflight A→B frame should be retried verbatim"
+    );
+    assert!(
+        is_encoded_frame_swap_transition(first, 1.0, 5.0),
+        "expected encoded A→B frame, got {:?}",
+        first
+    );
+
+    drop(writes);
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for UDP-timed session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_frame_swap_inflight_frame_stays_sticky_until_accepted() {
+    let backend = RetryFrameSwapTestBackend::new();
+    let writes = backend.writes.clone();
+    let ready = backend.ready.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(encode_transition())
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
+
+    ready.store(false, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let before = writes.lock().unwrap().len();
+    block_next_writes.store(3, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
+    ready.store(true, Ordering::SeqCst);
+    wait_for_writes(&writes, before + 1, std::time::Duration::from_millis(200));
+    session.send_frame(Frame::new(vec![make_point(9.0, 0.0)]));
+    wait_for_writes(&writes, before + 5, std::time::Duration::from_millis(300));
+
+    let writes = writes.lock().unwrap();
+    for attempt in &writes[before..before + 4] {
+        assert!(
+            is_encoded_frame_swap_transition(attempt, 1.0, 5.0),
+            "expected sticky A→B frame, got {:?}",
+            attempt
+        );
+    }
+
+    let next = &writes[before + 4];
+    assert!(
+        is_encoded_frame_swap_transition(next, 5.0, 9.0),
+        "expected B→C after A→B was accepted, got {:?}",
+        next
+    );
+
+    drop(writes);
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for UDP-timed session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_udp_timed_retries_same_transition_chunk_on_wouldblock() {
+    let backend = RetryUdpTimedTestBackend::new();
+    let writes = backend.writes.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(encode_transition())
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
+
+    let before = writes.lock().unwrap().len();
+    block_next_writes.store(1, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
+    wait_for_writes(&writes, before + 8, std::time::Duration::from_millis(400));
+
+    let writes = writes.lock().unwrap();
+    let retry_idx = writes[before..]
+        .windows(2)
+        .position(|window| window[0] == window[1] && is_transition_bearing_udp_chunk(&window[0]))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a retried transition-bearing UDP chunk, got {:?}",
+                &writes[before..]
+            )
+        });
+    let first = &writes[before + retry_idx];
+    assert!(
+        is_transition_bearing_udp_chunk(first),
+        "expected a transition-bearing UDP chunk, got {:?}",
+        first
+    );
+    if before + retry_idx + 2 < writes.len() {
+        assert_ne!(
+            first,
+            &writes[before + retry_idx + 2],
+            "retry should preserve one specific chunk, not collapse the whole output into a constant pattern"
+        );
+    }
+
+    drop(writes);
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for UDP-timed session, got {exit:?}"
+    );
 }
 
 #[test]
