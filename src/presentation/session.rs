@@ -602,6 +602,7 @@ impl FrameSession {
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
         let mut frame_buf: Vec<LaserPoint> = Vec::new();
+        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
 
         loop {
             // 1. Check stop
@@ -631,6 +632,7 @@ impl FrameSession {
                     ) {
                         Ok(_info) => {
                             engine.set_frame_capacity(backend.frame_capacity());
+                            color_delay.reset();
                             continue;
                         }
                         Err(exit) => return Ok(exit),
@@ -673,9 +675,7 @@ impl FrameSession {
             // Apply blanking modifications
             Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
 
-            // Note: no color delay for frame-swap. The frame loops on hardware,
-            // so a per-frame delay would create artifacts at the loop point.
-            // Frame-swap DACs (Helios) handle modulation timing internally.
+            color_delay.apply(&mut frame_buf);
 
             // 8. Write frame
             match backend.try_write(config.pps, &frame_buf) {
@@ -698,6 +698,7 @@ impl FrameSession {
                         ) {
                             Ok(_info) => {
                                 engine.set_frame_capacity(backend.frame_capacity());
+                                color_delay.reset();
                                 continue;
                             }
                             Err(exit) => return Ok(exit),
