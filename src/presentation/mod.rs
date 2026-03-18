@@ -112,32 +112,73 @@ pub enum TransitionPlan {
 /// is consistent regardless of whether the frame changed.
 pub type TransitionFn = Box<dyn Fn(&LaserPoint, &LaserPoint) -> TransitionPlan + Send>;
 
-/// Default transition: blank at source → linear travel → blank at destination.
+/// Default blanking transition settings (microseconds).
 ///
-/// Always inserts blanking, even for nearby points. The number of travel
-/// steps scales with the distance between `from` and `to` (minimum 1).
-pub fn default_transition(from: &LaserPoint, to: &LaserPoint) -> TransitionPlan {
-    let dx = to.x - from.x;
-    let dy = to.y - from.y;
-    let distance = (dx * dx + dy * dy).sqrt(); // 0.0 to ~2.83 (diagonal)
+/// Converted to point counts via `round(µs × pps / 1_000_000)`.
+const END_DWELL_US: f64 = 100.0;
+const START_DWELL_US: f64 = 400.0;
 
-    let travel = (distance * 30.0).ceil().max(1.0) as usize; // 1..~85
+/// Create the default transition function for the given PPS.
+///
+/// Produces a 3-phase blanking sequence between frames:
+///
+/// 1. **End dwell** — repeat `from` with laser OFF. Lets the galvo settle
+///    at the endpoint before moving.
+/// 2. **Transit** — quintic ease-in-out interpolation from→to with laser OFF.
+///    Point count scales with L∞ distance (0–8 points).
+/// 3. **Start dwell** — repeat `to` with laser OFF. Lets the galvo settle
+///    at the new position before the next frame lights up.
+///
+/// All points are blanked. The on-beam dwell phases (post-on, pre-on) from
+/// the full 5-phase sequence are omitted — those are the frame's responsibility.
+pub fn default_transition(pps: u32) -> TransitionFn {
+    let end_dwell = (END_DWELL_US * pps as f64 / 1_000_000.0).round() as usize;
+    let start_dwell = (START_DWELL_US * pps as f64 / 1_000_000.0).round() as usize;
 
-    let mut points = Vec::with_capacity(travel + 2);
+    Box::new(move |from: &LaserPoint, to: &LaserPoint| {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
 
-    // Blank at source
-    points.push(LaserPoint::blanked(from.x, from.y));
+        // L-infinity distance (correct for independent galvo axes)
+        let d_inf = dx.abs().max(dy.abs());
+        let transit = (32.0 * d_inf).ceil().clamp(0.0, 64.0) as usize;
 
-    // Linear travel
-    for i in 0..travel {
-        let t = (i + 1) as f32 / (travel + 1) as f32;
-        points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
+        let total = end_dwell + transit + start_dwell;
+        let mut points = Vec::with_capacity(total);
+
+        // Phase 1: end dwell — blanked at source
+        for _ in 0..end_dwell {
+            points.push(LaserPoint::blanked(from.x, from.y));
+        }
+
+        // Phase 2: transit — quintic ease-in-out from→to, blanked
+        for i in 0..transit {
+            let t = (i as f32 + 1.0) / (transit as f32 + 1.0);
+            let t = quintic_ease_in_out(t);
+            points.push(LaserPoint::blanked(from.x + dx * t, from.y + dy * t));
+        }
+
+        // Phase 3: start dwell — blanked at destination
+        for _ in 0..start_dwell {
+            points.push(LaserPoint::blanked(to.x, to.y));
+        }
+
+        TransitionPlan::Transition(points)
+    })
+}
+
+/// Quintic ease-in-out: smooth acceleration/deceleration for galvo transit.
+///
+/// `t` in [0, 1] → output in [0, 1].
+/// First half:  `16t⁵`
+/// Second half: `0.5(2t−2)⁵ + 1`
+fn quintic_ease_in_out(t: f32) -> f32 {
+    if t < 0.5 {
+        16.0 * t * t * t * t * t
+    } else {
+        let u = 2.0 * t - 2.0;
+        0.5 * u * u * u * u * u + 1.0
     }
-
-    // Blank at destination
-    points.push(LaserPoint::blanked(to.x, to.y));
-
-    TransitionPlan::Transition(points)
 }
 
 #[cfg(test)]

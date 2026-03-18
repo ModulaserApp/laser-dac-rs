@@ -65,11 +65,17 @@ fn test_authored_frame_clone_shares_data() {
 // default_transition tests
 // =========================================================================
 
+/// Helper: call default transition at 30k PPS.
+fn call_default_transition(from: &LaserPoint, to: &LaserPoint) -> TransitionPlan {
+    let tf = default_transition(30_000);
+    tf(from, to)
+}
+
 #[test]
 fn test_default_transition_scales_with_distance() {
-    let near = default_transition(&make_point(0.0, 0.0), &make_point(0.005, 0.0));
-    let far = default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
-    let mid = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
+    let near = call_default_transition(&make_point(0.0, 0.0), &make_point(0.005, 0.0));
+    let far = call_default_transition(&make_point(-1.0, -1.0), &make_point(1.0, 1.0));
+    let mid = call_default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
 
     let near_pts = match near {
         TransitionPlan::Transition(pts) => pts,
@@ -84,7 +90,7 @@ fn test_default_transition_scales_with_distance() {
         _ => panic!("mid should produce Transition"),
     };
 
-    // Near points still get blanking (at least blank-at-source + travel + blank-at-dest)
+    // All distances produce blanking (end_dwell + transit + start_dwell)
     assert!(
         near_pts.len() >= 3,
         "near should still produce blanking, got {}",
@@ -102,8 +108,8 @@ fn test_default_transition_scales_with_distance() {
 
 #[test]
 fn test_default_transition_always_blanks() {
-    // Even very close points get blanking
-    let result = default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
+    // Even very close points get blanking (end dwell + start dwell)
+    let result = call_default_transition(&make_point(0.0, 0.0), &make_point(0.01, 0.0));
     let pts = match result {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("should produce Transition"),
@@ -114,8 +120,8 @@ fn test_default_transition_always_blanks() {
         pts.len()
     );
 
-    // Farther points get more
-    let result = default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
+    // Farther points get more (more transit points)
+    let result = call_default_transition(&make_point(0.0, 0.0), &make_point(1.0, 0.0));
     let pts2 = match result {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("should produce Transition"),
@@ -127,7 +133,7 @@ fn test_default_transition_always_blanks() {
 fn test_default_transition_all_blanked() {
     let from = make_point(0.0, 0.0);
     let to = make_point(1.0, 1.0);
-    let result = match default_transition(&from, &to) {
+    let result = match call_default_transition(&from, &to) {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("expected Transition"),
     };
@@ -140,48 +146,129 @@ fn test_default_transition_all_blanked() {
 }
 
 #[test]
-fn test_default_transition_has_blank_travel_blank_structure() {
+fn test_default_transition_three_phase_structure() {
+    // At 30k PPS: end_dwell = round(100 * 30000 / 1e6) = 3 points
+    //             start_dwell = round(400 * 30000 / 1e6) = 12 points
+    //             transit for d_inf=1.0: ceil(32*1.0) = 32 points
+    // Total: 3 + 32 + 12 = 47
     let from = make_point(0.0, 0.0);
     let to = make_point(1.0, 0.0);
-    let result = match default_transition(&from, &to) {
+    let result = match call_default_transition(&from, &to) {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("expected Transition"),
     };
 
-    // First point: blank at source
-    assert_eq!(result[0].x, 0.0, "should start blanked at from");
-    assert_eq!(result[0].intensity, 0);
+    assert_eq!(
+        result.len(),
+        47,
+        "3 end_dwell + 32 transit + 12 start_dwell"
+    );
 
-    // Last point: blank at destination
-    let last = result.last().unwrap();
-    assert_eq!(last.x, 1.0, "should end blanked at to");
-    assert_eq!(last.intensity, 0);
+    // Phase 1: end dwell — blanked at source position
+    for p in &result[..3] {
+        assert_eq!(p.x, 0.0, "end dwell should be at from.x");
+        assert_eq!(p.intensity, 0);
+    }
 
-    // Middle points should be between from and to
-    let mid_idx = result.len() / 2;
+    // Phase 2: transit — between source and destination
+    for p in &result[3..35] {
+        assert!(
+            p.x > 0.0 && p.x < 1.0,
+            "transit should be between from and to"
+        );
+        assert_eq!(p.intensity, 0);
+    }
+
+    // Phase 3: start dwell — blanked at destination position
+    for p in &result[35..] {
+        assert_eq!(p.x, 1.0, "start dwell should be at to.x");
+        assert_eq!(p.intensity, 0);
+    }
+}
+
+#[test]
+fn test_default_transition_full_diagonal() {
+    // Full-range diagonal (-1,-1)→(1,1): d_inf = max(2.0, 2.0) = 2.0
+    // transit = ceil(32 * 2.0) = 64 (clamped max)
+    // At 30k: end_dwell=3, start_dwell=12, total = 3+64+12 = 79
+    let from = make_point(-1.0, -1.0);
+    let to = make_point(1.0, 1.0);
+    let result = match call_default_transition(&from, &to) {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("expected Transition"),
+    };
+    assert_eq!(result.len(), 79, "3 end + 64 transit + 12 start");
+}
+
+#[test]
+fn test_default_transition_same_point() {
+    // Same point: d_inf = 0, transit = 0
+    // Only end_dwell + start_dwell = 3 + 12 = 15 at 30k PPS
+    let p = make_point(0.5, -0.3);
+    let result = match call_default_transition(&p, &p) {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("expected Transition"),
+    };
+    assert_eq!(result.len(), 15, "end_dwell + start_dwell, no transit");
+    for pt in &result {
+        assert_eq!(pt.intensity, 0);
+        assert_eq!(pt.x, 0.5);
+        assert_eq!(pt.y, -0.3);
+    }
+}
+
+#[test]
+fn test_default_transition_quintic_easing() {
+    // Transit should use quintic ease-in-out, not linear.
+    // Near the start it should be slower (closer to from).
+    let from = make_point(0.0, 0.0);
+    let to = make_point(1.0, 0.0);
+    let result = match call_default_transition(&from, &to) {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("expected Transition"),
+    };
+
+    // Transit is result[3..35] (32 points for d_inf=1.0)
+    let transit = &result[3..35];
+
+    // First transit point should be closer to from (ease-in is slow)
     assert!(
-        result[mid_idx].x > 0.0 && result[mid_idx].x < 1.0,
-        "middle point should be between from and to, got {}",
-        result[mid_idx].x
+        transit[0].x < 0.25,
+        "first transit point should be near from, got {}",
+        transit[0].x
+    );
+    // Last transit point should be closer to to (ease-out is slow)
+    assert!(
+        transit[31].x > 0.75,
+        "last transit point should be near to, got {}",
+        transit[31].x
     );
 }
 
 #[test]
-fn test_default_transition_same_point_still_blanks() {
-    let p = make_point(0.5, -0.3);
-    let result = match default_transition(&p, &p) {
+fn test_default_transition_pps_scales_dwells() {
+    // Higher PPS should produce more dwell points
+    let tf_low = default_transition(10_000);
+    let tf_high = default_transition(100_000);
+
+    let from = make_point(0.0, 0.0);
+    let to = make_point(0.0, 0.0); // same point, transit=0
+
+    let low_pts = match tf_low(&from, &to) {
         TransitionPlan::Transition(pts) => pts,
         _ => panic!("expected Transition"),
     };
-    // Even same point gets blanking (blank at source + travel + blank at dest)
+    let high_pts = match tf_high(&from, &to) {
+        TransitionPlan::Transition(pts) => pts,
+        _ => panic!("expected Transition"),
+    };
+
     assert!(
-        result.len() >= 3,
-        "same point should still produce blanking, got {}",
-        result.len()
+        high_pts.len() > low_pts.len(),
+        "higher PPS should produce more dwell points: {} vs {}",
+        high_pts.len(),
+        low_pts.len()
     );
-    for pt in &result {
-        assert_eq!(pt.intensity, 0);
-    }
 }
 
 // =========================================================================
@@ -302,20 +389,23 @@ fn test_engine_fill_chunk_frame_change_inserts_transition() {
     engine.set_pending(frame_a);
     engine.set_pending(frame_b); // pending
 
-    // frame_a drawable: [frame(0.0) | self-loop-trans(2)] = 3 points
-    // Then A→B transition (2 points), then frame_b
-    let mut buffer = vec![LaserPoint::default(); 8];
-    let n = engine.fill_chunk(&mut buffer, 8);
-    assert_eq!(n, 8);
+    // A drawable = [0.0]. At seam: A→B transition directly (no stale A→A seam).
+    let mut buffer = vec![LaserPoint::default(); 6];
+    let n = engine.fill_chunk(&mut buffer, 6);
+    assert_eq!(n, 6);
 
+    // A's base point
     assert_eq!(buffer[0].x, 0.0);
-    assert_eq!(buffer[1].intensity, 0); // frame_a self-loop
+    assert_eq!(buffer[0].intensity, 65535);
+    // A→B transition (2 blanked points)
+    assert_eq!(buffer[1].intensity, 0);
     assert_eq!(buffer[2].intensity, 0);
-    // Cursor wraps → pending detected → A→B transition
-    assert_eq!(buffer[3].intensity, 0);
+    // B's base point
+    assert_eq!(buffer[3].x, 1.0);
+    assert_eq!(buffer[3].intensity, 65535);
+    // B→B self-loop transition
     assert_eq!(buffer[4].intensity, 0);
-    assert_eq!(buffer[5].x, 1.0);
-    assert_eq!(buffer[5].intensity, 65535);
+    assert_eq!(buffer[5].intensity, 0);
 }
 
 #[test]
@@ -647,12 +737,121 @@ fn test_engine_fill_chunk_multiple_wraps_in_single_call() {
 }
 
 // =========================================================================
+// FIFO seam correctness tests
+// =========================================================================
+
+#[test]
+fn test_fifo_no_stale_self_loop_seam() {
+    // Key regression test: when B is pending, the seam must be A→B directly,
+    // not A→A (stale self-loop) followed by A→B.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        // Encode from/to into the blanked point for verification
+        TransitionPlan::Transition(vec![LaserPoint::blanked(from.x, to.x)])
+    }));
+
+    let frame_a = make_frame(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]);
+    let frame_b = make_frame(vec![make_point(5.0, 0.0)]);
+
+    engine.set_pending(frame_a);
+    engine.set_pending(frame_b);
+
+    let mut buffer = vec![LaserPoint::default(); 4];
+    engine.fill_chunk(&mut buffer, 4);
+
+    // A base: 1.0, 2.0
+    assert_eq!(buffer[0].x, 1.0);
+    assert_eq!(buffer[0].intensity, 65535);
+    assert_eq!(buffer[1].x, 2.0);
+    assert_eq!(buffer[1].intensity, 65535);
+    // A→B transition: from=A.last(2.0), to=B.first(5.0)
+    // NOT an A→A self-loop transition (which would have to=1.0)
+    assert_eq!(buffer[2].x, 2.0, "transition 'from' should be A.last");
+    assert_eq!(
+        buffer[2].y, 5.0,
+        "transition 'to' should be B.first, not A.first"
+    );
+    assert_eq!(buffer[2].intensity, 0);
+    // B base: 5.0
+    assert_eq!(buffer[3].x, 5.0);
+    assert_eq!(buffer[3].intensity, 65535);
+}
+
+#[test]
+fn test_fifo_pending_at_seam_uses_latest() {
+    // When multiple frames are submitted before the seam, only the latest
+    // is used for the transition (B is skipped, seam goes A→C).
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        TransitionPlan::Transition(vec![LaserPoint::blanked(from.x, to.x)])
+    }));
+
+    let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
+    let frame_b = make_frame(vec![make_point(5.0, 0.0)]);
+    let frame_c = make_frame(vec![make_point(9.0, 0.0)]);
+
+    engine.set_pending(frame_a);
+    engine.set_pending(frame_b);
+    engine.set_pending(frame_c); // overwrites B
+
+    let mut buffer = vec![LaserPoint::default(); 4];
+    engine.fill_chunk(&mut buffer, 4);
+
+    assert_eq!(buffer[0].x, 1.0);
+    // A→C transition (B skipped)
+    assert_eq!(buffer[1].x, 1.0, "transition 'from' = A.last");
+    assert_eq!(buffer[1].y, 9.0, "transition 'to' = C.first, B skipped");
+    assert_eq!(buffer[1].intensity, 0);
+    assert_eq!(buffer[2].x, 9.0);
+    assert_eq!(buffer[2].intensity, 65535);
+}
+
+#[test]
+fn test_fifo_stale_self_loop_discarded_across_chunks() {
+    // P1 regression: self-loop transition points queued at the end of one
+    // fill_chunk call must be discarded if a pending frame arrives before
+    // the next fill_chunk call drains them.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        TransitionPlan::Transition(vec![
+            LaserPoint::blanked(from.x, to.x),
+            LaserPoint::blanked(to.x, to.y),
+        ])
+    }));
+
+    let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
+    engine.set_pending(frame_a);
+
+    // First call: emit A's point (1.0), then at seam: self-loop queues
+    // 2 transition points. Request exactly 1 point so the transition
+    // points remain unconsumed in transition_buf.
+    let mut buf1 = vec![LaserPoint::default(); 1];
+    engine.fill_chunk(&mut buf1, 1);
+    assert_eq!(buf1[0].x, 1.0);
+
+    // Now B arrives while stale A→A transition is queued
+    let frame_b = make_frame(vec![make_point(5.0, 0.0)]);
+    engine.set_pending(frame_b);
+
+    // Second call: the stale A→A transition must be discarded.
+    // We should see A→B transition then B, NOT stale A→A then A→B.
+    let mut buf2 = vec![LaserPoint::default(); 4];
+    engine.fill_chunk(&mut buf2, 4);
+
+    // A→B transition (2 points) then B(5.0) then B→B self-loop trans
+    assert_eq!(
+        buf2[0].intensity, 0,
+        "should be A→B transition, not stale A→A"
+    );
+    assert_eq!(buf2[1].intensity, 0);
+    assert_eq!(buf2[2].x, 5.0);
+    assert_eq!(buf2[2].intensity, 65535);
+}
+
+// =========================================================================
 // FIFO Coalesce tests
 // =========================================================================
 
 #[test]
 fn test_fifo_self_loop_coalesce_omits_last_point() {
-    // Coalesce means last ≈ first, so self-loop drawable omits the last point.
+    // Coalesce means last ≈ first, so self-loop skips the first point on wrap.
     let mut engine = make_engine_coalesce();
     let frame = make_frame(vec![
         make_point(0.0, 0.0),
@@ -736,10 +935,13 @@ fn test_fifo_a_to_c_skip_latest_coalesce() {
     let mut buffer = vec![LaserPoint::default(); 4];
     engine.fill_chunk(&mut buffer, 4);
 
+    // A=[0.0], emit 0.0. At seam: pending=C, Coalesce → skip C[0].
+    // C drawable=[0.0, 3.0], cursor=1 → emit 3.0.
+    // Self-loop Coalesce → cursor=1 → emit 3.0 again.
     assert_eq!(buffer[0].x, 0.0);
-    // C = [0.0, 3.0], self-loop coalesces → drawable = [0.0] (only 1 point).
-    // A→C coalesce with drawable.len()==1 → cursor stays at 0, no skip.
-    assert_eq!(buffer[1].x, 0.0);
+    assert_eq!(buffer[1].x, 3.0);
+    assert_eq!(buffer[2].x, 3.0);
+    assert_eq!(buffer[3].x, 3.0);
 }
 
 // =========================================================================
@@ -769,7 +971,8 @@ fn test_frame_swap_self_loop_coalesce() {
 
 #[test]
 fn test_frame_swap_a_to_b_coalesce() {
-    // FrameSwap A→B with Coalesce: no transition prefix, just B's points.
+    // FrameSwap A→B with Coalesce: A.last ≈ B.first, so B's first point
+    // is skipped to avoid a duplicate seam sample.
     let mut engine = make_engine_coalesce();
     let frame_a = make_frame(vec![make_point(0.0, 0.0)]);
     engine.set_pending(frame_a);
@@ -779,10 +982,9 @@ fn test_frame_swap_a_to_b_coalesce() {
     engine.set_pending(frame_b);
 
     let composed = engine.compose_hardware_frame();
-    // Coalesce: no transition prefix, just B's points
-    assert_eq!(composed.len(), 2);
-    assert_eq!(composed[0].x, 0.0);
-    assert_eq!(composed[1].x, 1.0);
+    // Coalesce: B[0] skipped (≈ A.last), only B[1..] emitted
+    assert_eq!(composed.len(), 1);
+    assert_eq!(composed[0].x, 1.0);
     assert_eq!(composed[0].intensity, 65535);
 }
 
@@ -832,29 +1034,30 @@ fn test_parity_self_loop_with_transition() {
 #[test]
 fn test_parity_self_loop_with_coalesce() {
     // Both FIFO and FrameSwap: A→A with Coalesce.
-    // Both should omit the last base point.
+    // Both handle the seam correctly — no duplicate at the wrap point.
     let frame = make_frame(vec![
         make_point(0.0, 0.0),
         make_point(1.0, 0.0),
         make_point(2.0, 0.0),
     ]);
 
-    // FIFO
+    // FIFO: drawable = [0.0, 1.0, 2.0]. At seam: Coalesce → skip first on wrap.
+    // First cycle: 0.0, 1.0, 2.0. Subsequent cycles start at index 1: 1.0, 2.0.
     let mut fifo_engine = make_engine_coalesce();
     fifo_engine.set_pending(frame.clone());
-    let mut buffer = vec![LaserPoint::default(); 4];
-    fifo_engine.fill_chunk(&mut buffer, 4);
-    // Drawable = [0.0, 1.0] (last omitted), cycling: 0.0, 1.0, 0.0, 1.0
+    let mut buffer = vec![LaserPoint::default(); 6];
+    fifo_engine.fill_chunk(&mut buffer, 6);
     assert_eq!(buffer[0].x, 0.0);
     assert_eq!(buffer[1].x, 1.0);
-    assert_eq!(buffer[2].x, 0.0);
+    assert_eq!(buffer[2].x, 2.0);
     assert_eq!(buffer[3].x, 1.0);
+    assert_eq!(buffer[4].x, 2.0);
+    assert_eq!(buffer[5].x, 1.0);
 
-    // FrameSwap
+    // FrameSwap: Coalesce omits last base point → [0.0, 1.0]
     let mut swap_engine = make_engine_coalesce();
     swap_engine.set_pending(frame);
     let composed = swap_engine.compose_hardware_frame();
-    // Coalesce: last omitted → [0.0, 1.0]
     assert_eq!(composed.len(), 2);
     assert_eq!(composed[0].x, 0.0);
     assert_eq!(composed[1].x, 1.0);
@@ -872,20 +1075,19 @@ fn test_parity_a_to_b_with_transition() {
     let frame_a = make_frame(vec![make_point(1.0, 0.0)]);
     let frame_b = make_frame(vec![make_point(5.0, 0.0)]);
 
-    // FIFO: A plays, then transition, then B
+    // FIFO: A plays, then A→B transition directly, then B
     let mut fifo_engine = PresentationEngine::new(transition_fn());
     fifo_engine.set_pending(frame_a.clone());
     fifo_engine.set_pending(frame_b.clone());
-    // A drawable = [1.0, self-loop-trans(blanked)]. At wrap: A→B trans, then B.
-    let mut buffer = vec![LaserPoint::default(); 6];
-    fifo_engine.fill_chunk(&mut buffer, 6);
-    // buffer: 1.0(lit), self-trans(blank), A→B trans(blank), 5.0(lit), ...
+    // A drawable = [1.0]. At seam: A→B transition (no stale self-loop), then B.
+    let mut buffer = vec![LaserPoint::default(); 4];
+    fifo_engine.fill_chunk(&mut buffer, 4);
     assert_eq!(buffer[0].x, 1.0);
     assert_eq!(buffer[0].intensity, 65535);
-    assert_eq!(buffer[1].intensity, 0); // self-loop transition
-    assert_eq!(buffer[2].intensity, 0); // A→B transition
-    assert_eq!(buffer[3].x, 5.0);
-    assert_eq!(buffer[3].intensity, 65535);
+    assert_eq!(buffer[1].intensity, 0); // A→B transition
+    assert_eq!(buffer[2].x, 5.0);
+    assert_eq!(buffer[2].intensity, 65535);
+    assert_eq!(buffer[3].intensity, 0); // B→B self-loop transition
 
     // FrameSwap: compose A→B = [transition | B]
     let mut swap_engine = PresentationEngine::new(transition_fn());
@@ -919,17 +1121,15 @@ fn test_parity_a_to_b_with_coalesce() {
     assert_eq!(buffer[0].x, 0.0); // frame_a
     assert_eq!(buffer[1].x, 1.0); // frame_b[1] — B[0] skipped
 
-    // FrameSwap: A→B with Coalesce → just B's points (no transition prefix)
+    // FrameSwap: A→B with Coalesce → B[0] skipped (≈ A.last), B[1..] emitted
     let mut swap_engine = make_engine_coalesce();
     swap_engine.set_pending(frame_a);
     let _ = swap_engine.compose_hardware_frame(); // promote A
     swap_engine.set_pending(frame_b);
     let composed = swap_engine.compose_hardware_frame();
-    // Coalesce: no prefix, just B's 3 points
-    assert_eq!(composed.len(), 3);
-    assert_eq!(composed[0].x, 0.0);
-    assert_eq!(composed[1].x, 1.0);
-    assert_eq!(composed[2].x, 2.0);
+    assert_eq!(composed.len(), 2);
+    assert_eq!(composed[0].x, 1.0);
+    assert_eq!(composed[1].x, 2.0);
 }
 
 #[test]
@@ -945,18 +1145,17 @@ fn test_parity_a_to_c_skip() {
     let frame_b = make_frame(vec![make_point(5.0, 0.0)]); // will be skipped
     let frame_c = make_frame(vec![make_point(9.0, 0.0)]);
 
-    // FIFO
+    // FIFO: A plays, then A→C transition directly (no stale self-loop), then C.
     let mut fifo_engine = PresentationEngine::new(transition_fn());
     fifo_engine.set_pending(frame_a.clone());
     fifo_engine.set_pending(frame_b.clone());
     fifo_engine.set_pending(frame_c.clone()); // overwrites B
-    let mut buffer = vec![LaserPoint::default(); 5];
-    fifo_engine.fill_chunk(&mut buffer, 5);
+    let mut buffer = vec![LaserPoint::default(); 4];
+    fifo_engine.fill_chunk(&mut buffer, 4);
     assert_eq!(buffer[0].x, 1.0);
-    // A drawable: [1.0, self-trans]. At wrap: pending=C, trans(1.0→9.0).
-    assert_eq!(buffer[1].intensity, 0);
-    assert_eq!(buffer[2].intensity, 0);
-    assert_eq!(buffer[3].x, 9.0);
+    assert_eq!(buffer[1].intensity, 0); // A→C transition (B skipped, no stale self-loop)
+    assert_eq!(buffer[2].x, 9.0);
+    assert_eq!(buffer[3].intensity, 0); // C→C self-loop transition
 
     // FrameSwap
     let mut swap_engine = PresentationEngine::new(transition_fn());
@@ -1402,7 +1601,7 @@ fn test_compose_hardware_frame_a_to_b_no_cycling_artifact() {
 fn test_engine_reset_clears_state() {
     use super::engine::PresentationEngine;
 
-    let mut engine = PresentationEngine::new(Box::new(default_transition));
+    let mut engine = PresentationEngine::new(default_transition(30_000));
 
     // Set a frame and advance cursor
     let frame = Frame::new(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]);

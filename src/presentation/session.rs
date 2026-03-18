@@ -47,7 +47,7 @@ impl FrameSessionConfig {
             (Self::DEFAULT_COLOR_DELAY.as_secs_f64() * pps as f64).ceil() as usize;
         Self {
             pps,
-            transition_fn: Box::new(default_transition),
+            transition_fn: default_transition(pps),
             startup_blank: std::time::Duration::from_millis(1),
             color_delay_points,
             reconnect: None,

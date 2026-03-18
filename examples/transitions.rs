@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     let device = open_device(&device_info.id)?;
 
     let transition_fn: TransitionFn = match args.mode {
-        Mode::Default | Mode::Animated => Box::new(default_transition),
+        Mode::Default | Mode::Animated => default_transition(30_000),
         Mode::None => Box::new(|_: &LaserPoint, _: &LaserPoint| TransitionPlan::Transition(vec![])),
     };
 
@@ -132,10 +132,10 @@ fn main() -> Result<()> {
     } else {
         // Two shapes — alternates every 50ms (~20 swaps/second).
         // Shapes are 0.6 units apart (moderate distance).
-        let frame_left = Frame::new(make_triangle(n, -0.3, 0.0, 0.35));
+        let frame_left = make_line(n, -0.3, 0.0, 0.35, 65535, 0, 0);
         let frame_right = make_circle(n, 0.3, 0.0, 0.18, 0, 65535, 0);
 
-        println!("  Alternating: red triangle (left) ↔ green circle (right)");
+        println!("  Alternating: red line (left) ↔ green circle (right)");
         println!("  Swapping every ~50ms — watch the gap between shapes.\n");
 
         if matches!(args.mode, Mode::None) {
@@ -173,9 +173,12 @@ fn make_circle_points(
     g: u16,
     b: u16,
 ) -> Vec<LaserPoint> {
+    // Closed loop: n points around the circle, last point = first point.
+    // Use n-1 segments so point[n-1] wraps back to the same angle as point[0].
+    let segments = if n > 1 { n - 1 } else { 1 };
     (0..n)
         .map(|i| {
-            let angle = (i as f32 / n as f32) * 2.0 * PI;
+            let angle = (i as f32 / segments as f32) * 2.0 * PI;
             let x = (cx + radius * angle.cos()).clamp(-1.0, 1.0);
             let y = (cy + radius * angle.sin()).clamp(-1.0, 1.0);
             LaserPoint::new(x, y, r, g, b, 65535)
@@ -183,28 +186,25 @@ fn make_circle_points(
         .collect()
 }
 
-/// Generate a triangle at an offset position.
-fn make_triangle(n: usize, cx: f32, cy: f32, scale: f32) -> Vec<LaserPoint> {
-    let vertices = [
-        (cx - 0.5 * scale, cy - 0.4 * scale, 65535u16, 0u16, 0u16),
-        (cx + 0.5 * scale, cy - 0.4 * scale, 65535, 0, 0),
-        (cx, cy + 0.4 * scale, 65535, 0, 0),
-    ];
-
-    let points_per_edge = n / 3;
+/// Generate a vertical line (top→bottom→top) as a closed loop.
+fn make_line(n: usize, cx: f32, cy: f32, half_height: f32, r: u16, g: u16, b: u16) -> Frame {
+    let half = n / 2;
     let mut points = Vec::with_capacity(n);
 
-    for edge in 0..3 {
-        let (x1, y1, r, g, b) = vertices[edge];
-        let (x2, y2, _, _, _) = vertices[(edge + 1) % 3];
-
-        for i in 0..points_per_edge {
-            let t = i as f32 / points_per_edge as f32;
-            let x = (x1 + (x2 - x1) * t).clamp(-1.0, 1.0);
-            let y = (y1 + (y2 - y1) * t).clamp(-1.0, 1.0);
-            points.push(LaserPoint::new(x, y, r, g, b, 65535));
-        }
+    // Down stroke: top to bottom
+    for i in 0..half {
+        let t = i as f32 / half as f32;
+        let y = (cy + half_height - 2.0 * half_height * t).clamp(-1.0, 1.0);
+        points.push(LaserPoint::new(cx, y, r, g, b, 65535));
     }
 
-    points
+    // Up stroke: bottom to top (closes back to start)
+    let remaining = n - half;
+    for i in 0..remaining {
+        let t = i as f32 / remaining as f32;
+        let y = (cy - half_height + 2.0 * half_height * t).clamp(-1.0, 1.0);
+        points.push(LaserPoint::new(cx, y, r, g, b, 65535));
+    }
+
+    Frame::new(points)
 }
