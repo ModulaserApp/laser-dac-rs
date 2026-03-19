@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Shared code for examples.
 
 pub mod audio;

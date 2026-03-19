@@ -2546,25 +2546,35 @@ fn test_frame_session_fifo_output_filter_not_rerun_for_inner_retry() {
     let session = FrameSession::start(backend_kind, config, None).unwrap();
 
     session.control().arm().unwrap();
-    let before_writes = writes.lock().unwrap().len();
     block_next_writes.store(1, Ordering::SeqCst);
     session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
-    wait_for_writes(
-        &writes,
-        before_writes + 2,
-        std::time::Duration::from_millis(200),
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(200));
+
+    let retried_chunk = observations.invocations.lock().unwrap()[0].points.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    while std::time::Instant::now() < deadline {
+        let duplicated = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|write| **write == retried_chunk)
+            .count();
+        if duplicated >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|write| **write == retried_chunk)
+            .count()
+            >= 2,
+        "expected the same stamped FIFO chunk to be written twice after WouldBlock"
     );
 
-    let retried_chunk = {
-        let writes = writes.lock().unwrap();
-        writes[before_writes..]
-            .windows(2)
-            .find(|window| {
-                window[0] == window[1] && window[0].iter().any(|point| point.intensity != 0)
-            })
-            .map(|window| window[0].clone())
-            .expect("expected a duplicated visible FIFO chunk")
-    };
     let stamp = retried_chunk[0].intensity;
     assert_eq!(
         observations
@@ -2608,7 +2618,14 @@ fn test_frame_session_arm_disarm() {
     assert!(!shutter.load(Ordering::SeqCst));
 
     session.control().stop().unwrap();
-    session.join().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for arm/disarm session, got {exit:?}"
+    );
 }
 
 #[test]

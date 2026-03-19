@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Audio capture and visualization for laser examples.
 //!
 //! Provides low-latency audio-reactive point generation for Jerobeam-style
