@@ -334,26 +334,22 @@ On reconnect:
 This mirrors existing replay behavior and ensures downstream filters do not
 carry stale state across transport discontinuities.
 
-## Companion Requirement: Final-Output Liveness
+## Related Work: Final-Output Liveness
 
 Downstream applications such as Modulaser may need a watchdog that monitors
 activity from the final output path rather than from authored-frame submission.
 
-This plan therefore includes a small companion requirement:
+That work is intentionally split into a separate plan:
 
-- `FrameSession` must expose or internally maintain final-write activity
-  timestamps suitable for downstream watchdog integration
-- this liveness mechanism is separate from `OutputFilter`
-- filter invocation counts are not a sufficient liveness signal because retries
+- [frame-session-liveness-plan.md](/Users/rutger/Dev/laser-dac-rs/plans/frame-session-liveness-plan.md)
+
+The important boundary for this plan is:
+
+- `OutputFilter` is not the watchdog signal
+- filter invocation counts are not a sufficient liveness source because retries
   reuse an already-filtered buffer and pre-first-frame FIFO keepalive blanks do
   not invoke the filter
-
-The exact public shape can be decided during implementation. It may be:
-
-- a lightweight status/metrics handle on `FrameSession`, or
-- an internal heartbeat surface used by downstream integration code
-
-But the requirement itself is part of this work, not a follow-up footnote.
+- the filter API should not be distorted just to carry watchdog state
 
 ## Modulaser Parity Targets
 
@@ -370,11 +366,11 @@ The implementation should preserve parity for:
 - continuity resets:
   reconnect and arm/disarm edges must reset filter continuity explicitly
 - liveness:
-  downstream watchdogs must still be able to observe activity from the final
-  output path even when the filter is not invoked
+  downstream watchdog support is required, but tracked separately from this
+  feature because it is not an `OutputFilter` responsibility
 - first-frame behavior:
   pre-first-frame FIFO keepalive blanks must not invoke the filter, but they
-  must not disappear from liveness accounting
+  still matter for the separate liveness design
 - color-delay ordering:
   the filter must run after color delay so downstream safety sees the true
   hardware-bound color/intensity sequence
@@ -399,7 +395,6 @@ and debugging.
 - Run the filter after blanking and color delay, before backend write
 - Ensure retry loops reuse the already-filtered buffer
 - Call `reset(reason)` on startup, reconnect, arm, and disarm
-- Add final-output liveness tracking suitable for downstream watchdogs
 
 ### 3. `src/lib.rs`
 
@@ -472,16 +467,9 @@ Build test filters that stamp or count invocations:
 - `TaggingFilter` to mutate intensity/RGB in a detectable way
 - `RecordingFilter` to capture slice lengths and context
 
-### Liveness tests
-
-- retries do not falsely appear as stalled output
-- pre-first-frame FIFO keepalive activity is visible to the liveness surface even
-  though it does not invoke the filter
-- frame-swap ready-wait / retry loops continue to report output-thread liveness
-
 ## Rollout Strategy
 
-1. Land the API, reset semantics, and liveness tracking first with tests
+1. Land the API and reset semantics first with tests
 2. Update docs and examples
 3. Keep it opt-in: no behavior change for callers that do not install a filter
 4. Downstream projects can then migrate frame-mode safety/output processing onto
