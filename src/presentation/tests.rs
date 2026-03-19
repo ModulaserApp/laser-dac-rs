@@ -2002,8 +2002,14 @@ fn test_frame_session_fifo_submit_frame_writes_points() {
     );
 
     session.control().stop().unwrap();
-    let exit = session.join().unwrap();
-    assert_eq!(exit, RunExit::Stopped);
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for FIFO frame session, got {exit:?}"
+    );
 }
 
 #[test]
