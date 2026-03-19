@@ -80,6 +80,11 @@ impl PresentationEngine {
         self.frame_swap_transition_len = 0;
     }
 
+    /// Returns true once a logical frame has been submitted to the engine.
+    pub fn has_logical_frame(&self) -> bool {
+        self.current_base.is_some()
+    }
+
     /// Submit a new frame. Latest-wins: multiple calls before consumption
     /// keep only the most recent frame.
     ///

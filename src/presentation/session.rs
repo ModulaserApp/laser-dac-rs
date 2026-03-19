@@ -12,7 +12,10 @@ use crate::stream::StreamControl;
 use crate::types::{DacInfo, LaserPoint, RunExit};
 
 use super::engine::{ColorDelayLine, PresentationEngine};
-use super::{default_transition, Frame, TransitionFn};
+use super::{
+    default_transition, Frame, OutputFilter, OutputFilterContext, OutputResetReason,
+    PresentedSliceKind, TransitionFn,
+};
 
 // =============================================================================
 // FrameSessionConfig
@@ -37,6 +40,8 @@ pub struct FrameSessionConfig {
     /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
     /// reconnection when the device disconnects.
     pub reconnect: Option<crate::types::ReconnectConfig>,
+    /// Optional hook for processing the final presented output.
+    pub output_filter: Option<Box<dyn OutputFilter>>,
 }
 
 impl FrameSessionConfig {
@@ -52,6 +57,7 @@ impl FrameSessionConfig {
             startup_blank: std::time::Duration::from_millis(1),
             color_delay_points,
             reconnect: None,
+            output_filter: None,
         }
     }
 
@@ -81,13 +87,10 @@ impl FrameSessionConfig {
         self
     }
 
-    /// Compute the number of startup blank points for this config.
-    fn startup_blank_points(&self) -> usize {
-        if self.startup_blank.is_zero() {
-            0
-        } else {
-            (self.startup_blank.as_secs_f64() * self.pps as f64).ceil() as usize
-        }
+    /// Install a final-output filter (builder pattern).
+    pub fn with_output_filter(mut self, filter: Box<dyn OutputFilter>) -> Self {
+        self.output_filter = Some(filter);
+        self
     }
 }
 
@@ -246,24 +249,38 @@ impl FrameSession {
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
-        let pps = config.pps;
+        let FrameSessionConfig {
+            pps,
+            transition_fn,
+            startup_blank,
+            color_delay_points,
+            reconnect: _,
+            output_filter,
+        } = config;
         let pps_f64 = pps as f64;
-        let startup_blank_points = config.startup_blank_points();
+        let startup_blank_points = if startup_blank.is_zero() {
+            0
+        } else {
+            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
+        };
         // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
         // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
         let mut chunk_points =
             ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
         let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
 
-        let mut engine = PresentationEngine::new(config.transition_fn);
+        let mut engine = PresentationEngine::new(transition_fn);
         let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
-        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
+        let mut color_delay = ColorDelayLine::new(color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let mut last_armed = false;
         let mut next_send = Instant::now();
         let mut last_frame: Option<Frame> = None;
         let mut retry_points: Option<usize> = None;
+        let mut output_filter = output_filter;
+
+        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
             // 1. High-precision wait until next send time
@@ -314,6 +331,10 @@ impl FrameSession {
                             chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
                             chunk_buffer.resize(chunk_points, LaserPoint::default());
                             color_delay.reset();
+                            Self::reset_output_filter(
+                                &mut output_filter,
+                                OutputResetReason::Reconnect,
+                            );
                             retry_points = None;
                             continue;
                         }
@@ -330,14 +351,16 @@ impl FrameSession {
 
             // 6. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            Self::handle_shutter_transition(
+            if let Some(reason) = Self::handle_shutter_transition(
                 is_armed,
                 &mut last_armed,
                 &mut shutter_open,
                 &mut startup_blank_remaining,
                 startup_blank_points,
                 &mut backend,
-            );
+            ) {
+                Self::reset_output_filter(&mut output_filter, reason);
+            }
 
             // 7. Fill chunk from engine
             let n = if let Some(n) = retry_points {
@@ -357,6 +380,17 @@ impl FrameSession {
 
                 // Apply color delay (stateful — carries across chunks)
                 color_delay.apply(&mut chunk_buffer[..n]);
+                if engine.has_logical_frame() {
+                    Self::apply_output_filter(
+                        &mut output_filter,
+                        &mut chunk_buffer[..n],
+                        OutputFilterContext {
+                            pps,
+                            kind: PresentedSliceKind::FifoChunk,
+                            is_cyclic: false,
+                        },
+                    );
+                }
                 retry_points = Some(n);
                 n
             };
@@ -391,6 +425,10 @@ impl FrameSession {
                                     Duration::from_secs_f64(chunk_points as f64 / pps_f64);
                                 chunk_buffer.resize(chunk_points, LaserPoint::default());
                                 color_delay.reset();
+                                Self::reset_output_filter(
+                                    &mut output_filter,
+                                    OutputResetReason::Reconnect,
+                                );
                                 retry_points = None;
                                 continue;
                             }
@@ -415,22 +453,37 @@ impl FrameSession {
     ) -> Result<RunExit> {
         use std::time::{Duration, Instant};
 
-        let pps = config.pps as f64;
-        let startup_blank_points = config.startup_blank_points();
+        let FrameSessionConfig {
+            pps,
+            transition_fn,
+            startup_blank,
+            color_delay_points,
+            reconnect: _,
+            output_filter,
+        } = config;
+        let pps_f64 = pps as f64;
+        let startup_blank_points = if startup_blank.is_zero() {
+            0
+        } else {
+            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
+        };
         let mut max_points = backend.caps().max_points_per_chunk;
         let target_buffer_secs = 0.020_f64;
-        let target_buffer_points = (target_buffer_secs * pps) as u64;
+        let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
 
-        let mut engine = PresentationEngine::new(config.transition_fn);
+        let mut engine = PresentationEngine::new(transition_fn);
         let mut scheduled_ahead: u64 = 0;
         let mut fractional_consumed: f64 = 0.0;
         let mut last_iteration = Instant::now();
         let mut chunk_buffer = vec![LaserPoint::default(); max_points];
-        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
+        let mut color_delay = ColorDelayLine::new(color_delay_points);
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
+        let mut output_filter = output_filter;
+
+        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
             // 1. Check stop
@@ -445,7 +498,7 @@ impl FrameSession {
                 &mut fractional_consumed,
                 &mut last_iteration,
                 now,
-                pps,
+                pps_f64,
             );
 
             // 2. Check for new frame (latest-wins slot)
@@ -461,7 +514,7 @@ impl FrameSession {
             // 4. Sleep if buffer healthy
             if buffered > target_buffer_points {
                 let excess = buffered - target_buffer_points;
-                let sleep_time = Duration::from_secs_f64(excess as f64 / pps);
+                let sleep_time = Duration::from_secs_f64(excess as f64 / pps_f64);
                 Self::sleep_with_control_check(
                     &control,
                     &control_rx,
@@ -483,7 +536,7 @@ impl FrameSession {
                         &mut last_armed,
                         &mut engine,
                         &last_frame,
-                        config.pps,
+                        pps,
                         false,
                     ) {
                         Ok(info) => {
@@ -493,6 +546,10 @@ impl FrameSession {
                             max_points = info.caps.max_points_per_chunk;
                             chunk_buffer.resize(max_points, LaserPoint::default());
                             color_delay.reset();
+                            Self::reset_output_filter(
+                                &mut output_filter,
+                                OutputResetReason::Reconnect,
+                            );
                             continue;
                         }
                         Err(exit) => return Ok(exit),
@@ -508,18 +565,20 @@ impl FrameSession {
 
             // 7. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            Self::handle_shutter_transition(
+            if let Some(reason) = Self::handle_shutter_transition(
                 is_armed,
                 &mut last_armed,
                 &mut shutter_open,
                 &mut startup_blank_remaining,
                 startup_blank_points,
                 &mut backend,
-            );
+            ) {
+                Self::reset_output_filter(&mut output_filter, reason);
+            }
 
             // 8. Fill chunk from engine
-            let deficit = (target_buffer_secs - buffered as f64 / pps).max(0.0);
-            let target_points = ((deficit * pps).ceil() as usize).min(max_points);
+            let deficit = (target_buffer_secs - buffered as f64 / pps_f64).max(0.0);
+            let target_points = ((deficit * pps_f64).ceil() as usize).min(max_points);
             if target_points == 0 {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
@@ -540,10 +599,21 @@ impl FrameSession {
 
             // Apply color delay (stateful — carries across chunks)
             color_delay.apply(&mut chunk_buffer[..n]);
+            if engine.has_logical_frame() {
+                Self::apply_output_filter(
+                    &mut output_filter,
+                    &mut chunk_buffer[..n],
+                    OutputFilterContext {
+                        pps,
+                        kind: PresentedSliceKind::FifoChunk,
+                        is_cyclic: false,
+                    },
+                );
+            }
 
             // 9. Write to backend with retry on WouldBlock
             loop {
-                match backend.try_write(config.pps, &chunk_buffer[..n]) {
+                match backend.try_write(pps, &chunk_buffer[..n]) {
                     Ok(WriteOutcome::Written) => {
                         scheduled_ahead += n as u64;
                         break;
@@ -565,7 +635,7 @@ impl FrameSession {
                                 &mut last_armed,
                                 &mut engine,
                                 &last_frame,
-                                config.pps,
+                                pps,
                                 false,
                             ) {
                                 Ok(info) => {
@@ -575,6 +645,10 @@ impl FrameSession {
                                     max_points = info.caps.max_points_per_chunk;
                                     chunk_buffer.resize(max_points, LaserPoint::default());
                                     color_delay.reset();
+                                    Self::reset_output_filter(
+                                        &mut output_filter,
+                                        OutputResetReason::Reconnect,
+                                    );
                                     break;
                                 }
                                 Err(exit) => return Ok(exit),
@@ -604,16 +678,31 @@ impl FrameSession {
     ) -> Result<RunExit> {
         use std::time::Duration;
 
-        let startup_blank_points = config.startup_blank_points();
-        let mut engine = PresentationEngine::new(config.transition_fn);
+        let FrameSessionConfig {
+            pps,
+            transition_fn,
+            startup_blank,
+            color_delay_points,
+            reconnect: _,
+            output_filter,
+        } = config;
+        let startup_blank_points = if startup_blank.is_zero() {
+            0
+        } else {
+            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
+        };
+        let mut engine = PresentationEngine::new(transition_fn);
         engine.set_frame_capacity(backend.frame_capacity());
         let mut shutter_open = false;
         let mut startup_blank_remaining: usize = 0;
         let mut last_armed = false;
         let mut last_frame: Option<Frame> = None;
         let mut frame_buf: Vec<LaserPoint> = Vec::new();
-        let mut color_delay = ColorDelayLine::new(config.color_delay_points);
+        let mut color_delay = ColorDelayLine::new(color_delay_points);
         let mut write_pending = false;
+        let mut output_filter = output_filter;
+
+        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
             // 1. Check stop
@@ -638,12 +727,16 @@ impl FrameSession {
                         &mut last_armed,
                         &mut engine,
                         &last_frame,
-                        config.pps,
+                        pps,
                         true,
                     ) {
                         Ok(_info) => {
                             engine.set_frame_capacity(backend.frame_capacity());
                             color_delay.reset();
+                            Self::reset_output_filter(
+                                &mut output_filter,
+                                OutputResetReason::Reconnect,
+                            );
                             write_pending = false;
                             continue;
                         }
@@ -660,14 +753,16 @@ impl FrameSession {
 
             // 5. Handle arm/disarm transitions
             let is_armed = control.is_armed();
-            Self::handle_shutter_transition(
+            if let Some(reason) = Self::handle_shutter_transition(
                 is_armed,
                 &mut last_armed,
                 &mut shutter_open,
                 &mut startup_blank_remaining,
                 startup_blank_points,
                 &mut backend,
-            );
+            ) {
+                Self::reset_output_filter(&mut output_filter, reason);
+            }
 
             // 6. Check if device is ready
             if !write_pending && !backend.is_ready_for_frame() {
@@ -689,10 +784,19 @@ impl FrameSession {
                 Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
 
                 color_delay.apply(&mut frame_buf);
+                Self::apply_output_filter(
+                    &mut output_filter,
+                    &mut frame_buf,
+                    OutputFilterContext {
+                        pps,
+                        kind: PresentedSliceKind::FrameSwapFrame,
+                        is_cyclic: true,
+                    },
+                );
             }
 
             // 8. Write frame
-            match backend.try_write(config.pps, &frame_buf) {
+            match backend.try_write(pps, &frame_buf) {
                 Ok(WriteOutcome::Written) => {
                     write_pending = false;
                 }
@@ -710,12 +814,16 @@ impl FrameSession {
                             &mut last_armed,
                             &mut engine,
                             &last_frame,
-                            config.pps,
+                            pps,
                             true,
                         ) {
                             Ok(_info) => {
                                 engine.set_frame_capacity(backend.frame_capacity());
                                 color_delay.reset();
+                                Self::reset_output_filter(
+                                    &mut output_filter,
+                                    OutputResetReason::Reconnect,
+                                );
                                 write_pending = false;
                                 continue;
                             }
@@ -803,18 +911,25 @@ impl FrameSession {
         startup_blank_remaining: &mut usize,
         startup_blank_points: usize,
         backend: &mut BackendKind,
-    ) {
+    ) -> Option<OutputResetReason> {
         if !*last_armed && is_armed {
             *startup_blank_remaining = startup_blank_points;
             if !*shutter_open {
                 let _ = backend.set_shutter(true);
                 *shutter_open = true;
             }
-        } else if *last_armed && !is_armed && *shutter_open {
-            let _ = backend.set_shutter(false);
-            *shutter_open = false;
+            *last_armed = is_armed;
+            return Some(OutputResetReason::Arm);
+        } else if *last_armed && !is_armed {
+            if *shutter_open {
+                let _ = backend.set_shutter(false);
+                *shutter_open = false;
+            }
+            *last_armed = is_armed;
+            return Some(OutputResetReason::Disarm);
         }
         *last_armed = is_armed;
+        None
     }
 
     /// Apply disarm blanking and startup blanking to a buffer.
@@ -866,6 +981,25 @@ impl FrameSession {
             }
         }
         false
+    }
+
+    fn reset_output_filter(
+        output_filter: &mut Option<Box<dyn OutputFilter>>,
+        reason: OutputResetReason,
+    ) {
+        if let Some(filter) = output_filter.as_deref_mut() {
+            filter.reset(reason);
+        }
+    }
+
+    fn apply_output_filter(
+        output_filter: &mut Option<Box<dyn OutputFilter>>,
+        points: &mut [LaserPoint],
+        ctx: OutputFilterContext,
+    ) {
+        if let Some(filter) = output_filter.as_deref_mut() {
+            filter.filter(points, &ctx);
+        }
     }
 
     fn sleep_with_control_check(

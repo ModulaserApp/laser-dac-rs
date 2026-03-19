@@ -91,6 +91,10 @@ always finished before the next frame is chosen. Latest-wins applies until the
 next seam/chunk/frame has been materialized for transmission; once composed, that
 output is retried verbatim until the DAC accepts it.
 
+For advanced output-space processing on that final presented sequence, install
+an [`OutputFilter`](https://docs.rs/laser-dac/latest/laser_dac/trait.OutputFilter.html)
+with `FrameSessionConfig::with_output_filter(...)`.
+
 ### Empty Frames
 
 Submitting `Frame::new(vec![])` blanks the output (sends a single blanked point at origin).
@@ -152,6 +156,43 @@ let config = FrameSessionConfig::new(30_000)
     .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
         TransitionPlan::Transition(vec![])
     }));
+```
+
+### Final Output Filter
+
+`FrameSession` can run an optional `OutputFilter` on the exact point slice that
+is about to be written to hardware.
+
+- FIFO backends call it with `PresentedSliceKind::FifoChunk`
+- Frame-swap backends call it with `PresentedSliceKind::FrameSwapFrame`
+- Frame-swap slices are marked `is_cyclic = true` because the hardware loops the
+  submitted frame
+- The filter runs after transition composition, startup/disarm blanking, and
+  color delay
+- `WouldBlock` retries reuse the already-filtered buffer verbatim
+- Pre-first-frame FIFO keepalive blanks do not invoke the filter
+
+```rust
+use laser_dac::{
+    FrameSessionConfig, LaserPoint, OutputFilter, OutputFilterContext, OutputResetReason,
+};
+
+struct SafetyFilter;
+
+impl OutputFilter for SafetyFilter {
+    fn reset(&mut self, _reason: OutputResetReason) {}
+
+    fn filter(&mut self, points: &mut [LaserPoint], _ctx: &OutputFilterContext) {
+        for point in points {
+            if point.x.abs() > 1.0 || point.y.abs() > 1.0 {
+                *point = LaserPoint::blanked(point.x.clamp(-1.0, 1.0), point.y.clamp(-1.0, 1.0));
+            }
+        }
+    }
+}
+
+let config = FrameSessionConfig::new(30_000)
+    .with_output_filter(Box::new(SafetyFilter));
 ```
 
 ### Reconnecting Frame Session
@@ -232,6 +273,10 @@ Each backend handles conversion to its native format internally.
 | `Frame`       | Immutable frame of laser points for frame-mode output   |
 | `FrameSession`        | Active frame-mode session with automatic looping        |
 | `FrameSessionConfig`  | Frame session settings (PPS, transition fn, color delay) |
+| `OutputFilter`        | Hook for transforming the final presented output        |
+| `OutputFilterContext` | Metadata for a presented FIFO chunk or frame-swap frame |
+| `PresentedSliceKind`  | Whether the filter saw a FIFO chunk or frame-swap frame |
+| `OutputResetReason`   | Continuity reset reason for stateful output filters     |
 | `TransitionFn`        | Callback for computing transition plan between frames   |
 | `TransitionPlan`      | Enum: `Transition(points)` or `Coalesce` at seams       |
 | `DacInfo`             | DAC metadata (name, type, capabilities)                 |

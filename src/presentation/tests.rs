@@ -1180,12 +1180,160 @@ use crate::types::RunExit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+#[derive(Debug, Clone)]
+struct RecordedFilterCall {
+    points: Vec<LaserPoint>,
+    ctx: OutputFilterContext,
+}
+
+#[derive(Default)]
+struct FilterObservations {
+    calls: AtomicUsize,
+    resets: Mutex<Vec<OutputResetReason>>,
+    invocations: Mutex<Vec<RecordedFilterCall>>,
+}
+
+struct RecordingFilter {
+    observations: Arc<FilterObservations>,
+    intensity_tag: Option<u16>,
+}
+
+impl RecordingFilter {
+    fn new() -> (Self, Arc<FilterObservations>) {
+        let observations = Arc::new(FilterObservations::default());
+        (
+            Self {
+                observations: observations.clone(),
+                intensity_tag: None,
+            },
+            observations,
+        )
+    }
+
+    fn with_intensity_tag(tag: u16) -> (Self, Arc<FilterObservations>) {
+        let observations = Arc::new(FilterObservations::default());
+        (
+            Self {
+                observations: observations.clone(),
+                intensity_tag: Some(tag),
+            },
+            observations,
+        )
+    }
+}
+
+impl OutputFilter for RecordingFilter {
+    fn reset(&mut self, reason: OutputResetReason) {
+        self.observations.resets.lock().unwrap().push(reason);
+    }
+
+    fn filter(&mut self, points: &mut [LaserPoint], ctx: &OutputFilterContext) {
+        if let Some(tag) = self.intensity_tag {
+            for point in points.iter_mut() {
+                point.intensity = tag;
+            }
+        }
+        self.observations.calls.fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .invocations
+            .lock()
+            .unwrap()
+            .push(RecordedFilterCall {
+                points: points.to_vec(),
+                ctx: *ctx,
+            });
+    }
+}
+
+struct StampingFilter {
+    observations: Arc<FilterObservations>,
+    next_stamp: u16,
+}
+
+impl StampingFilter {
+    fn new() -> (Self, Arc<FilterObservations>) {
+        let observations = Arc::new(FilterObservations::default());
+        (
+            Self {
+                observations: observations.clone(),
+                next_stamp: 1,
+            },
+            observations,
+        )
+    }
+}
+
+impl OutputFilter for StampingFilter {
+    fn reset(&mut self, reason: OutputResetReason) {
+        self.observations.resets.lock().unwrap().push(reason);
+    }
+
+    fn filter(&mut self, points: &mut [LaserPoint], ctx: &OutputFilterContext) {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.saturating_add(1);
+        for point in points.iter_mut() {
+            point.intensity = stamp;
+        }
+        self.observations.calls.fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .invocations
+            .lock()
+            .unwrap()
+            .push(RecordedFilterCall {
+                points: points.to_vec(),
+                ctx: *ctx,
+            });
+    }
+}
+
+fn wait_for_filter_calls(
+    observations: &Arc<FilterObservations>,
+    min_len: usize,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if observations.calls.load(Ordering::SeqCst) >= min_len {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!(
+        "timed out waiting for {} filter calls, got {}",
+        min_len,
+        observations.calls.load(Ordering::SeqCst)
+    );
+}
+
+fn wait_for_filter_reset(
+    observations: &Arc<FilterObservations>,
+    reason: OutputResetReason,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if observations
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .any(|reset| reset == reason)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for reset {reason:?}");
+}
+
 /// Minimal FIFO test backend for FrameSession tests.
 struct FifoTestBackend {
     connected: bool,
     write_count: Arc<AtomicUsize>,
     points_written: Arc<AtomicUsize>,
     shutter_open: Arc<AtomicBool>,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
 }
 
 impl FifoTestBackend {
@@ -1195,6 +1343,7 @@ impl FifoTestBackend {
             write_count: Arc::new(AtomicUsize::new(0)),
             points_written: Arc::new(AtomicUsize::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
+            writes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -1238,6 +1387,7 @@ impl FifoBackend for FifoTestBackend {
         _pps: u32,
         points: &[LaserPoint],
     ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
         self.write_count.fetch_add(1, Ordering::SeqCst);
         self.points_written
             .fetch_add(points.len(), Ordering::SeqCst);
@@ -1252,6 +1402,8 @@ struct FrameSwapTestBackend {
     last_frame_size: Arc<AtomicUsize>,
     shutter_open: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    frame_capacity: usize,
 }
 
 impl FrameSwapTestBackend {
@@ -1262,6 +1414,15 @@ impl FrameSwapTestBackend {
             last_frame_size: Arc::new(AtomicUsize::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            frame_capacity: 4095,
+        }
+    }
+
+    fn new_with_capacity(frame_capacity: usize) -> Self {
+        Self {
+            frame_capacity,
+            ..Self::new()
         }
     }
 }
@@ -1301,7 +1462,7 @@ impl DacBackend for FrameSwapTestBackend {
 
 impl FrameSwapBackend for FrameSwapTestBackend {
     fn frame_capacity(&self) -> usize {
-        4095
+        self.frame_capacity
     }
     fn is_ready_for_frame(&mut self) -> bool {
         self.ready.load(Ordering::SeqCst)
@@ -1311,9 +1472,239 @@ impl FrameSwapBackend for FrameSwapTestBackend {
         _pps: u32,
         points: &[LaserPoint],
     ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
         self.write_count.fetch_add(1, Ordering::SeqCst);
         self.last_frame_size.store(points.len(), Ordering::SeqCst);
         Ok(crate::backend::WriteOutcome::Written)
+    }
+}
+
+struct RetryFifoTestBackend {
+    connected: bool,
+    caps: crate::types::DacCapabilities,
+    shutter_open: Arc<AtomicBool>,
+    block_next_writes: Arc<AtomicUsize>,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+}
+
+impl RetryFifoTestBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            caps: crate::types::DacCapabilities {
+                pps_min: 1000,
+                pps_max: 100000,
+                max_points_per_chunk: 20,
+                output_model: crate::types::OutputModel::NetworkFifo,
+            },
+            shutter_open: Arc::new(AtomicBool::new(false)),
+            block_next_writes: Arc::new(AtomicUsize::new(0)),
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl DacBackend for RetryFifoTestBackend {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("RetryFifoTest".into())
+    }
+    fn caps(&self) -> &crate::types::DacCapabilities {
+        &self.caps
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, open: bool) -> DacResult<()> {
+        self.shutter_open.store(open, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FifoBackend for RetryFifoTestBackend {
+    fn try_write_points(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
+        let remaining = self.block_next_writes.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.block_next_writes
+                .store(remaining - 1, Ordering::SeqCst);
+            return Ok(crate::backend::WriteOutcome::WouldBlock);
+        }
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+
+    fn queued_points(&self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+struct DisconnectAfterNFrameSwapBackend {
+    connected: bool,
+    fail_after: usize,
+    write_count: AtomicUsize,
+}
+
+impl DisconnectAfterNFrameSwapBackend {
+    fn new(fail_after: usize) -> Self {
+        Self {
+            connected: false,
+            fail_after,
+            write_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl DacBackend for DisconnectAfterNFrameSwapBackend {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    }
+    fn caps(&self) -> &crate::types::DacCapabilities {
+        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+            pps_min: 1000,
+            pps_max: 100000,
+            max_points_per_chunk: 4095,
+            output_model: crate::types::OutputModel::UsbFrameSwap,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _: bool) -> DacResult<()> {
+        Ok(())
+    }
+}
+
+impl FrameSwapBackend for DisconnectAfterNFrameSwapBackend {
+    fn frame_capacity(&self) -> usize {
+        4095
+    }
+    fn is_ready_for_frame(&mut self) -> bool {
+        true
+    }
+    fn write_frame(
+        &mut self,
+        _pps: u32,
+        _points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        let count = self.write_count.fetch_add(1, Ordering::SeqCst);
+        if count >= self.fail_after {
+            self.connected = false;
+            Err(crate::error::Error::disconnected("simulated disconnect"))
+        } else {
+            Ok(crate::backend::WriteOutcome::Written)
+        }
+    }
+}
+
+struct ReconnectFrameSwapBackend {
+    connected: bool,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+}
+
+impl ReconnectFrameSwapBackend {
+    fn new(writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>) -> Self {
+        Self {
+            connected: false,
+            writes,
+        }
+    }
+}
+
+impl DacBackend for ReconnectFrameSwapBackend {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    }
+    fn caps(&self) -> &crate::types::DacCapabilities {
+        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+            pps_min: 1000,
+            pps_max: 100000,
+            max_points_per_chunk: 4095,
+            output_model: crate::types::OutputModel::UsbFrameSwap,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _: bool) -> DacResult<()> {
+        Ok(())
+    }
+}
+
+impl FrameSwapBackend for ReconnectFrameSwapBackend {
+    fn frame_capacity(&self) -> usize {
+        4095
+    }
+    fn is_ready_for_frame(&mut self) -> bool {
+        true
+    }
+    fn write_frame(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+}
+
+struct FilterReconnectFrameSwapDiscoverer {
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+}
+
+impl crate::discovery::ExternalDiscoverer for FilterReconnectFrameSwapDiscoverer {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
+        let mut device = crate::discovery::ExternalDevice::new(());
+        device.ip_address = Some("10.0.0.77".parse().unwrap());
+        device.hardware_name = Some("Filter Reconnect FrameSwap".into());
+        vec![device]
+    }
+
+    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+        Ok(BackendKind::FrameSwap(Box::new(
+            ReconnectFrameSwapBackend::new(self.writes.clone()),
+        )))
     }
 }
 
@@ -1728,6 +2119,399 @@ fn test_frame_session_udp_timed_retries_same_transition_chunk_on_wouldblock() {
 }
 
 #[test]
+fn test_frame_session_fifo_output_filter_skips_keepalives_and_sees_color_delay() {
+    let backend = RetryUdpTimedTestBackend::new();
+    let writes = backend.writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+    let (filter, observations) = RecordingFilter::new();
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(1)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
+    assert_eq!(
+        observations.calls.load(Ordering::SeqCst),
+        0,
+        "pre-first-frame FIFO keepalives must not invoke the output filter"
+    );
+
+    session.send_frame(Frame::new(vec![
+        LaserPoint::new(0.0, 0.0, 100, 200, 300, 400),
+        LaserPoint::new(0.5, 0.0, 500, 600, 700, 800),
+        LaserPoint::new(1.0, 0.0, 900, 1000, 1100, 1200),
+    ]));
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(200));
+
+    let call = observations.invocations.lock().unwrap()[0].clone();
+    assert_eq!(call.ctx.kind, PresentedSliceKind::FifoChunk);
+    assert!(!call.ctx.is_cyclic);
+    assert_eq!(call.points.len(), 3);
+    assert_eq!(call.points[0].r, 0);
+    assert_eq!(call.points[0].g, 0);
+    assert_eq!(call.points[0].b, 0);
+    assert_eq!(call.points[0].intensity, 0);
+    assert_eq!(call.points[1].r, 100);
+    assert_eq!(call.points[1].g, 200);
+    assert_eq!(call.points[1].b, 300);
+    assert_eq!(call.points[1].intensity, 400);
+    assert_eq!(call.points[2].r, 500);
+    assert_eq!(call.points[2].g, 600);
+    assert_eq!(call.points[2].b, 700);
+    assert_eq!(call.points[2].intensity, 800);
+    assert!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|write| *write == call.points),
+        "backend should receive the same filtered FIFO chunk"
+    );
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for UDP-timed session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_frame_swap_output_filter_sees_post_clamp_cyclic_frame() {
+    let backend = FrameSwapTestBackend::new_with_capacity(3);
+    let writes = backend.writes.clone();
+    let write_count = backend.write_count.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+    let (filter, observations) = RecordingFilter::with_intensity_tag(1234);
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![
+                LaserPoint::blanked(10.0, 0.0),
+                LaserPoint::blanked(20.0, 0.0),
+            ])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(200));
+
+    let before_writes = write_count.load(Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![
+        make_point(30.0, 0.0),
+        make_point(40.0, 0.0),
+    ]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let call = loop {
+        if let Some(call) = observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|call| call.points.len() == 3 && call.points[1].x == 30.0)
+            .cloned()
+        {
+            break call;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the clamped A->B frame"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    while write_count.load(Ordering::SeqCst) <= before_writes {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    assert_eq!(call.ctx.kind, PresentedSliceKind::FrameSwapFrame);
+    assert!(call.ctx.is_cyclic);
+    assert_eq!(call.points.len(), 3);
+    assert_eq!(
+        call.points[0].x, 20.0,
+        "clamp should trim the first transition point"
+    );
+    assert_eq!(call.points[1].x, 30.0);
+    assert_eq!(call.points[2].x, 40.0);
+    assert!(call.points.iter().all(|point| point.intensity == 1234));
+    assert!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|write| *write == call.points),
+        "backend should receive the filtered frame-swap buffer verbatim"
+    );
+
+    session.control().stop().unwrap();
+    session.join().unwrap();
+}
+
+#[test]
+fn test_frame_session_output_filter_resets_on_arm_and_disarm_and_sees_blanking() {
+    let backend = FrameSwapTestBackend::new();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+    let (filter, observations) = RecordingFilter::new();
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::from_millis(2))
+        .with_color_delay_points(0)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.send_frame(Frame::new(vec![
+        make_point(1.0, 0.0),
+        make_point(2.0, 0.0),
+        make_point(3.0, 0.0),
+    ]));
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(200));
+    assert_eq!(
+        observations.resets.lock().unwrap().as_slice(),
+        &[OutputResetReason::SessionStart]
+    );
+
+    let before_arm = observations.calls.load(Ordering::SeqCst);
+    session.control().arm().unwrap();
+    wait_for_filter_reset(
+        &observations,
+        OutputResetReason::Arm,
+        std::time::Duration::from_millis(200),
+    );
+    let armed_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let armed = loop {
+        if let Some(call) = observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(before_arm)
+            .find(|call| {
+                call.points.len() >= 3
+                    && call.points[0].intensity == 0
+                    && call.points[1].intensity == 0
+                    && call.points[2].intensity != 0
+            })
+            .cloned()
+        {
+            break call;
+        }
+        assert!(
+            std::time::Instant::now() < armed_deadline,
+            "timed out waiting for post-arm startup blanking output"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(armed.points[0].intensity, 0);
+    assert_eq!(armed.points[1].intensity, 0);
+    assert_eq!(armed.points[2].intensity, 65535);
+
+    let before_disarm = observations.calls.load(Ordering::SeqCst);
+    session.control().disarm().unwrap();
+    wait_for_filter_reset(
+        &observations,
+        OutputResetReason::Disarm,
+        std::time::Duration::from_millis(200),
+    );
+    let disarmed_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let disarmed = loop {
+        if let Some(call) = observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(before_disarm)
+            .find(|call| call.points.iter().all(|point| point.intensity == 0))
+            .cloned()
+        {
+            break call;
+        }
+        assert!(
+            std::time::Instant::now() < disarmed_deadline,
+            "timed out waiting for disarmed blank output"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert!(disarmed.points.iter().all(|point| point.intensity == 0));
+
+    let before_rearm = observations.calls.load(Ordering::SeqCst);
+    session.control().arm().unwrap();
+    let rearmed_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let rearmed = loop {
+        if let Some(call) = observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(before_rearm)
+            .find(|call| {
+                call.points.len() >= 3
+                    && call.points[0].intensity == 0
+                    && call.points[1].intensity == 0
+                    && call.points[2].intensity != 0
+            })
+            .cloned()
+        {
+            break call;
+        }
+        assert!(
+            std::time::Instant::now() < rearmed_deadline,
+            "timed out waiting for post-rearm startup blanking output"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(rearmed.points[0].intensity, 0);
+    assert_eq!(rearmed.points[1].intensity, 0);
+    assert_eq!(rearmed.points[2].intensity, 65535);
+    assert_eq!(
+        observations.resets.lock().unwrap().as_slice(),
+        &[
+            OutputResetReason::SessionStart,
+            OutputResetReason::Arm,
+            OutputResetReason::Disarm,
+            OutputResetReason::Arm,
+        ]
+    );
+
+    session.control().stop().unwrap();
+    session.join().unwrap();
+}
+
+#[test]
+fn test_frame_session_frame_swap_output_filter_not_rerun_for_retry() {
+    let backend = RetryFrameSwapTestBackend::new();
+    let writes = backend.writes.clone();
+    let ready = backend.ready.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+    let (filter, observations) = RecordingFilter::new();
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(encode_transition())
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(200));
+
+    ready.store(false, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let before_writes = writes.lock().unwrap().len();
+    block_next_writes.store(1, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
+    ready.store(true, Ordering::SeqCst);
+    wait_for_writes(
+        &writes,
+        before_writes + 2,
+        std::time::Duration::from_millis(200),
+    );
+
+    let retried_frame = {
+        let writes = writes.lock().unwrap();
+        writes[before_writes].clone()
+    };
+    assert_eq!(
+        observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.points == retried_frame)
+            .count(),
+        1,
+        "retrying the same frame-swap write must not rerun the filter for that frame"
+    );
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for frame-swap session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_fifo_output_filter_not_rerun_for_inner_retry() {
+    let backend = RetryFifoTestBackend::new();
+    let writes = backend.writes.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+    let (filter, observations) = StampingFilter::new();
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    let before_writes = writes.lock().unwrap().len();
+    block_next_writes.store(1, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_writes(
+        &writes,
+        before_writes + 2,
+        std::time::Duration::from_millis(200),
+    );
+
+    let retried_chunk = {
+        let writes = writes.lock().unwrap();
+        writes[before_writes..]
+            .windows(2)
+            .find(|window| {
+                window[0] == window[1] && window[0].iter().any(|point| point.intensity != 0)
+            })
+            .map(|window| window[0].clone())
+            .expect("expected a duplicated visible FIFO chunk")
+    };
+    let stamp = retried_chunk[0].intensity;
+    assert_eq!(
+        observations
+            .invocations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.points[0].intensity == stamp)
+            .count(),
+        1,
+        "inner WouldBlock retry must reuse the already-filtered FIFO chunk"
+    );
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for FIFO session, got {exit:?}"
+    );
+}
+
+#[test]
 fn test_frame_session_arm_disarm() {
     let backend = FifoTestBackend::new();
     let shutter = backend.shutter_open.clone();
@@ -1946,6 +2730,74 @@ fn test_compose_hardware_frame_a_to_b_no_cycling_artifact() {
 // =========================================================================
 // Reconnect-related tests
 // =========================================================================
+
+#[test]
+fn test_frame_session_output_filter_resets_on_reconnect_and_replays_last_frame() {
+    use crate::stream::Dac;
+    use crate::types::{DacInfo, DacType, ReconnectConfig};
+
+    let reconnect_writes = Arc::new(Mutex::new(Vec::new()));
+    let reconnect_writes_factory = reconnect_writes.clone();
+    let initial_backend = DisconnectAfterNFrameSwapBackend::new(1);
+    let info = DacInfo {
+        id: "filterreconnectframeswap:10.0.0.77".to_string(),
+        name: "Filter Reconnect FrameSwap".to_string(),
+        kind: DacType::Custom("FilterReconnectFrameSwap".to_string()),
+        caps: initial_backend.caps().clone(),
+    };
+    let device = Dac::new(info, BackendKind::FrameSwap(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut discovery =
+                crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+            discovery.register(Box::new(FilterReconnectFrameSwapDiscoverer {
+                writes: reconnect_writes_factory.clone(),
+            }));
+            discovery
+        });
+
+    let (filter, observations) = RecordingFilter::new();
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_output_filter(Box::new(filter))
+        .with_reconnect(
+            ReconnectConfig::new()
+                .max_retries(3)
+                .backoff(std::time::Duration::from_millis(20)),
+        );
+
+    let (session, _info) = device.start_frame_session(config).unwrap();
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]));
+
+    wait_for_filter_reset(
+        &observations,
+        OutputResetReason::Reconnect,
+        std::time::Duration::from_millis(500),
+    );
+    wait_for_filter_calls(&observations, 2, std::time::Duration::from_millis(500));
+
+    let resets = observations.resets.lock().unwrap().clone();
+    assert_eq!(resets[0], OutputResetReason::SessionStart);
+    assert!(resets.contains(&OutputResetReason::Arm));
+    assert!(resets.contains(&OutputResetReason::Reconnect));
+
+    let invocations = observations.invocations.lock().unwrap().clone();
+    let first = &invocations[0].points;
+    assert!(
+        invocations[1..].iter().any(|call| call.points == *first),
+        "replayed last frame should flow through the filter again after reconnect"
+    );
+    assert!(
+        !reconnect_writes.lock().unwrap().is_empty(),
+        "reconnected backend should receive replayed output"
+    );
+
+    drop(session);
+}
 
 #[test]
 fn test_engine_reset_clears_state() {

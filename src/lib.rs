@@ -25,6 +25,11 @@
 //! // Frame replays automatically. Submit new frames for animation.
 //! ```
 //!
+//! For advanced frame-mode output-space processing on the final presented
+//! sequence, use [`FrameSessionConfig::with_output_filter`]. The filter runs
+//! after transition composition, blanking, and color delay, just before the
+//! backend write.
+//!
 //! ## Callback Mode (advanced, FIFO backends only)
 //!
 //! Fill point buffers via zero-allocation callback for custom timing.
@@ -128,7 +133,8 @@ pub use stream::{Dac, Stream, StreamControl};
 
 // Presentation types (frame-first API)
 pub use presentation::{
-    default_transition, Frame, FrameSession, FrameSessionConfig, TransitionFn, TransitionPlan,
+    default_transition, Frame, FrameSession, FrameSessionConfig, OutputFilter, OutputFilterContext,
+    OutputResetReason, PresentedSliceKind, TransitionFn, TransitionPlan,
 };
 
 // Conditional exports based on features

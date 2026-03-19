@@ -19,6 +19,61 @@ use crate::types::LaserPoint;
 use std::sync::Arc;
 
 // =============================================================================
+// OutputFilter
+// =============================================================================
+
+/// Why an [`OutputFilter`] was reset.
+///
+/// Resets happen at output continuity boundaries where downstream processing
+/// should discard history and treat the next presented slice as a fresh stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputResetReason {
+    /// The session scheduler started.
+    SessionStart,
+    /// The backend reconnected and presentation state was replayed.
+    Reconnect,
+    /// Output was armed and startup blanking is about to resume visible content.
+    Arm,
+    /// Output was disarmed and presented output becomes forced-blanked.
+    Disarm,
+}
+
+/// The delivery mode of the presented slice passed to an [`OutputFilter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedSliceKind {
+    /// A FIFO chunk materialized by the frame session.
+    FifoChunk,
+    /// A complete frame-swap hardware frame.
+    FrameSwapFrame,
+}
+
+/// Metadata describing the final presented slice seen by an [`OutputFilter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputFilterContext {
+    /// Output rate for the presented slice.
+    pub pps: u32,
+    /// Whether the slice is a FIFO chunk or a frame-swap frame.
+    pub kind: PresentedSliceKind,
+    /// Whether the slice should be interpreted as cyclic.
+    pub is_cyclic: bool,
+}
+
+/// Hook for advanced output-space processing in frame mode.
+///
+/// The filter runs on the final point sequence immediately before backend
+/// write, after transition composition, blanking, and color delay.
+///
+/// `WouldBlock` retries reuse the already-filtered buffer verbatim. The filter
+/// is only called again when a new presented slice is materialized.
+pub trait OutputFilter: Send + 'static {
+    /// Reset internal continuity state after a stream break.
+    fn reset(&mut self, _reason: OutputResetReason) {}
+
+    /// Transform the final presented output in place.
+    fn filter(&mut self, points: &mut [LaserPoint], ctx: &OutputFilterContext);
+}
+
+// =============================================================================
 // Frame
 // =============================================================================
 
