@@ -24,6 +24,25 @@ This preserves the frame-first architecture for all DACs, including frame-swap
 backends such as Helios and ShowNET, without forcing downstream apps to
 re-implement scheduling or maintain separate FIFO and frame-swap pipelines.
 
+## Architecture Decision
+
+This plan assumes the architectural decision has been made:
+
+- `FrameSession` is the canonical API for frame-producing output on both FIFO
+  and frame-swap DACs
+- `start_stream()` remains the FIFO-native callback API
+- `laser-dac-rs` will not emulate streaming on top of frame-swap DACs such as
+  Helios or ShowNET
+
+This is important because the output-filter hook is not a stopgap. It is the
+intended extension point for downstream applications that need final
+output-space processing without taking ownership of presentation or scheduling.
+
+Related note: reconnect-aware custom discovery is no longer a blocker for this
+work. `open_device_with(...)` and `Dac::with_discovery_factory(...)` already
+exist in the crate, so this plan focuses only on the final presented-output
+hook and its companion liveness requirements.
+
 ## Problem
 
 `FrameSession` already owns the presentation-critical logic:
@@ -70,16 +89,26 @@ immediately before backend write, while preserving:
 - Do not add a second scheduling API
 - Do not move scheduling responsibility out of `FrameSession`
 - Do not redesign the callback streaming API
+- Do not add frame-swap support to `start_stream()`
+- Do not emulate streaming semantics on top of frame-swap hardware
 
 ## Proposed API
 
 Use a small stateful trait instead of a plain closure. The filter may need
-persistent state across FIFO chunks or frame-swap frame submissions, and it may
-need explicit reset semantics on reconnect.
+persistent state across FIFO chunks or frame-swap frame submissions, and it
+needs explicit reset semantics for output continuity breaks.
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputResetReason {
+    SessionStart,
+    Reconnect,
+    Arm,
+    Disarm,
+}
+
 pub trait OutputFilter: Send + 'static {
-    fn reset(&mut self) {}
+    fn reset(&mut self, reason: OutputResetReason) {}
 
     fn filter(&mut self, points: &mut [LaserPoint], ctx: &OutputFilterContext);
 }
@@ -94,7 +123,6 @@ pub enum PresentedSliceKind {
 pub struct OutputFilterContext {
     pub pps: u32,
     pub kind: PresentedSliceKind,
-    pub is_retry: bool,
     pub is_cyclic: bool,
 }
 ```
@@ -124,9 +152,18 @@ impl FrameSessionConfig {
 
 Why a trait and not `FnMut`:
 
-- explicit `reset()` is useful on reconnect
+- explicit reset semantics are required at output continuity boundaries
 - clearer semantics for stateful processing
 - easier to extend later than a raw closure type alias
+
+Retry contract:
+
+- the filter runs once per newly materialized presented slice
+- `WouldBlock` retries reuse the already-filtered buffer verbatim
+- the filter is not re-run for the same materialized slice
+
+That contract is more useful than exposing an `is_retry` flag that should almost
+always be false.
 
 ## Exact Execution Order
 
@@ -164,12 +201,10 @@ Special case before the first frame:
 Context for the filter:
 
 - `kind = PresentedSliceKind::FifoChunk`
-- `is_retry = false` on first materialization
 - `is_cyclic = false`
 
 On `WouldBlock`, the already-filtered buffer must be retried verbatim. Do not
-re-run the filter during retry spins. Set `is_retry = true` only if we ever add
-logic that re-materializes the buffer before another write attempt.
+re-run the filter during retry spins.
 
 ### Frame-swap path
 
@@ -199,7 +234,6 @@ Proposed order:
 Context for the filter:
 
 - `kind = PresentedSliceKind::FrameSwapFrame`
-- `is_retry = false` on first materialization
 - `is_cyclic = true`
 
 This gives the filter the actual looped hardware frame, after transition
@@ -225,9 +259,10 @@ The filter can then treat the slice as a cyclic loop and process the final
 
 ## Reset Semantics
 
-Call `OutputFilter::reset()` whenever the output continuity is known to be
+Call `OutputFilter::reset(reason)` whenever the output continuity is known to be
 broken by session state changes. At minimum:
 
+- session startup before the first logical frame is materialized
 - reconnect success in `try_reconnect(...)`
 - color-delay reset on reconnect
 - `engine.reset()` on reconnect
@@ -243,7 +278,7 @@ Arm/disarm must not be left implementation-defined. The contract should be:
   stream becomes forced-blanked
 - re-arm is a second continuity break because startup blanking is injected
   before visible content resumes
-- therefore the filter resets on both edges
+- therefore the filter resets on both edges using distinct reasons
 
 After the reset, the filter still runs on the presented output as usual once a
 logical frame exists. That means disarmed blanked output and post-arm startup
@@ -270,16 +305,38 @@ On reconnect:
 2. reset engine
 3. replay `last_frame` into the engine
 4. reset color delay
-5. reset output filter
+5. reset output filter with `OutputResetReason::Reconnect`
 
 This mirrors existing replay behavior and ensures downstream filters do not
 carry stale state across transport discontinuities.
+
+## Companion Requirement: Final-Output Liveness
+
+Downstream applications such as Modulaser may need a watchdog that monitors
+activity from the final output path rather than from authored-frame submission.
+
+This plan therefore includes a small companion requirement:
+
+- `FrameSession` must expose or internally maintain final-write activity
+  timestamps suitable for downstream watchdog integration
+- this liveness mechanism is separate from `OutputFilter`
+- filter invocation counts are not a sufficient liveness signal because retries
+  reuse an already-filtered buffer and pre-first-frame FIFO keepalive blanks do
+  not invoke the filter
+
+The exact public shape can be decided during implementation. It may be:
+
+- a lightweight status/metrics handle on `FrameSession`, or
+- an internal heartbeat surface used by downstream integration code
+
+But the requirement itself is part of this work, not a follow-up footnote.
 
 ## File-Level Implementation Plan
 
 ### 1. `src/presentation/mod.rs`
 
-- Add public `OutputFilter`, `OutputFilterContext`, and `PresentedSliceKind`
+- Add public `OutputFilter`, `OutputFilterContext`, `PresentedSliceKind`, and
+  `OutputResetReason`
 - Re-export them from `lib.rs`
 
 ### 2. `src/presentation/session.rs`
@@ -289,7 +346,8 @@ carry stale state across transport discontinuities.
 - Thread the filter into all scheduler loops
 - Run the filter after blanking and color delay, before backend write
 - Ensure retry loops reuse the already-filtered buffer
-- Call `reset()` on reconnect
+- Call `reset(reason)` on startup, reconnect, arm, and disarm
+- Add final-output liveness tracking suitable for downstream watchdogs
 
 ### 3. `src/lib.rs`
 
@@ -301,6 +359,8 @@ carry stale state across transport discontinuities.
 - Document the new hook as an advanced frame-mode extension point
 - State clearly that it runs on the final presented sequence
 - State the difference between `FifoChunk` and `FrameSwapFrame`
+- State clearly that `start_stream()` remains FIFO-only and is not supported on
+  frame-swap DACs
 
 ## Testing Plan
 
@@ -335,10 +395,12 @@ Add focused tests in `src/presentation/tests.rs`.
 
 ### Reset tests
 
+- session startup triggers filter reset
 - reconnect triggers filter reset
 - replayed `last_frame` after reconnect flows through filter again
 - disarm transition triggers filter reset
 - re-arm transition triggers filter reset before startup blanking/content resume
+- reset reasons are correct for startup / reconnect / arm / disarm
 
 ### Semantics tests
 
@@ -358,9 +420,16 @@ Build test filters that stamp or count invocations:
 - `TaggingFilter` to mutate intensity/RGB in a detectable way
 - `RecordingFilter` to capture slice lengths and context
 
+### Liveness tests
+
+- retries do not falsely appear as stalled output
+- pre-first-frame FIFO keepalive activity is visible to the liveness surface even
+  though it does not invoke the filter
+- frame-swap ready-wait / retry loops continue to report output-thread liveness
+
 ## Rollout Strategy
 
-1. Land the API and internal wiring first with tests
+1. Land the API, reset semantics, and liveness tracking first with tests
 2. Update docs and examples
 3. Keep it opt-in: no behavior change for callers that do not install a filter
 4. Downstream projects can then migrate frame-mode safety/output processing onto
@@ -397,14 +466,15 @@ that wants fail-dark can blank or repair points in-place.
 
 ### Should the filter receive more context?
 
-Not initially. Keep the first version minimal.
+For the first version, keep `OutputFilterContext` small, but do not underspecify
+continuity semantics. The reset reason is part of the public contract now.
 
-If needed later, context could grow with:
+Additional context can still be added later if needed:
 
 - `frame_index`
 - `transition_prefix_len`
 - `armed` state
-- reconnect/discontinuity markers
+- reconnect/discontinuity markers beyond reset reason
 
 ## Recommendation
 
