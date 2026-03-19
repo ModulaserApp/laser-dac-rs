@@ -92,6 +92,30 @@ immediately before backend write, while preserving:
 - Do not add frame-swap support to `start_stream()`
 - Do not emulate streaming semantics on top of frame-swap hardware
 
+## Rejected Alternative
+
+The main alternative considered was adding frame-swap support to the callback
+streaming API by emulating streaming on top of frame-replacement hardware such
+as Helios and ShowNET.
+
+That approach was rejected for this plan.
+
+Why:
+
+- frame-swap DACs are modeled honestly in the crate as `FrameSwapBackend`s, not
+  as FIFO devices
+- `start_stream()` currently has coherent FIFO-native semantics:
+  `ChunkRequest`, `target_buffer`, `min_points`, and `buffered_points` all mean
+  something real for queue-driven backends
+- emulating streaming on top of frame-swap hardware would make those semantics
+  partly synthetic and backend-specific
+- the complexity would not replace `FrameSession`; it would add a second
+  presentation path that has to fake buffering, readiness, retry, and hold-last
+  behavior for hardware that natively accepts whole frames
+
+For long-term architecture, it is better to keep frame-swap DACs on the
+frame-first API and add the missing final-output hook there.
+
 ## Proposed API
 
 Use a small stateful trait instead of a plain closure. The filter may need
@@ -330,6 +354,34 @@ The exact public shape can be decided during implementation. It may be:
 - an internal heartbeat surface used by downstream integration code
 
 But the requirement itself is part of this work, not a follow-up footnote.
+
+## Modulaser Parity Targets
+
+This plan is intended to support Modulaser migration without losing important
+behavioral guarantees from its current output path.
+
+The implementation should preserve parity for:
+
+- seam handling:
+  self-loop seams and A->B seams must be filtered on the exact presented
+  sequence, including frame-swap transition-prefix clamping
+- retry behavior:
+  `WouldBlock` must retry the same already-filtered slice verbatim
+- continuity resets:
+  reconnect and arm/disarm edges must reset filter continuity explicitly
+- liveness:
+  downstream watchdogs must still be able to observe activity from the final
+  output path even when the filter is not invoked
+- first-frame behavior:
+  pre-first-frame FIFO keepalive blanks must not invoke the filter, but they
+  must not disappear from liveness accounting
+- color-delay ordering:
+  the filter must run after color delay so downstream safety sees the true
+  hardware-bound color/intensity sequence
+
+These parity targets do not require preserving Modulaser's current callback API.
+They require preserving the final observable behavior that matters for safety
+and debugging.
 
 ## File-Level Implementation Plan
 
