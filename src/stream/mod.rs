@@ -1222,7 +1222,7 @@ impl Dac {
 
     /// Set a custom discovery factory for reconnection.
     ///
-    /// When reconnection is enabled (via [`FrameSessionConfig::with_reconnect`] or
+    /// When reconnection is enabled (via [`crate::FrameSessionConfig::with_reconnect`] or
     /// [`StreamConfig::with_reconnect`]), the factory is called to create a
     /// [`DacDiscovery`] instance for each reconnection attempt. This is required
     /// for custom backends registered via [`DacDiscovery::register`] — without it,

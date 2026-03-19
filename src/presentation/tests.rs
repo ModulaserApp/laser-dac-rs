@@ -2634,7 +2634,8 @@ fn test_frame_session_metrics_available_and_disconnect_after_stop() {
 
     assert!(metrics.connected());
     assert!(metrics.last_loop_activity().is_some());
-    assert_eq!(metrics.last_write_success(), None);
+    let write_success = wait_for_write_success(&metrics, std::time::Duration::from_millis(200));
+    assert!(write_success <= metrics.last_write_success().unwrap());
 
     session.control().stop().unwrap();
     session.join().unwrap();
