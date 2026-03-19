@@ -220,3 +220,26 @@ pub fn open_device(id: &str) -> BackendResult<Dac> {
     });
     Ok(dac)
 }
+
+/// Open a DAC by ID using a custom discovery factory.
+///
+/// Like [`open_device`], but uses the provided factory to create the
+/// [`DacDiscovery`] instance. This is required for custom backends
+/// registered via [`DacDiscovery::register`] — the default `open_device`
+/// only finds built-in DAC types.
+///
+/// The factory is called once now for the initial open, and stored for
+/// future reconnection attempts. It must be `Fn` (not `FnOnce`) because
+/// reconnection may call it multiple times.
+pub fn open_device_with<F>(id: &str, factory: F) -> BackendResult<Dac>
+where
+    F: Fn() -> DacDiscovery + Send + 'static,
+{
+    let mut discovery = factory();
+    let mut dac = discovery.open_by_id(id)?;
+    dac.reconnect_target = Some(reconnect::ReconnectTarget {
+        device_id: id.to_string(),
+        discovery_factory: Some(Box::new(factory)),
+    });
+    Ok(dac)
+}

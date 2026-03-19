@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result, WriteOutcome};
+use crate::discovery::DacDiscovery;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
 use crate::scheduler;
 use crate::types::{
@@ -1218,6 +1219,35 @@ impl Dac {
         }
     }
 
+    /// Set a custom discovery factory for reconnection.
+    ///
+    /// When reconnection is enabled (via [`FrameSessionConfig::with_reconnect`] or
+    /// [`StreamConfig::with_reconnect`]), the factory is called to create a
+    /// [`DacDiscovery`] instance for each reconnection attempt. This is required
+    /// for custom backends registered via [`DacDiscovery::register`] — without it,
+    /// reconnection uses the default discovery which only finds built-in DAC types.
+    ///
+    /// For most cases, prefer [`open_device_with`](crate::open_device_with) which
+    /// handles both initial discovery and reconnection in one call. Use this method
+    /// when you build `Dac` instances yourself via `scan()` + `connect()` + `Dac::new()`.
+    pub fn with_discovery_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> DacDiscovery + Send + 'static,
+    {
+        match self.reconnect_target {
+            Some(ref mut target) => {
+                target.discovery_factory = Some(Box::new(factory));
+            }
+            None => {
+                self.reconnect_target = Some(ReconnectTarget {
+                    device_id: self.info.id.clone(),
+                    discovery_factory: Some(Box::new(factory)),
+                });
+            }
+        }
+        self
+    }
+
     /// Returns the device info.
     pub fn info(&self) -> &DacInfo {
         &self.info
@@ -1314,7 +1344,7 @@ impl Dac {
         // Wire reconnect policy if configured
         if let Some(rc) = reconnect_config {
             let target = stream.reconnect_target.take().ok_or_else(|| {
-                Error::invalid_config("reconnect requires a device opened via open_device()")
+                Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()")
             })?;
             stream.reconnect_policy = Some(ReconnectPolicy::new(rc, target));
         }
@@ -1376,7 +1406,7 @@ impl Dac {
         let reconnect_policy = match reconnect_config {
             Some(rc) => {
                 let target = self.reconnect_target.take().ok_or_else(|| {
-                    Error::invalid_config("reconnect requires a device opened via open_device()")
+                    Error::invalid_config("reconnect requires a reconnect target — use open_device(), open_device_with(), or Dac::with_discovery_factory()")
                 })?;
                 Some(ReconnectPolicy::new(rc, target))
             }

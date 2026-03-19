@@ -2088,8 +2088,8 @@ fn test_start_stream_reconnect_without_target_errors() {
         Err(e) => {
             let msg = format!("{}", e);
             assert!(
-                msg.contains("open_device"),
-                "error should mention open_device: {}",
+                msg.contains("open_device()") && msg.contains("with_discovery_factory"),
+                "error should mention open_device and alternatives: {}",
                 msg
             );
         }
@@ -3289,4 +3289,76 @@ fn test_fractional_consumed_prevents_stall() {
     control.stop().unwrap();
     let exit = handle.join().unwrap().unwrap();
     assert_eq!(exit, RunExit::Stopped);
+}
+
+#[test]
+fn with_discovery_factory_creates_target_when_none() {
+    let backend = TestBackend::new();
+    let info = DacInfo {
+        id: "test-factory".to_string(),
+        name: "Test Device".to_string(),
+        kind: DacType::Custom("Test".to_string()),
+        caps: backend.caps().clone(),
+    };
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    assert!(device.reconnect_target.is_none());
+
+    let device = device.with_discovery_factory(|| {
+        crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+    });
+
+    let target = device.reconnect_target.as_ref().unwrap();
+    assert_eq!(target.device_id, "test-factory");
+    assert!(target.discovery_factory.is_some());
+}
+
+#[test]
+fn with_discovery_factory_replaces_factory_on_existing_target() {
+    let backend = TestBackend::new();
+    let info = DacInfo {
+        id: "test-replace".to_string(),
+        name: "Test Device".to_string(),
+        kind: DacType::Custom("Test".to_string()),
+        caps: backend.caps().clone(),
+    };
+    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
+        device_id: "original-id".to_string(),
+        discovery_factory: None,
+    });
+
+    let device = device.with_discovery_factory(|| {
+        crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+    });
+
+    let target = device.reconnect_target.as_ref().unwrap();
+    assert_eq!(target.device_id, "original-id");
+    assert!(target.discovery_factory.is_some());
+}
+
+#[test]
+fn with_discovery_factory_enables_reconnect_for_frame_session() {
+    let backend = TestBackend::new();
+    let info = DacInfo {
+        id: "test-session".to_string(),
+        name: "Test Device".to_string(),
+        kind: DacType::Custom("Test".to_string()),
+        caps: backend.caps().clone(),
+    };
+    let device =
+        Dac::new(info, BackendKind::Fifo(Box::new(backend))).with_discovery_factory(|| {
+            crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+        });
+
+    let config = crate::presentation::FrameSessionConfig::new(30_000)
+        .with_reconnect(crate::types::ReconnectConfig::new());
+    let result = device.start_frame_session(config);
+    assert!(
+        result.is_ok(),
+        "start_frame_session should succeed with discovery factory: {:?}",
+        result.err()
+    );
+
+    let (session, _info) = result.unwrap();
+    drop(session);
 }
