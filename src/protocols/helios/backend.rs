@@ -3,7 +3,7 @@
 use crate::backend::{DacBackend, FrameSwapBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::helios::{
-    DeviceStatus, Frame, HeliosDac, HeliosDacController, Point as HeliosPoint,
+    DeviceStatus, Frame, HeliosDac, HeliosDacController, HeliosDacError, Point as HeliosPoint,
 };
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 
@@ -35,15 +35,32 @@ impl HeliosBackend {
 
     /// Discover all Helios DACs on the system.
     pub fn discover() -> Result<Vec<HeliosDac>> {
-        let controller = HeliosDacController::new()
-            .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))?;
-        controller
-            .list_devices()
-            .map_err(|e| Error::backend(std::io::Error::other(e.to_string())))
+        let controller = HeliosDacController::new().map_err(Self::map_err)?;
+        controller.list_devices().map_err(Self::map_err)
     }
 
-    fn map_err(e: crate::protocols::helios::native::HeliosDacError) -> Error {
-        Error::backend(std::io::Error::other(e.to_string()))
+    /// Take and leak any open USB device handle to prevent a segfault in
+    /// `libusb_close()` on macOS when the device was physically disconnected.
+    /// This is a bounded leak (~200 bytes) per disconnect event.
+    fn leak_handle(&mut self) {
+        if let Some(HeliosDac::Open { handle, .. }) = self.dac.take() {
+            std::mem::forget(handle);
+        }
+    }
+
+    /// Classify a Helios DAC error into the appropriate streaming error type.
+    ///
+    /// Fatal USB errors (`NoDevice`, `Io`, `Pipe`) indicate the device was
+    /// physically disconnected and are mapped to `Error::Disconnected` so the
+    /// stream layer can enter the reconnection path instead of calling
+    /// `disconnect()` on a dead handle.
+    fn map_err(e: HeliosDacError) -> Error {
+        match &e {
+            HeliosDacError::UsbError(
+                rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe,
+            ) => Error::disconnected(format!("USB device error: {e}")),
+            _ => Error::backend(std::io::Error::other(e.to_string())),
+        }
     }
 }
 
@@ -82,7 +99,7 @@ impl DacBackend for HeliosBackend {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        self.dac = None;
+        self.leak_handle();
         Ok(())
     }
 
@@ -102,6 +119,49 @@ impl DacBackend for HeliosBackend {
             dac.set_shutter(open).map_err(Self::map_err)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for HeliosBackend {
+    fn drop(&mut self) {
+        self.leak_handle();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_err_usb_no_device_is_disconnected() {
+        let err = HeliosBackend::map_err(HeliosDacError::UsbError(rusb::Error::NoDevice));
+        assert!(err.is_disconnected());
+    }
+
+    #[test]
+    fn map_err_usb_io_is_disconnected() {
+        let err = HeliosBackend::map_err(HeliosDacError::UsbError(rusb::Error::Io));
+        assert!(err.is_disconnected());
+    }
+
+    #[test]
+    fn map_err_usb_pipe_is_disconnected() {
+        let err = HeliosBackend::map_err(HeliosDacError::UsbError(rusb::Error::Pipe));
+        assert!(err.is_disconnected());
+    }
+
+    #[test]
+    fn map_err_usb_timeout_is_backend() {
+        let err = HeliosBackend::map_err(HeliosDacError::UsbError(rusb::Error::Timeout));
+        assert!(!err.is_disconnected());
+        assert!(matches!(err, Error::Backend(_)));
+    }
+
+    #[test]
+    fn map_err_device_not_opened_is_backend() {
+        let err = HeliosBackend::map_err(HeliosDacError::DeviceNotOpened);
+        assert!(!err.is_disconnected());
+        assert!(matches!(err, Error::Backend(_)));
     }
 }
 
