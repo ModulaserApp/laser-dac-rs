@@ -231,6 +231,23 @@ pub fn open_device(id: &str) -> BackendResult<Dac> {
 /// The factory is called once now for the initial open, and stored for
 /// future reconnection attempts. It must be `Fn` (not `FnOnce`) because
 /// reconnection may call it multiple times.
+///
+/// # Example
+///
+/// ```ignore
+/// use laser_dac::{open_device_with, DacDiscovery, EnabledDacTypes, FrameSessionConfig, ReconnectConfig};
+///
+/// let dac = open_device_with("shownet:my-device", || {
+///     let mut d = DacDiscovery::new(EnabledDacTypes::all());
+///     d.register(Box::new(MyShowNetDiscoverer::new()));
+///     d
+/// })?;
+///
+/// let config = FrameSessionConfig::new(30_000)
+///     .with_reconnect(ReconnectConfig::new());
+/// let (session, _info) = dac.start_frame_session(config)?;
+/// // Reconnection will also use the factory to find the custom backend
+/// ```
 pub fn open_device_with<F>(id: &str, factory: F) -> BackendResult<Dac>
 where
     F: Fn() -> DacDiscovery + Send + 'static,
