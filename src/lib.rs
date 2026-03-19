@@ -30,6 +30,10 @@
 //! after transition composition, blanking, and color delay, just before the
 //! backend write.
 //!
+//! For downstream watchdogs, [`FrameSession::metrics`] exposes a small liveness
+//! surface with connectivity, last-loop-activity, and last-write-success
+//! timestamps. Watchdog policy remains application-owned.
+//!
 //! ## Callback Mode (advanced, FIFO backends only)
 //!
 //! Fill point buffers via zero-allocation callback for custom timing.
@@ -133,8 +137,8 @@ pub use stream::{Dac, Stream, StreamControl};
 
 // Presentation types (frame-first API)
 pub use presentation::{
-    default_transition, Frame, FrameSession, FrameSessionConfig, OutputFilter, OutputFilterContext,
-    OutputResetReason, PresentedSliceKind, TransitionFn, TransitionPlan,
+    default_transition, Frame, FrameSession, FrameSessionConfig, FrameSessionMetrics, OutputFilter,
+    OutputFilterContext, OutputResetReason, PresentedSliceKind, TransitionFn, TransitionPlan,
 };
 
 // Conditional exports based on features

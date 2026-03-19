@@ -1708,6 +1708,35 @@ impl crate::discovery::ExternalDiscoverer for FilterReconnectFrameSwapDiscoverer
     }
 }
 
+struct DelayedReconnectFrameSwapDiscoverer {
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    empty_scans_remaining: Arc<AtomicUsize>,
+}
+
+impl crate::discovery::ExternalDiscoverer for DelayedReconnectFrameSwapDiscoverer {
+    fn dac_type(&self) -> crate::types::DacType {
+        crate::types::DacType::Custom("DelayedReconnectFrameSwap".into())
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
+        if self.empty_scans_remaining.load(Ordering::SeqCst) > 0 {
+            self.empty_scans_remaining.fetch_sub(1, Ordering::SeqCst);
+            return vec![];
+        }
+
+        let mut device = crate::discovery::ExternalDevice::new(());
+        device.ip_address = Some("10.0.0.88".parse().unwrap());
+        device.hardware_name = Some("Delayed Reconnect FrameSwap".into());
+        vec![device]
+    }
+
+    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+        Ok(BackendKind::FrameSwap(Box::new(
+            ReconnectFrameSwapBackend::new(self.writes.clone()),
+        )))
+    }
+}
+
 struct RetryFrameSwapTestBackend {
     connected: bool,
     caps: crate::types::DacCapabilities,
@@ -1871,6 +1900,54 @@ fn wait_for_writes(
         min_len,
         writes.lock().unwrap().len()
     );
+}
+
+fn wait_for_loop_activity_after(
+    metrics: &FrameSessionMetrics,
+    after: std::time::Instant,
+    timeout: std::time::Duration,
+) -> std::time::Instant {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(activity) = metrics.last_loop_activity() {
+            if activity > after {
+                return activity;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for loop activity after {after:?}");
+}
+
+fn wait_for_write_success(
+    metrics: &FrameSessionMetrics,
+    timeout: std::time::Duration,
+) -> std::time::Instant {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(write_success) = metrics.last_write_success() {
+            return write_success;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for write success");
+}
+
+fn wait_for_write_success_after(
+    metrics: &FrameSessionMetrics,
+    after: std::time::Instant,
+    timeout: std::time::Duration,
+) -> std::time::Instant {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Some(write_success) = metrics.last_write_success() {
+            if write_success > after {
+                return write_success;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    panic!("timed out waiting for write success after {after:?}");
 }
 
 fn encode_transition() -> TransitionFn {
@@ -2548,6 +2625,180 @@ fn test_frame_session_stop() {
 }
 
 #[test]
+fn test_frame_session_metrics_available_and_disconnect_after_stop() {
+    let backend = FifoTestBackend::new();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+    let config = FrameSessionConfig::new(30_000);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+
+    assert!(metrics.connected());
+    assert!(metrics.last_loop_activity().is_some());
+    assert_eq!(metrics.last_write_success(), None);
+
+    session.control().stop().unwrap();
+    session.join().unwrap();
+
+    assert!(!metrics.connected());
+}
+
+#[test]
+fn test_frame_session_fifo_metrics_advance_while_sleeping_with_healthy_buffer() {
+    let backend = FifoTestBackend::new();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+    let config = FrameSessionConfig::new(30).with_startup_blank(std::time::Duration::ZERO);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+
+    let first_write = wait_for_write_success(&metrics, std::time::Duration::from_millis(200));
+    let later_activity =
+        wait_for_loop_activity_after(&metrics, first_write, std::time::Duration::from_millis(200));
+
+    assert!(later_activity > first_write);
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for FIFO session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_udp_timed_metrics_advance_while_retrying_same_chunk() {
+    let backend = RetryUdpTimedTestBackend::new();
+    let writes = backend.writes.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    let baseline_write = wait_for_write_success(&metrics, std::time::Duration::from_millis(200));
+    let before_writes = writes.lock().unwrap().len();
+    let before_activity = metrics.last_loop_activity().unwrap();
+
+    block_next_writes.store(20, Ordering::SeqCst);
+    wait_for_writes(
+        &writes,
+        before_writes + 2,
+        std::time::Duration::from_millis(200),
+    );
+
+    assert!(
+        metrics.last_loop_activity().unwrap() > before_activity,
+        "loop activity should advance while retrying a WouldBlock UDP chunk"
+    );
+    assert_eq!(
+        metrics.last_write_success(),
+        Some(baseline_write),
+        "write-success timestamp must not advance on WouldBlock retries"
+    );
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for UDP-timed session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_frame_swap_metrics_advance_while_waiting_for_readiness() {
+    let backend = RetryFrameSwapTestBackend::new();
+    let ready = backend.ready.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+    let config = FrameSessionConfig::new(30_000).with_startup_blank(std::time::Duration::ZERO);
+    ready.store(false, Ordering::SeqCst);
+
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+
+    let before = metrics.last_loop_activity().unwrap();
+    let after =
+        wait_for_loop_activity_after(&metrics, before, std::time::Duration::from_millis(200));
+
+    assert!(after > before);
+    assert_eq!(metrics.last_write_success(), None);
+
+    session.control().stop().unwrap();
+    session.join().unwrap();
+}
+
+#[test]
+fn test_frame_session_metrics_write_success_only_advances_on_successful_write() {
+    let backend = RetryFrameSwapTestBackend::new();
+    let writes = backend.writes.clone();
+    let ready = backend.ready.clone();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::FrameSwap(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(encode_transition())
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    let first_write = wait_for_write_success(&metrics, std::time::Duration::from_millis(200));
+    assert!(first_write <= metrics.last_write_success().unwrap());
+
+    ready.store(false, Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let baseline_write = metrics.last_write_success().unwrap();
+    let before_writes = writes.lock().unwrap().len();
+    block_next_writes.store(3, Ordering::SeqCst);
+    session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
+    ready.store(true, Ordering::SeqCst);
+
+    wait_for_writes(
+        &writes,
+        before_writes + 2,
+        std::time::Duration::from_millis(200),
+    );
+    assert_eq!(
+        metrics.last_write_success(),
+        Some(baseline_write),
+        "WouldBlock retries must not look like successful writes"
+    );
+
+    let next_write = wait_for_write_success_after(
+        &metrics,
+        baseline_write,
+        std::time::Duration::from_millis(200),
+    );
+    assert!(next_write > baseline_write);
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for frame-swap session, got {exit:?}"
+    );
+}
+
+#[test]
 fn test_color_delay_line_carries_across_chunks() {
     use super::ColorDelayLine;
 
@@ -2795,6 +3046,80 @@ fn test_frame_session_output_filter_resets_on_reconnect_and_replays_last_frame()
         !reconnect_writes.lock().unwrap().is_empty(),
         "reconnected backend should receive replayed output"
     );
+
+    drop(session);
+}
+
+#[test]
+fn test_frame_session_metrics_advance_during_reconnect_backoff() {
+    use crate::stream::Dac;
+    use crate::types::{DacInfo, DacType, ReconnectConfig};
+
+    let reconnect_writes = Arc::new(Mutex::new(Vec::new()));
+    let reconnect_writes_factory = reconnect_writes.clone();
+    let empty_scans_remaining = Arc::new(AtomicUsize::new(3));
+    let empty_scans_remaining_factory = empty_scans_remaining.clone();
+    let initial_backend = DisconnectAfterNFrameSwapBackend::new(0);
+    let info = DacInfo {
+        id: "delayedreconnectframeswap:10.0.0.88".to_string(),
+        name: "Delayed Reconnect FrameSwap".to_string(),
+        kind: DacType::Custom("DelayedReconnectFrameSwap".to_string()),
+        caps: initial_backend.caps().clone(),
+    };
+    let device = Dac::new(info, BackendKind::FrameSwap(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut discovery =
+                crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+            discovery.register(Box::new(DelayedReconnectFrameSwapDiscoverer {
+                writes: reconnect_writes_factory.clone(),
+                empty_scans_remaining: empty_scans_remaining_factory.clone(),
+            }));
+            discovery
+        });
+
+    let config = FrameSessionConfig::new(1_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_reconnect(
+            ReconnectConfig::new()
+                .max_retries(10)
+                .backoff(std::time::Duration::from_millis(20)),
+        );
+
+    let (session, _info) = device.start_frame_session(config).unwrap();
+    let metrics = session.metrics();
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+
+    let disconnect_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    while metrics.connected() {
+        assert!(
+            std::time::Instant::now() < disconnect_deadline,
+            "timed out waiting for reconnect state"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let before = metrics.last_loop_activity().unwrap();
+    let progress_deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        let activity = metrics.last_loop_activity().unwrap();
+        if activity > before {
+            break;
+        }
+        assert!(
+            !metrics.connected(),
+            "reconnect should still be in progress while checking liveness"
+        );
+        assert!(
+            std::time::Instant::now() < progress_deadline,
+            "timed out waiting for reconnect liveness progress"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 
     drop(session);
 }

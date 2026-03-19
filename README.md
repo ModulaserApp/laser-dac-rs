@@ -195,6 +195,29 @@ let config = FrameSessionConfig::new(30_000)
     .with_output_filter(Box::new(SafetyFilter));
 ```
 
+### Frame Session Liveness
+
+`FrameSession::metrics()` exposes a small read-only liveness handle for
+downstream watchdogs.
+
+- `connected()` reports whether the session currently has a connected backend
+- `last_loop_activity()` reports the last scheduler-thread progress timestamp
+- `last_write_success()` reports the last successful backend write timestamp
+- watchdog cadence, stall thresholds, and emergency-disarm policy remain
+  downstream-owned
+
+```rust
+use laser_dac::{FrameSessionConfig, FrameSessionMetrics};
+
+let config = FrameSessionConfig::new(30_000);
+let (session, _info) = device.start_frame_session(config)?;
+let metrics: FrameSessionMetrics = session.metrics();
+
+if let Some(last) = metrics.last_loop_activity() {
+    println!("scheduler last progressed {:?} ago", last.elapsed());
+}
+```
+
 ### Reconnecting Frame Session
 
 For automatic reconnection when the device disconnects:

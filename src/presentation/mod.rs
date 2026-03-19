@@ -9,6 +9,7 @@
 mod engine;
 mod session;
 
+pub use session::FrameSessionMetrics;
 pub use session::{FrameSession, FrameSessionConfig};
 
 // Re-export internal types for tests (they live in sub-modules but tests use `super::*`)

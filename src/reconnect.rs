@@ -78,9 +78,14 @@ impl ReconnectPolicy {
     /// Sleep for a duration, checking for stop requests periodically.
     ///
     /// Returns `true` if stop was requested during sleep.
-    pub fn sleep_with_stop<F>(duration: Duration, is_stopped: F) -> bool
+    pub fn sleep_with_stop<FStop, FProgress>(
+        duration: Duration,
+        is_stopped: FStop,
+        on_progress: &mut FProgress,
+    ) -> bool
     where
-        F: Fn() -> bool,
+        FStop: Fn() -> bool,
+        FProgress: FnMut(),
     {
         const SLICE: Duration = Duration::from_millis(50);
         let mut remaining = duration;
@@ -91,6 +96,7 @@ impl ReconnectPolicy {
             let slice = remaining.min(SLICE);
             std::thread::sleep(slice);
             remaining = remaining.saturating_sub(slice);
+            on_progress();
         }
         is_stopped()
     }
@@ -100,14 +106,16 @@ impl ReconnectPolicy {
 ///
 /// This is the shared reconnect scaffolding used by stream and frame schedulers.
 /// Scheduler-specific state reset and callback timing remain local to the caller.
-pub(crate) fn reconnect_backend_with_retry<FStop, FValidate>(
+pub(crate) fn reconnect_backend_with_retry<FStop, FValidate, FProgress>(
     policy: &ReconnectPolicy,
     is_stopped: FStop,
     validate: FValidate,
+    mut on_progress: FProgress,
 ) -> std::result::Result<(DacInfo, BackendKind), RunExit>
 where
     FStop: Fn() -> bool,
     FValidate: Fn(&DacInfo, &BackendKind) -> std::result::Result<(), RunExit>,
+    FProgress: FnMut(),
 {
     if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
         cb(&Error::disconnected("backend disconnected"));
@@ -115,6 +123,7 @@ where
 
     let mut retries = 0u32;
     loop {
+        on_progress();
         if is_stopped() {
             return Err(RunExit::Stopped);
         }
@@ -125,10 +134,11 @@ where
             }
         }
 
-        if ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped) {
+        if ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress) {
             return Err(RunExit::Stopped);
         }
 
+        on_progress();
         log::info!(
             "'{}' reconnect attempt {} ...",
             policy.target.device_id,

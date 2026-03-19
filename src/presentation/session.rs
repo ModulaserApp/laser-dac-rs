@@ -1,8 +1,10 @@
 //! FrameSession and FrameSessionConfig — public frame-mode API.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::error::{Error, Result};
@@ -98,6 +100,90 @@ impl FrameSessionConfig {
 // FrameSession
 // =============================================================================
 
+/// Read-only liveness and connectivity metrics for a [`FrameSession`].
+#[derive(Clone)]
+pub struct FrameSessionMetrics {
+    inner: Arc<FrameSessionMetricsInner>,
+}
+
+struct FrameSessionMetricsInner {
+    connected: AtomicBool,
+    origin: Instant,
+    last_loop_activity_nanos: AtomicU64,
+    last_write_success_nanos: AtomicU64,
+}
+
+impl FrameSessionMetrics {
+    fn new(connected: bool) -> Self {
+        let metrics = Self {
+            inner: Arc::new(FrameSessionMetricsInner {
+                connected: AtomicBool::new(connected),
+                origin: Instant::now(),
+                last_loop_activity_nanos: AtomicU64::new(0),
+                last_write_success_nanos: AtomicU64::new(0),
+            }),
+        };
+        metrics.mark_loop_activity();
+        metrics
+    }
+
+    /// Returns whether the session currently has a connected backend.
+    pub fn connected(&self) -> bool {
+        self.inner.connected.load(Ordering::SeqCst)
+    }
+
+    /// Returns the last time the scheduler thread showed progress.
+    pub fn last_loop_activity(&self) -> Option<Instant> {
+        self.instant_from_nanos(self.inner.last_loop_activity_nanos.load(Ordering::SeqCst))
+    }
+
+    /// Returns the last time a backend write completed successfully.
+    pub fn last_write_success(&self) -> Option<Instant> {
+        self.instant_from_nanos(self.inner.last_write_success_nanos.load(Ordering::SeqCst))
+    }
+
+    fn instant_from_nanos(&self, nanos: u64) -> Option<Instant> {
+        if nanos == 0 {
+            None
+        } else {
+            self.inner.origin.checked_add(Duration::from_nanos(nanos))
+        }
+    }
+
+    fn now_nanos(&self) -> u64 {
+        (self.inner.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1)
+    }
+
+    fn mark_loop_activity(&self) {
+        self.inner
+            .last_loop_activity_nanos
+            .store(self.now_nanos(), Ordering::SeqCst);
+    }
+
+    fn mark_write_success(&self) {
+        let now = self.now_nanos();
+        self.inner
+            .last_loop_activity_nanos
+            .store(now, Ordering::SeqCst);
+        self.inner
+            .last_write_success_nanos
+            .store(now, Ordering::SeqCst);
+    }
+
+    fn set_connected(&self, connected: bool) {
+        self.inner.connected.store(connected, Ordering::SeqCst);
+        self.mark_loop_activity();
+    }
+}
+
+struct MetricsDisconnectGuard(FrameSessionMetrics);
+
+impl Drop for MetricsDisconnectGuard {
+    fn drop(&mut self) {
+        self.0.set_connected(false);
+    }
+}
+
 /// A frame-mode streaming session.
 ///
 /// Owns a scheduler thread that reads frames from a channel and writes them
@@ -121,6 +207,7 @@ pub struct FrameSession {
     control: StreamControl,
     thread: Option<JoinHandle<Result<RunExit>>>,
     frame_slot: Arc<Mutex<Option<Frame>>>,
+    metrics: FrameSessionMetrics,
 }
 
 impl FrameSession {
@@ -138,12 +225,15 @@ impl FrameSession {
         let (control_tx, control_rx) = mpsc::channel();
         let control = StreamControl::new(control_tx, std::time::Duration::ZERO);
         let frame_slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
+        let metrics = FrameSessionMetrics::new(backend.is_connected());
 
         let control_clone = control.clone();
         let is_frame_swap = backend.is_frame_swap();
         let slot_clone = frame_slot.clone();
+        let metrics_clone = metrics.clone();
 
         let thread = std::thread::spawn(move || {
+            let _disconnect_guard = MetricsDisconnectGuard(metrics_clone.clone());
             if is_frame_swap {
                 Self::run_frame_swap_loop(
                     backend,
@@ -151,6 +241,7 @@ impl FrameSession {
                     control_clone,
                     control_rx,
                     slot_clone,
+                    metrics_clone,
                     reconnect_policy,
                 )
             } else {
@@ -160,6 +251,7 @@ impl FrameSession {
                     control_clone,
                     control_rx,
                     slot_clone,
+                    metrics_clone,
                     reconnect_policy,
                 )
             }
@@ -169,6 +261,7 @@ impl FrameSession {
             control,
             thread: Some(thread),
             frame_slot,
+            metrics,
         })
     }
 
@@ -186,6 +279,11 @@ impl FrameSession {
     /// Returns true if the scheduler thread has finished.
     pub fn is_finished(&self) -> bool {
         self.thread.as_ref().is_some_and(|h| h.is_finished())
+    }
+
+    /// Returns a metrics handle for observing scheduler liveness.
+    pub fn metrics(&self) -> FrameSessionMetrics {
+        self.metrics.clone()
     }
 
     /// Wait for the session thread to finish and return the exit reason.
@@ -209,6 +307,7 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
+        metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
@@ -220,6 +319,7 @@ impl FrameSession {
                 control,
                 control_rx,
                 frame_slot,
+                metrics,
                 reconnect_policy,
             )
         } else {
@@ -229,6 +329,7 @@ impl FrameSession {
                 control,
                 control_rx,
                 frame_slot,
+                metrics,
                 reconnect_policy,
             )
         }
@@ -245,10 +346,9 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
+        metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
-        use std::time::{Duration, Instant};
-
         let FrameSessionConfig {
             pps,
             transition_fn,
@@ -283,6 +383,7 @@ impl FrameSession {
         Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
+            metrics.mark_loop_activity();
             // 1. High-precision wait until next send time
             Self::sleep_until_precise(
                 &control,
@@ -290,6 +391,7 @@ impl FrameSession {
                 next_send,
                 &mut shutter_open,
                 &mut backend,
+                &metrics,
             )?;
             next_send += chunk_duration;
 
@@ -323,6 +425,7 @@ impl FrameSession {
                         &last_frame,
                         pps,
                         false,
+                        &metrics,
                     ) {
                         Ok(_info) => {
                             next_send = Instant::now();
@@ -399,9 +502,11 @@ impl FrameSession {
             // buffer next cycle instead of advancing frame state.
             match backend.try_write(pps, &chunk_buffer[..n]) {
                 Ok(WriteOutcome::Written) => {
+                    metrics.mark_write_success();
                     retry_points = None;
                 }
                 Ok(WriteOutcome::WouldBlock) => {
+                    metrics.mark_loop_activity();
                     // Device busy — keep retry_points set and retry next cycle
                 }
                 Err(e) if e.is_disconnected() => {
@@ -416,6 +521,7 @@ impl FrameSession {
                             &last_frame,
                             pps,
                             false,
+                            &metrics,
                         ) {
                             Ok(_info) => {
                                 next_send = Instant::now();
@@ -449,10 +555,9 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
+        metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
-        use std::time::{Duration, Instant};
-
         let FrameSessionConfig {
             pps,
             transition_fn,
@@ -486,6 +591,7 @@ impl FrameSession {
         Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
+            metrics.mark_loop_activity();
             // 1. Check stop
             if control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
@@ -521,6 +627,7 @@ impl FrameSession {
                     sleep_time,
                     &mut shutter_open,
                     &mut backend,
+                    &metrics,
                 )?;
                 continue;
             }
@@ -538,6 +645,7 @@ impl FrameSession {
                         &last_frame,
                         pps,
                         false,
+                        &metrics,
                     ) {
                         Ok(info) => {
                             scheduled_ahead = 0;
@@ -580,13 +688,13 @@ impl FrameSession {
             let deficit = (target_buffer_secs - buffered as f64 / pps_f64).max(0.0);
             let target_points = ((deficit * pps_f64).ceil() as usize).min(max_points);
             if target_points == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
                 continue;
             }
 
             let n = engine.fill_chunk(&mut chunk_buffer, target_points);
             if n == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
                 continue;
             }
 
@@ -615,15 +723,17 @@ impl FrameSession {
             loop {
                 match backend.try_write(pps, &chunk_buffer[..n]) {
                     Ok(WriteOutcome::Written) => {
+                        metrics.mark_write_success();
                         scheduled_ahead += n as u64;
                         break;
                     }
                     Ok(WriteOutcome::WouldBlock) => {
+                        metrics.mark_loop_activity();
                         std::thread::yield_now();
                         if control.is_stop_requested() {
                             return Ok(RunExit::Stopped);
                         }
-                        std::thread::sleep(Duration::from_micros(100));
+                        Self::sleep_and_mark_activity(Duration::from_micros(100), &metrics);
                     }
                     Err(e) if e.is_disconnected() => {
                         if let Some(ref policy) = reconnect_policy {
@@ -637,6 +747,7 @@ impl FrameSession {
                                 &last_frame,
                                 pps,
                                 false,
+                                &metrics,
                             ) {
                                 Ok(info) => {
                                     scheduled_ahead = 0;
@@ -674,10 +785,9 @@ impl FrameSession {
         control: StreamControl,
         control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
+        metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
-        use std::time::Duration;
-
         let FrameSessionConfig {
             pps,
             transition_fn,
@@ -705,6 +815,7 @@ impl FrameSession {
         Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
 
         loop {
+            metrics.mark_loop_activity();
             // 1. Check stop
             if control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
@@ -729,6 +840,7 @@ impl FrameSession {
                         &last_frame,
                         pps,
                         true,
+                        &metrics,
                     ) {
                         Ok(_info) => {
                             engine.set_frame_capacity(backend.frame_capacity());
@@ -766,7 +878,7 @@ impl FrameSession {
 
             // 6. Check if device is ready
             if !write_pending && !backend.is_ready_for_frame() {
-                std::thread::sleep(Duration::from_millis(1));
+                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
                 continue;
             }
 
@@ -774,7 +886,7 @@ impl FrameSession {
             if !write_pending {
                 let composed = engine.compose_hardware_frame();
                 if composed.is_empty() {
-                    std::thread::sleep(Duration::from_millis(1));
+                    Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
                     continue;
                 }
                 frame_buf.clear();
@@ -798,11 +910,13 @@ impl FrameSession {
             // 8. Write frame
             match backend.try_write(pps, &frame_buf) {
                 Ok(WriteOutcome::Written) => {
+                    metrics.mark_write_success();
                     write_pending = false;
                 }
                 Ok(WriteOutcome::WouldBlock) => {
+                    metrics.mark_loop_activity();
                     write_pending = true;
-                    std::thread::sleep(Duration::from_millis(1));
+                    Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
                 }
                 Err(e) if e.is_disconnected() => {
                     if let Some(ref policy) = reconnect_policy {
@@ -816,6 +930,7 @@ impl FrameSession {
                             &last_frame,
                             pps,
                             true,
+                            &metrics,
                         ) {
                             Ok(_info) => {
                                 engine.set_frame_capacity(backend.frame_capacity());
@@ -856,7 +971,9 @@ impl FrameSession {
         last_frame: &Option<Frame>,
         config_pps: u32,
         expected_frame_swap: bool,
+        metrics: &FrameSessionMetrics,
     ) -> std::result::Result<DacInfo, RunExit> {
+        metrics.set_connected(false);
         let (info, new_backend) = reconnect_backend_with_retry(
             policy,
             || control.is_stop_requested(),
@@ -882,12 +999,14 @@ impl FrameSession {
 
                 Ok(())
             },
+            || metrics.mark_loop_activity(),
         )?;
 
         // Swap backend
         *backend = new_backend;
         *shutter_open = false;
         *last_armed = false;
+        metrics.set_connected(true);
 
         // Reset engine and replay last frame
         engine.reset();
@@ -1008,6 +1127,7 @@ impl FrameSession {
         duration: std::time::Duration,
         shutter_open: &mut bool,
         backend: &mut BackendKind,
+        metrics: &FrameSessionMetrics,
     ) -> Result<()> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(2);
         let mut remaining = duration;
@@ -1015,6 +1135,7 @@ impl FrameSession {
             let slice = remaining.min(SLICE);
             std::thread::sleep(slice);
             remaining = remaining.saturating_sub(slice);
+            metrics.mark_loop_activity();
             if control.is_stop_requested() {
                 return Err(Error::Stopped);
             }
@@ -1033,6 +1154,7 @@ impl FrameSession {
         deadline: std::time::Instant,
         shutter_open: &mut bool,
         backend: &mut BackendKind,
+        metrics: &FrameSessionMetrics,
     ) -> Result<()> {
         const BUSY_WAIT_THRESHOLD: std::time::Duration = std::time::Duration::from_micros(500);
         const SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
@@ -1052,12 +1174,18 @@ impl FrameSession {
             } else {
                 std::thread::yield_now();
             }
+            metrics.mark_loop_activity();
 
             if control.is_stop_requested() {
                 return Err(Error::Stopped);
             }
             Self::process_control_messages(control_rx, shutter_open, backend);
         }
+    }
+
+    fn sleep_and_mark_activity(duration: Duration, metrics: &FrameSessionMetrics) {
+        std::thread::sleep(duration);
+        metrics.mark_loop_activity();
     }
 }
 

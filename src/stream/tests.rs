@@ -2183,8 +2183,12 @@ fn test_sleep_with_stop_exits_on_stop() {
 
     // sleep_with_stop for 5 seconds should exit early
     let start = std::time::Instant::now();
-    let was_stopped =
-        ReconnectPolicy::sleep_with_stop(Duration::from_secs(5), || stopped.load(Ordering::SeqCst));
+    let mut on_progress = || {};
+    let was_stopped = ReconnectPolicy::sleep_with_stop(
+        Duration::from_secs(5),
+        || stopped.load(Ordering::SeqCst),
+        &mut on_progress,
+    );
 
     assert!(was_stopped);
     assert!(start.elapsed() < Duration::from_secs(1));

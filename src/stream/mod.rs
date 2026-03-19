@@ -505,6 +505,7 @@ impl Stream {
 
                 Ok(())
             },
+            || {},
         )?;
 
         // Swap the backend
