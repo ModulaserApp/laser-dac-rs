@@ -1230,6 +1230,30 @@ impl Dac {
     /// For most cases, prefer [`open_device_with`](crate::open_device_with) which
     /// handles both initial discovery and reconnection in one call. Use this method
     /// when you build `Dac` instances yourself via `scan()` + `connect()` + `Dac::new()`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use laser_dac::{Dac, DacDiscovery, EnabledDacTypes, FrameSessionConfig, ReconnectConfig};
+    ///
+    /// // Device opened through custom discovery path
+    /// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
+    /// discovery.register(Box::new(MyCustomDiscoverer::new()));
+    /// let devices = discovery.scan();
+    /// let backend = discovery.connect(devices.into_iter().next().unwrap())?;
+    /// let dac = Dac::new(info, backend);
+    ///
+    /// // Attach factory so reconnection can also find custom backends
+    /// let dac = dac.with_discovery_factory(|| {
+    ///     let mut d = DacDiscovery::new(EnabledDacTypes::all());
+    ///     d.register(Box::new(MyCustomDiscoverer::new()));
+    ///     d
+    /// });
+    ///
+    /// let config = FrameSessionConfig::new(30_000)
+    ///     .with_reconnect(ReconnectConfig::new());
+    /// let (session, _info) = dac.start_frame_session(config)?;
+    /// ```
     pub fn with_discovery_factory<F>(mut self, factory: F) -> Self
     where
         F: Fn() -> DacDiscovery + Send + 'static,

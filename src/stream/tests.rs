@@ -3362,3 +3362,208 @@ fn with_discovery_factory_enables_reconnect_for_frame_session() {
     let (session, _info) = result.unwrap();
     drop(session);
 }
+
+/// Minimal FIFO backend for reconnection tests — accepts all writes.
+struct ReconnectFifoBackend {
+    connected: bool,
+}
+
+impl ReconnectFifoBackend {
+    fn new() -> Self {
+        Self { connected: false }
+    }
+}
+
+impl DacBackend for ReconnectFifoBackend {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("TrackingTest".into())
+    }
+    fn caps(&self) -> &DacCapabilities {
+        static CAPS: DacCapabilities = DacCapabilities {
+            pps_min: 1000,
+            pps_max: 100000,
+            max_points_per_chunk: 1000,
+            output_model: crate::types::OutputModel::NetworkFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for ReconnectFifoBackend {
+    fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+        Ok(WriteOutcome::Written)
+    }
+}
+
+/// FIFO backend that returns Error::Disconnected after N writes.
+/// Unlike FailingWriteBackend (which returns Error::Backend), this triggers
+/// the reconnect path in FrameSession which checks `e.is_disconnected()`.
+struct DisconnectAfterNBackend {
+    connected: bool,
+    fail_after: usize,
+    write_count: AtomicUsize,
+}
+
+impl DisconnectAfterNBackend {
+    fn new(fail_after: usize) -> Self {
+        Self {
+            connected: false,
+            fail_after,
+            write_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl DacBackend for DisconnectAfterNBackend {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("TrackingTest".into())
+    }
+    fn caps(&self) -> &DacCapabilities {
+        static CAPS: DacCapabilities = DacCapabilities {
+            pps_min: 1000,
+            pps_max: 100000,
+            max_points_per_chunk: 1000,
+            output_model: crate::types::OutputModel::NetworkFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for DisconnectAfterNBackend {
+    fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let count = self.write_count.fetch_add(1, Ordering::SeqCst);
+        if count >= self.fail_after {
+            self.connected = false;
+            Err(Error::disconnected("simulated disconnect"))
+        } else {
+            Ok(WriteOutcome::Written)
+        }
+    }
+}
+
+/// Mock ExternalDiscoverer that tracks scan/connect calls and returns
+/// a ReconnectFifoBackend on connect. Uses a fixed IP so the stable_id is
+/// deterministic: "trackingtest:10.0.0.99"
+struct TrackingDiscoverer {
+    scan_count: Arc<AtomicUsize>,
+    connect_count: Arc<AtomicUsize>,
+}
+
+impl crate::discovery::ExternalDiscoverer for TrackingDiscoverer {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("TrackingTest".into())
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
+        let mut device = crate::discovery::ExternalDevice::new(());
+        device.ip_address = Some("10.0.0.99".parse().unwrap());
+        device.hardware_name = Some("Tracking Test Device".into());
+        vec![device]
+    }
+
+    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
+        self.connect_count.fetch_add(1, Ordering::SeqCst);
+        Ok(BackendKind::Fifo(Box::new(ReconnectFifoBackend::new())))
+    }
+}
+
+#[test]
+fn reconnect_rediscovers_custom_backend_via_factory() {
+    let scan_count = Arc::new(AtomicUsize::new(0));
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+
+    let scan_count_factory = scan_count.clone();
+    let connect_count_factory = connect_count.clone();
+    let reconnected_cb = reconnected.clone();
+
+    // Initial backend: disconnects after 2 writes (returns Error::Disconnected)
+    let initial_backend = DisconnectAfterNBackend::new(2);
+    let caps = initial_backend.caps().clone();
+
+    // stable_id for Custom("TrackingTest") with ip=10.0.0.99 is "trackingtest:10.0.0.99"
+    let device_id = "trackingtest:10.0.0.99";
+    let info = DacInfo {
+        id: device_id.to_string(),
+        name: "Tracking Test Device".to_string(),
+        kind: DacType::Custom("TrackingTest".to_string()),
+        caps,
+    };
+
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut d = crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+            d.register(Box::new(TrackingDiscoverer {
+                scan_count: scan_count_factory.clone(),
+                connect_count: connect_count_factory.clone(),
+            }));
+            d
+        });
+
+    let config = crate::presentation::FrameSessionConfig::new(30_000).with_reconnect(
+        crate::types::ReconnectConfig::new()
+            .max_retries(3)
+            .backoff(Duration::from_millis(50))
+            .on_reconnect(move |_info| {
+                reconnected_cb.store(true, Ordering::SeqCst);
+            }),
+    );
+    let (session, _info) = device.start_frame_session(config).unwrap();
+    session.control().arm().unwrap();
+    session.send_frame(crate::presentation::Frame::new(vec![LaserPoint::blanked(
+        0.0, 0.0,
+    )]));
+
+    // Wait for disconnect → reconnect cycle
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(
+        scan_count.load(Ordering::SeqCst) > 0,
+        "discoverer scan() should have been called during reconnect"
+    );
+    assert!(
+        connect_count.load(Ordering::SeqCst) > 0,
+        "discoverer connect() should have been called to reopen the device"
+    );
+    assert!(
+        reconnected.load(Ordering::SeqCst),
+        "on_reconnect callback should have fired, proving successful reconnect"
+    );
+
+    drop(session);
+}
