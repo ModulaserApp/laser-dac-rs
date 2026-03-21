@@ -13,15 +13,8 @@ const SDK_VERSION: u8 = 6;
 const HELIOS_VID: u16 = 0x1209;
 const HELIOS_PID: u16 = 0xE500;
 
-const _HELIOS_MAX_POINTS: u32 = 0x1000;
-const _HELIOS_MAX_RATE: u32 = 0xFFFF;
-const _HELIOS_MIN_RATE: u32 = 7;
-
-const _FRAME_BUFFER_SIZE: u32 = _HELIOS_MAX_POINTS * 7 + 5;
-
-// Interrupt endpoints
+// USB endpoints
 const ENDPOINT_BULK_OUT: u8 = 0x02;
-const _ENDPOINT_BULK_IN: u8 = 0x81;
 const ENDPOINT_INT_OUT: u8 = 0x06;
 const ENDPOINT_INT_IN: u8 = 0x83;
 
@@ -31,7 +24,6 @@ const CONTROL_SET_SHUTTER: u8 = 0x02;
 const CONTROL_GET_STATUS: u8 = 0x03;
 const CONTROL_GET_FIRMWARE_VERSION: u8 = 0x04;
 const CONTROL_GET_NAME: u8 = 0x05;
-const _CONTROL_SET_NAME: u8 = 0x06;
 const CONTROL_SEND_SDK_VERSION: u8 = 0x07;
 
 /// Controller for discovering and managing Helios DACs.
@@ -63,6 +55,30 @@ impl HeliosDacController {
     }
 }
 
+/// Mock USB device state for testing without real hardware.
+#[cfg(test)]
+pub(crate) struct MockUsbState {
+    /// When `false`, all USB operations fail with `disconnect_error`.
+    pub connected: bool,
+    /// The `rusb::Error` variant returned when the mock device is disconnected.
+    pub disconnect_error: fn() -> rusb::Error,
+}
+
+#[cfg(test)]
+impl MockUsbState {
+    pub fn new() -> Self {
+        Self {
+            connected: true,
+            disconnect_error: || rusb::Error::NoDevice,
+        }
+    }
+
+    pub fn with_disconnect_error(mut self, f: fn() -> rusb::Error) -> Self {
+        self.disconnect_error = f;
+        self
+    }
+}
+
 /// A Helios DAC device.
 ///
 /// Can be in either Idle (not opened) or Open state.
@@ -74,6 +90,10 @@ pub enum HeliosDac {
         device: rusb::Device<rusb::Context>,
         handle: rusb::DeviceHandle<rusb::Context>,
     },
+    /// Test-only variant that simulates USB communication.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    MockOpen(std::sync::Arc<std::sync::Mutex<MockUsbState>>),
 }
 
 impl HeliosDac {
@@ -95,21 +115,42 @@ impl HeliosDac {
         }
     }
 
-    /// Writes and outputs a frame to the DAC.
-    pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let frame_buffer = encode_frame(frame);
+    /// Returns a reference to the open USB handle, or an error if the device is not opened.
+    fn handle(&self) -> Result<&rusb::DeviceHandle<rusb::Context>> {
+        match self {
+            HeliosDac::Open { handle, .. } => Ok(handle),
+            #[cfg(test)]
+            HeliosDac::MockOpen(_) => Err(HeliosDacError::DeviceNotOpened), // never called for mocks
+            _ => Err(HeliosDacError::DeviceNotOpened),
+        }
+    }
 
-            handle.write_bulk(
-                ENDPOINT_BULK_OUT,
-                &frame_buffer,
-                bulk_transfer_timeout(frame_buffer.len()),
-            )?;
-
+    /// Check mock state and return an error if the simulated device is disconnected.
+    #[cfg(test)]
+    fn mock_check(
+        state: &std::sync::Arc<std::sync::Mutex<MockUsbState>>,
+    ) -> Result<()> {
+        let s = state.lock().unwrap();
+        if s.connected {
             Ok(())
         } else {
-            Err(HeliosDacError::DeviceNotOpened)
+            Err(HeliosDacError::UsbError((s.disconnect_error)()))
         }
+    }
+
+    /// Writes and outputs a frame to the DAC.
+    pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            return Self::mock_check(state);
+        }
+
+        let handle = self.handle()?;
+        let frame_buffer = encode_frame(frame);
+        let timeout = bulk_transfer_timeout(frame_buffer.len());
+
+        handle.write_bulk(ENDPOINT_BULK_OUT, &frame_buffer, timeout)?;
+        Ok(())
     }
 
     /// Gets name of DAC.
@@ -175,27 +216,34 @@ impl HeliosDac {
     }
 
     fn send_control(&self, buffer: &[u8]) -> Result<()> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let written_length =
-                handle.write_interrupt(ENDPOINT_INT_OUT, buffer, Duration::from_millis(16))?;
-            assert_eq!(written_length, buffer.len());
-
-            Ok(())
-        } else {
-            Err(HeliosDacError::DeviceNotOpened)
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            return Self::mock_check(state);
         }
+
+        let handle = self.handle()?;
+        let written_length =
+            handle.write_interrupt(ENDPOINT_INT_OUT, buffer, Duration::from_millis(16))?;
+        assert_eq!(written_length, buffer.len());
+        Ok(())
     }
 
     fn read_response(&self) -> Result<([u8; 32], usize)> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let mut buffer: [u8; 32] = [0; 32];
-            let size =
-                handle.read_interrupt(ENDPOINT_INT_IN, &mut buffer, Duration::from_millis(32))?;
-
-            Ok((buffer, size))
-        } else {
-            Err(HeliosDacError::DeviceNotOpened)
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            Self::mock_check(state)?;
+            // Return a status-ready response (0x83 = status prefix, 1 = ready).
+            let mut buf = [0u8; 32];
+            buf[0] = 0x83;
+            buf[1] = 1;
+            return Ok((buf, 2));
         }
+
+        let handle = self.handle()?;
+        let mut buffer: [u8; 32] = [0; 32];
+        let size =
+            handle.read_interrupt(ENDPOINT_INT_IN, &mut buffer, Duration::from_millis(32))?;
+        Ok((buffer, size))
     }
 }
 
