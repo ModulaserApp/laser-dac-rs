@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
 use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
-use crate::protocols::lasercube_usb::{DacController, rusb};
+use crate::protocols::lasercube_usb::{rusb, DacController};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// LaserCube USB DAC backend (LaserDock).

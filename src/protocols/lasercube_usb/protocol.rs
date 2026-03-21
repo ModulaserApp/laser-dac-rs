@@ -217,5 +217,4 @@ mod tests {
     fn test_sample_size() {
         assert_eq!(std::mem::size_of::<Sample>(), SAMPLE_SIZE_BYTES);
     }
-
 }

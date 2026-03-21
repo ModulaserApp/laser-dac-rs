@@ -282,7 +282,10 @@ fn test_stream_control_clone_shares_state() {
 #[test]
 fn test_device_start_stream_connects_backend() {
     let backend = TestBackend::new();
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
 
     assert!(!device.is_connected());
 
@@ -294,7 +297,10 @@ fn test_device_start_stream_connects_backend() {
 fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::NetworkFifo;
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -312,7 +318,10 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
 fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::UdpTimed;
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
 
     let cfg = StreamConfig::new(30_000)
         .with_target_buffer(Duration::from_millis(12))
@@ -327,7 +336,10 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
 fn test_device_start_stream_keeps_usb_defaults() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::UsbFrameSwap;
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -1200,7 +1212,10 @@ fn test_full_stream_lifecycle_create_arm_stream_stop() {
     let shutter_open = backend.shutter_open.clone();
 
     // 1. Create device and start stream
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     assert!(!device.is_connected());
 
     let (stream, returned_info) = device.start_stream(StreamConfig::new(30000)).unwrap();
@@ -1341,7 +1356,10 @@ fn test_full_stream_lifecycle_external_stop() {
 fn test_full_stream_lifecycle_into_dac_recovery() {
     // Test recovering Dac from stream for reuse
     let backend = TestBackend::new();
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     let (stream, _) = device.start_stream(StreamConfig::new(30000)).unwrap();
 
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -1653,7 +1671,10 @@ fn blank_producer(req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult 
 fn test_start_stream_with_reconnect_rejects_invalid_pps() {
     // Reconnect config should not bypass PPS validation
     let backend = TestBackend::new(); // pps_min: 1000, pps_max: 100000
-    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test".to_string(),
         discovery_factory: None,
@@ -1669,7 +1690,10 @@ fn test_start_stream_with_reconnect_rejects_invalid_pps() {
 fn test_start_stream_reconnect_without_target_errors() {
     // start_stream with reconnect on a Dac created via Dac::new (no target) should error
     let backend = TestBackend::new();
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
 
     let cfg = StreamConfig::new(30_000).with_reconnect(crate::types::ReconnectConfig::new());
     let result = device.start_stream(cfg);
@@ -1689,7 +1713,10 @@ fn test_start_stream_reconnect_without_target_errors() {
 #[test]
 fn test_start_stream_reconnect_with_target_succeeds() {
     let backend = TestBackend::new();
-    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test".to_string(),
         discovery_factory: None,
@@ -1780,7 +1807,10 @@ fn test_sleep_with_stop_exits_on_stop() {
 #[test]
 fn test_into_dac_preserves_reconnect_target() {
     let backend = TestBackend::new();
-    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test-id".to_string(),
         discovery_factory: None,
@@ -1801,7 +1831,10 @@ fn test_into_dac_preserves_target_without_reconnect() {
     // into_dac should preserve the reopen target even when reconnect was NOT enabled.
     // This allows: open_device -> start_stream(no reconnect) -> into_dac -> start_stream(with reconnect)
     let backend = TestBackend::new();
-    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test-id".to_string(),
         discovery_factory: None,
@@ -1824,7 +1857,10 @@ fn test_into_dac_preserves_target_without_reconnect() {
 #[test]
 fn test_dac_new_has_no_reconnect_target() {
     let backend = TestBackend::new();
-    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(
+        test_info(backend.caps()),
+        BackendKind::Fifo(Box::new(backend)),
+    );
     assert!(device.reconnect_target.is_none());
 }
 
@@ -2055,10 +2091,7 @@ fn test_fill_result_end_respects_drain_timeout() {
     use std::time::Instant;
 
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(50));
-    let stream = make_test_stream_with_cfg(
-        TestBackend::new().with_initial_queue(100000),
-        cfg,
-    );
+    let stream = make_test_stream_with_cfg(TestBackend::new().with_initial_queue(100000), cfg);
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2080,10 +2113,7 @@ fn test_fill_result_end_skips_drain_with_zero_timeout() {
     use std::time::Instant;
 
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::ZERO);
-    let stream = make_test_stream_with_cfg(
-        TestBackend::new().with_initial_queue(100000),
-        cfg,
-    );
+    let stream = make_test_stream_with_cfg(TestBackend::new().with_initial_queue(100000), cfg);
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2434,7 +2464,10 @@ fn test_startup_blank_zero_is_noop() {
 #[test]
 fn test_device_start_stream_rejects_frame_swap_backend() {
     let backend = FrameSwapTestBackend::new();
-    let device = Dac::new(test_info(&backend.inner.caps), BackendKind::FrameSwap(Box::new(backend)));
+    let device = Dac::new(
+        test_info(&backend.inner.caps),
+        BackendKind::FrameSwap(Box::new(backend)),
+    );
 
     let result = device.start_stream(StreamConfig::new(30_000));
     match result {

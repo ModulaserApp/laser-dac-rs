@@ -127,9 +127,7 @@ impl HeliosDac {
 
     /// Check mock state and return an error if the simulated device is disconnected.
     #[cfg(test)]
-    fn mock_check(
-        state: &std::sync::Arc<std::sync::Mutex<MockUsbState>>,
-    ) -> Result<()> {
+    fn mock_check(state: &std::sync::Arc<std::sync::Mutex<MockUsbState>>) -> Result<()> {
         let s = state.lock().unwrap();
         if s.connected {
             Ok(())

@@ -603,7 +603,6 @@ pub mod command {
             Ok(EmergencyStop)
         }
     }
-
 }
 
 #[cfg(test)]

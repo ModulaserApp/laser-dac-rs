@@ -93,7 +93,6 @@ impl DacController {
 
         Ok(dacs)
     }
-
 }
 
 /// Read the serial number from a LaserCube USB device.
@@ -110,4 +109,3 @@ pub fn get_serial_number<T: UsbContext>(device: &rusb::Device<T>) -> Option<Stri
         .read_serial_number_string(*lang, &descriptor, CONTROL_TIMEOUT)
         .ok()
 }
-
