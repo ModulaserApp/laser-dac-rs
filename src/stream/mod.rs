@@ -402,23 +402,30 @@ impl Stream {
         }
     }
 
+    /// Disarm, close shutter, and stop the backend (best-effort).
+    ///
+    /// Shared shutdown sequence used by `stop()`, `into_dac()`, and `Drop`.
+    /// All errors are ignored since this is a safety-critical shutdown path.
+    fn shutdown_backend(&mut self) {
+        let _ = self.control.disarm();
+        let _ = self.control.stop();
+        if let Some(b) = &mut self.backend {
+            let _ = b.set_shutter(false);
+            let _ = b.stop();
+        }
+    }
+
     /// Stop the stream and terminate output.
     ///
     /// Disarms the output (software blanking + hardware shutter) before stopping
     /// the backend to prevent the "freeze on last bright point" hazard.
     /// Use `disarm()` instead if you want to keep the stream alive but safe.
     pub fn stop(&mut self) -> Result<()> {
-        // Disarm: sets armed flag for software blanking
-        self.control.disarm()?;
+        self.shutdown_backend();
 
-        self.control.stop()?;
-
-        // Directly close shutter, stop, and disconnect backend (defense-in-depth).
         // Disconnect is needed for protocols like IDN where stop() only blanks
         // but the DAC keeps replaying its buffer until the session is closed.
         if let Some(b) = &mut self.backend {
-            let _ = b.set_shutter(false);
-            let _ = b.stop();
             b.disconnect()?;
         }
 
@@ -447,13 +454,7 @@ impl Stream {
     /// let (stream2, _) = device.start_stream(new_config)?;
     /// ```
     pub fn into_dac(mut self) -> (Dac, StreamStats) {
-        // Disarm (software blanking) and close shutter before stopping
-        let _ = self.control.disarm();
-        let _ = self.control.stop();
-        if let Some(backend) = &mut self.backend {
-            let _ = backend.set_shutter(false);
-            let _ = backend.stop();
-        }
+        self.shutdown_backend();
 
         // Take the backend (leaves None, so Drop won't try to stop again)
         let backend = self.backend.take();
@@ -547,7 +548,7 @@ impl Stream {
     /// Run the stream with the zero-allocation callback API.
     ///
     /// This method uses **pure buffer-driven timing**:
-    /// - Callback is invoked when `buffered < target_buffer`
+    /// - Callback is invoked when `buffered <= target_buffer`
     /// - Points requested varies based on buffer headroom (`min_points`, `target_points`)
     /// - Callback fills a library-owned buffer (zero allocations in hot path)
     ///
@@ -880,55 +881,38 @@ impl Stream {
         // Calculate how many points we need (use target_points as the fill amount)
         let n_points = req.target_points.max(1);
 
-        // Fill chunk_buffer with underrun content
-        let fill_start = if !is_armed {
-            // When disarmed, always output blanked points
-            for i in 0..n_points {
-                self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
-            }
-            n_points
-        } else {
+        // Determine the fill point based on arm state and underrun policy
+        if is_armed {
             match &self.config.underrun {
-                UnderrunPolicy::RepeatLast => {
-                    if self.state.last_chunk_len > 0 {
-                        // Repeat last chunk cyclically
-                        for i in 0..n_points {
-                            self.state.chunk_buffer[i] =
-                                self.state.last_chunk[i % self.state.last_chunk_len];
-                        }
-                        n_points
-                    } else {
-                        // No last chunk, fall back to blank
-                        for i in 0..n_points {
-                            self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                        }
-                        n_points
-                    }
-                }
-                UnderrunPolicy::Blank => {
-                    for i in 0..n_points {
-                        self.state.chunk_buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                    }
-                    n_points
-                }
-                UnderrunPolicy::Park { x, y } => {
-                    for i in 0..n_points {
-                        self.state.chunk_buffer[i] = LaserPoint::blanked(*x, *y);
-                    }
-                    n_points
-                }
                 UnderrunPolicy::Stop => {
                     self.control.stop()?;
                     return Err(Error::Stopped);
                 }
+                UnderrunPolicy::RepeatLast if self.state.last_chunk_len > 0 => {
+                    for i in 0..n_points {
+                        self.state.chunk_buffer[i] =
+                            self.state.last_chunk[i % self.state.last_chunk_len];
+                    }
+                }
+                UnderrunPolicy::Park { x, y } => {
+                    let park = LaserPoint::blanked(*x, *y);
+                    self.state.chunk_buffer[..n_points].fill(park);
+                }
+                // Blank, or RepeatLast with no stored chunk
+                _ => {
+                    self.state.chunk_buffer[..n_points].fill(LaserPoint::blanked(0.0, 0.0));
+                }
             }
-        };
+        } else {
+            // When disarmed, always output blanked points
+            self.state.chunk_buffer[..n_points].fill(LaserPoint::blanked(0.0, 0.0));
+        }
 
         // Write the fill points
         if let Some(backend) = &mut self.backend {
-            match backend.try_write(self.config.pps, &self.state.chunk_buffer[..fill_start]) {
+            match backend.try_write(self.config.pps, &self.state.chunk_buffer[..n_points]) {
                 Ok(WriteOutcome::Written) => {
-                    self.record_write(fill_start, is_armed);
+                    self.record_write(n_points, is_armed);
                 }
                 Ok(WriteOutcome::WouldBlock) => {
                     // Backend is full - expected during underrun
@@ -1034,45 +1018,25 @@ impl Stream {
     fn build_fill_request(&self, max_points: usize, buffered_points: u64) -> ChunkRequest {
         let pps = self.config.pps;
         let pps_f64 = pps as f64;
-
-        // Compute buffered duration directly (avoid Duration intermediary)
         let buffered_secs = buffered_points as f64 / pps_f64;
         let buffered = Duration::from_secs_f64(buffered_secs);
-
-        // Calculate start time for this chunk (when these points will play).
         let start = self.state.current_instant;
-
-        // Use cached config values (avoid per-iteration as_secs_f64() calls)
-        let target_buffer_secs = self.state.target_buffer_secs;
-        let min_buffer_secs = self.state.min_buffer_secs;
-
-        if self.info.caps.output_model == OutputModel::UdpTimed {
-            let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
-            return ChunkRequest {
-                start,
-                pps,
-                min_points: max_points,
-                target_points: max_points,
-                buffered_points,
-                buffered,
-                device_queued_points,
-            };
-        }
-
-        // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
-        let deficit_target = (target_buffer_secs - buffered_secs).max(0.0);
-        let target_points = (deficit_target * pps_f64).ceil() as usize;
-        let target_points = target_points.min(max_points);
-
-        // min_points: ceil((min_buffer - buffered) * pps) - minimum to avoid underrun
-        let deficit_min = (min_buffer_secs - buffered_secs).max(0.0);
-        let min_points = (deficit_min * pps_f64).ceil() as usize;
-        let min_points = min_points.min(max_points);
-
-        // Use buffered_points as the device queue estimate (already computed by
-        // estimate_buffer_points, which includes hardware feedback when available).
-        // This avoids a redundant second call to queued_points().
         let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
+
+        let (min_points, target_points) = if self.info.caps.output_model == OutputModel::UdpTimed {
+            // UdpTimed: always request a full packet
+            (max_points, max_points)
+        } else {
+            // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
+            let deficit_target = (self.state.target_buffer_secs - buffered_secs).max(0.0);
+            let target_points = ((deficit_target * pps_f64).ceil() as usize).min(max_points);
+
+            // min_points: ceil((min_buffer - buffered) * pps) - minimum to avoid underrun
+            let deficit_min = (self.state.min_buffer_secs - buffered_secs).max(0.0);
+            let min_points = ((deficit_min * pps_f64).ceil() as usize).min(max_points);
+
+            (min_points, target_points)
+        };
 
         ChunkRequest {
             start,

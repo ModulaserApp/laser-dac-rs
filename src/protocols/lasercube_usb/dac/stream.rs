@@ -7,15 +7,12 @@ use crate::protocols::lasercube_usb::protocol::{
     CMD_GET_MAX_DAC_RATE, CMD_GET_MAX_DAC_VALUE, CMD_GET_MIN_DAC_VALUE, CMD_GET_OUTPUT,
     CMD_GET_RINGBUFFER_EMPTY_SAMPLE_COUNT, CMD_GET_RINGBUFFER_SAMPLE_COUNT,
     CMD_GET_SAMPLE_ELEMENT_COUNT, CMD_GET_VERSION_MAJOR, CMD_GET_VERSION_MINOR, CMD_RUNNER_MODE,
-    CMD_SET_DAC_RATE, CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, DATA_ALT_SETTING,
-    DATA_INTERFACE, ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
-    RUNNER_MODE_SUB_ENABLE, RUNNER_MODE_SUB_RUN, SAMPLE_SIZE_BYTES,
+    CMD_SET_DAC_RATE, CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, CONTROL_TIMEOUT,
+    DATA_ALT_SETTING, DATA_INTERFACE, ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT,
+    ENDPOINT_DATA_OUT, RUNNER_MODE_SUB_ENABLE, RUNNER_MODE_SUB_RUN, SAMPLE_SIZE_BYTES,
 };
 use rusb::{DeviceHandle, UsbContext};
 use std::time::Duration;
-
-/// Timeout for control endpoint transfers.
-const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Timeout for data endpoint transfers. Zero means infinite/blocking,
 /// matching the reference C implementation for natural backpressure.
@@ -158,16 +155,6 @@ impl<T: UsbContext> Stream<T> {
         let space = self.get_u32(CMD_GET_RINGBUFFER_EMPTY_SAMPLE_COUNT)?;
         self.info.ringbuffer_free_space = space;
         Ok(space)
-    }
-
-    /// Set whether to flip X coordinates.
-    pub fn set_flip_x(&mut self, flip: bool) {
-        self.flip_x = flip;
-    }
-
-    /// Set whether to flip Y coordinates.
-    pub fn set_flip_y(&mut self, flip: bool) {
-        self.flip_y = flip;
     }
 
     /// Send samples to the DAC.

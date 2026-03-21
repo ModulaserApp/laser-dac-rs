@@ -47,23 +47,21 @@ impl Shape {
     }
 }
 
-/// Generate a complete frame of points for a static shape.
+/// Generate a complete frame of points for a shape.
 ///
 /// The frame contains exactly `n_points` points representing one full cycle
 /// of the shape. This frame is then streamed continuously by wrapping around
 /// — the DAC never waits for frame boundaries.
 ///
-/// For time-based shapes (OrbitingCircle), use `make_producer` instead.
+/// For time-based shapes (OrbitingCircle), this produces a static circle.
+/// Use `make_producer` for timestamp-driven animation in the stream API.
 pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoint> {
     let mut frame = vec![LaserPoint::default(); n_points];
     match shape {
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
-        Shape::Circle => fill_circle_points(&mut frame, n_points),
+        Shape::Circle | Shape::OrbitingCircle => fill_circle_points(&mut frame, n_points),
         Shape::Orientation => return fill_orientation_points(n_points, scale),
         Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
-        Shape::OrbitingCircle => {
-            panic!("time-based shapes don't have static frames; use make_producer()")
-        }
     }
     if (scale - 1.0).abs() > f32::EPSILON {
         scale_points(&mut frame[..n_points], scale);

@@ -185,18 +185,7 @@ impl Status {
     }
 
     pub fn update(&mut self, status: &protocol::DacStatus) -> Result<(), ProtocolError> {
-        self.protocol = status.protocol;
-        self.light_engine = LightEngine::from_protocol(status.light_engine_state)
-            .ok_or(ProtocolError::UnknownLightEngineState)?;
-        self.playback = Playback::from_protocol(status.playback_state)
-            .ok_or(ProtocolError::UnknownPlaybackState)?;
-        self.data_source = DataSource::from_protocol(status.source, status.source_flags)
-            .ok_or(ProtocolError::UnknownDataSource)?;
-        self.light_engine_flags = LightEngineFlags::from_bits_truncate(status.light_engine_flags);
-        self.playback_flags = PlaybackFlags::from_bits_truncate(status.playback_flags);
-        self.buffer_fullness = status.buffer_fullness;
-        self.point_rate = status.point_rate;
-        self.point_count = status.point_count;
+        *self = Self::from_protocol(status)?;
         Ok(())
     }
 
@@ -371,54 +360,37 @@ impl<'a> WriteToBytes for Command<'a> {
     }
 }
 
-impl<'a> From<command::PrepareStream> for Command<'a> {
-    fn from(command: command::PrepareStream) -> Self {
-        Command::PrepareStream(command)
-    }
+macro_rules! impl_from_command {
+    ($($variant:ident),* $(,)?) => {
+        $(
+            impl<'a> From<command::$variant> for Command<'a> {
+                fn from(command: command::$variant) -> Self {
+                    Command::$variant(command)
+                }
+            }
+        )*
+    };
 }
-impl<'a> From<command::Begin> for Command<'a> {
-    fn from(command: command::Begin) -> Self {
-        Command::Begin(command)
-    }
-}
-impl<'a> From<command::Update> for Command<'a> {
-    fn from(command: command::Update) -> Self {
-        Command::Update(command)
-    }
-}
-impl<'a> From<command::PointRate> for Command<'a> {
-    fn from(command: command::PointRate) -> Self {
-        Command::PointRate(command)
-    }
-}
+
+impl_from_command!(
+    PrepareStream,
+    Begin,
+    Update,
+    PointRate,
+    Stop,
+    EmergencyStop,
+    ClearEmergencyStop,
+    Ping,
+);
+
 impl<'a> From<command::Data<'a>> for Command<'a> {
     fn from(command: command::Data<'a>) -> Self {
         Command::Data(command)
     }
 }
-impl<'a> From<command::Stop> for Command<'a> {
-    fn from(command: command::Stop) -> Self {
-        Command::Stop(command)
-    }
-}
-impl<'a> From<command::EmergencyStop> for Command<'a> {
-    fn from(command: command::EmergencyStop) -> Self {
-        Command::EmergencyStop(command)
-    }
-}
 impl<'a> From<command::EmergencyStopAlt> for Command<'a> {
     fn from(_: command::EmergencyStopAlt) -> Self {
         Command::EmergencyStop(command::EmergencyStop)
-    }
-}
-impl<'a> From<command::ClearEmergencyStop> for Command<'a> {
-    fn from(command: command::ClearEmergencyStop) -> Self {
-        Command::ClearEmergencyStop(command)
-    }
-}
-impl<'a> From<command::Ping> for Command<'a> {
-    fn from(command: command::Ping) -> Self {
-        Command::Ping(command)
     }
 }
 

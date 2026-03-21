@@ -1,6 +1,10 @@
 //! Low-level USB protocol types and constants for LaserCube/LaserDock DAC communication.
 
 use crate::types::LaserPoint;
+use std::time::Duration;
+
+/// Timeout for USB control transfers (shared across modules).
+pub const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// USB Vendor ID for LaserDock/LaserCube USB devices.
 pub const LASERDOCK_VID: u16 = 0x1fc9;
@@ -117,11 +121,6 @@ impl Sample {
         Self::new(2048, 2048, 0, 0, 0)
     }
 
-    /// Create a blank sample at a specific position.
-    pub fn blank_at(x: u16, y: u16) -> Self {
-        Self::new(x, y, 0, 0, 0)
-    }
-
     /// Get the red component.
     pub fn red(&self) -> u8 {
         (self.rg & 0xFF) as u8
@@ -135,24 +134,6 @@ impl Sample {
     /// Get the blue component.
     pub fn blue(&self) -> u8 {
         (self.b & 0xFF) as u8
-    }
-
-    /// Create a sample from signed coordinates (-32768 to 32767).
-    ///
-    /// This maps the signed range to the 0-4095 range used by the device.
-    pub fn from_signed(x: i16, y: i16, r: u8, g: u8, b: u8) -> Self {
-        // Map from [-32768, 32767] to [0, 4095]
-        let x_mapped = (((x as i32) + 32768) * 4095 / 65535) as u16;
-        let y_mapped = (((y as i32) + 32768) * 4095 / 65535) as u16;
-        Self::new(x_mapped, y_mapped, r, g, b)
-    }
-
-    /// Convert coordinates to signed values (-32768 to 32767).
-    pub fn to_signed(&self) -> (i16, i16) {
-        // Map from [0, 4095] to [-32768, 32767]
-        let x = ((self.x as i32) * 65535 / 4095 - 32768) as i16;
-        let y = ((self.y as i32) * 65535 / 4095 - 32768) as i16;
-        (x, y)
     }
 
     /// Flip the X coordinate.
@@ -190,11 +171,6 @@ impl From<&LaserPoint> for Sample {
             LaserPoint::color_to_u8(p.b),
         )
     }
-}
-
-/// Convert a float in range [-1.0, 1.0] to a LaserDock coordinate (0-4095).
-pub fn float_to_coordinate(value: f32) -> u16 {
-    ((MAX_COORDINATE_VALUE as f32) * (value + 1.0) / 2.0).round() as u16
 }
 
 #[cfg(test)]
@@ -242,19 +218,4 @@ mod tests {
         assert_eq!(std::mem::size_of::<Sample>(), SAMPLE_SIZE_BYTES);
     }
 
-    #[test]
-    fn test_float_to_coordinate() {
-        assert_eq!(float_to_coordinate(-1.0), 0);
-        assert_eq!(float_to_coordinate(0.0), 2048);
-        assert_eq!(float_to_coordinate(1.0), 4095);
-    }
-
-    #[test]
-    fn test_sample_signed_roundtrip() {
-        let sample = Sample::from_signed(0, 0, 100, 150, 200);
-        let (x, y) = sample.to_signed();
-        // Allow some rounding error
-        assert!((x as i32).abs() < 100);
-        assert!((y as i32).abs() < 100);
-    }
 }

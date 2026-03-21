@@ -282,23 +282,11 @@ fn test_stream_control_clone_shares_state() {
 #[test]
 fn test_device_start_stream_connects_backend() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
 
-    // Device should not be connected initially
     assert!(!device.is_connected());
 
-    // start_stream should connect and return a usable stream
-    let cfg = StreamConfig::new(30000);
-    let result = device.start_stream(cfg);
-    assert!(result.is_ok());
-
-    let (stream, _info) = result.unwrap();
+    let (stream, _info) = device.start_stream(StreamConfig::new(30000)).unwrap();
     assert!(stream.backend.as_ref().unwrap().is_connected());
 }
 
@@ -306,13 +294,7 @@ fn test_device_start_stream_connects_backend() {
 fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::NetworkFifo;
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -330,13 +312,7 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
 fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::UdpTimed;
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
 
     let cfg = StreamConfig::new(30_000)
         .with_target_buffer(Duration::from_millis(12))
@@ -351,13 +327,7 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
 fn test_device_start_stream_keeps_usb_defaults() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::UsbFrameSwap;
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -370,17 +340,7 @@ fn test_device_start_stream_keeps_usb_defaults() {
 
 #[test]
 fn test_handle_underrun_advances_state() {
-    let mut backend = TestBackend::new();
-    backend.connected = true;
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream(TestBackend::new());
 
     // Record initial state
     let initial_instant = stream.state.current_instant;
@@ -413,19 +373,7 @@ fn test_run_retries_on_would_block() {
     // Create a backend that returns WouldBlock 3 times before accepting
     let backend = TestBackend::new().with_would_block_count(3);
     let write_count = backend.write_count.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(backend);
 
     let produced_count = Arc::new(AtomicUsize::new(0));
     let produced_count_clone = produced_count.clone();
@@ -455,19 +403,7 @@ fn test_run_retries_on_would_block() {
 fn test_arm_opens_shutter_disarm_closes_shutter() {
     let backend = TestBackend::new();
     let shutter_open = backend.shutter_open.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
 
     // Initially shutter is closed
     assert!(!shutter_open.load(Ordering::SeqCst));
@@ -492,21 +428,9 @@ fn test_arm_opens_shutter_disarm_closes_shutter() {
 
 #[test]
 fn test_handle_underrun_blanks_when_disarmed() {
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     // Use RepeatLast policy - but when disarmed, should still blank
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Set some last_chunk with colored points using the pre-allocated buffer
     let colored_point = LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
@@ -541,19 +465,7 @@ fn test_handle_underrun_blanks_when_disarmed() {
 fn test_stop_closes_shutter() {
     let backend = TestBackend::new();
     let shutter_open = backend.shutter_open.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
 
     // Arm first to open shutter
     stream.control.arm().unwrap();
@@ -569,19 +481,7 @@ fn test_stop_closes_shutter() {
 fn test_arm_disarm_arm_cycle() {
     let backend = TestBackend::new();
     let shutter_open = backend.shutter_open.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
     let control = stream.control();
 
     // Initial state: disarmed
@@ -615,22 +515,14 @@ fn test_arm_disarm_arm_cycle() {
 fn test_run_buffer_driven_behavior() {
     // Test that run uses buffer-driven timing
     // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
+    let backend = NoQueueTestBackend::new();
     let write_count = backend.inner.write_count.clone();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
 
     // Use short target buffer for testing
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(10))
         .with_min_buffer(Duration::from_millis(5));
-    let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -666,22 +558,12 @@ fn test_run_sleeps_when_buffer_healthy() {
     // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
     use std::time::Instant;
 
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
     // Very small target buffer, skip drain
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(5))
         .with_min_buffer(Duration::from_millis(2))
         .with_drain_timeout(Duration::ZERO);
-    let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -724,20 +606,7 @@ fn test_run_stops_on_control_stop() {
     // Test that stop() via control handle terminates the loop promptly
     use std::thread;
 
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(TestBackend::new());
     let control = stream.control();
 
     // Spawn a thread to stop the stream after a short delay
@@ -765,20 +634,7 @@ fn test_run_stops_on_control_stop() {
 #[test]
 fn test_run_producer_ended() {
     // Test that ChunkResult::End terminates the stream gracefully
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(TestBackend::new());
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -812,19 +668,8 @@ fn test_run_starved_applies_underrun_policy() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    // Use Blank policy for underrun
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -859,18 +704,8 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -905,18 +740,7 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
 #[test]
 fn test_estimate_buffer_uses_software_when_no_hardware() {
     // When hardware doesn't report queue depth, use software estimate
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream(NoQueueTestBackend::new());
 
     // Set software estimate to 500 points
     stream.state.scheduled_ahead = 500;
@@ -931,19 +755,7 @@ fn test_estimate_buffer_uses_min_of_hardware_and_software() {
     // When hardware reports queue depth, use min(hardware, software)
     let backend = TestBackend::new().with_initial_queue(300);
     let queued = backend.queued.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
 
     // Software says 500, hardware says 300 -> should use 300 (conservative)
     stream.state.scheduled_ahead = 500;
@@ -968,19 +780,7 @@ fn test_estimate_buffer_conservative_prevents_underrun() {
     // by ensuring we never overestimate the buffer
     let backend = TestBackend::new().with_initial_queue(100);
     let queued = backend.queued.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
 
     // Simulate: software thinks 1000 points scheduled, but hardware only has 100
     // This can happen if hardware consumed points faster than expected
@@ -1011,20 +811,10 @@ fn test_build_fill_request_uses_conservative_estimation() {
     // Verify that build_fill_request uses conservative buffer estimation
     let backend = TestBackend::new().with_initial_queue(200);
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(40))
         .with_min_buffer(Duration::from_millis(10));
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(backend, cfg);
 
     // Set software estimate higher than hardware
     stream.state.scheduled_ahead = 500;
@@ -1040,23 +830,13 @@ fn test_build_fill_request_uses_conservative_estimation() {
 fn test_build_fill_request_calculates_min_and_target_points() {
     // Verify that min_points and target_points are calculated correctly
     // based on buffer state. Use NoQueueTestBackend so software estimate is used directly.
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
     // 30000 PPS, target_buffer = 40ms, min_buffer = 10ms
     // target_buffer = 40ms * 30000 = 1200 points
     // min_buffer = 10ms * 30000 = 300 points
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(40))
         .with_min_buffer(Duration::from_millis(10));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
 
     // Empty buffer: need full target
     stream.state.scheduled_ahead = 0;
@@ -1089,22 +869,11 @@ fn test_build_fill_request_calculates_min_and_target_points() {
 #[test]
 fn test_build_fill_request_ceiling_rounds_min_points() {
     // Verify that min_points uses ceiling to prevent underrun
-    // Use NoQueueTestBackend so software estimate is used directly.
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
     // min_buffer = 10ms at 30000 PPS = 300 points exactly
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(40))
         .with_min_buffer(Duration::from_millis(10));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
 
     // Buffer at 299 points: 1 point below min_buffer
     stream.state.scheduled_ahead = 299;
@@ -1127,19 +896,7 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
     // Test that Filled(n) writes n points to backend and updates stream state
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(backend);
 
     let points_written = Arc::new(AtomicUsize::new(0));
     let points_written_clone = points_written.clone();
@@ -1187,20 +944,8 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
 #[test]
 fn test_fill_result_filled_updates_last_chunk_when_armed() {
     // Test that Filled(n) updates last_chunk for RepeatLast policy when armed
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm the stream so last_chunk gets updated
     let control = stream.control();
@@ -1241,18 +986,8 @@ fn test_fill_result_starved_repeat_last_with_stored_chunk() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
     let control = stream.control();
@@ -1298,18 +1033,8 @@ fn test_fill_result_starved_repeat_last_without_stored_chunk_falls_back_to_blank
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
     let control = stream.control();
@@ -1348,19 +1073,8 @@ fn test_fill_result_starved_with_park_policy() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    // Park at specific position
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Park { x: 0.5, y: -0.5 });
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
     let control = stream.control();
@@ -1392,20 +1106,8 @@ fn test_fill_result_starved_with_park_policy() {
 #[test]
 fn test_fill_result_starved_with_stop_policy() {
     // Test that Starved with Stop policy terminates the stream
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Stop);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Must arm the stream for underrun policy to be checked
     // (disarmed streams always output blanks regardless of policy)
@@ -1432,20 +1134,7 @@ fn test_fill_result_starved_with_stop_policy() {
 #[test]
 fn test_fill_result_end_returns_producer_ended() {
     // Test that End terminates the stream with ProducerEnded
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(TestBackend::new());
 
     let result = stream.run(
         |_req, _buffer| {
@@ -1463,19 +1152,7 @@ fn test_fill_result_filled_exceeds_buffer_clamped() {
     // Test that Filled(n) where n > buffer.len() is clamped
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(backend);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -1522,19 +1199,11 @@ fn test_full_stream_lifecycle_create_arm_stream_stop() {
     let queued = backend.queued.clone();
     let shutter_open = backend.shutter_open.clone();
 
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
     // 1. Create device and start stream
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
     assert!(!device.is_connected());
 
-    let cfg = StreamConfig::new(30000);
-    let (stream, returned_info) = device.start_stream(cfg).unwrap();
+    let (stream, returned_info) = device.start_stream(StreamConfig::new(30000)).unwrap();
     assert_eq!(returned_info.id, "test");
 
     // 2. Get control handle and verify initial state
@@ -1587,18 +1256,8 @@ fn test_full_stream_lifecycle_with_underrun_recovery() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream for underrun policy to work
     let control = stream.control();
@@ -1652,20 +1311,7 @@ fn test_full_stream_lifecycle_external_stop() {
     // Test stopping stream from external control handle
     use std::thread;
 
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(TestBackend::new());
 
     let control = stream.control();
     let control_clone = control.clone();
@@ -1695,18 +1341,8 @@ fn test_full_stream_lifecycle_external_stop() {
 fn test_full_stream_lifecycle_into_dac_recovery() {
     // Test recovering Dac from stream for reuse
     let backend = TestBackend::new();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
-    // First stream session
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
-    let cfg = StreamConfig::new(30000);
-    let (stream, _) = device.start_stream(cfg).unwrap();
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    let (stream, _) = device.start_stream(StreamConfig::new(30000)).unwrap();
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -1737,20 +1373,7 @@ fn test_full_stream_lifecycle_into_dac_recovery() {
 #[test]
 fn test_stream_stats_tracking() {
     // Test that stream statistics are tracked correctly
-    let backend = TestBackend::new();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(TestBackend::new());
 
     // Arm the stream
     let control = stream.control();
@@ -1788,19 +1411,7 @@ fn test_stream_disarm_during_streaming() {
 
     let backend = TestBackend::new();
     let shutter_open = backend.shutter_open.clone();
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(backend);
 
     let control = stream.control();
     let control_clone = control.clone();
@@ -1890,22 +1501,12 @@ fn test_stream_with_mock_backend_disconnect() {
         }
     }
 
-    let mut backend = DisconnectingBackend {
+    let backend = DisconnectingBackend {
         inner: TestBackend::new(),
         disconnect_after: Arc::new(AtomicUsize::new(3)),
         call_count: Arc::new(AtomicUsize::new(0)),
     };
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000);
-    let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let stream = make_test_stream(backend);
 
     let error_occurred = Arc::new(AtomicBool::new(false));
     let error_occurred_clone = error_occurred.clone();
@@ -2052,13 +1653,7 @@ fn blank_producer(req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult 
 fn test_start_stream_with_reconnect_rejects_invalid_pps() {
     // Reconnect config should not bypass PPS validation
     let backend = TestBackend::new(); // pps_min: 1000, pps_max: 100000
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test".to_string(),
         discovery_factory: None,
@@ -2074,13 +1669,7 @@ fn test_start_stream_with_reconnect_rejects_invalid_pps() {
 fn test_start_stream_reconnect_without_target_errors() {
     // start_stream with reconnect on a Dac created via Dac::new (no target) should error
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
 
     let cfg = StreamConfig::new(30_000).with_reconnect(crate::types::ReconnectConfig::new());
     let result = device.start_stream(cfg);
@@ -2100,13 +1689,7 @@ fn test_start_stream_reconnect_without_target_errors() {
 #[test]
 fn test_start_stream_reconnect_with_target_succeeds() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test".to_string(),
         discovery_factory: None,
@@ -2197,13 +1780,7 @@ fn test_sleep_with_stop_exits_on_stop() {
 #[test]
 fn test_into_dac_preserves_reconnect_target() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test-id".to_string(),
         discovery_factory: None,
@@ -2224,13 +1801,7 @@ fn test_into_dac_preserves_target_without_reconnect() {
     // into_dac should preserve the reopen target even when reconnect was NOT enabled.
     // This allows: open_device -> start_stream(no reconnect) -> into_dac -> start_stream(with reconnect)
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+    let mut device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "test-id".to_string(),
         discovery_factory: None,
@@ -2253,29 +1824,34 @@ fn test_into_dac_preserves_target_without_reconnect() {
 #[test]
 fn test_dac_new_has_no_reconnect_target() {
     let backend = TestBackend::new();
-    let info = DacInfo {
+    let device = Dac::new(test_info(backend.caps()), BackendKind::Fifo(Box::new(backend)));
+    assert!(device.reconnect_target.is_none());
+}
+
+/// Create a standard `DacInfo` from capabilities (id="test", name="Test Device").
+fn test_info(caps: &DacCapabilities) -> DacInfo {
+    DacInfo {
         id: "test".to_string(),
         name: "Test Device".to_string(),
         kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
-    assert!(device.reconnect_target.is_none());
+        caps: caps.clone(),
+    }
 }
 
 fn make_test_stream(mut backend: impl FifoBackend + 'static) -> Stream {
     backend.connect().unwrap();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: backend.dac_type(),
-        caps: backend.caps().clone(),
-    };
+    let info = test_info(backend.caps());
     Stream::with_backend(
         info,
         BackendKind::Fifo(Box::new(backend)),
         StreamConfig::new(30000),
     )
+}
+
+fn make_test_stream_with_cfg(mut backend: impl FifoBackend + 'static, cfg: StreamConfig) -> Stream {
+    backend.connect().unwrap();
+    let info = test_info(backend.caps());
+    Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg)
 }
 
 #[test]
@@ -2453,19 +2029,8 @@ fn test_fill_result_end_drains_with_queue_depth() {
     let backend = TestBackend::new().with_initial_queue(1000);
     let queued = backend.queued.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    // Use short drain timeout for test
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Simulate queue draining by setting it to 0 before the stream runs
     queued.store(0, Ordering::SeqCst);
@@ -2489,21 +2054,11 @@ fn test_fill_result_end_respects_drain_timeout() {
     // Test that drain respects timeout and doesn't block forever
     use std::time::Instant;
 
-    let backend = TestBackend::new().with_initial_queue(100000); // Large queue that won't drain
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    // Very short timeout
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(50));
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(
+        TestBackend::new().with_initial_queue(100000),
+        cfg,
+    );
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2524,21 +2079,11 @@ fn test_fill_result_end_skips_drain_with_zero_timeout() {
     // Test that drain is skipped when timeout is zero
     use std::time::Instant;
 
-    let backend = TestBackend::new().with_initial_queue(100000);
-
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
-    // Zero timeout = skip drain
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::ZERO);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(
+        TestBackend::new().with_initial_queue(100000),
+        cfg,
+    );
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2559,19 +2104,8 @@ fn test_fill_result_end_drains_without_queue_depth() {
     // Test drain behavior when queued_points() returns None
     use std::time::Instant;
 
-    let mut backend = NoQueueTestBackend::new();
-    backend.inner.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.inner.caps().clone(),
-    };
-
-    // Short drain timeout
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
-    let stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2594,18 +2128,8 @@ fn test_fill_result_end_closes_shutter() {
     let backend = TestBackend::new();
     let shutter_open = backend.shutter_open.clone();
 
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(10));
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream first
     let control = stream.control();
@@ -2638,18 +2162,7 @@ fn test_fill_result_end_closes_shutter() {
 #[test]
 fn test_color_delay_zero_is_passthrough() {
     // With delay=0, colors should pass through unchanged
-    let mut backend = TestBackend::new();
-    backend.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
-    let cfg = StreamConfig::new(30000); // color_delay defaults to ZERO
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream(TestBackend::new());
 
     // Arm the stream so points aren't blanked
     stream.control.arm().unwrap();
@@ -2674,19 +2187,9 @@ fn test_color_delay_zero_is_passthrough() {
 #[test]
 fn test_color_delay_shifts_colors() {
     // With delay=3 points, first 3 outputs should be blanked, rest shifted
-    let mut backend = TestBackend::new();
-    backend.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
     // 10000 PPS, delay = 300µs → ceil(0.0003 * 10000) = 3 points
     let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(300));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm the stream
     stream.control.arm().unwrap();
@@ -2734,19 +2237,9 @@ fn test_color_delay_shifts_colors() {
 #[test]
 fn test_color_delay_resets_on_disarm_arm() {
     // Disarm should clear the delay line, arm should re-fill it
-    let mut backend = TestBackend::new();
-    backend.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
     // 10000 PPS, delay = 200µs → ceil(0.0002 * 10000) = 2 points
     let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm: should pre-fill delay line
     stream.handle_shutter_transition(true);
@@ -2765,19 +2258,9 @@ fn test_color_delay_resets_on_disarm_arm() {
 #[test]
 fn test_color_delay_dynamic_change() {
     // Changing delay at runtime via atomic should resize the deque
-    let mut backend = TestBackend::new();
-    backend.connected = true;
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
-
     // Start with 200µs delay at 10000 PPS → 2 points
     let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm
     stream.control.arm().unwrap();
@@ -2829,23 +2312,12 @@ fn test_color_delay_dynamic_change() {
 
 #[test]
 fn test_startup_blank_blanks_first_n_points() {
-    let backend = TestBackend::new();
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     // 10000 PPS, startup_blank = 500µs → ceil(0.0005 * 10000) = 5 points
     // Disable color delay to isolate startup blanking
     let cfg = StreamConfig::new(10000)
         .with_startup_blank(Duration::from_micros(500))
         .with_color_delay(Duration::ZERO);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     assert_eq!(stream.state.startup_blank_points, 5);
 
@@ -2886,22 +2358,11 @@ fn test_startup_blank_blanks_first_n_points() {
 
 #[test]
 fn test_startup_blank_resets_on_rearm() {
-    let backend = TestBackend::new();
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     // 10000 PPS, startup_blank = 500µs → 5 points
     let cfg = StreamConfig::new(10000)
         .with_startup_blank(Duration::from_micros(500))
         .with_color_delay(Duration::ZERO);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // First arm cycle: consume startup blanking
     stream.state.last_armed = false;
@@ -2938,22 +2399,11 @@ fn test_startup_blank_resets_on_rearm() {
 
 #[test]
 fn test_startup_blank_zero_is_noop() {
-    let backend = TestBackend::new();
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     // Disable startup blanking
     let cfg = StreamConfig::new(10000)
         .with_startup_blank(Duration::ZERO)
         .with_color_delay(Duration::ZERO);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     assert_eq!(stream.state.startup_blank_points, 0);
 
@@ -2984,14 +2434,7 @@ fn test_startup_blank_zero_is_noop() {
 #[test]
 fn test_device_start_stream_rejects_frame_swap_backend() {
     let backend = FrameSwapTestBackend::new();
-    let caps = backend.inner.caps.clone();
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps,
-    };
-    let device = Dac::new(info, BackendKind::FrameSwap(Box::new(backend)));
+    let device = Dac::new(test_info(&backend.inner.caps), BackendKind::FrameSwap(Box::new(backend)));
 
     let result = device.start_stream(StreamConfig::new(30_000));
     match result {
@@ -3008,19 +2451,8 @@ fn test_device_start_stream_rejects_frame_swap_backend() {
 
 #[test]
 fn test_network_fifo_accumulates_scheduled_ahead() {
-    let backend = TestBackend::new(); // default: NetworkFifo
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-
     let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm and write two chunks of 50 points each
     stream.control.arm().unwrap();
@@ -3043,21 +2475,13 @@ fn test_network_fifo_accumulates_scheduled_ahead() {
 
 #[test]
 fn test_udp_timed_prefills_to_max_points_per_chunk() {
-    let mut backend = NoQueueTestBackend::new()
+    let backend = NoQueueTestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
-    backend.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: backend.dac_type(),
-        caps: backend.caps().clone(),
-    };
     let cfg = StreamConfig::new(1000)
         .with_target_buffer(Duration::from_millis(500))
         .with_min_buffer(Duration::from_millis(100));
-    let mut stream = Stream::with_backend(info, BackendKind::Fifo(Box::new(backend)), cfg);
+    let mut stream = make_test_stream_with_cfg(backend, cfg);
 
     // UdpTimed target = max_points_per_chunk = 179
     // One write of 179 exceeds the target → stops after 1 write
@@ -3081,17 +2505,7 @@ fn test_udp_timed_uses_max_points_per_chunk_for_lead() {
     let backend = NoQueueTestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-    let cfg = StreamConfig::new(30_000);
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream(backend);
 
     // UdpTimed target = max_points_per_chunk, not target_buffer_points
     assert_eq!(stream.scheduler_target_buffer_points(), 179);
@@ -3102,17 +2516,7 @@ fn test_udp_timed_build_fill_request_uses_full_packet() {
     let backend = NoQueueTestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
-    let cfg = StreamConfig::new(30_000);
-    let mut stream = Stream::with_backend(info, backend_box, cfg);
+    let mut stream = make_test_stream(backend);
     stream.state.scheduled_ahead = 120;
 
     let req = stream.build_fill_request(179, 120);
@@ -3147,19 +2551,10 @@ fn test_network_fifo_lasercube_default_target_requests_topup() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "LaserCube Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
     let cfg = StreamConfig::new(30_000)
         .with_target_buffer(Duration::from_millis(50))
         .with_min_buffer(Duration::from_millis(20));
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
     let buffered = stream.estimate_buffer_points();
@@ -3176,19 +2571,10 @@ fn test_network_fifo_lasercube_large_target_uses_more_capacity() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let mut backend_box = BackendKind::Fifo(Box::new(backend));
-    backend_box.connect().unwrap();
-
-    let info = DacInfo {
-        id: "test".to_string(),
-        name: "LaserCube Test".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend_box.caps().clone(),
-    };
     let cfg = StreamConfig::new(30_000)
         .with_target_buffer(Duration::from_millis(200))
         .with_min_buffer(Duration::from_millis(50));
-    let stream = Stream::with_backend(info, backend_box, cfg);
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let buffered = stream.estimate_buffer_points();
     let req = stream.build_fill_request(5700, buffered);
@@ -3298,12 +2684,8 @@ fn test_fractional_consumed_prevents_stall() {
 #[test]
 fn with_discovery_factory_creates_target_when_none() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test-factory".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
+    let mut info = test_info(backend.caps());
+    info.id = "test-factory".to_string();
     let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
     assert!(device.reconnect_target.is_none());
 
@@ -3319,12 +2701,8 @@ fn with_discovery_factory_creates_target_when_none() {
 #[test]
 fn with_discovery_factory_replaces_factory_on_existing_target() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test-replace".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
+    let mut info = test_info(backend.caps());
+    info.id = "test-replace".to_string();
     let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
     device.reconnect_target = Some(crate::reconnect::ReconnectTarget {
         device_id: "original-id".to_string(),
@@ -3343,12 +2721,8 @@ fn with_discovery_factory_replaces_factory_on_existing_target() {
 #[test]
 fn with_discovery_factory_enables_reconnect_for_frame_session() {
     let backend = TestBackend::new();
-    let info = DacInfo {
-        id: "test-session".to_string(),
-        name: "Test Device".to_string(),
-        kind: DacType::Custom("Test".to_string()),
-        caps: backend.caps().clone(),
-    };
+    let mut info = test_info(backend.caps());
+    info.id = "test-session".to_string();
     let device =
         Dac::new(info, BackendKind::Fifo(Box::new(backend))).with_discovery_factory(|| {
             crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())

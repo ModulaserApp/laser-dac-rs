@@ -177,13 +177,6 @@ impl DiscoverDacs {
         }
     }
 
-    /// Send another discovery broadcast.
-    ///
-    /// This can be useful to re-scan the network without creating a new `DiscoverDacs`.
-    pub fn rescan(&mut self) -> io::Result<()> {
-        self.seen_ips.clear();
-        send_discovery_broadcast(&self.socket)
-    }
 }
 
 impl Iterator for DiscoverDacs {

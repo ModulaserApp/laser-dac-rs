@@ -40,10 +40,10 @@ const BLACKLISTED_DEVICE_NAMES: &[&str] = &["studio display speakers"];
 
 /// Returns `true` when the device name matches a known non-laser audio device.
 pub(crate) fn is_blacklisted_device(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let normalized = normalize_device_name(name);
     BLACKLISTED_DEVICE_NAMES
         .iter()
-        .any(|blocked| lower == *blocked)
+        .any(|blocked| normalized == *blocked)
 }
 
 #[cfg(test)]

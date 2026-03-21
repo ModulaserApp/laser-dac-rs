@@ -1,13 +1,11 @@
 //! Low-level protocol types and constants for LaserCube WiFi DAC communication.
 
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use std::io;
 
 use crate::types::LaserPoint;
 
 // Network ports
-/// Keep-alive / heartbeat port (not actively used).
-pub const ALIVE_PORT: u16 = 45456;
 /// Command and control port.
 pub const CMD_PORT: u16 = 45457;
 /// Point data transmission port.
@@ -46,24 +44,9 @@ pub trait WriteBytes {
     fn write_bytes<P: WriteToBytes>(&mut self, protocol: P) -> io::Result<()>;
 }
 
-/// A trait for reading protocol types from little-endian bytes.
-pub trait ReadBytes {
-    fn read_bytes<P: ReadFromBytes>(&mut self) -> io::Result<P>;
-}
-
 /// Protocol types that may be written to little-endian bytes.
 pub trait WriteToBytes {
     fn write_to_bytes<W: WriteBytesExt>(&self, writer: W) -> io::Result<()>;
-}
-
-/// Protocol types that may be read from little-endian bytes.
-pub trait ReadFromBytes: Sized {
-    fn read_from_bytes<R: ReadBytesExt>(reader: R) -> io::Result<Self>;
-}
-
-/// Types that have a constant size when written to or read from bytes.
-pub trait SizeBytes {
-    const SIZE_BYTES: usize;
 }
 
 /// A laser point with position and color.
@@ -135,21 +118,6 @@ impl WriteToBytes for Point {
         writer.write_u16::<LittleEndian>(self.b)?;
         Ok(())
     }
-}
-
-impl ReadFromBytes for Point {
-    fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
-        let x = reader.read_u16::<LittleEndian>()?;
-        let y = reader.read_u16::<LittleEndian>()?;
-        let r = reader.read_u16::<LittleEndian>()?;
-        let g = reader.read_u16::<LittleEndian>()?;
-        let b = reader.read_u16::<LittleEndian>()?;
-        Ok(Point { x, y, r, g, b })
-    }
-}
-
-impl SizeBytes for Point {
-    const SIZE_BYTES: usize = POINT_SIZE_BYTES;
 }
 
 impl From<&LaserPoint> for Point {
@@ -316,14 +284,5 @@ where
 {
     fn write_bytes<P: WriteToBytes>(&mut self, protocol: P) -> io::Result<()> {
         protocol.write_to_bytes(self)
-    }
-}
-
-impl<R> ReadBytes for R
-where
-    R: ReadBytesExt,
-{
-    fn read_bytes<P: ReadFromBytes>(&mut self) -> io::Result<P> {
-        P::read_from_bytes(self)
     }
 }

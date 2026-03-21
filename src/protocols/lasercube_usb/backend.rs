@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
 use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
-use crate::protocols::lasercube_usb::{discover_dacs, rusb};
+use crate::protocols::lasercube_usb::{DacController, rusb};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// LaserCube USB DAC backend (LaserDock).
@@ -37,7 +37,8 @@ impl LasercubeUsbBackend {
     }
 
     pub fn discover_devices() -> Result<Vec<rusb::Device<rusb::Context>>> {
-        discover_dacs().map_err(Error::backend)
+        let controller = DacController::new().map_err(Error::backend)?;
+        controller.list_devices().map_err(Error::backend)
     }
 
     /// Handle a stream error by classifying it as fatal (disconnected) or transient.

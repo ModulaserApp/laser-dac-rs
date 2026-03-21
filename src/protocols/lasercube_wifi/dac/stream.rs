@@ -211,16 +211,6 @@ impl Stream {
         Ok(())
     }
 
-    /// Borrow the inner DAC to examine its state.
-    pub fn dac(&self) -> &Addressed {
-        &self.dac
-    }
-
-    /// Get the current free buffer space on the device.
-    pub fn free_buffer_space(&self) -> u16 {
-        self.dac.status.free_buffer_space
-    }
-
     /// Get the estimated number of points currently in the device buffer.
     pub fn estimated_buffer_fullness(&self) -> u16 {
         self.buffer_estimator
@@ -231,11 +221,6 @@ impl Stream {
     pub fn safe_writable_points(&mut self) -> u16 {
         self.try_receive_buffer_status();
         self.buffer_estimator.max_points_to_add(Instant::now())
-    }
-
-    /// Get the current playback rate in Hz.
-    pub fn point_rate(&self) -> u32 {
-        self.current_rate
     }
 
     /// Set the playback rate in Hz.
@@ -297,18 +282,6 @@ impl Stream {
         self.buffer_estimator.reset();
         Ok(())
     }
-
-    /// Set the read timeout for the command socket.
-    pub fn set_cmd_timeout(&self, timeout: Option<Duration>) -> Result<(), CommunicationError> {
-        self.cmd_socket.set_read_timeout(timeout)?;
-        Ok(())
-    }
-
-    /// Set the read timeout for the data socket.
-    pub fn set_data_timeout(&self, timeout: Option<Duration>) -> Result<(), CommunicationError> {
-        self.data_socket.set_read_timeout(timeout)?;
-        Ok(())
-    }
 }
 
 impl Drop for Stream {
@@ -323,19 +296,4 @@ impl Drop for Stream {
 /// This is a convenience function that calls `Stream::connect`.
 pub fn connect(dac: &Addressed) -> Result<Stream, CommunicationError> {
     Stream::connect(dac)
-}
-
-/// Connect to a LaserCube DAC with a custom timeout.
-///
-/// This is a convenience function that calls `Stream::connect_with_timeout`.
-pub fn connect_timeout(dac: &Addressed, timeout: Duration) -> Result<Stream, CommunicationError> {
-    Stream::connect_with_timeout(dac, timeout)
-}
-
-/// Calculate buffer usage from max and free space.
-///
-/// Returns the number of points currently in the device buffer.
-#[inline]
-pub fn calculate_buffer_used(max_buffer_space: u16, free_buffer_space: u16) -> u16 {
-    max_buffer_space.saturating_sub(free_buffer_space)
 }

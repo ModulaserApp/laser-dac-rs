@@ -462,11 +462,31 @@ pub mod command {
         const SIZE_BYTES: usize = 1;
     }
 
-    impl WriteToBytes for PrepareStream {
-        fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
-            writer.write_u8(Self::START_BYTE)
-        }
+    macro_rules! impl_unit_command_bytes {
+        ($($cmd:ident),* $(,)?) => {
+            $(
+                impl WriteToBytes for $cmd {
+                    fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
+                        writer.write_u8(Self::START_BYTE)
+                    }
+                }
+
+                impl ReadFromBytes for $cmd {
+                    fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
+                        if reader.read_u8()? != Self::START_BYTE {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid command",
+                            ));
+                        }
+                        Ok($cmd)
+                    }
+                }
+            )*
+        };
     }
+
+    impl_unit_command_bytes!(PrepareStream, Stop, ClearEmergencyStop, Ping);
 
     impl WriteToBytes for Begin {
         fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
@@ -511,12 +531,6 @@ pub mod command {
         }
     }
 
-    impl WriteToBytes for Stop {
-        fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
-            writer.write_u8(Self::START_BYTE)
-        }
-    }
-
     impl WriteToBytes for EmergencyStop {
         fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
             writer.write_u8(Self::START_BYTE)
@@ -526,30 +540,6 @@ pub mod command {
     impl WriteToBytes for EmergencyStopAlt {
         fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
             writer.write_u8(Self::START_BYTE)
-        }
-    }
-
-    impl WriteToBytes for ClearEmergencyStop {
-        fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
-            writer.write_u8(Self::START_BYTE)
-        }
-    }
-
-    impl WriteToBytes for Ping {
-        fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
-            writer.write_u8(Self::START_BYTE)
-        }
-    }
-
-    impl ReadFromBytes for PrepareStream {
-        fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
-            if reader.read_u8()? != Self::START_BYTE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid command",
-                ));
-            }
-            Ok(PrepareStream)
         }
     }
 
@@ -601,18 +591,6 @@ pub mod command {
         }
     }
 
-    impl ReadFromBytes for Stop {
-        fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
-            if reader.read_u8()? != Self::START_BYTE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid command",
-                ));
-            }
-            Ok(Stop)
-        }
-    }
-
     impl ReadFromBytes for EmergencyStop {
         fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
             let command = reader.read_u8()?;
@@ -626,29 +604,6 @@ pub mod command {
         }
     }
 
-    impl ReadFromBytes for ClearEmergencyStop {
-        fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
-            if reader.read_u8()? != Self::START_BYTE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid command",
-                ));
-            }
-            Ok(ClearEmergencyStop)
-        }
-    }
-
-    impl ReadFromBytes for Ping {
-        fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
-            if reader.read_u8()? != Self::START_BYTE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid command",
-                ));
-            }
-            Ok(Ping)
-        }
-    }
 }
 
 #[cfg(test)]

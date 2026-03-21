@@ -306,203 +306,19 @@ impl Stream {
             return Ok(());
         }
 
-        trace!(
-            "IDN stream: write_frame #{} - {} points, pps={}, format={:?}, time_since_last={:?}",
-            self.frame_count,
-            points.len(),
-            self.scan_speed,
-            self.point_format,
-            self.last_send_time.map(|t| t.elapsed()),
-        );
-
-        // Pad to minimum sample count by repeating the last point
-        let padded;
-        let points = if points.len() < MIN_SAMPLES_PER_FRAME {
-            trace!(
-                "IDN stream: padding {} points to minimum {}",
-                points.len(),
-                MIN_SAMPLES_PER_FRAME
-            );
-            padded = Self::pad_points(points);
-            &padded[..]
-        } else {
-            points
-        };
-
-        if self.scan_speed == 0 {
-            warn!("IDN stream: scan_speed is 0, cannot send frame");
-            return Err(CommunicationError::Protocol(
-                ProtocolError::InvalidPointFormat,
-            ));
-        }
-
-        let now = Instant::now();
-
-        // Determine if we need to send config.
-        let needs_config =
-            Self::needs_config(self.frame_count, self.previous_format, self.point_format);
-
-        if needs_config {
-            trace!(
-                "IDN stream: will send config (frame_count={}, prev_format={:?}, cur_format={:?}, last_config={:?})",
-                self.frame_count,
-                self.previous_format,
-                self.point_format,
-                self.last_config_time.map(|t| t.elapsed()),
-            );
-        }
-
-        if self.previous_format != Some(self.point_format) {
-            self.service_data_match = self.service_data_match.wrapping_add(1);
-            trace!(
-                "IDN stream: format changed, service_data_match now {}",
-                self.service_data_match
-            );
-        }
-
-        // Set non-zero initial timestamp on the first frame
-        if self.frame_count == 0 {
-            self.timestamp = self.connect_time.elapsed().as_micros() as u64;
-            trace!(
-                "IDN stream: first frame, initial timestamp = {} us ({} ms since connect)",
-                self.timestamp,
-                self.timestamp / 1000
-            );
-        }
-
-        let bytes_per_sample = P::SIZE_BYTES;
-        let service_id = self.dac.service_id();
-
-        // Calculate content ID
-        let mut content_id = IDNFLG_CONTENTID_CHANNELMSG | self.channel_id();
-
-        // Calculate header sizes
-        let config_size = if needs_config {
-            content_id |= IDNFLG_CONTENTID_CONFIG_LSTFRG;
-            ChannelConfigHeader::SIZE_BYTES + self.point_format.descriptors().len() * 2
-        } else {
-            0
-        };
-
-        let header_size = PacketHeader::SIZE_BYTES
-            + ChannelMessageHeader::SIZE_BYTES
-            + config_size
-            + SampleChunkHeader::SIZE_BYTES;
-
-        // Calculate how many points fit in one packet, distributing samples
-        // evenly across packets to produce uniform timing (matching C++ reference).
-        let max_points_per_packet = (MAX_UDP_PAYLOAD - header_size) / bytes_per_sample;
-        let num_packets = points.len().div_ceil(max_points_per_packet);
-        let points_to_send = points.len() / num_packets;
-
-        // Calculate duration for this chunk
-        let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
-
-        let is_only = num_packets == 1;
-        let cnk_type = self.chunk_type(true, is_only);
+        let mut padded = Vec::new();
+        let points = self.prepare_points(points, &mut padded)?;
+        let (seq, points_to_send) = self.build_and_send_first_packet(points, IDNCMD_RT_CNLMSG)?;
 
         trace!(
-            "IDN stream: packet layout - service_id={}, channel_id=0x{:04x}, content_id=0x{:04x}, \
-             bytes_per_sample={}, header_size={}, max_pts/pkt={}, num_packets={}, pts_this_pkt={}, \
-             duration={}us, timestamp={}",
-            service_id,
-            self.channel_id(),
-            content_id | cnk_type as u16,
-            bytes_per_sample,
-            header_size,
-            max_points_per_packet,
-            num_packets,
-            points_to_send,
-            duration_us,
-            self.timestamp,
-        );
-
-        // Build the packet
-        self.packet_buffer.clear();
-
-        // Packet header
-        let seq = self.next_sequence();
-        let packet_header = PacketHeader {
-            command: IDNCMD_RT_CNLMSG,
-            flags: self.client_group,
-            sequence: seq,
-        };
-        self.packet_buffer.write_bytes(packet_header)?;
-
-        // Channel message header
-        // totalSize = size from ChannelMessage start to end of packet payload
-        // Per C++ reference: totalSize = bufferEnd - channelMsgHdr (includes full 8-byte header)
-        let msg_size = ChannelMessageHeader::SIZE_BYTES
-            + config_size
-            + SampleChunkHeader::SIZE_BYTES
-            + points_to_send * bytes_per_sample;
-
-        let channel_msg = ChannelMessageHeader {
-            total_size: msg_size as u16,
-            content_id: content_id | cnk_type as u16,
-            timestamp: (self.timestamp & 0xFFFF_FFFF) as u32,
-        };
-        self.packet_buffer.write_bytes(channel_msg)?;
-
-        trace!(
-            "IDN stream: channel_msg total_size={}, content_id=0x{:04x}, timestamp={}",
-            msg_size,
-            channel_msg.content_id,
-            channel_msg.timestamp,
-        );
-
-        // Channel config (if needed)
-        if needs_config {
-            self.write_config(service_id, now)?;
-        }
-
-        // Sample chunk header
-        let sdm = self.sdm_flags();
-        let chunk_header = SampleChunkHeader::new(sdm, duration_us as u32);
-        self.packet_buffer.write_bytes(chunk_header)?;
-
-        trace!(
-            "IDN stream: sample_chunk sdm_flags=0x{:02x}, duration={}us",
-            sdm,
-            duration_us
-        );
-
-        // Write points
-        for point in points.iter().take(points_to_send) {
-            self.packet_buffer.write_bytes(point)?;
-        }
-
-        // Send the packet
-        let total_bytes = self.packet_buffer.len();
-        let sent_bytes = self.socket.send(&self.packet_buffer)?;
-        self.last_send_time = Some(now);
-
-        if sent_bytes != total_bytes {
-            warn!(
-                "IDN stream: partial send! wanted {} bytes, sent {}",
-                total_bytes, sent_bytes
-            );
-        }
-
-        trace!(
-            "IDN stream: sent frame #{} packet - seq={}, {} bytes, {} points",
-            self.frame_count,
+            "IDN stream: sent frame #{} packet - seq={}, {} points",
+            self.frame_count - 1,
             seq,
-            sent_bytes,
             points_to_send,
         );
-
-        // Update state
-        self.timestamp += duration_us;
-        self.frame_count += 1;
 
         // If there are remaining points, send them in subsequent packets
         if points_to_send < points.len() {
-            let remaining = points.len() - points_to_send;
-            trace!(
-                "IDN stream: {} remaining points, sending continuation",
-                remaining
-            );
             self.write_frame_continuation(&points[points_to_send..])?;
         }
 
@@ -610,36 +426,72 @@ impl Stream {
             return Err(CommunicationError::Protocol(ProtocolError::BufferTooSmall));
         }
 
-        // Pad to minimum sample count by repeating the last point
-        let padded;
+        let mut padded = Vec::new();
+        let points = self.prepare_points(points, &mut padded)?;
+        let (ack_seq, points_to_send) =
+            self.build_and_send_first_packet(points, IDNCMD_RT_CNLMSG_ACKREQ)?;
+
+        // Wait for acknowledgment
+        let ack = self.recv_acknowledge(timeout, ack_seq)?;
+
+        // Send remaining points in subsequent packets (fire-and-forget)
+        if points_to_send < points.len() {
+            self.write_frame_continuation(&points[points_to_send..])?;
+        }
+
+        Ok(ack)
+    }
+
+    /// Validate inputs, pad points if needed, and update pre-frame state.
+    ///
+    /// The caller must declare `padded` as an uninitialized `Vec<P>` and pass
+    /// it mutably; this method may populate it and return a reference to it.
+    /// The returned slice is valid for the lifetime of both `points` and `padded`.
+    fn prepare_points<'a, P: Point>(
+        &mut self,
+        points: &'a [P],
+        padded: &'a mut Vec<P>,
+    ) -> Result<&'a [P]> {
         let points = if points.len() < MIN_SAMPLES_PER_FRAME {
-            padded = Self::pad_points(points);
-            &padded[..]
+            trace!(
+                "IDN stream: padding {} points to minimum {}",
+                points.len(),
+                MIN_SAMPLES_PER_FRAME
+            );
+            *padded = Self::pad_points(points);
+            padded.as_slice()
         } else {
             points
         };
 
         if self.scan_speed == 0 {
+            warn!("IDN stream: scan_speed is 0, cannot send frame");
             return Err(CommunicationError::Protocol(
                 ProtocolError::InvalidPointFormat,
             ));
         }
 
-        let now = Instant::now();
-
-        // Determine if we need to send config.
-        let needs_config =
-            Self::needs_config(self.frame_count, self.previous_format, self.point_format);
-
         if self.previous_format != Some(self.point_format) {
             self.service_data_match = self.service_data_match.wrapping_add(1);
         }
 
-        // Set non-zero initial timestamp on the first frame
         if self.frame_count == 0 {
             self.timestamp = self.connect_time.elapsed().as_micros() as u64;
         }
 
+        Ok(points)
+    }
+
+    /// Build and send the first packet of a frame. Returns the sequence number
+    /// used and how many points were included in this packet.
+    fn build_and_send_first_packet<P: Point>(
+        &mut self,
+        points: &[P],
+        command: u8,
+    ) -> Result<(u16, usize)> {
+        let now = Instant::now();
+        let needs_config =
+            Self::needs_config(self.frame_count, self.previous_format, self.point_format);
         let bytes_per_sample = P::SIZE_BYTES;
         let service_id = self.dac.service_id();
 
@@ -668,27 +520,28 @@ impl Stream {
         // Calculate duration for this chunk
         let duration_us = ((points_to_send as u64) * 1_000_000) / (self.scan_speed as u64);
 
+        let is_only = num_packets == 1;
+        let cnk_type = self.chunk_type(true, is_only);
+
         // Build the packet
         self.packet_buffer.clear();
 
-        // Packet header - use ACKREQ command
-        let ack_seq = self.next_sequence();
+        let seq = self.next_sequence();
         let packet_header = PacketHeader {
-            command: IDNCMD_RT_CNLMSG_ACKREQ,
+            command,
             flags: self.client_group,
-            sequence: ack_seq,
+            sequence: seq,
         };
         self.packet_buffer.write_bytes(packet_header)?;
 
         // Channel message header
         // totalSize = size from ChannelMessage start to end of packet payload
+        // Per C++ reference: totalSize = bufferEnd - channelMsgHdr (includes full 8-byte header)
         let msg_size = ChannelMessageHeader::SIZE_BYTES
             + config_size
             + SampleChunkHeader::SIZE_BYTES
             + points_to_send * bytes_per_sample;
 
-        let is_only = num_packets == 1;
-        let cnk_type = self.chunk_type(true, is_only);
         let channel_msg = ChannelMessageHeader {
             total_size: msg_size as u16,
             content_id: content_id | cnk_type as u16,
@@ -718,15 +571,7 @@ impl Stream {
         self.timestamp += duration_us;
         self.frame_count += 1;
 
-        // Wait for acknowledgment
-        let ack = self.recv_acknowledge(timeout, ack_seq)?;
-
-        // Send remaining points in subsequent packets (fire-and-forget)
-        if points_to_send < points.len() {
-            self.write_frame_continuation(&points[points_to_send..])?;
-        }
-
-        Ok(ack)
+        Ok((seq, points_to_send))
     }
 
     /// Receive an acknowledgment response from the server.

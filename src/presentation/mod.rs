@@ -181,7 +181,7 @@ const START_DWELL_US: f64 = 400.0;
 /// 1. **End dwell** — repeat `from` with laser OFF. Lets the galvo settle
 ///    at the endpoint before moving.
 /// 2. **Transit** — quintic ease-in-out interpolation from→to with laser OFF.
-///    Point count scales with L∞ distance (0–8 points).
+///    Point count scales with L∞ distance (0–64 points).
 /// 3. **Start dwell** — repeat `to` with laser OFF. Lets the galvo settle
 ///    at the new position before the next frame lights up.
 ///

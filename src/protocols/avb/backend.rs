@@ -679,18 +679,19 @@ fn choose_stream_config(
     config_ranges: &[OutputConfigRange],
     default_sample_rate: Option<u32>,
 ) -> Option<(u16, u32)> {
-    let mut qualifying = config_ranges
+    let qualifying: Vec<_> = config_ranges
         .iter()
         .filter(|r| r.channels >= MIN_CHANNELS)
-        .peekable();
+        .collect();
 
-    qualifying.peek()?;
+    if qualifying.is_empty() {
+        return None;
+    }
 
     // Try the default sample rate first.
     if let Some(rate) = default_sample_rate {
-        if let Some(best) = config_ranges
+        if let Some(best) = qualifying
             .iter()
-            .filter(|r| r.channels >= MIN_CHANNELS)
             .filter(|r| (r.min_sample_rate..=r.max_sample_rate).contains(&rate))
             .min_by_key(|r| r.channels)
         {
@@ -700,6 +701,7 @@ fn choose_stream_config(
 
     // Fallback: pick the lowest-channel qualifying range and use its max sample rate.
     qualifying
+        .iter()
         .min_by_key(|r| r.channels)
         .map(|r| (r.channels, r.max_sample_rate))
 }
@@ -913,8 +915,10 @@ mod tests {
         fn snapshot(&self) -> Vec<Vec<f32>> {
             self.captured_frames
                 .lock()
-                .map(|frames| frames.iter().cloned().collect())
-                .unwrap_or_default()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect()
         }
 
         fn frame_count(&self) -> usize {
@@ -926,10 +930,7 @@ mod tests {
         }
 
         fn opened_stream_configs(&self) -> Vec<SelectedStreamConfig> {
-            self.opened_stream_configs
-                .lock()
-                .map(|configs| configs.clone())
-                .unwrap_or_default()
+            self.opened_stream_configs.lock().unwrap().clone()
         }
     }
 

@@ -113,20 +113,13 @@ impl PresentationEngine {
     pub fn fill_chunk(&mut self, buffer: &mut [LaserPoint], max_points: usize) -> usize {
         let max_points = max_points.min(buffer.len());
 
-        // Before first frame: output blanked at origin
-        if self.current_base.is_none() {
-            for p in &mut buffer[..max_points] {
-                *p = LaserPoint::blanked(0.0, 0.0);
-            }
-            return max_points;
-        }
-
-        // Rebuild drawable if dirty
+        // Rebuild drawable if dirty (no-op when current_base is None)
         if self.drawable_dirty {
             self.refresh_drawable();
         }
 
-        if self.drawable.is_empty() {
+        // No frame yet or empty frame: output blanked at origin
+        if self.current_base.is_none() || self.drawable.is_empty() {
             for p in &mut buffer[..max_points] {
                 *p = LaserPoint::blanked(0.0, 0.0);
             }
@@ -299,7 +292,7 @@ impl PresentationEngine {
 
         let points = current.points();
         self.frame_swap_transition_len =
-            build_self_loop_drawable(&self.transition_fn, points, &mut self.drawable, true);
+            build_self_loop_drawable(&self.transition_fn, points, &mut self.drawable);
         self.clamp_to_capacity();
     }
 
@@ -377,8 +370,8 @@ impl PresentationEngine {
 /// Build a seam-adjusted drawable for a self-loop, applying the transition
 /// function to the seam between the frame's last and first points.
 ///
-/// For `Transition(points)`: places transition as prefix (frame-swap) or
-/// suffix (FIFO) depending on `prefix_mode`.
+/// For `Transition(points)`: places the transition as a prefix before the
+/// base frame points (used by frame-swap delivery).
 ///
 /// For `Coalesce`: omits the last base point so the loop represents the
 /// seam point once. Single-point frames are kept unchanged.
@@ -388,7 +381,6 @@ fn build_self_loop_drawable(
     transition_fn: &TransitionFn,
     base: &[LaserPoint],
     drawable: &mut Vec<LaserPoint>,
-    prefix_mode: bool,
 ) -> usize {
     let last = base.last().unwrap();
     let first = base.first().unwrap();
@@ -397,13 +389,8 @@ fn build_self_loop_drawable(
     match plan {
         TransitionPlan::Transition(pts) => {
             let transition_len = pts.len();
-            if prefix_mode {
-                drawable.extend_from_slice(&pts);
-                drawable.extend_from_slice(base);
-            } else {
-                drawable.extend_from_slice(base);
-                drawable.extend_from_slice(&pts);
-            }
+            drawable.extend_from_slice(&pts);
+            drawable.extend_from_slice(base);
             transition_len
         }
         TransitionPlan::Coalesce => {
