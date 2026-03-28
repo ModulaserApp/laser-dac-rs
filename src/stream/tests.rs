@@ -441,7 +441,7 @@ fn test_arm_opens_shutter_disarm_closes_shutter() {
 #[test]
 fn test_handle_underrun_blanks_when_disarmed() {
     // Use RepeatLast policy - but when disarmed, should still blank
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
     let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Set some last_chunk with colored points using the pre-allocated buffer
@@ -680,7 +680,7 @@ fn test_run_starved_applies_underrun_policy() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Blank);
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -716,7 +716,7 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Blank);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Blank);
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -956,7 +956,7 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
 #[test]
 fn test_fill_result_filled_updates_last_chunk_when_armed() {
     // Test that Filled(n) updates last_chunk for RepeatLast policy when armed
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
     let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Arm the stream so last_chunk gets updated
@@ -998,7 +998,7 @@ fn test_fill_result_starved_repeat_last_with_stored_chunk() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
@@ -1045,7 +1045,7 @@ fn test_fill_result_starved_repeat_last_without_stored_chunk_falls_back_to_blank
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
@@ -1085,7 +1085,7 @@ fn test_fill_result_starved_with_park_policy() {
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Park { x: 0.5, y: -0.5 });
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Park { x: 0.5, y: -0.5 });
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream
@@ -1118,7 +1118,7 @@ fn test_fill_result_starved_with_park_policy() {
 #[test]
 fn test_fill_result_starved_with_stop_policy() {
     // Test that Starved with Stop policy terminates the stream
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::Stop);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Stop);
     let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     // Must arm the stream for underrun policy to be checked
@@ -1266,12 +1266,12 @@ fn test_full_stream_lifecycle_create_arm_stream_stop() {
 }
 
 #[test]
-fn test_full_stream_lifecycle_with_underrun_recovery() {
+fn test_full_stream_lifecycle_with_idle_policy_recovery() {
     // Test lifecycle with underrun and recovery
     let backend = TestBackend::new();
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_underrun(UnderrunPolicy::RepeatLast);
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm the stream for underrun policy to work
@@ -1460,6 +1460,132 @@ fn test_stream_disarm_during_streaming() {
     assert_eq!(result.unwrap(), RunExit::Stopped);
     // Shutter should have been closed by disarm
     assert!(!shutter_open.load(Ordering::SeqCst));
+}
+
+// =========================================================================
+// Disarm scanner parking regression tests
+// =========================================================================
+// These tests verify that disarming parks scanners at a fixed position
+// instead of continuing to trace the shape path with blanked colors.
+// See: https://github.com/ModulaserApp/Modulaser-v2/issues/117
+
+#[test]
+fn test_disarm_parks_scanners_at_origin_default_policy() {
+    // Regression: disarming with the default Blank policy must park scanners
+    // at (0,0) — not keep tracing the shape path with blanked colors.
+    let mut stream = make_test_stream(TestBackend::new());
+
+    // Fill buffer with shape points (simulating a circle being traced)
+    let n = 10;
+    for i in 0..n {
+        let angle = i as f32 * 0.628; // ~36° steps
+        stream.state.chunk_buffer[i] =
+            LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535);
+    }
+
+    // Stream starts disarmed by default
+    assert!(!stream.control.is_armed());
+
+    let mut on_error = |_: Error| {};
+    stream.write_fill_points(n, &mut on_error).unwrap();
+
+    // Every point must be parked at (0,0) with laser off
+    for i in 0..n {
+        let p = &stream.state.chunk_buffer[i];
+        assert_eq!(p.x, 0.0, "point {i}: x must be 0.0 (parked), got {}", p.x);
+        assert_eq!(p.y, 0.0, "point {i}: y must be 0.0 (parked), got {}", p.y);
+        assert_eq!(p.r, 0, "point {i}: must be blanked");
+        assert_eq!(p.g, 0, "point {i}: must be blanked");
+        assert_eq!(p.b, 0, "point {i}: must be blanked");
+        assert_eq!(p.intensity, 0, "point {i}: must be blanked");
+    }
+}
+
+#[test]
+fn test_disarm_parks_scanners_at_configured_park_position() {
+    // When IdlePolicy::Park is set, disarmed scanners must park at that position.
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Park { x: 0.5, y: -0.3 });
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+
+    // Fill buffer with shape points
+    let n = 10;
+    for i in 0..n {
+        stream.state.chunk_buffer[i] =
+            LaserPoint::new(i as f32 * 0.1, i as f32 * -0.1, 65535, 65535, 65535, 65535);
+    }
+
+    assert!(!stream.control.is_armed());
+
+    let mut on_error = |_: Error| {};
+    stream.write_fill_points(n, &mut on_error).unwrap();
+
+    for i in 0..n {
+        let p = &stream.state.chunk_buffer[i];
+        assert_eq!(p.x, 0.5, "point {i}: x must be park position 0.5");
+        assert_eq!(p.y, -0.3, "point {i}: y must be park position -0.3");
+        assert_eq!(p.r, 0, "point {i}: must be blanked");
+    }
+}
+
+#[test]
+fn test_disarm_repeat_last_falls_back_to_blank() {
+    // RepeatLast must NOT repeat lit content when disarmed — falls back to Blank.
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+
+    // Simulate having a stored "last chunk" with lit content
+    let lit = LaserPoint::new(0.8, 0.8, 65535, 65535, 65535, 65535);
+    for i in 0..100 {
+        stream.state.last_chunk[i] = lit;
+    }
+    stream.state.last_chunk_len = 100;
+
+    // Fill buffer with shape points
+    let n = 10;
+    for i in 0..n {
+        stream.state.chunk_buffer[i] = lit;
+    }
+
+    assert!(!stream.control.is_armed());
+
+    let mut on_error = |_: Error| {};
+    stream.write_fill_points(n, &mut on_error).unwrap();
+
+    // Must be blanked at origin — not repeating the lit content
+    for i in 0..n {
+        let p = &stream.state.chunk_buffer[i];
+        assert_eq!(p.x, 0.0, "point {i}: must be parked at origin, not shape position");
+        assert_eq!(p.y, 0.0, "point {i}: must be parked at origin, not shape position");
+        assert_eq!(p.r, 0, "point {i}: must be blanked, not repeating lit content");
+    }
+}
+
+#[test]
+fn test_disarm_underrun_respects_park_policy() {
+    // handle_underrun when disarmed must also respect IdlePolicy::Park.
+    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Park { x: -0.5, y: 0.5 });
+    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+
+    assert!(!stream.control.is_armed());
+
+    let req = ChunkRequest {
+        start: StreamInstant::new(0),
+        pps: 30000,
+        min_points: 50,
+        target_points: 50,
+        buffered_points: 0,
+        buffered: Duration::ZERO,
+        device_queued_points: None,
+    };
+
+    stream.handle_underrun(&req).unwrap();
+
+    for i in 0..50 {
+        let p = &stream.state.chunk_buffer[i];
+        assert_eq!(p.x, -0.5, "point {i}: must park at configured x");
+        assert_eq!(p.y, 0.5, "point {i}: must park at configured y");
+        assert_eq!(p.r, 0, "point {i}: must be blanked");
+    }
 }
 
 #[test]

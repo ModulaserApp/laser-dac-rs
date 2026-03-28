@@ -497,8 +497,8 @@ pub struct StreamConfig {
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub min_buffer: std::time::Duration,
 
-    /// What to do when the producer can't keep up.
-    pub underrun: UnderrunPolicy,
+    /// What to do when the stream is idle (underrun or disarmed).
+    pub idle_policy: IdlePolicy,
 
     /// Maximum time to wait for queued points to drain on graceful shutdown (default: 1s).
     ///
@@ -581,7 +581,7 @@ impl Default for StreamConfig {
             pps: 30_000,
             target_buffer: Self::DEFAULT_TARGET_BUFFER,
             min_buffer: Self::DEFAULT_MIN_BUFFER,
-            underrun: UnderrunPolicy::default(),
+            idle_policy: IdlePolicy::default(),
             drain_timeout: std::time::Duration::from_secs(1),
             color_delay: std::time::Duration::ZERO,
             startup_blank: std::time::Duration::from_millis(1),
@@ -627,10 +627,19 @@ impl StreamConfig {
         self
     }
 
-    /// Set the underrun policy (builder pattern).
-    pub fn with_underrun(mut self, policy: UnderrunPolicy) -> Self {
-        self.underrun = policy;
+    /// Set the idle policy (builder pattern).
+    ///
+    /// Controls behavior when the stream is idle — either because the producer
+    /// can't keep up (underrun) or the stream is disarmed. See [`IdlePolicy`].
+    pub fn with_idle_policy(mut self, policy: IdlePolicy) -> Self {
+        self.idle_policy = policy;
         self
+    }
+
+    /// Deprecated — use [`with_idle_policy`](Self::with_idle_policy) instead.
+    #[deprecated(since = "0.8.0", note = "renamed to with_idle_policy")]
+    pub fn with_underrun(self, policy: IdlePolicy) -> Self {
+        self.with_idle_policy(policy)
     }
 
     /// Set the drain timeout for graceful shutdown (builder pattern).
@@ -666,14 +675,18 @@ impl StreamConfig {
     }
 }
 
-/// Policy for what to do when the producer can't keep up with the stream.
+/// Policy for what to output when the stream is idle (disarmed or underrun).
+///
+/// This governs both underrun recovery (producer can't keep up) and disarm
+/// behavior (laser safety off). When disarmed, `RepeatLast` falls back to
+/// `Blank` — repeating lit content on a disarmed stream is never correct.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default)]
-pub enum UnderrunPolicy {
-    /// Repeat the last chunk of points.
+pub enum IdlePolicy {
+    /// Repeat the last chunk of points (underrun only; falls back to `Blank` when disarmed).
     RepeatLast,
-    /// Output blanked points (laser off).
+    /// Output blanked points at the origin (laser off, scanners park at 0,0).
     #[default]
     Blank,
     /// Park the beam at a specific position with laser off.
@@ -681,6 +694,10 @@ pub enum UnderrunPolicy {
     /// Stop the stream entirely on underrun.
     Stop,
 }
+
+/// Deprecated alias — use [`IdlePolicy`] instead.
+#[deprecated(since = "0.8.0", note = "renamed to IdlePolicy")]
+pub type UnderrunPolicy = IdlePolicy;
 
 /// A request to fill a buffer with points for streaming.
 ///
@@ -1126,7 +1143,7 @@ mod tests {
             pps: 45000,
             target_buffer: Duration::from_millis(50),
             min_buffer: Duration::from_millis(12),
-            underrun: UnderrunPolicy::Park { x: 0.5, y: -0.3 },
+            idle_policy: IdlePolicy::Park { x: 0.5, y: -0.3 },
             drain_timeout: Duration::from_secs(2),
             color_delay: Duration::from_micros(150),
             startup_blank: Duration::from_micros(800),
@@ -1144,9 +1161,9 @@ mod tests {
         assert_eq!(restored.color_delay, config.color_delay);
         assert_eq!(restored.startup_blank, config.startup_blank);
 
-        // Verify underrun policy
-        match restored.underrun {
-            UnderrunPolicy::Park { x, y } => {
+        // Verify idle policy
+        match restored.idle_policy {
+            IdlePolicy::Park { x, y } => {
                 assert!((x - 0.5).abs() < f32::EPSILON);
                 assert!((y - (-0.3)).abs() < f32::EPSILON);
             }

@@ -42,7 +42,7 @@ use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectT
 use crate::scheduler;
 use crate::types::{
     ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
-    StreamConfig, StreamInstant, StreamStats, StreamStatus, UnderrunPolicy,
+    IdlePolicy, StreamConfig, StreamInstant, StreamStats, StreamStatus,
 };
 
 // =============================================================================
@@ -811,11 +811,15 @@ impl Stream {
         // Handle shutter transitions
         self.handle_shutter_transition(is_armed);
 
-        // Blank points in-place when disarmed
+        // When disarmed, apply idle policy (park scanners instead of tracing shapes)
         if !is_armed {
-            for p in &mut self.state.chunk_buffer[..n] {
-                *p = LaserPoint::blanked(p.x, p.y);
-            }
+            let park = match &self.config.idle_policy {
+                IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+                // RepeatLast falls back to Blank when disarmed — repeating lit
+                // content on a disarmed stream is never correct.
+                _ => LaserPoint::blanked(0.0, 0.0),
+            };
+            self.state.chunk_buffer[..n].fill(park);
         }
 
         // Apply startup blanking: force first N points after arming to blank
@@ -896,7 +900,7 @@ impl Stream {
         }
     }
 
-    /// Handle underrun for the fill API by applying the underrun policy.
+    /// Handle underrun by applying the idle policy.
     fn handle_underrun(&mut self, req: &ChunkRequest) -> Result<()> {
         self.state.stats.underrun_count += 1;
 
@@ -906,20 +910,20 @@ impl Stream {
         // Calculate how many points we need (use target_points as the fill amount)
         let n_points = req.target_points.max(1);
 
-        // Determine the fill point based on arm state and underrun policy
+        // Determine the fill point based on arm state and idle policy
         if is_armed {
-            match &self.config.underrun {
-                UnderrunPolicy::Stop => {
+            match &self.config.idle_policy {
+                IdlePolicy::Stop => {
                     self.control.stop()?;
                     return Err(Error::Stopped);
                 }
-                UnderrunPolicy::RepeatLast if self.state.last_chunk_len > 0 => {
+                IdlePolicy::RepeatLast if self.state.last_chunk_len > 0 => {
                     for i in 0..n_points {
                         self.state.chunk_buffer[i] =
                             self.state.last_chunk[i % self.state.last_chunk_len];
                     }
                 }
-                UnderrunPolicy::Park { x, y } => {
+                IdlePolicy::Park { x, y } => {
                     let park = LaserPoint::blanked(*x, *y);
                     self.state.chunk_buffer[..n_points].fill(park);
                 }
@@ -929,8 +933,12 @@ impl Stream {
                 }
             }
         } else {
-            // When disarmed, always output blanked points
-            self.state.chunk_buffer[..n_points].fill(LaserPoint::blanked(0.0, 0.0));
+            // When disarmed, apply idle policy for scanner parking
+            let park = match &self.config.idle_policy {
+                IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+                _ => LaserPoint::blanked(0.0, 0.0),
+            };
+            self.state.chunk_buffer[..n_points].fill(park);
         }
 
         // Write the fill points

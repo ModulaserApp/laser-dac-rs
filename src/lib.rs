@@ -129,8 +129,12 @@ pub use types::{
     StreamInstant,
     StreamStats,
     StreamStatus,
-    UnderrunPolicy,
+    IdlePolicy,
 };
+
+// Deprecated alias for backwards compatibility
+#[allow(deprecated)]
+pub use types::UnderrunPolicy;
 
 // Stream and Dac types
 pub use stream::{Dac, Stream, StreamControl};

@@ -51,6 +51,12 @@ pub struct FrameSessionConfig {
     /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
     /// reconnection when the device disconnects.
     pub reconnect: Option<crate::types::ReconnectConfig>,
+    /// Policy for what to output when the stream is idle (disarmed).
+    ///
+    /// Controls scanner behavior when disarmed. Default: [`IdlePolicy::Blank`]
+    /// (park at origin with laser off). Use [`IdlePolicy::Park`] to park at a
+    /// specific position.
+    pub idle_policy: crate::types::IdlePolicy,
     /// Optional hook for processing the final presented output.
     pub output_filter: Option<Box<dyn OutputFilter>>,
 }
@@ -67,6 +73,7 @@ impl FrameSessionConfig {
             transition_fn: default_transition(pps),
             startup_blank: std::time::Duration::from_millis(1),
             color_delay_points,
+            idle_policy: crate::types::IdlePolicy::default(),
             reconnect: None,
             output_filter: None,
         }
@@ -95,6 +102,14 @@ impl FrameSessionConfig {
     /// Requires the device to have been opened via [`open_device`](crate::open_device).
     pub fn with_reconnect(mut self, config: crate::types::ReconnectConfig) -> Self {
         self.reconnect = Some(config);
+        self
+    }
+
+    /// Set the idle policy (builder pattern).
+    ///
+    /// Controls scanner behavior when disarmed. See [`crate::types::IdlePolicy`].
+    pub fn with_idle_policy(mut self, policy: crate::types::IdlePolicy) -> Self {
+        self.idle_policy = policy;
         self
     }
 
@@ -363,6 +378,7 @@ impl FrameSession {
             transition_fn,
             startup_blank,
             color_delay_points,
+            idle_policy,
             reconnect: _,
             output_filter,
         } = config;
@@ -489,6 +505,7 @@ impl FrameSession {
                     is_armed,
                     &mut startup_blank_remaining,
                     &mut chunk_buffer[..n],
+                    &idle_policy,
                 );
 
                 // Apply color delay (stateful — carries across chunks)
@@ -566,6 +583,7 @@ impl FrameSession {
             transition_fn,
             startup_blank,
             color_delay_points,
+            idle_policy,
             output_filter,
             ..
         } = config;
@@ -703,6 +721,7 @@ impl FrameSession {
                 is_armed,
                 &mut startup_blank_remaining,
                 &mut chunk_buffer[..n],
+                &idle_policy,
             );
 
             // Apply color delay (stateful — carries across chunks)
@@ -791,6 +810,7 @@ impl FrameSession {
             transition_fn,
             startup_blank,
             color_delay_points,
+            idle_policy,
             output_filter,
             ..
         } = config;
@@ -888,7 +908,7 @@ impl FrameSession {
                 frame_buf.extend_from_slice(composed);
 
                 // Apply blanking modifications
-                Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf);
+                Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf, &idle_policy);
 
                 color_delay.apply(&mut frame_buf);
                 Self::apply_output_filter(
@@ -1050,11 +1070,16 @@ impl FrameSession {
         is_armed: bool,
         startup_blank_remaining: &mut usize,
         buffer: &mut [LaserPoint],
+        idle_policy: &crate::types::IdlePolicy,
     ) {
         if !is_armed {
-            for p in buffer.iter_mut() {
-                *p = LaserPoint::blanked(p.x, p.y);
-            }
+            // When disarmed, apply idle policy: park scanners instead of tracing shapes
+            let park = match idle_policy {
+                crate::types::IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+                // RepeatLast falls back to Blank when disarmed
+                _ => LaserPoint::blanked(0.0, 0.0),
+            };
+            buffer.fill(park);
         } else if *startup_blank_remaining > 0 {
             let blank_count = buffer.len().min(*startup_blank_remaining);
             for p in &mut buffer[..blank_count] {
