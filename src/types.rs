@@ -706,7 +706,7 @@ pub struct ChunkRequest {
     /// Use this for audio synchronization.
     pub start: StreamInstant,
 
-    /// Points per second (fixed for stream duration).
+    /// Points per second (current value, may change via `StreamControl::set_pps`).
     pub pps: u32,
 
     /// Minimum points needed to avoid imminent underrun.

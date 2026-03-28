@@ -19,6 +19,15 @@ use super::{
     PresentedSliceKind, TransitionFn,
 };
 
+/// Convert a duration to a point count at the given PPS rate.
+fn duration_to_points(d: Duration, pps: u32) -> usize {
+    if d.is_zero() {
+        0
+    } else {
+        (d.as_secs_f64() * pps as f64).ceil() as usize
+    }
+}
+
 // =============================================================================
 // FrameSessionConfig
 // =============================================================================
@@ -223,7 +232,7 @@ impl FrameSession {
         }
 
         let (control_tx, control_rx) = mpsc::channel();
-        let control = StreamControl::new(control_tx, std::time::Duration::ZERO);
+        let control = StreamControl::new(control_tx, std::time::Duration::ZERO, config.pps);
         let frame_slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
         let metrics = FrameSessionMetrics::new(backend.is_connected());
 
@@ -350,24 +359,19 @@ impl FrameSession {
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let FrameSessionConfig {
-            pps,
+            pps: initial_pps,
             transition_fn,
             startup_blank,
             color_delay_points,
             reconnect: _,
             output_filter,
         } = config;
-        let pps_f64 = pps as f64;
-        let startup_blank_points = if startup_blank.is_zero() {
-            0
-        } else {
-            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
-        };
+        let initial_pps_f64 = initial_pps as f64;
         // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
         // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
         let mut chunk_points =
-            ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
-        let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+            ((initial_pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
+        let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / initial_pps_f64);
 
         let mut engine = PresentationEngine::new(transition_fn);
         let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
@@ -401,6 +405,17 @@ impl FrameSession {
                 next_send = now;
             }
 
+            let pps = control.pps();
+            let pps_f64 = pps as f64;
+            let new_chunk_points =
+                ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
+            if new_chunk_points != chunk_points {
+                chunk_points = new_chunk_points;
+                chunk_buffer.resize(chunk_points, LaserPoint::default());
+                chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
+            }
+            let startup_blank_points = duration_to_points(startup_blank, pps);
+
             // 2. Check stop
             if control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
@@ -423,16 +438,11 @@ impl FrameSession {
                         &mut last_armed,
                         &mut engine,
                         &last_frame,
-                        pps,
                         false,
                         &metrics,
                     ) {
                         Ok(_info) => {
                             next_send = Instant::now();
-                            chunk_points = ((pps_f64 * 0.010).ceil() as usize)
-                                .min(backend.caps().max_points_per_chunk);
-                            chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
-                            chunk_buffer.resize(chunk_points, LaserPoint::default());
                             color_delay.reset();
                             Self::reset_output_filter(
                                 &mut output_filter,
@@ -519,17 +529,11 @@ impl FrameSession {
                             &mut last_armed,
                             &mut engine,
                             &last_frame,
-                            pps,
                             false,
                             &metrics,
                         ) {
                             Ok(_info) => {
                                 next_send = Instant::now();
-                                chunk_points = ((pps_f64 * 0.010).ceil() as usize)
-                                    .min(backend.caps().max_points_per_chunk);
-                                chunk_duration =
-                                    Duration::from_secs_f64(chunk_points as f64 / pps_f64);
-                                chunk_buffer.resize(chunk_points, LaserPoint::default());
                                 color_delay.reset();
                                 Self::reset_output_filter(
                                     &mut output_filter,
@@ -559,22 +563,14 @@ impl FrameSession {
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let FrameSessionConfig {
-            pps,
             transition_fn,
             startup_blank,
             color_delay_points,
-            reconnect: _,
             output_filter,
+            ..
         } = config;
-        let pps_f64 = pps as f64;
-        let startup_blank_points = if startup_blank.is_zero() {
-            0
-        } else {
-            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
-        };
         let mut max_points = backend.caps().max_points_per_chunk;
         let target_buffer_secs = 0.020_f64;
-        let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
 
         let mut engine = PresentationEngine::new(transition_fn);
         let mut scheduled_ahead: u64 = 0;
@@ -596,6 +592,11 @@ impl FrameSession {
             if control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
             }
+
+            let pps = control.pps();
+            let pps_f64 = pps as f64;
+            let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
+            let startup_blank_points = duration_to_points(startup_blank, pps);
 
             // Time-based decay of scheduled_ahead
             let now = Instant::now();
@@ -643,7 +644,6 @@ impl FrameSession {
                         &mut last_armed,
                         &mut engine,
                         &last_frame,
-                        pps,
                         false,
                         &metrics,
                     ) {
@@ -745,7 +745,6 @@ impl FrameSession {
                                 &mut last_armed,
                                 &mut engine,
                                 &last_frame,
-                                pps,
                                 false,
                                 &metrics,
                             ) {
@@ -789,18 +788,12 @@ impl FrameSession {
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let FrameSessionConfig {
-            pps,
             transition_fn,
             startup_blank,
             color_delay_points,
-            reconnect: _,
             output_filter,
+            ..
         } = config;
-        let startup_blank_points = if startup_blank.is_zero() {
-            0
-        } else {
-            (startup_blank.as_secs_f64() * pps as f64).ceil() as usize
-        };
         let mut engine = PresentationEngine::new(transition_fn);
         engine.set_frame_capacity(backend.frame_capacity());
         let mut shutter_open = false;
@@ -821,6 +814,9 @@ impl FrameSession {
                 return Ok(RunExit::Stopped);
             }
 
+            let pps = control.pps();
+            let startup_blank_points = duration_to_points(startup_blank, pps);
+
             // 2. Check for new frame (latest-wins slot)
             if let Some(frame) = frame_slot.lock().unwrap().take() {
                 last_frame = Some(frame.clone());
@@ -838,7 +834,6 @@ impl FrameSession {
                         &mut last_armed,
                         &mut engine,
                         &last_frame,
-                        pps,
                         true,
                         &metrics,
                     ) {
@@ -928,7 +923,6 @@ impl FrameSession {
                             &mut last_armed,
                             &mut engine,
                             &last_frame,
-                            pps,
                             true,
                             &metrics,
                         ) {
@@ -969,20 +963,20 @@ impl FrameSession {
         last_armed: &mut bool,
         engine: &mut PresentationEngine,
         last_frame: &Option<Frame>,
-        config_pps: u32,
         expected_frame_swap: bool,
         metrics: &FrameSessionMetrics,
     ) -> std::result::Result<DacInfo, RunExit> {
         metrics.set_connected(false);
+        let current_pps = control.pps();
         let (info, new_backend) = reconnect_backend_with_retry(
             policy,
             || control.is_stop_requested(),
             |info, new_backend| {
-                if config_pps < info.caps.pps_min || config_pps > info.caps.pps_max {
+                if current_pps < info.caps.pps_min || current_pps > info.caps.pps_max {
                     log::error!(
                         "'{}' PPS {} outside new device range [{}, {}]",
                         policy.target.device_id,
-                        config_pps,
+                        current_pps,
                         info.caps.pps_min,
                         info.caps.pps_max
                     );

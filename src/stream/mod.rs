@@ -31,7 +31,7 @@
 //! New streams always start disarmed for safety.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -85,16 +85,19 @@ struct StreamControlInner {
     control_tx: Mutex<Sender<ControlMsg>>,
     /// Color delay in microseconds (readable per-chunk without locking).
     color_delay_micros: AtomicU64,
+    /// Points per second (hot-swappable without session restart).
+    pps: AtomicU32,
 }
 
 impl StreamControl {
-    pub(crate) fn new(control_tx: Sender<ControlMsg>, color_delay: Duration) -> Self {
+    pub(crate) fn new(control_tx: Sender<ControlMsg>, color_delay: Duration, pps: u32) -> Self {
         Self {
             inner: Arc::new(StreamControlInner {
                 armed: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
                 control_tx: Mutex::new(control_tx),
                 color_delay_micros: AtomicU64::new(color_delay.as_micros() as u64),
+                pps: AtomicU32::new(pps),
             }),
         }
     }
@@ -151,6 +154,20 @@ impl StreamControl {
     /// Get the current color delay.
     pub fn color_delay(&self) -> Duration {
         Duration::from_micros(self.inner.color_delay_micros.load(Ordering::SeqCst))
+    }
+
+    /// Set the points per second rate.
+    ///
+    /// Takes effect within one chunk period — the stream loop reads this
+    /// atomically each iteration and recalculates timing on the fly.
+    /// No session restart required.
+    pub fn set_pps(&self, pps: u32) {
+        self.inner.pps.store(pps, Ordering::SeqCst);
+    }
+
+    /// Get the current points per second rate.
+    pub fn pps(&self) -> u32 {
+        self.inner.pps.load(Ordering::SeqCst)
     }
 
     /// Request the stream to stop.
@@ -313,12 +330,13 @@ impl Stream {
         let startup_blank_points =
             Self::duration_micros_to_points(config.startup_blank.as_micros() as u64, config.pps);
         let color_delay = config.color_delay;
+        let pps = config.pps;
         let state = StreamState::new(max_points, startup_blank_points, &config);
         Self {
             info,
             backend: Some(backend),
             config,
-            control: StreamControl::new(control_tx, color_delay),
+            control: StreamControl::new(control_tx, color_delay, pps),
             control_rx,
             state,
             reconnect_policy: None,
@@ -592,7 +610,6 @@ impl Stream {
     {
         use std::time::Instant;
 
-        let pps = self.config.pps as f64;
         let mut max_points = self.info.caps.max_points_per_chunk;
 
         // Track time between iterations to decrement scheduled_ahead for backends
@@ -606,6 +623,14 @@ impl Stream {
             if self.control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
             }
+
+            self.config.pps = self.control.pps();
+            let pps = self.config.pps as f64;
+            self.state.target_buffer_points = (self.state.target_buffer_secs * pps) as u64;
+            self.state.startup_blank_points = Self::duration_micros_to_points(
+                self.config.startup_blank.as_micros() as u64,
+                self.config.pps,
+            );
 
             // Decrement scheduled_ahead based on elapsed time since last iteration.
             // This is critical for backends without queued_points() - without this,

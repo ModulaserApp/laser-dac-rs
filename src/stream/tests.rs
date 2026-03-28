@@ -246,7 +246,7 @@ impl crate::backend::FrameSwapBackend for FrameSwapTestBackend {
 #[test]
 fn test_stream_control_arm_disarm() {
     let (tx, _rx) = mpsc::channel();
-    let control = StreamControl::new(tx, Duration::ZERO);
+    let control = StreamControl::new(tx, Duration::ZERO, 30_000);
     assert!(!control.is_armed());
 
     control.arm().unwrap();
@@ -259,7 +259,7 @@ fn test_stream_control_arm_disarm() {
 #[test]
 fn test_stream_control_stop() {
     let (tx, _rx) = mpsc::channel();
-    let control = StreamControl::new(tx, Duration::ZERO);
+    let control = StreamControl::new(tx, Duration::ZERO, 30_000);
     assert!(!control.is_stop_requested());
 
     control.stop().unwrap();
@@ -269,7 +269,7 @@ fn test_stream_control_stop() {
 #[test]
 fn test_stream_control_clone_shares_state() {
     let (tx, _rx) = mpsc::channel();
-    let control1 = StreamControl::new(tx, Duration::ZERO);
+    let control1 = StreamControl::new(tx, Duration::ZERO, 30_000);
     let control2 = control1.clone();
 
     control1.arm().unwrap();
