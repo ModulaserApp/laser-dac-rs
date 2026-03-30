@@ -1554,9 +1554,18 @@ fn test_disarm_repeat_last_falls_back_to_blank() {
     // Must be blanked at origin — not repeating the lit content
     for i in 0..n {
         let p = &stream.state.chunk_buffer[i];
-        assert_eq!(p.x, 0.0, "point {i}: must be parked at origin, not shape position");
-        assert_eq!(p.y, 0.0, "point {i}: must be parked at origin, not shape position");
-        assert_eq!(p.r, 0, "point {i}: must be blanked, not repeating lit content");
+        assert_eq!(
+            p.x, 0.0,
+            "point {i}: must be parked at origin, not shape position"
+        );
+        assert_eq!(
+            p.y, 0.0,
+            "point {i}: must be parked at origin, not shape position"
+        );
+        assert_eq!(
+            p.r, 0,
+            "point {i}: must be blanked, not repeating lit content"
+        );
     }
 }
 

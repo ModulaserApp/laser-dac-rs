@@ -41,8 +41,8 @@ use crate::discovery::DacDiscovery;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
 use crate::scheduler;
 use crate::types::{
-    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, LaserPoint, OutputModel, RunExit,
-    IdlePolicy, StreamConfig, StreamInstant, StreamStats, StreamStatus,
+    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, IdlePolicy, LaserPoint,
+    OutputModel, RunExit, StreamConfig, StreamInstant, StreamStats, StreamStatus,
 };
 
 // =============================================================================

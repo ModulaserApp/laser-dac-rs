@@ -53,8 +53,8 @@ pub struct FrameSessionConfig {
     pub reconnect: Option<crate::types::ReconnectConfig>,
     /// Policy for what to output when the stream is idle (disarmed).
     ///
-    /// Controls scanner behavior when disarmed. Default: [`IdlePolicy::Blank`]
-    /// (park at origin with laser off). Use [`IdlePolicy::Park`] to park at a
+    /// Controls scanner behavior when disarmed. Default: [`Blank`](crate::types::IdlePolicy::Blank)
+    /// (park at origin with laser off). Use [`Park`](crate::types::IdlePolicy::Park) to park at a
     /// specific position.
     pub idle_policy: crate::types::IdlePolicy,
     /// Optional hook for processing the final presented output.
@@ -908,7 +908,12 @@ impl FrameSession {
                 frame_buf.extend_from_slice(composed);
 
                 // Apply blanking modifications
-                Self::apply_blanking(is_armed, &mut startup_blank_remaining, &mut frame_buf, &idle_policy);
+                Self::apply_blanking(
+                    is_armed,
+                    &mut startup_blank_remaining,
+                    &mut frame_buf,
+                    &idle_policy,
+                );
 
                 color_delay.apply(&mut frame_buf);
                 Self::apply_output_filter(

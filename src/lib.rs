@@ -121,6 +121,7 @@ pub use types::{
     DacInfo,
     DacType,
     EnabledDacTypes,
+    IdlePolicy,
     LaserPoint,
     OutputModel,
     ReconnectConfig,
@@ -129,7 +130,6 @@ pub use types::{
     StreamInstant,
     StreamStats,
     StreamStatus,
-    IdlePolicy,
 };
 
 // Deprecated alias for backwards compatibility
