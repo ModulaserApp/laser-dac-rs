@@ -433,9 +433,42 @@ impl ColorDelayLine {
         }
     }
 
+    /// Current delay in points.
+    pub fn delay(&self) -> usize {
+        self.delay
+    }
+
     /// Reset the carry buffer (e.g., after reconnect).
     pub fn reset(&mut self) {
         self.carry.fill((0, 0, 0, 0));
+    }
+
+    /// Resize the delay line to a new point count.
+    ///
+    /// - **Grow**: pads the front of the carry buffer with black (oldest slots).
+    /// - **Shrink**: keeps the most recent entries (trims from the front).
+    /// - **Equal**: no-op.
+    pub fn resize(&mut self, new_delay: usize) {
+        if new_delay == self.delay {
+            return;
+        }
+        if new_delay == 0 {
+            self.delay = 0;
+            self.carry.clear();
+            return;
+        }
+        let old_len = self.carry.len();
+        if new_delay > old_len {
+            // Grow: prepend black entries, keep existing carry at the end
+            let extra = new_delay - old_len;
+            let mut new_carry = vec![(0, 0, 0, 0); extra];
+            new_carry.extend_from_slice(&self.carry);
+            self.carry = new_carry;
+        } else {
+            // Shrink: keep only the most recent (tail) entries
+            self.carry.drain(..old_len - new_delay);
+        }
+        self.delay = new_delay;
     }
 
     /// Apply color delay to a chunk, using carried state from the previous chunk.

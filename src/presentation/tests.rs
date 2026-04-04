@@ -3341,3 +3341,150 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
     let result = device.start_frame_session(config);
     assert!(result.is_err());
 }
+
+// =========================================================================
+// ColorDelayLine::resize tests
+// =========================================================================
+
+#[test]
+fn test_color_delay_line_resize_grow() {
+    // Start with delay=1, apply a chunk, then grow to delay=3.
+    // After resize, the carry buffer should be padded with black at the front
+    // and the new delay should be applied.
+    let mut cdl = ColorDelayLine::new(1);
+
+    // Apply a 3-point chunk so carry holds the last 1 color = (3,3,3,3)
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 1, 1, 1, 1),
+        LaserPoint::new(0.0, 0.0, 2, 2, 2, 2),
+        LaserPoint::new(0.0, 0.0, 3, 3, 3, 3),
+    ];
+    cdl.apply(&mut points);
+
+    // Grow to delay=3
+    cdl.resize(3);
+    assert_eq!(cdl.delay(), 3);
+
+    // Apply another 3-point chunk with known colors
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 10, 10, 10, 10),
+        LaserPoint::new(0.0, 0.0, 20, 20, 20, 20),
+        LaserPoint::new(0.0, 0.0, 30, 30, 30, 30),
+    ];
+    cdl.apply(&mut points2);
+
+    // With delay=3, the first 3 points should get the carry buffer colors.
+    // Carry after resize(3) = [(0,0,0,0), (0,0,0,0), (3,3,3,3)]
+    // So point0 gets (0,0,0,0), point1 gets (0,0,0,0), point2 gets (3,3,3,3)
+    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (0, 0, 0, 0));
+    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (0, 0, 0, 0));
+    assert_eq!((points2[2].r, points2[2].g, points2[2].b, points2[2].intensity), (3, 3, 3, 3));
+}
+
+#[test]
+fn test_color_delay_line_resize_shrink() {
+    // Start with delay=3, apply a chunk, then shrink to delay=1.
+    let mut cdl = ColorDelayLine::new(3);
+
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 1, 1, 1, 1),
+        LaserPoint::new(0.0, 0.0, 2, 2, 2, 2),
+        LaserPoint::new(0.0, 0.0, 3, 3, 3, 3),
+        LaserPoint::new(0.0, 0.0, 4, 4, 4, 4),
+    ];
+    cdl.apply(&mut points);
+    // carry = [(2,2,2,2), (3,3,3,3), (4,4,4,4)]
+
+    // Shrink to delay=1 — keep only the most recent 1 entry = (4,4,4,4)
+    cdl.resize(1);
+    assert_eq!(cdl.delay(), 1);
+
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 10, 10, 10, 10),
+        LaserPoint::new(0.0, 0.0, 20, 20, 20, 20),
+    ];
+    cdl.apply(&mut points2);
+
+    // With delay=1, point0 gets carry[0] = (4,4,4,4), point1 gets scratch[0] = (10,10,10,10)
+    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (4, 4, 4, 4));
+    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (10, 10, 10, 10));
+}
+
+#[test]
+fn test_color_delay_line_resize_to_zero() {
+    let mut cdl = ColorDelayLine::new(2);
+
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 1, 1, 1, 1),
+        LaserPoint::new(0.0, 0.0, 2, 2, 2, 2),
+        LaserPoint::new(0.0, 0.0, 3, 3, 3, 3),
+    ];
+    cdl.apply(&mut points);
+
+    cdl.resize(0);
+    assert_eq!(cdl.delay(), 0);
+
+    // With delay=0, apply should be a no-op — colors pass through unchanged
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 10, 10, 10, 10),
+        LaserPoint::new(0.0, 0.0, 20, 20, 20, 20),
+    ];
+    cdl.apply(&mut points2);
+    assert_eq!((points2[0].r, points2[0].g), (10, 10));
+    assert_eq!((points2[1].r, points2[1].g), (20, 20));
+}
+
+#[test]
+fn test_color_delay_line_resize_same_is_noop() {
+    let mut cdl = ColorDelayLine::new(2);
+
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 1, 1, 1, 1),
+        LaserPoint::new(0.0, 0.0, 2, 2, 2, 2),
+        LaserPoint::new(0.0, 0.0, 3, 3, 3, 3),
+    ];
+    cdl.apply(&mut points);
+    // carry = [(2,2,2,2), (3,3,3,3)]
+
+    cdl.resize(2);
+
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 10, 10, 10, 10),
+        LaserPoint::new(0.0, 0.0, 20, 20, 20, 20),
+        LaserPoint::new(0.0, 0.0, 30, 30, 30, 30),
+    ];
+    cdl.apply(&mut points2);
+
+    // delay=2 unchanged, point0 = carry[0] = (2,2,2,2), point1 = carry[1] = (3,3,3,3)
+    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (2, 2, 2, 2));
+    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (3, 3, 3, 3));
+    assert_eq!((points2[2].r, points2[2].g, points2[2].b, points2[2].intensity), (10, 10, 10, 10));
+}
+
+#[test]
+fn test_color_delay_line_resize_from_zero() {
+    let mut cdl = ColorDelayLine::new(0);
+
+    // Apply with delay=0 — no-op
+    let mut points = vec![
+        LaserPoint::new(0.0, 0.0, 5, 5, 5, 5),
+    ];
+    cdl.apply(&mut points);
+    assert_eq!(points[0].r, 5);
+
+    // Grow from 0 to 2
+    cdl.resize(2);
+    assert_eq!(cdl.delay(), 2);
+
+    let mut points2 = vec![
+        LaserPoint::new(0.0, 0.0, 10, 10, 10, 10),
+        LaserPoint::new(0.0, 0.0, 20, 20, 20, 20),
+        LaserPoint::new(0.0, 0.0, 30, 30, 30, 30),
+    ];
+    cdl.apply(&mut points2);
+
+    // carry was empty, resize to 2 fills with black
+    assert_eq!((points2[0].r, points2[0].g), (0, 0));
+    assert_eq!((points2[1].r, points2[1].g), (0, 0));
+    assert_eq!((points2[2].r, points2[2].g), (10, 10));
+}

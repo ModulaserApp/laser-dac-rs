@@ -247,7 +247,12 @@ impl FrameSession {
         }
 
         let (control_tx, control_rx) = mpsc::channel();
-        let control = StreamControl::new(control_tx, std::time::Duration::ZERO, config.pps);
+        let initial_color_delay = if config.color_delay_points > 0 {
+            Duration::from_secs_f64(config.color_delay_points as f64 / config.pps as f64)
+        } else {
+            Duration::ZERO
+        };
+        let control = StreamControl::new(control_tx, initial_color_delay, config.pps);
         let frame_slot: Arc<Mutex<Option<Frame>>> = Arc::new(Mutex::new(None));
         let metrics = FrameSessionMetrics::new(backend.is_connected());
 
@@ -431,6 +436,7 @@ impl FrameSession {
                 chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
             }
             let startup_blank_points = duration_to_points(startup_blank, pps);
+            color_delay.resize(duration_to_points(control.color_delay(), pps));
 
             // 2. Check stop
             if control.is_stop_requested() {
@@ -615,6 +621,7 @@ impl FrameSession {
             let pps_f64 = pps as f64;
             let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
             let startup_blank_points = duration_to_points(startup_blank, pps);
+            color_delay.resize(duration_to_points(control.color_delay(), pps));
 
             // Time-based decay of scheduled_ahead
             let now = Instant::now();
@@ -836,6 +843,7 @@ impl FrameSession {
 
             let pps = control.pps();
             let startup_blank_points = duration_to_points(startup_blank, pps);
+            color_delay.resize(duration_to_points(control.color_delay(), pps));
 
             // 2. Check for new frame (latest-wins slot)
             if let Some(frame) = frame_slot.lock().unwrap().take() {
