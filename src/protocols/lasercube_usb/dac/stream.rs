@@ -6,18 +6,17 @@ use crate::protocols::lasercube_usb::protocol::{
     Sample, CMD_CLEAR_RINGBUFFER, CMD_GET_BULK_PACKET_SAMPLE_COUNT, CMD_GET_DAC_RATE,
     CMD_GET_MAX_DAC_RATE, CMD_GET_MAX_DAC_VALUE, CMD_GET_MIN_DAC_VALUE, CMD_GET_OUTPUT,
     CMD_GET_RINGBUFFER_EMPTY_SAMPLE_COUNT, CMD_GET_RINGBUFFER_SAMPLE_COUNT,
-    CMD_GET_SAMPLE_ELEMENT_COUNT, CMD_GET_VERSION_MAJOR, CMD_GET_VERSION_MINOR, CMD_SET_DAC_RATE,
-    CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, DATA_ALT_SETTING, DATA_INTERFACE,
-    ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
+    CMD_GET_SAMPLE_ELEMENT_COUNT, CMD_GET_VERSION_MAJOR, CMD_GET_VERSION_MINOR, CMD_RUNNER_MODE,
+    CMD_SET_DAC_RATE, CMD_SET_OUTPUT, CONTROL_INTERFACE, CONTROL_PACKET_SIZE, CONTROL_TIMEOUT,
+    DATA_ALT_SETTING, DATA_INTERFACE, ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
+    RUNNER_MODE_SUB_ENABLE, RUNNER_MODE_SUB_RUN, SAMPLE_SIZE_BYTES,
 };
 use rusb::{DeviceHandle, UsbContext};
 use std::time::Duration;
 
-/// Default USB timeout for control operations.
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(100);
-
-/// Number of retry attempts for failed transfers.
-const MAX_RETRY_ATTEMPTS: usize = 3;
+/// Timeout for data endpoint transfers. Zero means infinite/blocking,
+/// matching the reference C implementation for natural backpressure.
+const DATA_TIMEOUT: Duration = Duration::ZERO;
 
 /// A bidirectional USB communication stream with a LaserCube/LaserDock DAC.
 pub struct Stream<T: UsbContext> {
@@ -34,6 +33,24 @@ pub struct Stream<T: UsbContext> {
 }
 
 impl<T: UsbContext> Stream<T> {
+    /// Clear any stuck runner mode state from a previous session.
+    ///
+    /// Sends the toggle sequence: enable(1), enable(0), run(1), run(0).
+    /// Errors are ignored since older firmware may not support this command.
+    fn clear_runner_mode(handle: &DeviceHandle<T>) {
+        let packets: [[u8; 3]; 4] = [
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 0],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 0],
+        ];
+        let mut discard = [0u8; CONTROL_PACKET_SIZE];
+        for packet in &packets {
+            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, CONTROL_TIMEOUT);
+            let _ = handle.read_bulk(ENDPOINT_CONTROL_IN, &mut discard, CONTROL_TIMEOUT);
+        }
+    }
+
     /// Open a stream to a LaserCube/LaserDock USB device.
     ///
     /// This claims the necessary interfaces and initializes the device.
@@ -46,6 +63,9 @@ impl<T: UsbContext> Stream<T> {
         // Claim data interface with alternate setting
         handle.claim_interface(DATA_INTERFACE)?;
         handle.set_alternate_setting(DATA_INTERFACE, DATA_ALT_SETTING)?;
+
+        // Clear any stuck runner mode from a previous session
+        Self::clear_runner_mode(&handle);
 
         let mut stream = Stream {
             handle,
@@ -137,19 +157,10 @@ impl<T: UsbContext> Stream<T> {
         Ok(space)
     }
 
-    /// Set whether to flip X coordinates.
-    pub fn set_flip_x(&mut self, flip: bool) {
-        self.flip_x = flip;
-    }
-
-    /// Set whether to flip Y coordinates.
-    pub fn set_flip_y(&mut self, flip: bool) {
-        self.flip_y = flip;
-    }
-
     /// Send samples to the DAC.
     ///
-    /// This sends the samples to the device's ring buffer for playback.
+    /// Samples are sent in chunks of `bulk_packet_sample_count` to match
+    /// the device's expected USB bulk transfer size.
     pub fn send_samples(&mut self, samples: &[Sample]) -> Result<()> {
         if self.status != DeviceStatus::Initialized {
             return Err(Error::DeviceNotOpened);
@@ -169,13 +180,26 @@ impl<T: UsbContext> Stream<T> {
             })
             .collect();
 
-        self.send_data(&buffer)
+        let chunk_bytes = self.info.bulk_packet_sample_count as usize * SAMPLE_SIZE_BYTES;
+        if chunk_bytes == 0 {
+            return self.send_data(&buffer);
+        }
+
+        for chunk in buffer.chunks(chunk_bytes) {
+            self.send_data(chunk)?;
+        }
+        Ok(())
     }
 
     /// Write a frame of samples at the specified rate.
     ///
-    /// This is a convenience method that sets the rate and sends the samples.
+    /// The rate is clamped to the device's maximum DAC rate.
     pub fn write_frame(&mut self, samples: &[Sample], rate: u32) -> Result<()> {
+        let rate = if self.info.max_dac_rate > 0 {
+            rate.min(self.info.max_dac_rate)
+        } else {
+            rate
+        };
         if self.info.current_rate != rate {
             self.set_rate(rate)?;
         }
@@ -253,7 +277,7 @@ impl<T: UsbContext> Stream<T> {
     fn send_control(&self, data: &[u8]) -> Result<usize> {
         let transferred = self
             .handle
-            .write_bulk(ENDPOINT_CONTROL_OUT, data, DEFAULT_TIMEOUT)?;
+            .write_bulk(ENDPOINT_CONTROL_OUT, data, CONTROL_TIMEOUT)?;
 
         if transferred != data.len() {
             return Err(Error::Usb(rusb::Error::Io));
@@ -267,7 +291,7 @@ impl<T: UsbContext> Stream<T> {
         let mut buffer = [0u8; CONTROL_PACKET_SIZE];
         let transferred =
             self.handle
-                .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, DEFAULT_TIMEOUT)?;
+                .read_bulk(ENDPOINT_CONTROL_IN, &mut buffer, CONTROL_TIMEOUT)?;
 
         if transferred != CONTROL_PACKET_SIZE {
             return Err(Error::InvalidResponse);
@@ -277,23 +301,19 @@ impl<T: UsbContext> Stream<T> {
     }
 
     /// Send data to the data endpoint.
+    ///
+    /// Uses an infinite timeout so the transfer blocks until the device accepts
+    /// the data, providing natural backpressure (matching the reference implementation).
     fn send_data(&self, data: &[u8]) -> Result<()> {
-        let mut attempts = MAX_RETRY_ATTEMPTS;
+        let transferred = self
+            .handle
+            .write_bulk(ENDPOINT_DATA_OUT, data, DATA_TIMEOUT)?;
 
-        loop {
-            match self
-                .handle
-                .write_bulk(ENDPOINT_DATA_OUT, data, DEFAULT_TIMEOUT)
-            {
-                Ok(transferred) if transferred == data.len() => return Ok(()),
-                Ok(_) => return Err(Error::Usb(rusb::Error::Io)),
-                Err(rusb::Error::Timeout) if attempts > 0 => {
-                    attempts -= 1;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
+        if transferred != data.len() {
+            return Err(Error::Usb(rusb::Error::Io));
         }
+
+        Ok(())
     }
 }
 

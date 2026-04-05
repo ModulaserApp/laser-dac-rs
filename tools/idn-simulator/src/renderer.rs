@@ -52,17 +52,6 @@ pub fn render_laser_canvas(
         return laser_rect;
     }
 
-    // Debug: log first point
-    let p = &points[0];
-    log::debug!(
-        "First point: x={:.3}, y={:.3}, r={:.3}, g={:.3}, b={:.3}, i={:.3}",
-        p.x,
-        p.y,
-        p.r,
-        p.g,
-        p.b,
-        p.intensity
-    );
     let y_mult = if settings.invert_y { 1.0 } else { -1.0 };
 
     // Draw laser lines

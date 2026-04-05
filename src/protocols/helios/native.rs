@@ -13,25 +13,17 @@ const SDK_VERSION: u8 = 6;
 const HELIOS_VID: u16 = 0x1209;
 const HELIOS_PID: u16 = 0xE500;
 
-const _HELIOS_MAX_POINTS: u32 = 0x1000;
-const _HELIOS_MAX_RATE: u32 = 0xFFFF;
-const _HELIOS_MIN_RATE: u32 = 7;
-
-const _FRAME_BUFFER_SIZE: u32 = _HELIOS_MAX_POINTS * 7 + 5;
-
-// Interrupt endpoints
+// USB endpoints
 const ENDPOINT_BULK_OUT: u8 = 0x02;
-const _ENDPOINT_BULK_IN: u8 = 0x81;
 const ENDPOINT_INT_OUT: u8 = 0x06;
 const ENDPOINT_INT_IN: u8 = 0x83;
 
 // Interrupt control bytes
 const CONTROL_STOP: u8 = 0x01;
-const _CONTROL_SET_SHUTTER: u8 = 0x02;
+const CONTROL_SET_SHUTTER: u8 = 0x02;
 const CONTROL_GET_STATUS: u8 = 0x03;
 const CONTROL_GET_FIRMWARE_VERSION: u8 = 0x04;
 const CONTROL_GET_NAME: u8 = 0x05;
-const _CONTROL_SET_NAME: u8 = 0x06;
 const CONTROL_SEND_SDK_VERSION: u8 = 0x07;
 
 /// Controller for discovering and managing Helios DACs.
@@ -63,6 +55,30 @@ impl HeliosDacController {
     }
 }
 
+/// Mock USB device state for testing without real hardware.
+#[cfg(test)]
+pub(crate) struct MockUsbState {
+    /// When `false`, all USB operations fail with `disconnect_error`.
+    pub connected: bool,
+    /// The `rusb::Error` variant returned when the mock device is disconnected.
+    pub disconnect_error: fn() -> rusb::Error,
+}
+
+#[cfg(test)]
+impl MockUsbState {
+    pub fn new() -> Self {
+        Self {
+            connected: true,
+            disconnect_error: || rusb::Error::NoDevice,
+        }
+    }
+
+    pub fn with_disconnect_error(mut self, f: fn() -> rusb::Error) -> Self {
+        self.disconnect_error = f;
+        self
+    }
+}
+
 /// A Helios DAC device.
 ///
 /// Can be in either Idle (not opened) or Open state.
@@ -74,6 +90,10 @@ pub enum HeliosDac {
         device: rusb::Device<rusb::Context>,
         handle: rusb::DeviceHandle<rusb::Context>,
     },
+    /// Test-only variant that simulates USB communication.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    MockOpen(std::sync::Arc<std::sync::Mutex<MockUsbState>>),
 }
 
 impl HeliosDac {
@@ -95,49 +115,40 @@ impl HeliosDac {
         }
     }
 
-    /// Writes and outputs a frame to the DAC.
-    pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let mut frame_buffer = Vec::new();
+    /// Returns a reference to the open USB handle, or an error if the device is not opened.
+    fn handle(&self) -> Result<&rusb::DeviceHandle<rusb::Context>> {
+        match self {
+            HeliosDac::Open { handle, .. } => Ok(handle),
+            #[cfg(test)]
+            HeliosDac::MockOpen(_) => Err(HeliosDacError::DeviceNotOpened), // never called for mocks
+            _ => Err(HeliosDacError::DeviceNotOpened),
+        }
+    }
 
-            // this is a bug workaround, the mcu won't correctly receive transfers with these sizes
-            let mut pps_actual = frame.pps;
-            let mut num_of_points_actual = frame.points.len();
-            if (frame.points.len() - 45).is_multiple_of(64) {
-                num_of_points_actual -= 1;
-                // adjust pps to keep the same frame duration even with one less point
-                pps_actual = frame.pps
-                    * ((num_of_points_actual as f32) / (frame.points.len() as f32) + 0.5f32) as u32;
-            }
-
-            for point in frame.points {
-                frame_buffer.push((point.coordinate.x >> 4) as u8);
-                frame_buffer.push(
-                    ((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8,
-                );
-                frame_buffer.push((point.coordinate.y & 0xFF) as u8);
-                frame_buffer.push(point.color.r);
-                frame_buffer.push(point.color.g);
-                frame_buffer.push(point.color.b);
-                frame_buffer.push(point.intensity);
-            }
-            frame_buffer.push((pps_actual & 0xFF) as u8);
-            frame_buffer.push((pps_actual >> 8) as u8);
-            frame_buffer.push((num_of_points_actual & 0xFF) as u8);
-            frame_buffer.push((num_of_points_actual >> 8) as u8);
-            frame_buffer.push(0); // flags
-
-            let timeout = ((8 + frame_buffer.len()) >> 5) as u64;
-            handle.write_bulk(
-                ENDPOINT_BULK_OUT,
-                &frame_buffer,
-                Duration::from_millis(timeout),
-            )?;
-
+    /// Check mock state and return an error if the simulated device is disconnected.
+    #[cfg(test)]
+    fn mock_check(state: &std::sync::Arc<std::sync::Mutex<MockUsbState>>) -> Result<()> {
+        let s = state.lock().unwrap();
+        if s.connected {
             Ok(())
         } else {
-            Err(HeliosDacError::DeviceNotOpened)
+            Err(HeliosDacError::UsbError((s.disconnect_error)()))
         }
+    }
+
+    /// Writes and outputs a frame to the DAC.
+    pub fn write_frame(&mut self, frame: Frame) -> Result<()> {
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            return Self::mock_check(state);
+        }
+
+        let handle = self.handle()?;
+        let frame_buffer = encode_frame(frame);
+        let timeout = bulk_transfer_timeout(frame_buffer.len());
+
+        handle.write_bulk(ENDPOINT_BULK_OUT, &frame_buffer, timeout)?;
+        Ok(())
     }
 
     /// Gets name of DAC.
@@ -191,33 +202,46 @@ impl HeliosDac {
         self.send_control(&ctrl_buffer)
     }
 
+    /// Opens or closes the hardware shutter.
+    pub fn set_shutter(&self, open: bool) -> Result<()> {
+        let ctrl_buffer = [CONTROL_SET_SHUTTER, open as u8];
+        self.send_control(&ctrl_buffer)
+    }
+
     fn call_control(&self, buffer: &[u8]) -> Result<([u8; 32], usize)> {
         self.send_control(buffer)?;
         self.read_response()
     }
 
     fn send_control(&self, buffer: &[u8]) -> Result<()> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let written_length =
-                handle.write_interrupt(ENDPOINT_INT_OUT, buffer, Duration::from_millis(16))?;
-            assert_eq!(written_length, buffer.len());
-
-            Ok(())
-        } else {
-            Err(HeliosDacError::DeviceNotOpened)
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            return Self::mock_check(state);
         }
+
+        let handle = self.handle()?;
+        let written_length =
+            handle.write_interrupt(ENDPOINT_INT_OUT, buffer, Duration::from_millis(16))?;
+        assert_eq!(written_length, buffer.len());
+        Ok(())
     }
 
     fn read_response(&self) -> Result<([u8; 32], usize)> {
-        if let HeliosDac::Open { handle, .. } = self {
-            let mut buffer: [u8; 32] = [0; 32];
-            let size =
-                handle.read_interrupt(ENDPOINT_INT_IN, &mut buffer, Duration::from_millis(32))?;
-
-            Ok((buffer, size))
-        } else {
-            Err(HeliosDacError::DeviceNotOpened)
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            Self::mock_check(state)?;
+            // Return a status-ready response (0x83 = status prefix, 1 = ready).
+            let mut buf = [0u8; 32];
+            buf[0] = 0x83;
+            buf[1] = 1;
+            return Ok((buf, 2));
         }
+
+        let handle = self.handle()?;
+        let mut buffer: [u8; 32] = [0; 32];
+        let size =
+            handle.read_interrupt(ENDPOINT_INT_IN, &mut buffer, Duration::from_millis(32))?;
+        Ok((buffer, size))
     }
 }
 
@@ -225,6 +249,57 @@ impl From<rusb::Device<rusb::Context>> for HeliosDac {
     fn from(device: Device<Context>) -> Self {
         HeliosDac::Idle(device)
     }
+}
+
+fn encode_frame(frame: Frame) -> Vec<u8> {
+    let requested_points = frame.points.len();
+    let (pps_actual, num_of_points_actual) = adjusted_frame_params(frame.pps, requested_points);
+
+    let mut frame_buffer = Vec::with_capacity(num_of_points_actual * 7 + 5);
+    for point in frame.points.into_iter().take(num_of_points_actual) {
+        frame_buffer.push((point.coordinate.x >> 4) as u8);
+        frame_buffer
+            .push(((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8);
+        frame_buffer.push((point.coordinate.y & 0xFF) as u8);
+        frame_buffer.push(point.color.r);
+        frame_buffer.push(point.color.g);
+        frame_buffer.push(point.color.b);
+        frame_buffer.push(point.intensity);
+    }
+    frame_buffer.push((pps_actual & 0xFF) as u8);
+    frame_buffer.push((pps_actual >> 8) as u8);
+    frame_buffer.push((num_of_points_actual & 0xFF) as u8);
+    frame_buffer.push((num_of_points_actual >> 8) as u8);
+    frame_buffer.push(frame.flags.bits());
+
+    frame_buffer
+}
+
+fn adjusted_frame_params(requested_pps: u32, requested_points: usize) -> (u32, usize) {
+    if requested_points >= 45 && (requested_points - 45).is_multiple_of(64) {
+        let actual_points = requested_points - 1;
+        let pps_actual = (((requested_pps as u64) * (actual_points as u64))
+            + (requested_points as u64 / 2))
+            / (requested_points as u64);
+        log::debug!(
+            "helios transfer-size workaround applied: requested_points={}, actual_points={}, requested_pps={}, actual_pps={}",
+            requested_points,
+            actual_points,
+            requested_pps,
+            pps_actual
+        );
+        (pps_actual as u32, actual_points)
+    } else {
+        (requested_pps, requested_points)
+    }
+}
+
+/// Compute the USB bulk transfer timeout for a frame buffer.
+///
+/// Matches the Helios C++ SDK formula: `8 + (bufferSize >> 5)` ms.
+/// The constant 8ms base ensures a minimum timeout even for tiny frames.
+fn bulk_transfer_timeout(buffer_len: usize) -> Duration {
+    Duration::from_millis((8 + (buffer_len >> 5)) as u64)
 }
 
 /// Errors that can occur when communicating with a Helios DAC.
@@ -238,4 +313,68 @@ pub enum HeliosDacError {
     InvalidDeviceResult,
     #[error("could not parse string: {0}")]
     Utf8Error(#[from] std::string::FromUtf8Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::helios::{Color, Coordinate, Point, WriteFrameFlags};
+
+    fn test_point() -> Point {
+        Point {
+            coordinate: Coordinate { x: 0x123, y: 0x456 },
+            color: Color::new(0x11, 0x22, 0x33),
+            intensity: 0x44,
+        }
+    }
+
+    #[test]
+    fn test_bulk_transfer_timeout_matches_sdk() {
+        // C++ SDK: 8 + (frameBufferSize >> 5) ms
+        // Must have an 8ms minimum floor for any buffer size.
+
+        // 1 point = 12 bytes → 8 + 0 = 8ms
+        assert_eq!(bulk_transfer_timeout(12), Duration::from_millis(8));
+
+        // 10 points = 75 bytes → 8 + 2 = 10ms
+        assert_eq!(bulk_transfer_timeout(75), Duration::from_millis(10));
+
+        // 100 points = 710 bytes → 8 + 22 = 30ms
+        assert_eq!(bulk_transfer_timeout(710), Duration::from_millis(30));
+
+        // 4095 points = 28670 bytes → 8 + 895 = 903ms
+        assert_eq!(bulk_transfer_timeout(28670), Duration::from_millis(903));
+
+        // Empty buffer → still 8ms minimum
+        assert_eq!(bulk_transfer_timeout(0), Duration::from_millis(8));
+    }
+
+    #[test]
+    fn test_adjusted_frame_params_leaves_small_frames_unchanged() {
+        assert_eq!(adjusted_frame_params(30_000, 1), (30_000, 1));
+        assert_eq!(adjusted_frame_params(30_000, 44), (30_000, 44));
+    }
+
+    #[test]
+    fn test_adjusted_frame_params_applies_problem_size_workaround() {
+        assert_eq!(adjusted_frame_params(30_000, 45), (29_333, 44));
+        assert_eq!(adjusted_frame_params(30_000, 109), (29_725, 108));
+    }
+
+    #[test]
+    fn test_encode_frame_truncates_problematic_transfer_payload() {
+        let points = vec![test_point(); 109];
+        let buffer = encode_frame(Frame::new_with_flags(
+            30_000,
+            points,
+            WriteFrameFlags::SINGLE_MODE,
+        ));
+
+        assert_eq!(buffer.len(), 108 * 7 + 5);
+
+        let footer = &buffer[buffer.len() - 5..];
+        assert_eq!(u16::from_le_bytes([footer[0], footer[1]]), 29_725);
+        assert_eq!(u16::from_le_bytes([footer[2], footer[3]]), 108);
+        assert_eq!(footer[4], WriteFrameFlags::SINGLE_MODE.bits());
+    }
 }

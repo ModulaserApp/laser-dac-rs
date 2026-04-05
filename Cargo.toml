@@ -1,6 +1,6 @@
 [package]
 name = "laser-dac"
-version = "0.7.0"
+version = "0.11.6"
 edition = "2021"
 authors = ["Kees Kluskens <kees@kees.im>"]
 description = "Unified laser DAC abstraction supporting multiple protocols"
@@ -20,16 +20,18 @@ members = [".", "tools/idn-simulator", "tools/idn-mock-server"]
 default = ["all-dacs"]
 
 # Meta features
-all-dacs = ["usb-dacs", "network-dacs"]
+all-dacs = ["usb-dacs", "network-dacs", "audio-dacs"]
 usb-dacs = ["helios", "lasercube-usb"]
 network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
+audio-dacs = ["avb"]
 
 # Individual DAC protocols
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
 ether-dream = []
-idn = []
+idn = ["dep:socket2", "dep:libc"]
 lasercube-wifi = ["dep:socket2", "dep:libc"]
+avb = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Audio output (oscilloscope XY mode)
 audio-out = ["dep:cpal"]
@@ -45,6 +47,8 @@ thiserror = "1.0"
 bitflags = "2"
 byteorder = "1.5"
 log = "0.4"
+cpal = { version = "0.15", optional = true }
+crossbeam-queue = { version = "0.3", optional = true }
 
 # USB DACs (optional)
 rusb = { version = "0.9", optional = true }
@@ -55,8 +59,10 @@ socket2 = { version = "0.5", features = ["all"], optional = true }
 # Optional serialization
 serde = { version = "1.0", features = ["derive"], optional = true }
 
-# Audio output (optional)
-cpal = { version = "0.15", optional = true }
+# Windows-only: enable ASIO support for AVB backend
+[target.'cfg(windows)'.dependencies]
+cpal = { version = "0.15", features = ["asio"], optional = true }
+
 
 # Unix-only for lasercube-wifi
 [target.'cfg(unix)'.dependencies]
@@ -64,23 +70,21 @@ libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+ctrlc = "3.4"
 env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 idn-mock-server = { path = "tools/idn-mock-server" }
 cpal = "0.15"
+hound = "3.5"
 
 [[example]]
 name = "stream"
 path = "examples/stream.rs"
 
 [[example]]
-name = "callback"
-path = "examples/callback.rs"
-
-[[example]]
-name = "frame_adapter"
-path = "examples/frame_adapter.rs"
+name = "frame"
+path = "examples/frame.rs"
 
 [[example]]
 name = "audio"
@@ -94,6 +98,11 @@ path = "examples/reconnect.rs"
 name = "scope_xy"
 path = "examples/scope_xy.rs"
 required-features = ["audio-out"]
+
+[[example]]
+name = "transitions"
+path = "examples/transitions.rs"
+
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

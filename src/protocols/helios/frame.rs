@@ -17,11 +17,15 @@ pub struct Frame {
 
 impl Frame {
     /// Create a new frame with the given point rate and points.
+    ///
+    /// Defaults to `SINGLE_MODE` (play once, don't repeat), matching the
+    /// official Helios SDK's `HELIOS_FLAGS_DEFAULT`. This prevents the DAC
+    /// from repeating the last frame indefinitely if the host stops sending.
     pub fn new(pps: u32, points: Vec<Point>) -> Self {
         Frame {
             pps,
             points,
-            flags: WriteFrameFlags::empty(),
+            flags: WriteFrameFlags::SINGLE_MODE,
         }
     }
 
@@ -94,13 +98,17 @@ impl From<&LaserPoint> for Point {
     /// [`LaserPoint`] uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// Helios uses u16 12-bit coordinates (0-4095) with inverted axes and u8 colors.
     fn from(p: &LaserPoint) -> Self {
-        let dac_x = ((1.0 - (p.x + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
-        let dac_y = ((1.0 - (p.y + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0) as u16;
-
         Point {
-            coordinate: Coordinate { x: dac_x, y: dac_y },
-            color: Color::new((p.r >> 8) as u8, (p.g >> 8) as u8, (p.b >> 8) as u8),
-            intensity: (p.intensity >> 8) as u8,
+            coordinate: Coordinate {
+                x: LaserPoint::coord_to_u12_inverted(p.x),
+                y: LaserPoint::coord_to_u12_inverted(p.y),
+            },
+            color: Color::new(
+                LaserPoint::color_to_u8(p.r),
+                LaserPoint::color_to_u8(p.g),
+                LaserPoint::color_to_u8(p.b),
+            ),
+            intensity: LaserPoint::color_to_u8(p.intensity),
         }
     }
 }
@@ -124,9 +132,9 @@ mod tests {
         let laser_point = LaserPoint::new(0.0, 0.0, 128 * 257, 64 * 257, 32 * 257, 200 * 257);
         let helios_point: Point = (&laser_point).into();
 
-        // (1.0 - (0.0 + 1.0) / 2.0) * 4095 = (1.0 - 0.5) * 4095 = 2047.5 -> 2047
-        assert_eq!(helios_point.coordinate.x, 2047);
-        assert_eq!(helios_point.coordinate.y, 2047);
+        // (1.0 - (0.0 + 1.0) / 2.0) * 4095 = (1.0 - 0.5) * 4095 = 2047.5 -> 2048
+        assert_eq!(helios_point.coordinate.x, 2048);
+        assert_eq!(helios_point.coordinate.y, 2048);
         // Colors should downscale from u16 to u8 (>> 8)
         assert_eq!(helios_point.color.r, 128);
         assert_eq!(helios_point.color.g, 64);
@@ -155,10 +163,10 @@ mod tests {
         let laser_point = LaserPoint::new(-0.5, 0.5, 0, 0, 0, 0);
         let helios_point: Point = (&laser_point).into();
 
-        // x: (1.0 - (-0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.25) * 4095 = 3071
-        // y: (1.0 - (0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.75) * 4095 = 1023
+        // x: (1.0 - (-0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.25) * 4095 = 3071.25 -> 3071
+        // y: (1.0 - (0.5 + 1.0) / 2.0) * 4095 = (1.0 - 0.75) * 4095 = 1023.75 -> 1024
         assert_eq!(helios_point.coordinate.x, 3071);
-        assert_eq!(helios_point.coordinate.y, 1023);
+        assert_eq!(helios_point.coordinate.y, 1024);
     }
 
     #[test]

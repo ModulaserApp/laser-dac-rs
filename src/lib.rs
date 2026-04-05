@@ -1,55 +1,46 @@
 //! Unified DAC backend abstraction for laser projectors.
 //!
 //! This crate provides a common interface for communicating with various
-//! laser DAC (Digital-to-Analog Converter) hardware using a streaming API
-//! that provides uniform pacing and backpressure across all device types.
+//! laser DAC (Digital-to-Analog Converter) hardware. Two API styles are
+//! available:
 //!
 //! # Getting Started
 //!
-//! The streaming API provides two modes of operation:
+//! ## Frame Mode (recommended)
 //!
-//! ## Blocking Mode
-//!
-//! Use `next_request()` to get what to produce, then `write()` to send points:
+//! Submit complete frames with automatic transition blanking:
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint};
+//! use laser_dac::{open_device, FrameSessionConfig, Frame, LaserPoint};
 //!
-//! // Discover devices
-//! let devices = list_devices().unwrap();
-//! println!("Found {} devices", devices.len());
+//! let device = open_device("my-device").unwrap();
+//! let config = FrameSessionConfig::new(30_000);
+//! let (session, _info) = device.start_frame_session(config).unwrap();
 //!
-//! // Open and start streaming
-//! let device = open_device(&devices[0].id).unwrap();
-//! let config = StreamConfig::new(30_000); // 30k points per second
-//! let (mut stream, info) = device.start_stream(config).unwrap();
-//!
-//! // Arm the output (allow laser to fire)
-//! stream.control().arm().unwrap();
-//!
-//! // Streaming loop
-//! loop {
-//!     let req = stream.next_request().unwrap();
-//!
-//!     // Generate points for this chunk
-//!     let points: Vec<LaserPoint> = (0..req.n_points)
-//!         .map(|i| {
-//!             let t = (req.start.points() + i as u64) as f32 / req.pps as f32;
-//!             let angle = t * std::f32::consts::TAU;
-//!             LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535)
-//!         })
-//!         .collect();
-//!
-//!     stream.write(&req, &points).unwrap();
-//! }
+//! session.control().arm().unwrap();
+//! session.send_frame(Frame::new(vec![
+//!     LaserPoint::new(-0.5, 0.0, 65535, 0, 0, 65535),
+//!     LaserPoint::new( 0.5, 0.0, 0, 65535, 0, 65535),
+//! ]));
+//! // Frame replays automatically. Submit new frames for animation.
 //! ```
 //!
-//! ## Callback Mode
+//! For advanced frame-mode output-space processing on the final presented
+//! sequence, use [`FrameSessionConfig::with_output_filter`]. The filter runs
+//! after transition composition, blanking, and color delay, just before the
+//! backend write.
 //!
-//! Use `run()` with a producer closure for simpler code:
+//! For downstream watchdogs, [`FrameSession::metrics`] exposes a small liveness
+//! surface with connectivity, last-loop-activity, and last-write-success
+//! timestamps. Watchdog policy remains application-owned.
+//!
+//! ## Callback Mode (advanced, FIFO backends only)
+//!
+//! Fill point buffers via zero-allocation callback for custom timing.
+//! Not available for frame-swap backends (Helios) — use Frame Mode instead.
 //!
 //! ```no_run
-//! use laser_dac::{list_devices, open_device, StreamConfig, LaserPoint, ChunkRequest};
+//! use laser_dac::{open_device, StreamConfig, LaserPoint, ChunkRequest, ChunkResult};
 //!
 //! let device = open_device("my-device").unwrap();
 //! let config = StreamConfig::new(30_000);
@@ -58,10 +49,12 @@
 //! stream.control().arm().unwrap();
 //!
 //! let exit = stream.run(
-//!     |req: ChunkRequest| {
-//!         // Return Some(points) to continue, None to stop
-//!         let points = vec![LaserPoint::blanked(0.0, 0.0); req.n_points];
-//!         Some(points)
+//!     |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
+//!         let n = req.target_points;
+//!         for i in 0..n {
+//!             buffer[i] = LaserPoint::blanked(0.0, 0.0);
+//!         }
+//!         ChunkResult::Filled(n)
 //!     },
 //!     |err| eprintln!("Stream error: {}", err),
 //! );
@@ -69,17 +62,19 @@
 //!
 //! # Supported DACs
 //!
-//! - **Helios** - USB laser DAC (feature: `helios`)
+//! - **Helios** - USB laser DAC, Frame API only (feature: `helios`)
 //! - **Ether Dream** - Network laser DAC (feature: `ether-dream`)
 //! - **IDN** - ILDA Digital Network protocol (feature: `idn`)
 //! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)
 //! - **LaserCube USB** - USB laser DAC / LaserDock (feature: `lasercube-usb`)
+//! - **AVB Audio Devices** - AVB audio output via CoreAudio/ASIO (feature: `avb`, macOS/Windows)
 //!
 //! # Features
 //!
 //! - `all-dacs` (default): Enable all DAC protocols
 //! - `usb-dacs`: Enable USB DACs (Helios, LaserCube USB)
 //! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube WiFi)
+//! - `audio-dacs`: Enable audio DACs (AVB)
 //!
 //! # Coordinate System
 //!
@@ -93,17 +88,20 @@
 pub mod backend;
 pub mod discovery;
 mod error;
-mod frame_adapter;
+#[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
+mod net_utils;
+pub mod presentation;
 pub mod protocols;
-pub mod session;
+pub(crate) mod reconnect;
+mod scheduler;
 pub mod stream;
 pub mod types;
 
 // Crate-level error types
 pub use error::{Error, Result};
 
-// Backend trait and types
-pub use backend::{StreamBackend, WriteOutcome};
+// Backend traits and types
+pub use backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend, WriteOutcome};
 
 // Discovery types
 pub use discovery::{
@@ -115,6 +113,7 @@ pub use types::{
     // DAC types
     caps_for_dac_type,
     ChunkRequest,
+    ChunkResult,
     // Streaming types
     DacCapabilities,
     DacConnectionState,
@@ -122,22 +121,29 @@ pub use types::{
     DacInfo,
     DacType,
     EnabledDacTypes,
+    IdlePolicy,
     LaserPoint,
     OutputModel,
+    ReconnectConfig,
     RunExit,
     StreamConfig,
     StreamInstant,
     StreamStats,
     StreamStatus,
-    UnderrunPolicy,
 };
 
-// Stream and Dac types
-pub use session::{ReconnectingSession, SessionControl};
-pub use stream::{Dac, OwnedDac, Stream, StreamControl};
+// Deprecated alias for backwards compatibility
+#[allow(deprecated)]
+pub use types::UnderrunPolicy;
 
-// Frame adapters (converts point buffers to continuous streams)
-pub use frame_adapter::{Frame, FrameAdapter, SharedFrameAdapter};
+// Stream and Dac types
+pub use stream::{Dac, Stream, StreamControl};
+
+// Presentation types (frame-first API)
+pub use presentation::{
+    default_transition, Frame, FrameSession, FrameSessionConfig, FrameSessionMetrics, OutputFilter,
+    OutputFilterContext, OutputResetReason, PresentedSliceKind, TransitionFn, TransitionPlan,
+};
 
 // Conditional exports based on features
 
@@ -170,6 +176,12 @@ pub use protocols::lasercube_wifi;
 pub use backend::LasercubeUsbBackend;
 #[cfg(feature = "lasercube-usb")]
 pub use protocols::lasercube_usb;
+
+// AVB
+#[cfg(feature = "avb")]
+pub use backend::AvbBackend;
+#[cfg(feature = "avb")]
+pub use protocols::avb;
 
 // Re-export rusb for consumers that need the Context type (for LaserCube USB)
 #[cfg(feature = "lasercube-usb")]
@@ -212,27 +224,53 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 ///
 /// The ID should match the `id` field returned by [`list_devices`].
 /// IDs are namespaced by protocol (e.g., `etherdream:aa:bb:cc:dd:ee:ff`,
-/// `idn:hostname.local`, `helios:serial`).
+/// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    let discovered = discovery.scan();
+    let mut dac = discovery.open_by_id(id)?;
+    dac.reconnect_target = Some(reconnect::ReconnectTarget {
+        device_id: id.to_string(),
+        discovery_factory: None,
+    });
+    Ok(dac)
+}
 
-    let device = discovered
-        .into_iter()
-        .find(|d| d.info().stable_id() == id)
-        .ok_or_else(|| backend::Error::disconnected(format!("DAC not found: {}", id)))?;
-
-    let info = device.info();
-    let name = info.name();
-    let dac_type = device.dac_type();
-    let stream_backend = discovery.connect(device)?;
-
-    let dac_info = DacInfo {
-        id: id.to_string(),
-        name,
-        kind: dac_type,
-        caps: stream_backend.caps().clone(),
-    };
-
-    Ok(Dac::new(dac_info, stream_backend))
+/// Open a DAC by ID using a custom discovery factory.
+///
+/// Like [`open_device`], but uses the provided factory to create the
+/// [`DacDiscovery`] instance. This is required for custom backends
+/// registered via [`DacDiscovery::register`] — the default `open_device`
+/// only finds built-in DAC types.
+///
+/// The factory is called once now for the initial open, and stored for
+/// future reconnection attempts. It must be `Fn` (not `FnOnce`) because
+/// reconnection may call it multiple times.
+///
+/// # Example
+///
+/// ```ignore
+/// use laser_dac::{open_device_with, DacDiscovery, EnabledDacTypes, FrameSessionConfig, ReconnectConfig};
+///
+/// let dac = open_device_with("shownet:my-device", || {
+///     let mut d = DacDiscovery::new(EnabledDacTypes::all());
+///     d.register(Box::new(MyShowNetDiscoverer::new()));
+///     d
+/// })?;
+///
+/// let config = FrameSessionConfig::new(30_000)
+///     .with_reconnect(ReconnectConfig::new());
+/// let (session, _info) = dac.start_frame_session(config)?;
+/// // Reconnection will also use the factory to find the custom backend
+/// ```
+pub fn open_device_with<F>(id: &str, factory: F) -> BackendResult<Dac>
+where
+    F: Fn() -> DacDiscovery + Send + 'static,
+{
+    let mut discovery = factory();
+    let mut dac = discovery.open_by_id(id)?;
+    dac.reconnect_target = Some(reconnect::ReconnectTarget {
+        device_id: id.to_string(),
+        discovery_factory: Some(Box::new(factory)),
+    });
+    Ok(dac)
 }

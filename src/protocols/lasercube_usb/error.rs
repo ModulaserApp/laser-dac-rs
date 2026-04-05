@@ -16,14 +16,6 @@ pub enum Error {
     /// Device returned invalid or unexpected data.
     #[error("invalid device response")]
     InvalidResponse,
-
-    /// Failed to initialize the device.
-    #[error("device initialization failed")]
-    InitializationFailed,
-
-    /// Operation timed out.
-    #[error("operation timed out")]
-    Timeout,
 }
 
 /// Result type alias for LaserCube USB DAC operations.

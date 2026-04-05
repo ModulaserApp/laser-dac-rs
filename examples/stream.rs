@@ -1,14 +1,17 @@
-//! Streaming example.
+//! Streaming API example.
 //!
-//! This example demonstrates the basic streaming workflow: discover devices,
-//! open a connection, and stream points in a loop.
+//! Demonstrates the streaming workflow: discover devices, open a connection,
+//! and stream points via a producer callback with buffer-driven timing.
 //!
-//! Run with: `cargo run --example stream -- [triangle|circle]`
+//! Try `orbiting-circle` for the best demo — it uses stream timestamps for
+//! smooth continuous animation, which is the streaming API's strength.
+//!
+//! Run with: `cargo run --example stream -- [orbiting-circle|triangle|circle]`
 
 mod common;
 
 use clap::Parser;
-use common::{create_points, Args};
+use common::{make_producer, Args};
 use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
@@ -31,7 +34,7 @@ fn main() -> Result<()> {
 
     // Start streaming
     let config = StreamConfig::new(30_000);
-    let (mut stream, info) = device.start_stream(config)?;
+    let (stream, info) = device.start_stream(config)?;
 
     println!(
         "\nStreaming {} to {}... Press Ctrl+C to stop\n",
@@ -42,12 +45,24 @@ fn main() -> Result<()> {
     // Arm the output (allow laser to fire)
     stream.control().arm()?;
 
-    loop {
-        let req = stream.next_request()?;
+    // Install Ctrl+C handler to stop stream gracefully (disarm + stop backend)
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
 
-        // Generate points for this chunk
-        let points = create_points(args.shape, &req);
+    let mut producer = make_producer(args.shape, args.points, args.scale);
 
-        stream.write(&req, &points)?;
-    }
+    // Run stream — static shapes cycle through a pre-generated frame,
+    // time-based shapes compute points from stream timestamps
+    let exit = stream.run(
+        move |req, buffer| producer(req, buffer),
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
+
+    println!("\nStream ended: {:?}", exit);
+    Ok(())
 }

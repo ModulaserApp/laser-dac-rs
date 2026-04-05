@@ -1,10 +1,12 @@
 //! High-level abstractions around a LaserCube WiFi DAC.
 
+pub mod buffer_estimator;
 pub mod stream;
 
+pub use self::buffer_estimator::BufferEstimator;
 pub use self::stream::Stream;
 
-use crate::protocols::lasercube_wifi::protocol::{self, DeviceInfo};
+use crate::protocols::lasercube_wifi::protocol::DeviceInfo;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::ops;
@@ -56,13 +58,6 @@ impl Addressed {
             },
         };
         Addressed { source_addr, dac }
-    }
-}
-
-impl Dac {
-    /// Update the buffer status.
-    pub fn update_buffer_status(&mut self, status: &protocol::BufferStatus) {
-        self.status.free_buffer_space = status.free_space;
     }
 }
 

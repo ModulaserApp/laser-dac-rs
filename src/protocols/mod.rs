@@ -20,3 +20,6 @@ pub mod lasercube_usb;
 
 #[cfg(feature = "audio-out")]
 pub mod audio_out;
+
+#[cfg(feature = "avb")]
+pub mod avb;

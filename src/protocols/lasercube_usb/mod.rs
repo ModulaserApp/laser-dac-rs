@@ -5,11 +5,12 @@
 //! # Example
 //!
 //! ```no_run
-//! use laser_dac::protocols::lasercube_usb::{discover_dacs, dac::Stream, protocol::Sample};
+//! use laser_dac::protocols::lasercube_usb::{DacController, dac::Stream, protocol::Sample};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Discover LaserCube USB devices
-//!     let devices = discover_dacs()?;
+//!     let controller = DacController::new()?;
+//!     let devices = controller.list_devices()?;
 //!
 //!     if let Some(device) = devices.into_iter().next() {
 //!         // Open the device
@@ -56,18 +57,12 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_min: 1,
         pps_max: 35_000,
         max_points_per_chunk: 4096,
-        prefers_constant_pps: false,
-        can_estimate_queue: false,
-        output_model: OutputModel::UsbFrameSwap,
+        output_model: OutputModel::NetworkFifo,
     }
 }
 
-use protocol::{LASERDOCK_PID, LASERDOCK_VID};
+use protocol::{CONTROL_TIMEOUT, LASERDOCK_PID, LASERDOCK_VID};
 use rusb::UsbContext;
-use std::time::Duration;
-
-/// Timeout for USB control transfers.
-const TIMEOUT: Duration = Duration::from_millis(100);
 
 /// A controller for managing LaserCube/LaserDock USB DAC discovery.
 pub struct DacController {
@@ -98,37 +93,6 @@ impl DacController {
 
         Ok(dacs)
     }
-
-    /// Open the first available LaserCube/LaserDock USB device.
-    pub fn open_first(&self) -> Result<dac::Stream<rusb::Context>> {
-        let devices = self.list_devices()?;
-        let device = devices.into_iter().next().ok_or(Error::DeviceNotOpened)?;
-        dac::Stream::open(device)
-    }
-}
-
-/// Discover LaserCube/LaserDock USB devices on the system.
-///
-/// This is a convenience function that creates a controller and lists devices.
-///
-/// # Example
-///
-/// ```no_run
-/// use laser_dac::protocols::lasercube_usb::discover_dacs;
-///
-/// let devices = discover_dacs().expect("failed to discover devices");
-/// println!("Found {} device(s)", devices.len());
-/// ```
-pub fn discover_dacs() -> Result<Vec<rusb::Device<rusb::Context>>> {
-    let controller = DacController::new()?;
-    controller.list_devices()
-}
-
-/// Check if a USB device is a LaserCube/LaserDock.
-pub fn is_laserdock_device<T: UsbContext>(device: &rusb::Device<T>) -> bool {
-    device
-        .device_descriptor()
-        .is_ok_and(|d| d.vendor_id() == LASERDOCK_VID && d.product_id() == LASERDOCK_PID)
 }
 
 /// Read the serial number from a LaserCube USB device.
@@ -139,32 +103,9 @@ pub fn get_serial_number<T: UsbContext>(device: &rusb::Device<T>) -> Option<Stri
     // Check if device has a serial number string
     descriptor.serial_number_string_index()?;
     let handle = device.open().ok()?;
-    let languages = handle.read_languages(TIMEOUT).ok()?;
+    let languages = handle.read_languages(CONTROL_TIMEOUT).ok()?;
     let lang = languages.first()?;
     handle
-        .read_serial_number_string(*lang, &descriptor, TIMEOUT)
+        .read_serial_number_string(*lang, &descriptor, CONTROL_TIMEOUT)
         .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sample_creation() {
-        let sample = Sample::new(2048, 2048, 255, 128, 64);
-        assert_eq!(sample.x, 2048);
-        assert_eq!(sample.y, 2048);
-        assert_eq!(sample.red(), 255);
-        assert_eq!(sample.green(), 128);
-        assert_eq!(sample.blue(), 64);
-    }
-
-    #[test]
-    fn test_sample_blank() {
-        let blank = Sample::blank();
-        assert_eq!(blank.red(), 0);
-        assert_eq!(blank.green(), 0);
-        assert_eq!(blank.blue(), 0);
-    }
 }

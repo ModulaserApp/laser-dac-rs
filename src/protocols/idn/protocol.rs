@@ -30,12 +30,12 @@ pub const IDNCMD_SERVICEMAP_REQUEST: u8 = 0x12;
 pub const IDNCMD_SERVICEMAP_RESPONSE: u8 = 0x13;
 
 // Parameter commands
-pub const IDNCMD_PARAM_GET_REQUEST: u8 = 0x20;
-pub const IDNCMD_PARAM_GET_RESPONSE: u8 = 0x21;
-pub const IDNCMD_PARAM_SET_REQUEST: u8 = 0x22;
-pub const IDNCMD_PARAM_SET_RESPONSE: u8 = 0x23;
-pub const IDNCMD_PARAM_LIST_REQUEST: u8 = 0x24;
-pub const IDNCMD_PARAM_LIST_RESPONSE: u8 = 0x25;
+pub const IDNCMD_SERVICE_PARAMS_REQUEST: u8 = 0x20;
+pub const IDNCMD_SERVICE_PARAMS_RESPONSE: u8 = 0x21;
+pub const IDNCMD_UNIT_PARAMS_REQUEST: u8 = 0x22;
+pub const IDNCMD_UNIT_PARAMS_RESPONSE: u8 = 0x23;
+pub const IDNCMD_LINK_PARAMS_REQUEST: u8 = 0x28;
+pub const IDNCMD_LINK_PARAMS_RESPONSE: u8 = 0x29;
 
 // Realtime stream commands
 pub const IDNCMD_RT_CNLMSG: u8 = 0x40;
@@ -103,6 +103,12 @@ pub const EXTENDED_SAMPLE_SIZE: usize = 20;
 // -------------------------------------------------------------------------------------------------
 //  Traits
 // -------------------------------------------------------------------------------------------------
+
+/// Parse a null-terminated byte array as a UTF-8 string.
+fn null_terminated_str(bytes: &[u8]) -> &str {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..end]).unwrap_or("")
+}
 
 /// A trait for writing any of the IDN protocol types to bytes.
 pub trait WriteBytes {
@@ -241,12 +247,7 @@ impl SizeBytes for ScanResponse {
 impl ScanResponse {
     /// Parse the hostname as a string, trimming null bytes.
     pub fn hostname_str(&self) -> &str {
-        let end = self
-            .hostname
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.hostname.len());
-        std::str::from_utf8(&self.hostname[..end]).unwrap_or("")
+        null_terminated_str(&self.hostname)
     }
 }
 
@@ -353,12 +354,7 @@ impl SizeBytes for ServiceMapEntry {
 impl ServiceMapEntry {
     /// Parse the name as a string, trimming null bytes.
     pub fn name_str(&self) -> &str {
-        let end = self
-            .name
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(self.name.len());
-        std::str::from_utf8(&self.name[..end]).unwrap_or("")
+        null_terminated_str(&self.name)
     }
 
     /// Check if this entry is a relay (service_id == 0).
@@ -417,7 +413,7 @@ impl SizeBytes for ChannelMessageHeader {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ChannelConfigHeader {
-    /// Number of 16-bit words in the descriptor array
+    /// Number of descriptor pairs (32-bit words) in the descriptor array
     pub word_count: u8,
     /// Upper 4 bits: Decoder flags; Lower 4 bits: Config flags
     pub flags: u8,
@@ -924,15 +920,13 @@ impl From<&LaserPoint> for PointXyrgbi {
     /// IDN PointXyrgbi uses i16 signed coordinates (-32768 to 32767) and u8 colors.
     /// Coordinates are inverted to match hardware orientation.
     fn from(p: &LaserPoint) -> Self {
-        let x = (p.x.clamp(-1.0, 1.0) * -32767.0) as i16;
-        let y = (p.y.clamp(-1.0, 1.0) * -32767.0) as i16;
         PointXyrgbi::new(
-            x,
-            y,
-            (p.r >> 8) as u8,
-            (p.g >> 8) as u8,
-            (p.b >> 8) as u8,
-            (p.intensity >> 8) as u8,
+            LaserPoint::coord_to_i16_inverted(p.x),
+            LaserPoint::coord_to_i16_inverted(p.y),
+            LaserPoint::color_to_u8(p.r),
+            LaserPoint::color_to_u8(p.g),
+            LaserPoint::color_to_u8(p.b),
+            LaserPoint::color_to_u8(p.intensity),
         )
     }
 }
@@ -1259,9 +1253,9 @@ mod tests {
         let laser_point = LaserPoint::new(0.5, -0.5, 100 * 257, 100 * 257, 100 * 257, 100 * 257);
         let idn_point: PointXyrgbi = (&laser_point).into();
 
-        // 0.5 * -32767 = -16383.5 -> -16383 (axis inverted)
-        assert_eq!(idn_point.x, -16383);
-        assert_eq!(idn_point.y, 16383);
+        // 0.5 * -32767 = -16383.5 -> -16384 (axis inverted)
+        assert_eq!(idn_point.x, -16384);
+        assert_eq!(idn_point.y, 16384);
     }
 
     #[test]
