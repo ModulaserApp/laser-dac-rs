@@ -383,10 +383,8 @@ impl Stream {
         let chunk_header = SampleChunkHeader::new(self.sdm_flags(), duration_us as u32);
         self.packet_buffer.write_bytes(chunk_header)?;
 
-        // Write points
-        for point in points.iter().take(points_to_send) {
-            self.packet_buffer.write_bytes(point)?;
-        }
+        // Write points (batch encode bypasses per-point trait dispatch)
+        P::encode_batch_into(&points[..points_to_send], &mut self.packet_buffer);
 
         let sent_bytes = self.socket.send(&self.packet_buffer)?;
         self.last_send_time = Some(Instant::now());
@@ -558,10 +556,8 @@ impl Stream {
         let chunk_header = SampleChunkHeader::new(self.sdm_flags(), duration_us as u32);
         self.packet_buffer.write_bytes(chunk_header)?;
 
-        // Write points
-        for point in points.iter().take(points_to_send) {
-            self.packet_buffer.write_bytes(point)?;
-        }
+        // Write points (batch encode bypasses per-point trait dispatch)
+        P::encode_batch_into(&points[..points_to_send], &mut self.packet_buffer);
 
         // Send the packet
         self.socket.send(&self.packet_buffer)?;

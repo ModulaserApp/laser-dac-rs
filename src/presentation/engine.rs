@@ -434,6 +434,7 @@ impl ColorDelayLine {
     }
 
     /// Current delay in points.
+    #[allow(dead_code)]
     pub fn delay(&self) -> usize {
         self.delay
     }
