@@ -3376,9 +3376,33 @@ fn test_color_delay_line_resize_grow() {
     // With delay=3, the first 3 points should get the carry buffer colors.
     // Carry after resize(3) = [(0,0,0,0), (0,0,0,0), (3,3,3,3)]
     // So point0 gets (0,0,0,0), point1 gets (0,0,0,0), point2 gets (3,3,3,3)
-    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (0, 0, 0, 0));
-    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (0, 0, 0, 0));
-    assert_eq!((points2[2].r, points2[2].g, points2[2].b, points2[2].intensity), (3, 3, 3, 3));
+    assert_eq!(
+        (
+            points2[0].r,
+            points2[0].g,
+            points2[0].b,
+            points2[0].intensity
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        (
+            points2[1].r,
+            points2[1].g,
+            points2[1].b,
+            points2[1].intensity
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        (
+            points2[2].r,
+            points2[2].g,
+            points2[2].b,
+            points2[2].intensity
+        ),
+        (3, 3, 3, 3)
+    );
 }
 
 #[test]
@@ -3406,8 +3430,24 @@ fn test_color_delay_line_resize_shrink() {
     cdl.apply(&mut points2);
 
     // With delay=1, point0 gets carry[0] = (4,4,4,4), point1 gets scratch[0] = (10,10,10,10)
-    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (4, 4, 4, 4));
-    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (10, 10, 10, 10));
+    assert_eq!(
+        (
+            points2[0].r,
+            points2[0].g,
+            points2[0].b,
+            points2[0].intensity
+        ),
+        (4, 4, 4, 4)
+    );
+    assert_eq!(
+        (
+            points2[1].r,
+            points2[1].g,
+            points2[1].b,
+            points2[1].intensity
+        ),
+        (10, 10, 10, 10)
+    );
 }
 
 #[test]
@@ -3456,9 +3496,33 @@ fn test_color_delay_line_resize_same_is_noop() {
     cdl.apply(&mut points2);
 
     // delay=2 unchanged, point0 = carry[0] = (2,2,2,2), point1 = carry[1] = (3,3,3,3)
-    assert_eq!((points2[0].r, points2[0].g, points2[0].b, points2[0].intensity), (2, 2, 2, 2));
-    assert_eq!((points2[1].r, points2[1].g, points2[1].b, points2[1].intensity), (3, 3, 3, 3));
-    assert_eq!((points2[2].r, points2[2].g, points2[2].b, points2[2].intensity), (10, 10, 10, 10));
+    assert_eq!(
+        (
+            points2[0].r,
+            points2[0].g,
+            points2[0].b,
+            points2[0].intensity
+        ),
+        (2, 2, 2, 2)
+    );
+    assert_eq!(
+        (
+            points2[1].r,
+            points2[1].g,
+            points2[1].b,
+            points2[1].intensity
+        ),
+        (3, 3, 3, 3)
+    );
+    assert_eq!(
+        (
+            points2[2].r,
+            points2[2].g,
+            points2[2].b,
+            points2[2].intensity
+        ),
+        (10, 10, 10, 10)
+    );
 }
 
 #[test]
@@ -3466,9 +3530,7 @@ fn test_color_delay_line_resize_from_zero() {
     let mut cdl = ColorDelayLine::new(0);
 
     // Apply with delay=0 — no-op
-    let mut points = vec![
-        LaserPoint::new(0.0, 0.0, 5, 5, 5, 5),
-    ];
+    let mut points = vec![LaserPoint::new(0.0, 0.0, 5, 5, 5, 5)];
     cdl.apply(&mut points);
     assert_eq!(points[0].r, 5);
 

@@ -3,8 +3,8 @@
 use crate::backend::{DacBackend, FrameSwapBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::helios::{
-    DeviceStatus, HeliosDac, HeliosDacController, HeliosDacError, Point as HeliosPoint,
-    WriteFrameFlags, encode_frame_into,
+    encode_frame_into, DeviceStatus, HeliosDac, HeliosDacController, HeliosDacError,
+    Point as HeliosPoint, WriteFrameFlags,
 };
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 
