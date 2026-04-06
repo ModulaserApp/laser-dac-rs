@@ -30,6 +30,8 @@ pub struct Stream<T: UsbContext> {
     flip_x: bool,
     /// Whether Y coordinates should be flipped.
     flip_y: bool,
+    /// Reusable byte buffer for USB data transfers (avoids per-send allocation).
+    send_buffer: Vec<u8>,
 }
 
 impl<T: UsbContext> Stream<T> {
@@ -73,6 +75,7 @@ impl<T: UsbContext> Stream<T> {
             status: DeviceStatus::Unknown,
             flip_x: true,
             flip_y: true,
+            send_buffer: Vec::new(),
         };
 
         // Read device information
@@ -166,27 +169,26 @@ impl<T: UsbContext> Stream<T> {
             return Err(Error::DeviceNotOpened);
         }
 
-        let buffer: Vec<u8> = samples
-            .iter()
-            .flat_map(|sample| {
-                let mut s = *sample;
-                if self.flip_x {
-                    s.flip_x();
-                }
-                if self.flip_y {
-                    s.flip_y();
-                }
-                s.to_bytes()
-            })
-            .collect();
+        self.send_buffer.clear();
+        self.send_buffer.reserve(samples.len() * SAMPLE_SIZE_BYTES);
+        for sample in samples {
+            let mut s = *sample;
+            if self.flip_x {
+                s.flip_x();
+            }
+            if self.flip_y {
+                s.flip_y();
+            }
+            self.send_buffer.extend_from_slice(&s.to_bytes());
+        }
 
         let chunk_bytes = self.info.bulk_packet_sample_count as usize * SAMPLE_SIZE_BYTES;
         if chunk_bytes == 0 {
-            return self.send_data(&buffer);
+            return Self::send_data_to_endpoint(&self.handle, &self.send_buffer);
         }
 
-        for chunk in buffer.chunks(chunk_bytes) {
-            self.send_data(chunk)?;
+        for chunk in self.send_buffer.chunks(chunk_bytes) {
+            Self::send_data_to_endpoint(&self.handle, chunk)?;
         }
         Ok(())
     }
@@ -304,10 +306,8 @@ impl<T: UsbContext> Stream<T> {
     ///
     /// Uses an infinite timeout so the transfer blocks until the device accepts
     /// the data, providing natural backpressure (matching the reference implementation).
-    fn send_data(&self, data: &[u8]) -> Result<()> {
-        let transferred = self
-            .handle
-            .write_bulk(ENDPOINT_DATA_OUT, data, DATA_TIMEOUT)?;
+    fn send_data_to_endpoint(handle: &DeviceHandle<T>, data: &[u8]) -> Result<()> {
+        let transferred = handle.write_bulk(ENDPOINT_DATA_OUT, data, DATA_TIMEOUT)?;
 
         if transferred != data.len() {
             return Err(Error::Usb(rusb::Error::Io));
