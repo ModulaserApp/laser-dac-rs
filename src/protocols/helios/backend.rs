@@ -3,7 +3,8 @@
 use crate::backend::{DacBackend, FrameSwapBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::helios::{
-    DeviceStatus, Frame, HeliosDac, HeliosDacController, HeliosDacError, Point as HeliosPoint,
+    DeviceStatus, HeliosDac, HeliosDacController, HeliosDacError, Point as HeliosPoint,
+    WriteFrameFlags, encode_frame_into,
 };
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 
@@ -12,6 +13,10 @@ pub struct HeliosBackend {
     dac: Option<HeliosDac>,
     device_index: usize,
     caps: DacCapabilities,
+    /// Pre-allocated buffer for LaserPoint → HeliosPoint conversion.
+    point_buffer: Vec<HeliosPoint>,
+    /// Pre-allocated buffer for wire-format frame encoding.
+    frame_buffer: Vec<u8>,
 }
 
 impl HeliosBackend {
@@ -21,6 +26,8 @@ impl HeliosBackend {
             dac: None,
             device_index,
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
+            frame_buffer: Vec::new(),
         }
     }
 
@@ -30,6 +37,8 @@ impl HeliosBackend {
             dac: Some(dac),
             device_index: 0,
             caps: super::default_capabilities(),
+            point_buffer: Vec::new(),
+            frame_buffer: Vec::new(),
         }
     }
 
@@ -160,6 +169,8 @@ mod tests {
             dac: Some(HeliosDac::MockOpen(state)),
             device_index: 0,
             caps: super::super::default_capabilities(),
+            point_buffer: Vec::new(),
+            frame_buffer: Vec::new(),
         }
     }
 
@@ -332,9 +343,19 @@ impl FrameSwapBackend for HeliosBackend {
             }
         }
 
-        let helios_points: Vec<HeliosPoint> = points.iter().map(|p| p.into()).collect();
-        let helios_frame = Frame::new(pps, helios_points);
-        dac.write_frame(helios_frame).map_err(Self::map_err)?;
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(HeliosPoint::from));
+
+        encode_frame_into(
+            pps,
+            &self.point_buffer,
+            WriteFrameFlags::SINGLE_MODE,
+            &mut self.frame_buffer,
+        );
+
+        dac.write_frame_buffer(&self.frame_buffer)
+            .map_err(Self::map_err)?;
 
         Ok(WriteOutcome::Written)
     }

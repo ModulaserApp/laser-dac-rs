@@ -151,6 +151,22 @@ impl HeliosDac {
         Ok(())
     }
 
+    /// Write a pre-encoded frame buffer to the DAC.
+    ///
+    /// Use [`encode_frame_into`] to build the buffer, then call this to
+    /// send it. Avoids allocating a new buffer per frame.
+    pub fn write_frame_buffer(&mut self, buf: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let HeliosDac::MockOpen(state) = self {
+            return Self::mock_check(state);
+        }
+
+        let handle = self.handle()?;
+        let timeout = bulk_transfer_timeout(buf.len());
+        handle.write_bulk(ENDPOINT_BULK_OUT, buf, timeout)?;
+        Ok(())
+    }
+
     /// Gets name of DAC.
     pub fn name(&self) -> Result<String> {
         let ctrl_buffer = [CONTROL_GET_NAME, 0];
@@ -252,27 +268,43 @@ impl From<rusb::Device<rusb::Context>> for HeliosDac {
 }
 
 fn encode_frame(frame: Frame) -> Vec<u8> {
-    let requested_points = frame.points.len();
-    let (pps_actual, num_of_points_actual) = adjusted_frame_params(frame.pps, requested_points);
+    let mut buf = Vec::with_capacity(frame.points.len() * 7 + 5);
+    encode_frame_into(frame.pps, &frame.points, frame.flags, &mut buf);
+    buf
+}
 
-    let mut frame_buffer = Vec::with_capacity(num_of_points_actual * 7 + 5);
-    for point in frame.points.into_iter().take(num_of_points_actual) {
-        frame_buffer.push((point.coordinate.x >> 4) as u8);
-        frame_buffer
-            .push(((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8);
-        frame_buffer.push((point.coordinate.y & 0xFF) as u8);
-        frame_buffer.push(point.color.r);
-        frame_buffer.push(point.color.g);
-        frame_buffer.push(point.color.b);
-        frame_buffer.push(point.intensity);
+/// Encode a Helios frame into a reusable byte buffer.
+///
+/// Clears `buf` and writes the wire-format bytes for the given points,
+/// PPS, and flags. Use with [`HeliosDac::write_frame_buffer`] to avoid
+/// per-frame heap allocation.
+pub fn encode_frame_into(
+    pps: u32,
+    points: &[super::Point],
+    flags: super::WriteFrameFlags,
+    buf: &mut Vec<u8>,
+) {
+    let requested_points = points.len();
+    let (pps_actual, num_of_points_actual) = adjusted_frame_params(pps, requested_points);
+
+    buf.clear();
+    buf.reserve(num_of_points_actual * 7 + 5);
+    for point in points.iter().take(num_of_points_actual) {
+        buf.extend_from_slice(&[
+            (point.coordinate.x >> 4) as u8,
+            ((point.coordinate.x & 0x0F) << 4) as u8 | (point.coordinate.y >> 8) as u8,
+            (point.coordinate.y & 0xFF) as u8,
+            point.color.r,
+            point.color.g,
+            point.color.b,
+            point.intensity,
+        ]);
     }
-    frame_buffer.push((pps_actual & 0xFF) as u8);
-    frame_buffer.push((pps_actual >> 8) as u8);
-    frame_buffer.push((num_of_points_actual & 0xFF) as u8);
-    frame_buffer.push((num_of_points_actual >> 8) as u8);
-    frame_buffer.push(frame.flags.bits());
-
-    frame_buffer
+    buf.push((pps_actual & 0xFF) as u8);
+    buf.push((pps_actual >> 8) as u8);
+    buf.push((num_of_points_actual & 0xFF) as u8);
+    buf.push((num_of_points_actual >> 8) as u8);
+    buf.push(flags.bits());
 }
 
 fn adjusted_frame_params(requested_pps: u32, requested_points: usize) -> (u32, usize) {
