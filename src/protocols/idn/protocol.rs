@@ -897,6 +897,24 @@ impl WriteToBytes for PointXyrgbi {
     }
 }
 
+impl PointXyrgbi {
+    /// Batch-encode a slice of points directly into a byte buffer.
+    ///
+    /// This bypasses the per-point `WriteToBytes` trait dispatch and
+    /// `write_all` overhead by doing a single `reserve` upfront and
+    /// extending in a tight loop. Use this in the packet-building hot
+    /// path instead of looping `buf.write_bytes(point)`.
+    #[inline]
+    pub fn encode_batch(points: &[Self], buf: &mut Vec<u8>) {
+        buf.reserve(points.len() * XYRGBI_SAMPLE_SIZE);
+        for p in points {
+            let xb = p.x.to_be_bytes();
+            let yb = p.y.to_be_bytes();
+            buf.extend_from_slice(&[xb[0], xb[1], yb[0], yb[1], p.r, p.g, p.b, p.i]);
+        }
+    }
+}
+
 impl ReadFromBytes for PointXyrgbi {
     fn read_from_bytes<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
         let x = reader.read_i16::<BE>()?;
@@ -1124,6 +1142,19 @@ pub trait Point: WriteToBytes + SizeBytes + Copy {
     fn x(&self) -> i16;
     /// Get the Y coordinate.
     fn y(&self) -> i16;
+
+    /// Batch-encode a slice of points into a byte buffer.
+    ///
+    /// The default implementation falls back to per-point `write_to_bytes`.
+    /// Concrete types can override this to bypass per-point trait dispatch
+    /// (see [`PointXyrgbi`] for the optimized version).
+    fn encode_batch_into(points: &[Self], buf: &mut Vec<u8>) {
+        buf.reserve(points.len() * Self::SIZE_BYTES);
+        for p in points {
+            // write_to_bytes on Vec<u8> is infallible
+            let _ = p.write_to_bytes(&mut *buf);
+        }
+    }
 }
 
 impl Point for PointXyrgbi {
@@ -1132,6 +1163,11 @@ impl Point for PointXyrgbi {
     }
     fn y(&self) -> i16 {
         self.y
+    }
+
+    #[inline]
+    fn encode_batch_into(points: &[Self], buf: &mut Vec<u8>) {
+        Self::encode_batch(points, buf);
     }
 }
 
