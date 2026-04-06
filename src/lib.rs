@@ -67,6 +67,7 @@
 //! - **IDN** - ILDA Digital Network protocol (feature: `idn`)
 //! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)
 //! - **LaserCube USB** - USB laser DAC / LaserDock (feature: `lasercube-usb`)
+//! - **Oscilloscope** - XY mode via stereo audio output (feature: `oscilloscope`)
 //! - **AVB Audio Devices** - AVB audio output via CoreAudio/ASIO (feature: `avb`, macOS/Windows)
 //!
 //! # Features
@@ -74,7 +75,7 @@
 //! - `all-dacs` (default): Enable all DAC protocols
 //! - `usb-dacs`: Enable USB DACs (Helios, LaserCube USB)
 //! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube WiFi)
-//! - `audio-dacs`: Enable audio DACs (AVB)
+//! - `audio-dacs`: Enable audio DACs (Oscilloscope, AVB)
 //!
 //! # Coordinate System
 //!

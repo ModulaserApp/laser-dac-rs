@@ -18,8 +18,8 @@ pub mod lasercube_wifi;
 #[cfg(feature = "lasercube-usb")]
 pub mod lasercube_usb;
 
-#[cfg(feature = "audio-out")]
-pub mod audio_out;
+#[cfg(feature = "oscilloscope")]
+pub mod oscilloscope;
 
 #[cfg(feature = "avb")]
 pub mod avb;

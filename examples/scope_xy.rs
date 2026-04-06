@@ -1,96 +1,135 @@
 //! Oscilloscope XY output via audio interface.
 //!
-//! Outputs Lissajous patterns to stereo audio (L=X, R=Y).
-//! Connect audio outputs to an oscilloscope in XY mode.
+//! Sends laser shapes to a stereo audio output (L=X, R=Y) for display
+//! on an oscilloscope in XY mode.
 //!
-//! Run with: `cargo run --example scope_xy --features audio-out`
+//! Run with: `cargo run --example scope_xy --features oscilloscope -- [shape] [--device <name>]`
+//!
+//! Shapes: triangle, circle, orbiting-circle, orientation, test-pattern
 //!
 //! **Note:** A DC-coupled audio interface is required for accurate DC
 //! representation. AC-coupled interfaces will high-pass filter the signal,
 //! causing the image to drift.
 
-use laser_dac::{list_devices, open_device, DacType, LaserPoint, Result, StreamConfig};
-use std::f32::consts::PI;
+mod common;
+
+use clap::Parser;
+use common::{make_producer, Shape};
+use laser_dac::{
+    list_devices, open_device, ChunkRequest, ChunkResult, DacType, LaserPoint, Result, StreamConfig,
+};
+
+#[derive(Parser)]
+#[command(about = "Send shapes to an oscilloscope in XY mode")]
+struct Args {
+    /// Shape to display
+    #[arg(value_enum, default_value_t = Shape::Circle)]
+    shape: Shape,
+
+    /// Number of points per frame (detail level for static shapes)
+    #[arg(short, long, default_value_t = 200)]
+    points: usize,
+
+    /// Geometry scale around center (0,0); range: (0, 10]
+    #[arg(long, default_value_t = 0.8, value_parser = parse_scale)]
+    scale: f32,
+
+    /// Audio device name (substring match). If omitted, lists devices and uses the first one.
+    #[arg(short, long)]
+    device: Option<String>,
+}
+
+fn parse_scale(value: &str) -> std::result::Result<f32, String> {
+    let scale: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid scale '{value}': expected a float in (0, 10]"))?;
+    if !scale.is_finite() || scale <= 0.0 || scale > 10.0 {
+        return Err("scale must be finite and in (0, 10]".to_string());
+    }
+    Ok(scale)
+}
 
 fn main() -> Result<()> {
     env_logger::init();
+    let args = Args::parse();
 
-    println!("Scanning for audio output devices...\n");
+    println!("Scanning for oscilloscope devices...\n");
     let devices = list_devices()?;
 
-    // Find audio output devices
     let audio_devices: Vec<_> = devices
         .iter()
-        .filter(|d| d.kind == DacType::Audio)
+        .filter(|d| d.kind == DacType::Oscilloscope)
         .collect();
 
     if audio_devices.is_empty() {
-        println!("No audio output devices found.");
-        println!("Make sure you have an audio output device connected.");
+        println!("No oscilloscope devices found.");
+        println!("Make sure the `oscilloscope` feature is enabled and an audio device is connected.");
         return Ok(());
     }
 
-    println!("Found {} audio device(s):", audio_devices.len());
+    println!("Found {} oscilloscope device(s):", audio_devices.len());
     for (i, dev) in audio_devices.iter().enumerate() {
-        println!("  [{}] {} (sample rate: {} Hz)", i, dev.name, dev.caps.pps_max);
+        println!(
+            "  [{}] {} (sample rate: {} Hz)",
+            i, dev.name, dev.caps.pps_max
+        );
     }
     println!();
 
-    // Use BlackHole 2ch if available, otherwise first device
-    let audio_device = audio_devices
-        .iter()
-        .find(|d| d.name.contains("BlackHole 2ch"))
-        .copied()
-        .unwrap_or(audio_devices[0]);
-    println!("Using: {}", audio_device.name);
+    // Select device: by --device substring, or first available
+    let selected = if let Some(ref pattern) = args.device {
+        audio_devices
+            .iter()
+            .find(|d| d.name.to_lowercase().contains(&pattern.to_lowercase()))
+            .copied()
+            .ok_or_else(|| {
+                laser_dac::Error::invalid_config(format!(
+                    "No oscilloscope device matching '{}'. See list above.",
+                    pattern
+                ))
+            })?
+    } else {
+        audio_devices[0]
+    };
 
-    let device = open_device(&audio_device.id)?;
-    let sample_rate = device.caps().pps_max; // PPS = sample rate for audio
+    println!("Using: {} ({})", selected.name, selected.id);
+
+    let device = open_device(&selected.id)?;
+    let sample_rate = device.caps().pps_max;
 
     println!("Sample rate: {} Hz", sample_rate);
+    println!("Shape: {}", args.shape.name());
     println!();
 
-    // Start streaming at the device's sample rate
+    // For oscilloscope, PPS must equal the sample rate
     let config = StreamConfig::new(sample_rate);
-    let (mut stream, info) = device.start_stream(config)?;
+    let (stream, info) = device.start_stream(config)?;
 
-    println!("Streaming Lissajous pattern to {}...", info.name);
+    println!("Streaming {} to {}...", args.shape.name(), info.name);
     println!("Connect audio L/R outputs to oscilloscope X/Y inputs.");
     println!("Press Ctrl+C to stop.\n");
 
     // Arm the output (unmute)
     stream.control().arm()?;
 
-    // Lissajous pattern parameters
-    let freq_x = 3.0; // X frequency
-    let freq_y = 2.0; // Y frequency (3:2 ratio creates a nice figure)
-    let phase_offset = PI / 4.0; // Phase offset for Y
+    // Ctrl+C handler
+    let control = stream.control().clone();
+    ctrlc::set_handler(move || {
+        let _ = control.stop();
+    })
+    .expect("failed to set Ctrl+C handler");
 
-    let mut t = 0.0f32;
-    let dt = 1.0 / sample_rate as f32;
+    let mut producer = make_producer(args.shape, args.points, args.scale);
 
-    loop {
-        let req = stream.next_request()?;
+    let exit = stream.run(
+        move |req: &ChunkRequest, buffer: &mut [LaserPoint]| -> ChunkResult {
+            producer(req, buffer)
+        },
+        |err| {
+            eprintln!("Stream error: {}", err);
+        },
+    )?;
 
-        // Generate Lissajous figure points
-        let points: Vec<LaserPoint> = (0..req.n_points)
-            .map(|i| {
-                let time = t + i as f32 * dt;
-                let x = (2.0 * PI * freq_x * time).sin();
-                let y = (2.0 * PI * freq_y * time + phase_offset).sin();
-
-                // Full intensity white (though color doesn't matter for audio)
-                LaserPoint::new(x, y, 65535, 65535, 65535, 65535)
-            })
-            .collect();
-
-        t += req.n_points as f32 * dt;
-
-        // Keep t from growing too large (wrap at 1 second)
-        if t > 1.0 {
-            t -= 1.0;
-        }
-
-        stream.write(&req, &points)?;
-    }
+    println!("\nStream ended: {:?}", exit);
+    Ok(())
 }

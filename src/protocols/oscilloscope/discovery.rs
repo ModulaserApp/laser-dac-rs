@@ -1,38 +1,38 @@
-//! Audio output device discovery.
+//! Oscilloscope device discovery.
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
-use super::AudioOutBackend;
-use crate::backend::{Result, StreamBackend};
+use super::OscilloscopeBackend;
+use crate::backend::{BackendKind, Result};
 use crate::error::Error;
 
-/// Information about a discovered audio output device.
+/// Information about a discovered oscilloscope-capable audio device.
 #[derive(Debug, Clone)]
-pub struct AudioDeviceInfo {
+pub struct OscilloscopeDeviceInfo {
     /// Device name from the audio system
     pub name: String,
     /// Default sample rate for the device
     pub sample_rate: u32,
 }
 
-/// Discovery for audio output devices.
-pub struct AudioOutDiscovery {
+/// Discovery for oscilloscope-capable audio devices.
+pub struct OscilloscopeDiscovery {
     /// Cached device info from last scan
-    devices: Vec<AudioDeviceInfo>,
+    devices: Vec<OscilloscopeDeviceInfo>,
 }
 
-impl AudioOutDiscovery {
-    /// Create a new audio output discovery instance.
+impl OscilloscopeDiscovery {
+    /// Create a new oscilloscope discovery instance.
     pub fn new() -> Self {
         Self {
             devices: Vec::new(),
         }
     }
 
-    /// Scan for available audio output devices.
+    /// Scan for available oscilloscope-capable audio devices.
     ///
     /// Returns information about each discovered device.
-    pub fn scan(&mut self) -> Vec<AudioDeviceInfo> {
+    pub fn scan(&mut self) -> Vec<OscilloscopeDeviceInfo> {
         self.devices.clear();
 
         let host = cpal::default_host();
@@ -64,10 +64,7 @@ impl AudioOutDiscovery {
 
             let sample_rate = config.sample_rate().0;
 
-            let info = AudioDeviceInfo {
-                name,
-                sample_rate,
-            };
+            let info = OscilloscopeDeviceInfo { name, sample_rate };
 
             self.devices.push(info);
         }
@@ -77,8 +74,8 @@ impl AudioOutDiscovery {
 
     /// Connect to a device by name.
     ///
-    /// Returns an `AudioOutBackend` for the device.
-    pub fn connect(&self, device_name: &str) -> Result<Box<dyn StreamBackend>> {
+    /// Returns a `BackendKind::Fifo` wrapping an [`OscilloscopeBackend`].
+    pub fn connect(&self, device_name: &str) -> Result<BackendKind> {
         let info = self
             .devices
             .iter()
@@ -87,14 +84,14 @@ impl AudioOutDiscovery {
                 Error::disconnected(format!("Audio device '{}' not found", device_name))
             })?;
 
-        Ok(Box::new(AudioOutBackend::new(
+        Ok(BackendKind::Fifo(Box::new(OscilloscopeBackend::new(
             info.name.clone(),
             info.sample_rate,
-        )))
+        ))))
     }
 
     /// Connect to a device by index.
-    pub fn connect_by_index(&self, index: usize) -> Result<Box<dyn StreamBackend>> {
+    pub fn connect_by_index(&self, index: usize) -> Result<BackendKind> {
         let info = self.devices.get(index).ok_or_else(|| {
             Error::disconnected(format!(
                 "Audio device index {} out of range (found {} devices)",
@@ -103,14 +100,14 @@ impl AudioOutDiscovery {
             ))
         })?;
 
-        Ok(Box::new(AudioOutBackend::new(
+        Ok(BackendKind::Fifo(Box::new(OscilloscopeBackend::new(
             info.name.clone(),
             info.sample_rate,
-        )))
+        ))))
     }
 
     /// Get device info by index.
-    pub fn get_info(&self, index: usize) -> Option<&AudioDeviceInfo> {
+    pub fn get_info(&self, index: usize) -> Option<&OscilloscopeDeviceInfo> {
         self.devices.get(index)
     }
 
@@ -125,7 +122,7 @@ impl AudioOutDiscovery {
     }
 }
 
-impl Default for AudioOutDiscovery {
+impl Default for OscilloscopeDiscovery {
     fn default() -> Self {
         Self::new()
     }

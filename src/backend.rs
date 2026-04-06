@@ -264,8 +264,8 @@ pub use crate::protocols::lasercube_wifi::LasercubeWifiBackend;
 #[cfg(feature = "lasercube-usb")]
 pub use crate::protocols::lasercube_usb::LasercubeUsbBackend;
 
-#[cfg(feature = "audio-out")]
-pub use crate::protocols::audio_out::AudioOutBackend;
+#[cfg(feature = "oscilloscope")]
+pub use crate::protocols::oscilloscope::OscilloscopeBackend;
 
 #[cfg(feature = "avb")]
 pub use crate::protocols::avb::AvbBackend;

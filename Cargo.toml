@@ -23,7 +23,7 @@ default = ["all-dacs"]
 all-dacs = ["usb-dacs", "network-dacs", "audio-dacs"]
 usb-dacs = ["helios", "lasercube-usb"]
 network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
-audio-dacs = ["avb"]
+audio-dacs = ["avb", "oscilloscope"]
 
 # Individual DAC protocols
 helios = ["dep:rusb"]
@@ -33,8 +33,8 @@ idn = ["dep:socket2", "dep:libc"]
 lasercube-wifi = ["dep:socket2", "dep:libc"]
 avb = ["dep:cpal", "dep:crossbeam-queue"]
 
-# Audio output (oscilloscope XY mode)
-audio-out = ["dep:cpal"]
+# Oscilloscope XY mode via audio output
+oscilloscope = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Optional serialization
 serde = ["dep:serde"]
@@ -97,7 +97,7 @@ path = "examples/reconnect.rs"
 [[example]]
 name = "scope_xy"
 path = "examples/scope_xy.rs"
-required-features = ["audio-out"]
+required-features = ["oscilloscope"]
 
 [[example]]
 name = "transitions"

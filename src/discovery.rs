@@ -144,14 +144,13 @@ use crate::protocols::lasercube_usb::rusb;
 #[cfg(feature = "lasercube-usb")]
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
-#[cfg(feature = "audio-out")]
-use crate::protocols::audio_out::{AudioDeviceInfo, AudioOutDiscovery};
+#[cfg(feature = "oscilloscope")]
+use crate::protocols::oscilloscope::{OscilloscopeDeviceInfo, OscilloscopeDiscovery};
 
 #[cfg(feature = "avb")]
 use crate::backend::AvbBackend;
 #[cfg(feature = "avb")]
 use crate::protocols::avb::{discover_device_selectors as discover_avb_selectors, AvbSelector};
-
 
 // =============================================================================
 // DiscoveredDevice
@@ -207,9 +206,9 @@ impl DiscoveredDevice {
     /// discovered during scanning (since audio caps depend on the device).
     pub fn caps(&self) -> crate::types::DacCapabilities {
         match &self.inner {
-            #[cfg(feature = "audio-out")]
-            DiscoveredDeviceInner::Audio { info } => {
-                crate::protocols::audio_out::default_capabilities(info.sample_rate)
+            #[cfg(feature = "oscilloscope")]
+            DiscoveredDeviceInner::Oscilloscope { info } => {
+                crate::protocols::oscilloscope::default_capabilities(info.sample_rate)
             }
             _ => crate::types::caps_for_dac_type(&self.dac_type),
         }
@@ -316,10 +315,11 @@ impl DiscoveredDeviceInfo {
                     return format!("lasercube-wifi:{}", ip);
                 }
             }
-            #[cfg(feature = "audio-out")]
-            DacType::Audio => {
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => {
                 if let Some(ref hw_name) = self.hardware_name {
-                    return format!("audio:{}", hw_name);
+                    let slug = slugify_device_id(hw_name);
+                    return format!("oscilloscope:{}", slug);
                 }
             }
             DacType::Avb => {
@@ -391,10 +391,8 @@ enum DiscoveredDeviceInner {
     },
     #[cfg(feature = "lasercube-usb")]
     LasercubeUsb(rusb::Device<rusb::Context>),
-    #[cfg(feature = "audio-out")]
-    Audio {
-        info: AudioDeviceInfo,
-    },
+    #[cfg(feature = "oscilloscope")]
+    Oscilloscope { info: OscilloscopeDeviceInfo },
     #[cfg(feature = "avb")]
     Avb(AvbSelector),
     /// External discoverer device.
@@ -411,7 +409,7 @@ enum DiscoveredDeviceInner {
         feature = "idn",
         feature = "lasercube-wifi",
         feature = "lasercube-usb",
-        feature = "audio-out",
+        feature = "oscilloscope",
         feature = "avb"
     )))]
     _Placeholder,
@@ -826,8 +824,8 @@ pub struct DacDiscovery {
     lasercube_wifi: LasercubeWifiDiscovery,
     #[cfg(feature = "lasercube-usb")]
     lasercube_usb: Option<LasercubeUsbDiscovery>,
-    #[cfg(feature = "audio-out")]
-    audio_out: AudioOutDiscovery,
+    #[cfg(feature = "oscilloscope")]
+    oscilloscope: OscilloscopeDiscovery,
     #[cfg(feature = "avb")]
     avb: AvbDiscovery,
     enabled: EnabledDacTypes,
@@ -855,8 +853,8 @@ impl DacDiscovery {
             lasercube_wifi: LasercubeWifiDiscovery::new(),
             #[cfg(feature = "lasercube-usb")]
             lasercube_usb: LasercubeUsbDiscovery::new(),
-            #[cfg(feature = "audio-out")]
-            audio_out: AudioOutDiscovery::new(),
+            #[cfg(feature = "oscilloscope")]
+            oscilloscope: OscilloscopeDiscovery::new(),
             #[cfg(feature = "avb")]
             avb: AvbDiscovery::new(),
             enabled,
@@ -962,18 +960,19 @@ impl DacDiscovery {
             }
         }
 
-        // Audio output
-        #[cfg(feature = "audio-out")]
-        if self.enabled.is_enabled(DacType::Audio) {
-            for info in self.audio_out.scan() {
+        // Oscilloscope
+        #[cfg(feature = "oscilloscope")]
+        if self.enabled.is_enabled(DacType::Oscilloscope) {
+            for info in self.oscilloscope.scan() {
                 devices.push(DiscoveredDevice {
-                    dac_type: DacType::Audio,
+                    dac_type: DacType::Oscilloscope,
                     ip_address: None,
                     mac_address: None,
                     hostname: None,
                     usb_address: None,
                     hardware_name: Some(info.name.clone()),
-                    inner: DiscoveredDeviceInner::Audio { info },
+                    device_index: None,
+                    inner: DiscoveredDeviceInner::Oscilloscope { info },
                 });
             }
         }
@@ -983,7 +982,6 @@ impl DacDiscovery {
         if self.enabled.is_enabled(DacType::Avb) {
             devices.extend(self.avb.scan());
         }
-
 
         // External discoverers
         for (index, discoverer) in self.external.iter_mut().enumerate() {
@@ -1023,6 +1021,8 @@ impl DacDiscovery {
             "helios" => Some(DacType::Helios),
             "lasercube-usb" => Some(DacType::LasercubeUsb),
             "lasercube-wifi" => Some(DacType::LasercubeWifi),
+            #[cfg(feature = "oscilloscope")]
+            "oscilloscope" => Some(DacType::Oscilloscope),
             "avb" => Some(DacType::Avb),
             _ => None,
         }
@@ -1103,12 +1103,12 @@ impl DacDiscovery {
                 .as_ref()
                 .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
                 .connect(device),
-            #[cfg(feature = "audio-out")]
-            DacType::Audio => {
-                let DiscoveredDeviceInner::Audio { info } = device.inner else {
-                    return Err(Error::invalid_config("Invalid device type for Audio"));
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => {
+                let DiscoveredDeviceInner::Oscilloscope { info } = device.inner else {
+                    return Err(Error::invalid_config("Invalid device type for Oscilloscope"));
                 };
-                self.audio_out.connect(&info.name)
+                self.oscilloscope.connect(&info.name)
             }
             #[cfg(feature = "avb")]
             DacType::Avb => self.avb.connect(device),
