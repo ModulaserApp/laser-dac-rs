@@ -196,7 +196,6 @@ impl PresentationEngine {
                             self.cursor = 0;
                         }
                         TransitionPlan::Coalesce => {
-                            self.transition_buf.clear();
                             self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
                         }
                     }
@@ -331,7 +330,6 @@ impl PresentationEngine {
                     self.transition_is_self_loop = false;
                 }
                 TransitionPlan::Coalesce => {
-                    self.transition_buf.clear();
                     coalesce = true;
                 }
             }
