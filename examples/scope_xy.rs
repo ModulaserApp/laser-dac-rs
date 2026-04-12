@@ -63,7 +63,9 @@ fn main() -> Result<()> {
 
     if audio_devices.is_empty() {
         println!("No oscilloscope devices found.");
-        println!("Make sure the `oscilloscope` feature is enabled and an audio device is connected.");
+        println!(
+            "Make sure the `oscilloscope` feature is enabled and an audio device is connected."
+        );
         return Ok(());
     }
 

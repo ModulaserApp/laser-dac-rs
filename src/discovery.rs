@@ -1106,7 +1106,9 @@ impl DacDiscovery {
             #[cfg(feature = "oscilloscope")]
             DacType::Oscilloscope => {
                 let DiscoveredDeviceInner::Oscilloscope { info } = device.inner else {
-                    return Err(Error::invalid_config("Invalid device type for Oscilloscope"));
+                    return Err(Error::invalid_config(
+                        "Invalid device type for Oscilloscope",
+                    ));
                 };
                 self.oscilloscope.connect(&info.name)
             }
