@@ -114,6 +114,10 @@ pub enum DacType {
     LasercubeWifi,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
     LasercubeUsb,
+    /// Oscilloscope XY output via stereo audio interface.
+    /// Maps LaserPoint.x → Left channel, LaserPoint.y → Right channel.
+    #[cfg(feature = "oscilloscope")]
+    Oscilloscope,
     /// AVB audio device backend.
     Avb,
     /// Custom DAC implementation (for external/third-party backends).
@@ -122,6 +126,7 @@ pub enum DacType {
 
 impl DacType {
     /// Returns all available DAC types.
+    #[cfg(not(feature = "oscilloscope"))]
     pub fn all() -> &'static [DacType] {
         &[
             DacType::Helios,
@@ -133,6 +138,20 @@ impl DacType {
         ]
     }
 
+    /// Returns all available DAC types.
+    #[cfg(feature = "oscilloscope")]
+    pub fn all() -> &'static [DacType] {
+        &[
+            DacType::Helios,
+            DacType::EtherDream,
+            DacType::Idn,
+            DacType::LasercubeWifi,
+            DacType::LasercubeUsb,
+            DacType::Avb,
+            DacType::Oscilloscope,
+        ]
+    }
+
     /// Returns the display name for this DAC type.
     pub fn display_name(&self) -> &str {
         match self {
@@ -141,6 +160,8 @@ impl DacType {
             DacType::Idn => "IDN",
             DacType::LasercubeWifi => "LaserCube WiFi",
             DacType::LasercubeUsb => "LaserCube USB (Laserdock)",
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => "Oscilloscope",
             DacType::Avb => "AVB Audio Device",
             DacType::Custom(name) => name,
         }
@@ -154,6 +175,8 @@ impl DacType {
             DacType::Idn => "ILDA Digital Network laser DAC",
             DacType::LasercubeWifi => "WiFi laser DAC",
             DacType::LasercubeUsb => "USB laser DAC",
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => "Oscilloscope XY output via stereo audio",
             DacType::Avb => "AVB audio network output",
             DacType::Custom(_) => "Custom DAC",
         }
@@ -356,6 +379,9 @@ pub fn caps_for_dac_type(dac_type: &DacType) -> DacCapabilities {
         DacType::LasercubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
         #[cfg(not(feature = "lasercube-usb"))]
         DacType::LasercubeUsb => DacCapabilities::default(),
+
+        #[cfg(feature = "oscilloscope")]
+        DacType::Oscilloscope => DacCapabilities::default(), // Caps depend on sample rate, use backend's actual caps
 
         #[cfg(feature = "avb")]
         DacType::Avb => crate::protocols::avb::default_capabilities(),
@@ -973,13 +999,18 @@ mod tests {
     #[test]
     fn test_dac_type_all_returns_all_builtin_types() {
         let all_types = DacType::all();
+        #[cfg(not(feature = "oscilloscope"))]
         assert_eq!(all_types.len(), 6);
+        #[cfg(feature = "oscilloscope")]
+        assert_eq!(all_types.len(), 7);
         assert!(all_types.contains(&DacType::Helios));
         assert!(all_types.contains(&DacType::EtherDream));
         assert!(all_types.contains(&DacType::Idn));
         assert!(all_types.contains(&DacType::LasercubeWifi));
         assert!(all_types.contains(&DacType::LasercubeUsb));
         assert!(all_types.contains(&DacType::Avb));
+        #[cfg(feature = "oscilloscope")]
+        assert!(all_types.contains(&DacType::Oscilloscope));
     }
 
     #[test]

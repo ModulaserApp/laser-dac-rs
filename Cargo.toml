@@ -23,7 +23,7 @@ default = ["all-dacs"]
 all-dacs = ["usb-dacs", "network-dacs", "audio-dacs"]
 usb-dacs = ["helios", "lasercube-usb"]
 network-dacs = ["ether-dream", "idn", "lasercube-wifi"]
-audio-dacs = ["avb"]
+audio-dacs = ["avb", "oscilloscope"]
 
 # Individual DAC protocols
 helios = ["dep:rusb"]
@@ -32,6 +32,9 @@ ether-dream = []
 idn = ["dep:socket2", "dep:libc"]
 lasercube-wifi = ["dep:socket2", "dep:libc"]
 avb = ["dep:cpal", "dep:crossbeam-queue"]
+
+# Oscilloscope XY mode via audio output
+oscilloscope = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Optional serialization
 serde = ["dep:serde"]
@@ -59,6 +62,7 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 # Windows-only: enable ASIO support for AVB backend
 [target.'cfg(windows)'.dependencies]
 cpal = { version = "0.15", features = ["asio"], optional = true }
+
 
 # Unix-only for lasercube-wifi
 [target.'cfg(unix)'.dependencies]
@@ -91,8 +95,14 @@ name = "reconnect"
 path = "examples/reconnect.rs"
 
 [[example]]
+name = "scope_xy"
+path = "examples/scope_xy.rs"
+required-features = ["oscilloscope"]
+
+[[example]]
 name = "transitions"
 path = "examples/transitions.rs"
+
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

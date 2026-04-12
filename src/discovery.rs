@@ -144,6 +144,9 @@ use crate::protocols::lasercube_usb::rusb;
 #[cfg(feature = "lasercube-usb")]
 use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
 
+#[cfg(feature = "oscilloscope")]
+use crate::protocols::oscilloscope::{OscilloscopeDeviceInfo, OscilloscopeDiscovery};
+
 #[cfg(feature = "avb")]
 use crate::backend::AvbBackend;
 #[cfg(feature = "avb")]
@@ -194,6 +197,21 @@ impl DiscoveredDevice {
     /// Returns the DAC type.
     pub fn dac_type(&self) -> DacType {
         self.dac_type.clone()
+    }
+
+    /// Returns device-specific capabilities.
+    ///
+    /// For most DAC types this delegates to `caps_for_dac_type`. For audio
+    /// devices, the capabilities are derived from the actual sample rate
+    /// discovered during scanning (since audio caps depend on the device).
+    pub fn caps(&self) -> crate::types::DacCapabilities {
+        match &self.inner {
+            #[cfg(feature = "oscilloscope")]
+            DiscoveredDeviceInner::Oscilloscope { info } => {
+                crate::protocols::oscilloscope::default_capabilities(info.sample_rate)
+            }
+            _ => crate::types::caps_for_dac_type(&self.dac_type),
+        }
     }
 
     /// Returns a lightweight, cloneable info struct for this device.
@@ -297,6 +315,13 @@ impl DiscoveredDeviceInfo {
                     return format!("lasercube-wifi:{}", ip);
                 }
             }
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => {
+                if let Some(ref hw_name) = self.hardware_name {
+                    let slug = slugify_device_id(hw_name);
+                    return format!("oscilloscope:{}", slug);
+                }
+            }
             DacType::Avb => {
                 if let Some(ref hw_name) = self.hardware_name {
                     let slug = slugify_device_id(hw_name);
@@ -366,6 +391,8 @@ enum DiscoveredDeviceInner {
     },
     #[cfg(feature = "lasercube-usb")]
     LasercubeUsb(rusb::Device<rusb::Context>),
+    #[cfg(feature = "oscilloscope")]
+    Oscilloscope { info: OscilloscopeDeviceInfo },
     #[cfg(feature = "avb")]
     Avb(AvbSelector),
     /// External discoverer device.
@@ -382,6 +409,7 @@ enum DiscoveredDeviceInner {
         feature = "idn",
         feature = "lasercube-wifi",
         feature = "lasercube-usb",
+        feature = "oscilloscope",
         feature = "avb"
     )))]
     _Placeholder,
@@ -796,6 +824,8 @@ pub struct DacDiscovery {
     lasercube_wifi: LasercubeWifiDiscovery,
     #[cfg(feature = "lasercube-usb")]
     lasercube_usb: Option<LasercubeUsbDiscovery>,
+    #[cfg(feature = "oscilloscope")]
+    oscilloscope: OscilloscopeDiscovery,
     #[cfg(feature = "avb")]
     avb: AvbDiscovery,
     enabled: EnabledDacTypes,
@@ -823,6 +853,8 @@ impl DacDiscovery {
             lasercube_wifi: LasercubeWifiDiscovery::new(),
             #[cfg(feature = "lasercube-usb")]
             lasercube_usb: LasercubeUsbDiscovery::new(),
+            #[cfg(feature = "oscilloscope")]
+            oscilloscope: OscilloscopeDiscovery::new(),
             #[cfg(feature = "avb")]
             avb: AvbDiscovery::new(),
             enabled,
@@ -928,6 +960,23 @@ impl DacDiscovery {
             }
         }
 
+        // Oscilloscope
+        #[cfg(feature = "oscilloscope")]
+        if self.enabled.is_enabled(DacType::Oscilloscope) {
+            for info in self.oscilloscope.scan() {
+                devices.push(DiscoveredDevice {
+                    dac_type: DacType::Oscilloscope,
+                    ip_address: None,
+                    mac_address: None,
+                    hostname: None,
+                    usb_address: None,
+                    hardware_name: Some(info.name.clone()),
+                    device_index: None,
+                    inner: DiscoveredDeviceInner::Oscilloscope { info },
+                });
+            }
+        }
+
         // AVB
         #[cfg(feature = "avb")]
         if self.enabled.is_enabled(DacType::Avb) {
@@ -972,6 +1021,8 @@ impl DacDiscovery {
             "helios" => Some(DacType::Helios),
             "lasercube-usb" => Some(DacType::LasercubeUsb),
             "lasercube-wifi" => Some(DacType::LasercubeWifi),
+            #[cfg(feature = "oscilloscope")]
+            "oscilloscope" => Some(DacType::Oscilloscope),
             "avb" => Some(DacType::Avb),
             _ => None,
         }
@@ -1052,6 +1103,13 @@ impl DacDiscovery {
                 .as_ref()
                 .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
                 .connect(device),
+            #[cfg(feature = "oscilloscope")]
+            DacType::Oscilloscope => {
+                let DiscoveredDeviceInner::Oscilloscope { info } = device.inner else {
+                    return Err(Error::invalid_config("Invalid device type for Oscilloscope"));
+                };
+                self.oscilloscope.connect(&info.name)
+            }
             #[cfg(feature = "avb")]
             DacType::Avb => self.avb.connect(device),
             _ => Err(Error::invalid_config(format!(
