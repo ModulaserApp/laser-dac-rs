@@ -150,16 +150,26 @@ impl PresentationEngine {
                     continue;
                 }
 
-                buffer[written] = self.transition_buf[self.transition_cursor];
-                self.transition_cursor += 1;
-                written += 1;
+                // Batch-drain as many transition points as fit in the output.
+                let trans_avail = self.transition_buf.len() - self.transition_cursor;
+                let out_avail = max_points - written;
+                let batch = trans_avail.min(out_avail);
+                buffer[written..written + batch].copy_from_slice(
+                    &self.transition_buf[self.transition_cursor..self.transition_cursor + batch],
+                );
+                written += batch;
+                self.transition_cursor += batch;
                 continue;
             }
 
-            // Output current frame point
-            buffer[written] = self.drawable[self.cursor];
-            written += 1;
-            self.cursor += 1;
+            // Batch-copy drawable points until the next seam or buffer full.
+            let drawable_avail = self.drawable.len() - self.cursor;
+            let out_avail = max_points - written;
+            let batch = drawable_avail.min(out_avail);
+            buffer[written..written + batch]
+                .copy_from_slice(&self.drawable[self.cursor..self.cursor + batch]);
+            written += batch;
+            self.cursor += batch;
 
             // At the seam: compute transition dynamically against pending or self
             if self.cursor >= self.drawable.len() {
