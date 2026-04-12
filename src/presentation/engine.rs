@@ -227,11 +227,7 @@ impl PresentationEngine {
                     // A.last ≈ B.first — skip B's first point to avoid a
                     // duplicate logical seam sample in the hardware frame.
                     let pts = pending.points();
-                    if pts.len() > 1 {
-                        self.drawable.extend_from_slice(&pts[1..]);
-                    } else {
-                        self.drawable.extend_from_slice(pts);
-                    }
+                    self.drawable.extend_from_slice(if pts.len() > 1 { &pts[1..] } else { pts });
                 }
             }
 
@@ -374,13 +370,10 @@ fn build_self_loop_drawable(
             transition_len
         }
         TransitionPlan::Coalesce => {
-            if base.len() > 1 {
-                // Omit the last base point — on wrap, cursor returns to
-                // first which is the same logical point.
-                drawable.extend_from_slice(&base[..base.len() - 1]);
-            } else {
-                drawable.extend_from_slice(base);
-            }
+            // Omit the last base point for len > 1 — on wrap, cursor returns to
+            // first which is the same logical point.
+            let end = if base.len() > 1 { base.len() - 1 } else { base.len() };
+            drawable.extend_from_slice(&base[..end]);
             0
         }
     }
@@ -462,19 +455,13 @@ impl ColorDelayLine {
         self.scratch
             .extend(points.iter().map(|p| (p.r, p.g, p.b, p.intensity)));
 
-        // Apply delay: for the first `delay` points, use the carry buffer;
-        // for the rest, use colors from earlier in this chunk.
+        // Apply delay: for the first `delay` points use carry; for the rest, scratch.
         for (i, point) in points.iter_mut().enumerate() {
-            let (r, g, b, intensity) = if i < self.delay {
-                // Use carried colors from previous chunk (carry.len() == self.delay)
+            (point.r, point.g, point.b, point.intensity) = if i < self.delay {
                 self.carry[i]
             } else {
                 self.scratch[i - self.delay]
             };
-            point.r = r;
-            point.g = g;
-            point.b = b;
-            point.intensity = intensity;
         }
 
         // Update carry buffer: keep the last `delay` colors from this chunk
