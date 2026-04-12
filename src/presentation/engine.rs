@@ -183,33 +183,21 @@ impl PresentationEngine {
                         return max_points;
                     }
                 } else {
-                    // Self-loop: compute seam dynamically (current.last → current.first)
-                    let outgoing_last = self
-                        .current_base
-                        .as_ref()
-                        .and_then(|f| f.last_point())
-                        .copied();
-                    let incoming_first = self
-                        .current_base
-                        .as_ref()
-                        .and_then(|f| f.first_point())
-                        .copied();
-
-                    match (outgoing_last, incoming_first) {
-                        (Some(last), Some(first)) => match (self.transition_fn)(&last, &first) {
-                            TransitionPlan::Transition(points) => {
-                                self.transition_buf = points;
-                                self.transition_cursor = 0;
-                                self.transition_is_self_loop = true;
-                                self.cursor = 0;
-                            }
-                            TransitionPlan::Coalesce => {
-                                self.transition_buf.clear();
-                                self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
-                            }
-                        },
-                        _ => {
+                    // Self-loop: compute seam dynamically using drawable first/last.
+                    // drawable is non-empty here (checked above) and is always a
+                    // direct copy of current_base.points(), so these unwraps are safe.
+                    let last = self.drawable.last().unwrap();
+                    let first = self.drawable.first().unwrap();
+                    match (self.transition_fn)(last, first) {
+                        TransitionPlan::Transition(points) => {
+                            self.transition_buf = points;
+                            self.transition_cursor = 0;
+                            self.transition_is_self_loop = true;
                             self.cursor = 0;
+                        }
+                        TransitionPlan::Coalesce => {
+                            self.transition_buf.clear();
+                            self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
                         }
                     }
                 }
