@@ -122,9 +122,7 @@ impl PresentationEngine {
 
         // No frame yet or empty frame: output blanked at origin
         if self.current_base.is_none() || self.drawable.is_empty() {
-            for p in &mut buffer[..max_points] {
-                *p = LaserPoint::blanked(0.0, 0.0);
-            }
+            buffer[..max_points].fill(LaserPoint::blanked(0.0, 0.0));
             return max_points;
         }
 
@@ -142,9 +140,7 @@ impl PresentationEngine {
                     self.promote_pending();
 
                     if self.drawable.is_empty() {
-                        for p in &mut buffer[written..max_points] {
-                            *p = LaserPoint::blanked(0.0, 0.0);
-                        }
+                        buffer[written..max_points].fill(LaserPoint::blanked(0.0, 0.0));
                         return max_points;
                     }
                     continue;
@@ -172,9 +168,7 @@ impl PresentationEngine {
                     self.promote_pending();
 
                     if self.drawable.is_empty() {
-                        for p in &mut buffer[written..max_points] {
-                            *p = LaserPoint::blanked(0.0, 0.0);
-                        }
+                        buffer[written..max_points].fill(LaserPoint::blanked(0.0, 0.0));
                         return max_points;
                     }
                 } else {
@@ -451,16 +445,15 @@ impl ColorDelayLine {
             self.carry.clear();
             return;
         }
-        let old_len = self.carry.len();
-        if new_delay > old_len {
+        if new_delay > self.delay {
             // Grow: prepend black entries, keep existing carry at the end
-            let extra = new_delay - old_len;
+            let extra = new_delay - self.delay;
             let mut new_carry = vec![(0, 0, 0, 0); extra];
             new_carry.extend_from_slice(&self.carry);
             self.carry = new_carry;
         } else {
             // Shrink: keep only the most recent (tail) entries
-            self.carry.drain(..old_len - new_delay);
+            self.carry.drain(..self.delay - new_delay);
         }
         self.delay = new_delay;
     }
@@ -480,9 +473,8 @@ impl ColorDelayLine {
         // for the rest, use colors from earlier in this chunk.
         for (i, point) in points.iter_mut().enumerate() {
             let (r, g, b, intensity) = if i < self.delay {
-                // Use carried colors from previous chunk
-                let carry_idx = self.carry.len() - self.delay + i;
-                self.carry[carry_idx]
+                // Use carried colors from previous chunk (carry.len() == self.delay)
+                self.carry[i]
             } else {
                 self.scratch[i - self.delay]
             };
