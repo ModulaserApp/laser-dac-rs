@@ -96,12 +96,12 @@ impl OscilloscopeBackend {
     }
 
     /// Convert a laser point to stereo audio samples.
+    ///
+    /// Unlike laser DACs, the oscilloscope beam is always visible — there is
+    /// no "laser off" state.  Blanked points therefore still output the XY
+    /// position so the beam tracks correctly; sending silence (0,0) would
+    /// make it spike to the screen centre.
     fn point_to_samples(p: &LaserPoint, config: &OscilloscopeConfig) -> (f32, f32) {
-        // Blanked points (intensity == 0) output silence
-        if p.intensity == 0 {
-            return (0.0, 0.0);
-        }
-
         let mut l = p.x * config.gain + config.dc_offset;
         let mut r = p.y * config.gain + config.dc_offset;
 
@@ -416,8 +416,11 @@ impl FifoBackend for OscilloscopeBackend {
 
         // Convert points using pre-allocated buffer
         self.sample_buffer.clear();
-        self.sample_buffer
-            .extend(points.iter().map(|p| Self::point_to_samples(p, &self.config)));
+        self.sample_buffer.extend(
+            points
+                .iter()
+                .map(|p| Self::point_to_samples(p, &self.config)),
+        );
 
         for &sample in &self.sample_buffer {
             // Capacity was checked above; push should not fail
