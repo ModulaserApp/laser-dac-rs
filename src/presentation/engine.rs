@@ -207,12 +207,12 @@ impl PresentationEngine {
         if let Some(pending) = self.pending_base.take() {
             // Frame change: A→B transition.
             // Compute transition from current (A) to pending (B) BEFORE promoting.
-            let plan = match &self.current_base {
-                Some(current) => match (current.last_point(), pending.first_point()) {
-                    (Some(last), Some(first)) => (self.transition_fn)(last, first),
-                    _ => TransitionPlan::Transition(vec![]),
-                },
-                None => TransitionPlan::Transition(vec![]),
+            let plan = match (
+                self.current_base.as_ref().and_then(|c| c.last_point()),
+                pending.first_point(),
+            ) {
+                (Some(last), Some(first)) => (self.transition_fn)(last, first),
+                _ => TransitionPlan::Transition(vec![]),
             };
 
             self.drawable.clear();
@@ -266,14 +266,13 @@ impl PresentationEngine {
     fn refresh_drawable_for_frame_swap(&mut self) {
         self.drawable.clear();
         self.drawable_dirty = false;
+        self.frame_swap_transition_len = 0;
 
         let Some(current) = &self.current_base else {
-            self.frame_swap_transition_len = 0;
             return;
         };
 
         if current.is_empty() {
-            self.frame_swap_transition_len = 0;
             self.drawable.push(LaserPoint::blanked(0.0, 0.0));
             return;
         }
@@ -304,33 +303,27 @@ impl PresentationEngine {
     fn promote_pending(&mut self) {
         let pending = self.pending_base.take().unwrap();
 
-        let outgoing_last = self
-            .current_base
-            .as_ref()
-            .and_then(|f| f.last_point())
-            .copied();
-        let mut coalesce = false;
-
-        if let (Some(last), Some(first)) = (outgoing_last.as_ref(), pending.first_point()) {
-            match (self.transition_fn)(last, first) {
-                TransitionPlan::Transition(points) => {
-                    self.transition_buf = points;
-                    self.transition_cursor = 0;
-                    self.transition_is_self_loop = false;
-                }
-                TransitionPlan::Coalesce => {
-                    coalesce = true;
-                }
-            }
-        }
+        let plan = match (
+            self.current_base.as_ref().and_then(|f| f.last_point()),
+            pending.first_point(),
+        ) {
+            (Some(last), Some(first)) => (self.transition_fn)(last, first),
+            _ => TransitionPlan::Transition(vec![]),
+        };
 
         self.current_base = Some(pending);
         self.refresh_drawable();
 
-        if coalesce {
-            self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
-        } else {
-            self.cursor = 0;
+        match plan {
+            TransitionPlan::Transition(points) => {
+                self.transition_buf = points;
+                self.transition_cursor = 0;
+                self.transition_is_self_loop = false;
+                self.cursor = 0;
+            }
+            TransitionPlan::Coalesce => {
+                self.cursor = if self.drawable.len() > 1 { 1 } else { 0 };
+            }
         }
     }
 
