@@ -17,7 +17,9 @@ use super::{Frame, TransitionFn, TransitionPlan};
 ///   Traverses the drawable, inserting transition points at frame boundaries.
 /// - [`compose_hardware_frame`](Self::compose_hardware_frame): Frame-swap
 ///   delivery. Returns a complete composed frame with transition points.
-pub(crate) struct PresentationEngine {
+#[cfg_attr(feature = "testutils", doc(hidden))]
+#[cfg_attr(not(feature = "testutils"), allow(dead_code))]
+pub struct PresentationEngine {
     /// The currently playing frame.
     pub(crate) current_base: Option<Frame>,
     /// The next frame to promote (latest-wins).

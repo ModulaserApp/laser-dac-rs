@@ -14,7 +14,13 @@ pub use session::{FrameSession, FrameSessionConfig};
 
 // Re-export internal types for tests (they live in sub-modules but tests use `super::*`)
 #[cfg(test)]
-pub(crate) use engine::{ColorDelayLine, PresentationEngine};
+pub(crate) use engine::ColorDelayLine;
+#[cfg(all(test, not(feature = "testutils")))]
+pub(crate) use engine::PresentationEngine;
+
+// Re-export PresentationEngine for benchmarks behind testutils feature
+#[cfg(feature = "testutils")]
+pub use engine::PresentationEngine;
 
 use crate::types::LaserPoint;
 use std::sync::Arc;
