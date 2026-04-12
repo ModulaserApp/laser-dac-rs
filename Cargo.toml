@@ -108,6 +108,10 @@ name = "bench_fill_chunk"
 path = "examples/bench_fill_chunk.rs"
 required-features = ["testutils"]
 
+[[example]]
+name = "bench_transition"
+path = "examples/bench_transition.rs"
+
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]
