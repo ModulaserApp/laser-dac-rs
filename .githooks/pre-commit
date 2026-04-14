@@ -1,0 +1,18 @@
+#!/bin/sh
+. "$HOME/.cargo/env" 2>/dev/null
+
+# Get staged .rs files
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$')
+if [ -n "$STAGED" ]; then
+    cargo fmt
+    echo "$STAGED" | xargs git add
+fi
+
+# Run validation on any Rust changes
+if [ -n "$STAGED" ]; then
+    echo "Running cargo check..."
+    cargo check --all-targets || exit 1
+
+    echo "Running cargo clippy..."
+    cargo clippy --all-targets -- -D warnings || exit 1
+fi
