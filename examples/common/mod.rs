@@ -77,6 +77,7 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
 ///
 /// For time-based shapes (OrbitingCircle), the callback computes each
 /// point from the stream timestamp, producing smooth continuous animation.
+#[allow(clippy::type_complexity)]
 pub fn make_producer(
     shape: Shape,
     points: usize,
@@ -96,8 +97,8 @@ pub fn make_producer(
             let mut cursor = 0usize;
             Box::new(move |req, buffer| {
                 let n = req.target_points.min(buffer.len());
-                for i in 0..n {
-                    buffer[i] = frame[cursor];
+                for item in buffer.iter_mut().take(n) {
+                    *item = frame[cursor];
                     cursor += 1;
                     if cursor >= frame.len() {
                         cursor = 0;
@@ -192,7 +193,7 @@ fn fill_triangle_points(buffer: &mut [LaserPoint], n_points: usize) {
 /// Generates a closed circle: the last point equals the first point,
 /// so the transition function produces no blanking at the loop seam.
 fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
-    for i in 0..n_points {
+    for (i, item) in buffer.iter_mut().take(n_points).enumerate() {
         let angle = (i as f32 / n_points as f32) * 2.0 * PI;
         let x = 0.5 * angle.cos();
         let y = 0.5 * angle.sin();
@@ -200,7 +201,7 @@ fn fill_circle_points(buffer: &mut [LaserPoint], n_points: usize) {
         let hue = i as f32 / n_points as f32;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
+        *item = LaserPoint::new(x, y, r, g, b, 65535);
     }
 }
 
@@ -380,7 +381,7 @@ fn fill_orbiting_circle_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_
 
     let pps = req.pps as f64;
 
-    for i in 0..n_points {
+    for (i, item) in buffer.iter_mut().take(n_points).enumerate() {
         let point_index = req.start.0 + i as u64;
         let t_secs = point_index as f64 / pps;
 
@@ -399,7 +400,7 @@ fn fill_orbiting_circle_points(req: &ChunkRequest, buffer: &mut [LaserPoint], n_
         let hue = (t_secs as f32 / 3.0) % 1.0;
         let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-        buffer[i] = LaserPoint::new(x, y, r, g, b, 65535);
+        *item = LaserPoint::new(x, y, r, g, b, 65535);
     }
 }
 

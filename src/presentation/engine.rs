@@ -227,7 +227,8 @@ impl PresentationEngine {
                     // A.last ≈ B.first — skip B's first point to avoid a
                     // duplicate logical seam sample in the hardware frame.
                     let pts = pending.points();
-                    self.drawable.extend_from_slice(if pts.len() > 1 { &pts[1..] } else { pts });
+                    self.drawable
+                        .extend_from_slice(if pts.len() > 1 { &pts[1..] } else { pts });
                 }
             }
 
@@ -372,7 +373,11 @@ fn build_self_loop_drawable(
         TransitionPlan::Coalesce => {
             // Omit the last base point for len > 1 — on wrap, cursor returns to
             // first which is the same logical point.
-            let end = if base.len() > 1 { base.len() - 1 } else { base.len() };
+            let end = if base.len() > 1 {
+                base.len() - 1
+            } else {
+                base.len()
+            };
             drawable.extend_from_slice(&base[..end]);
             0
         }

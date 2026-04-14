@@ -2258,11 +2258,7 @@ fn test_frame_session_fifo_output_filter_skips_keepalives_and_sees_color_delay()
     assert_eq!(call.points[2].b, 700);
     assert_eq!(call.points[2].intensity, 800);
     assert!(
-        writes
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|write| *write == call.points),
+        writes.lock().unwrap().contains(&call.points),
         "backend should receive the same filtered FIFO chunk"
     );
 
@@ -2339,11 +2335,7 @@ fn test_frame_session_frame_swap_output_filter_sees_post_clamp_cyclic_frame() {
     assert_eq!(call.points[2].x, 40.0);
     assert!(call.points.iter().all(|point| point.intensity == 1234));
     assert!(
-        writes
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|write| *write == call.points),
+        writes.lock().unwrap().contains(&call.points),
         "backend should receive the filtered frame-swap buffer verbatim"
     );
 

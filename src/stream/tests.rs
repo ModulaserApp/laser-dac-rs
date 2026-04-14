@@ -394,8 +394,8 @@ fn test_run_retries_on_would_block() {
             let count = produced_count_clone.fetch_add(1, Ordering::SeqCst);
             if count < 1 {
                 let n = req.target_points.min(buffer.len());
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             } else {
@@ -548,8 +548,8 @@ fn test_run_buffer_driven_behavior() {
                 ChunkResult::End
             } else {
                 let n = req.target_points.min(buffer.len()).min(100);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             }
@@ -591,8 +591,8 @@ fn test_run_sleeps_when_buffer_healthy() {
             } else {
                 // Fill buffer to trigger sleep
                 let n = req.target_points.min(buffer.len());
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             }
@@ -631,8 +631,8 @@ fn test_run_stops_on_control_stop() {
     let result = stream.run(
         |req, buffer| {
             let n = req.target_points.min(buffer.len()).min(10);
-            for i in 0..n {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for pt in buffer.iter_mut().take(n) {
+                *pt = LaserPoint::blanked(0.0, 0.0);
             }
             ChunkResult::Filled(n)
         },
@@ -658,8 +658,8 @@ fn test_run_producer_ended() {
             if count == 0 {
                 // First call: return some data
                 let n = req.target_points.min(buffer.len()).min(100);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             } else {
@@ -922,9 +922,8 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
             if count < 3 {
                 // Fill with specific number of points
                 let n = req.target_points.min(50);
-                for i in 0..n {
-                    buffer[i] =
-                        LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
+                for (i, pt) in buffer.iter_mut().enumerate().take(n) {
+                    *pt = LaserPoint::new(0.1 * i as f32, 0.2 * i as f32, 1000, 2000, 3000, 4000);
                 }
                 points_written_clone.fetch_add(n, Ordering::SeqCst);
                 ChunkResult::Filled(n)
@@ -973,8 +972,8 @@ fn test_fill_result_filled_updates_last_chunk_when_armed() {
             if count == 0 {
                 // Write specific points that we can verify later
                 let n = req.target_points.min(10);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::new(0.5, 0.5, 10000, 20000, 30000, 40000);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::new(0.5, 0.5, 10000, 20000, 30000, 40000);
                 }
                 ChunkResult::Filled(n)
             } else if count == 1 {
@@ -1015,8 +1014,8 @@ fn test_fill_result_starved_repeat_last_with_stored_chunk() {
             if count == 0 {
                 // First call: provide some data to establish last_chunk
                 let n = req.target_points.min(50);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::new(0.3, 0.3, 5000, 5000, 5000, 5000);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::new(0.3, 0.3, 5000, 5000, 5000, 5000);
                 }
                 ChunkResult::Filled(n)
             } else if count == 1 {
@@ -1175,8 +1174,8 @@ fn test_fill_result_filled_exceeds_buffer_clamped() {
 
             if count == 0 {
                 // Fill some points but claim we wrote more than buffer size
-                for i in 0..buffer.len() {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut() {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 // Return a value larger than buffer - should be clamped
                 ChunkResult::Filled(buffer.len() + 1000)
@@ -1241,9 +1240,9 @@ fn test_full_stream_lifecycle_create_arm_stream_stop() {
             if count < 5 {
                 // Fill with data
                 let n = req.target_points.min(buffer.len()).min(100);
-                for i in 0..n {
+                for (i, pt) in buffer.iter_mut().enumerate().take(n) {
                     let t = i as f32 / 100.0;
-                    buffer[i] = LaserPoint::new(t, t, 10000, 20000, 30000, 40000);
+                    *pt = LaserPoint::new(t, t, 10000, 20000, 30000, 40000);
                 }
                 ChunkResult::Filled(n)
             } else {
@@ -1289,8 +1288,8 @@ fn test_full_stream_lifecycle_with_idle_policy_recovery() {
                 0 => {
                     // First call: provide data (establishes last_chunk)
                     let n = req.target_points.min(buffer.len()).min(50);
-                    for i in 0..n {
-                        buffer[i] = LaserPoint::new(0.5, 0.5, 30000, 30000, 30000, 30000);
+                    for pt in buffer.iter_mut().take(n) {
+                        *pt = LaserPoint::new(0.5, 0.5, 30000, 30000, 30000, 30000);
                     }
                     ChunkResult::Filled(n)
                 }
@@ -1301,8 +1300,8 @@ fn test_full_stream_lifecycle_with_idle_policy_recovery() {
                 2 => {
                     // Third call: recover with new data
                     let n = req.target_points.min(buffer.len()).min(50);
-                    for i in 0..n {
-                        buffer[i] = LaserPoint::new(-0.5, -0.5, 20000, 20000, 20000, 20000);
+                    for pt in buffer.iter_mut().take(n) {
+                        *pt = LaserPoint::new(-0.5, -0.5, 20000, 20000, 20000, 20000);
                     }
                     ChunkResult::Filled(n)
                 }
@@ -1341,8 +1340,8 @@ fn test_full_stream_lifecycle_external_stop() {
         |req, buffer| {
             // Keep streaming until stopped
             let n = req.target_points.min(buffer.len()).min(10);
-            for i in 0..n {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for pt in buffer.iter_mut().take(n) {
+                *pt = LaserPoint::blanked(0.0, 0.0);
             }
             ChunkResult::Filled(n)
         },
@@ -1370,8 +1369,8 @@ fn test_full_stream_lifecycle_into_dac_recovery() {
             let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
             if count < 2 {
                 let n = req.target_points.min(buffer.len()).min(50);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             } else {
@@ -1406,8 +1405,8 @@ fn test_stream_stats_tracking() {
             let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
             if count < 3 {
                 let n = req.target_points.min(buffer.len()).min(points_per_call);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             } else {
@@ -1449,8 +1448,8 @@ fn test_stream_disarm_during_streaming() {
     let result = stream.run(
         |req, buffer| {
             let n = req.target_points.min(buffer.len()).min(10);
-            for i in 0..n {
-                buffer[i] = LaserPoint::new(0.1, 0.1, 50000, 50000, 50000, 50000);
+            for pt in buffer.iter_mut().take(n) {
+                *pt = LaserPoint::new(0.1, 0.1, 50000, 50000, 50000, 50000);
             }
             ChunkResult::Filled(n)
         },
@@ -1667,8 +1666,8 @@ fn test_stream_with_mock_backend_disconnect() {
     let result = stream.run(
         |req, buffer| {
             let n = req.target_points.min(buffer.len()).min(10);
-            for i in 0..n {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for pt in buffer.iter_mut().take(n) {
+                *pt = LaserPoint::blanked(0.0, 0.0);
             }
             ChunkResult::Filled(n)
         },
@@ -1791,8 +1790,8 @@ impl FifoBackend for FailingWriteBackend {
 /// Producer that fills up to 10 blanked points per call (shared by write-error tests).
 fn blank_producer(req: &ChunkRequest, buffer: &mut [LaserPoint]) -> ChunkResult {
     let n = req.target_points.min(buffer.len()).min(10);
-    for i in 0..n {
-        buffer[i] = LaserPoint::blanked(0.0, 0.0);
+    for pt in buffer.iter_mut().take(n) {
+        *pt = LaserPoint::blanked(0.0, 0.0);
     }
     ChunkResult::Filled(n)
 }
@@ -2304,8 +2303,8 @@ fn test_fill_result_end_closes_shutter() {
         |req, buffer| {
             // Fill some points then end
             let n = req.target_points.min(buffer.len()).min(10);
-            for i in 0..n {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for pt in buffer.iter_mut().take(n) {
+                *pt = LaserPoint::blanked(0.0, 0.0);
             }
             ChunkResult::End
         },
@@ -2820,8 +2819,8 @@ fn test_fractional_consumed_prevents_stall() {
         stream.run(
             |req, buffer| {
                 let n = req.target_points.min(buffer.len()).min(100);
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::blanked(0.0, 0.0);
                 }
                 ChunkResult::Filled(n)
             },

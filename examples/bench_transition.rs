@@ -5,7 +5,7 @@
 //! Run with:
 //!   cargo run --release --example bench_transition
 
-use laser_dac::{default_transition, LaserPoint, TransitionPlan};
+use laser_dac::{default_transition, LaserPoint};
 use std::hint::black_box;
 use std::time::Instant;
 

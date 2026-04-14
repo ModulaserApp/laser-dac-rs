@@ -157,6 +157,58 @@ impl Drop for HeliosBackend {
     }
 }
 
+impl FrameSwapBackend for HeliosBackend {
+    fn frame_capacity(&self) -> usize {
+        self.caps.max_points_per_chunk
+    }
+
+    fn is_ready_for_frame(&mut self) -> bool {
+        let Some(dac) = self.dac.as_mut() else {
+            return false;
+        };
+        match dac.status() {
+            Ok(DeviceStatus::Ready) => true,
+            Ok(DeviceStatus::NotReady) => false,
+            Err(e) => {
+                if Self::is_fatal_usb_error(&e) {
+                    self.leak_handle();
+                }
+                false
+            }
+        }
+    }
+
+    fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let dac = self
+            .dac
+            .as_mut()
+            .ok_or_else(|| Error::disconnected("Not connected"))?;
+
+        match dac.status().map_err(Self::map_err)? {
+            DeviceStatus::Ready => {}
+            DeviceStatus::NotReady => {
+                return Ok(WriteOutcome::WouldBlock);
+            }
+        }
+
+        self.point_buffer.clear();
+        self.point_buffer
+            .extend(points.iter().map(HeliosPoint::from));
+
+        encode_frame_into(
+            pps,
+            &self.point_buffer,
+            WriteFrameFlags::SINGLE_MODE,
+            &mut self.frame_buffer,
+        );
+
+        dac.write_frame_buffer(&self.frame_buffer)
+            .map_err(Self::map_err)?;
+
+        Ok(WriteOutcome::Written)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,57 +358,5 @@ mod tests {
 
         let err = backend.write_frame(30_000, &points).unwrap_err();
         assert!(err.is_disconnected());
-    }
-}
-
-impl FrameSwapBackend for HeliosBackend {
-    fn frame_capacity(&self) -> usize {
-        self.caps.max_points_per_chunk
-    }
-
-    fn is_ready_for_frame(&mut self) -> bool {
-        let Some(dac) = self.dac.as_mut() else {
-            return false;
-        };
-        match dac.status() {
-            Ok(DeviceStatus::Ready) => true,
-            Ok(DeviceStatus::NotReady) => false,
-            Err(e) => {
-                if Self::is_fatal_usb_error(&e) {
-                    self.leak_handle();
-                }
-                false
-            }
-        }
-    }
-
-    fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        let dac = self
-            .dac
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("Not connected"))?;
-
-        match dac.status().map_err(Self::map_err)? {
-            DeviceStatus::Ready => {}
-            DeviceStatus::NotReady => {
-                return Ok(WriteOutcome::WouldBlock);
-            }
-        }
-
-        self.point_buffer.clear();
-        self.point_buffer
-            .extend(points.iter().map(HeliosPoint::from));
-
-        encode_frame_into(
-            pps,
-            &self.point_buffer,
-            WriteFrameFlags::SINGLE_MODE,
-            &mut self.frame_buffer,
-        );
-
-        dac.write_frame_buffer(&self.frame_buffer)
-            .map_err(Self::map_err)?;
-
-        Ok(WriteOutcome::Written)
     }
 }

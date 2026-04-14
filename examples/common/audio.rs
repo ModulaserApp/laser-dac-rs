@@ -379,8 +379,8 @@ pub fn fill_audio_points(
     }
 
     if !ensure_audio_initialized() {
-        for i in 0..n_points {
-            buffer[i] = LaserPoint::blanked(0.0, 0.0);
+        for item in buffer.iter_mut().take(n_points) {
+            *item = LaserPoint::blanked(0.0, 0.0);
         }
         return;
     }
@@ -388,8 +388,8 @@ pub fn fill_audio_points(
     let state = match AUDIO_STATE.get() {
         Some(s) => s,
         None => {
-            for i in 0..n_points {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for item in buffer.iter_mut().take(n_points) {
+                *item = LaserPoint::blanked(0.0, 0.0);
             }
             return;
         }
@@ -426,8 +426,8 @@ pub fn fill_audio_points(
 
         if max_amp < config.blank_threshold {
             debug!("Audio: silence detected (max_amp={:.4}), blanking", max_amp);
-            for i in 0..n_points {
-                buffer[i] = LaserPoint::blanked(0.0, 0.0);
+            for item in buffer.iter_mut().take(n_points) {
+                *item = LaserPoint::blanked(0.0, 0.0);
             }
             return;
         }

@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     let n = args.points;
 
     if matches!(args.mode, Mode::Animated) {
-        let frames = vec![
+        let frames = [
             make_circle(n, -0.4, 0.25, 0.2, 65535, 0, 0), // red, top-left
             make_circle(n, 0.4, 0.25, 0.2, 0, 65535, 0),  // green, top-right
             make_circle(n, 0.0, -0.35, 0.2, 0, 0, 65535), // blue, bottom-center
