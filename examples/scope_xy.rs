@@ -34,6 +34,10 @@ struct Args {
     #[arg(long, default_value_t = 0.8, value_parser = parse_scale)]
     scale: f32,
 
+    /// Points per second (the backend resamples to the audio sample rate).
+    #[arg(long, default_value_t = 30_000)]
+    pps: u32,
+
     /// Audio device name (substring match). If omitted, lists devices and uses the first one.
     #[arg(short, long)]
     device: Option<String>,
@@ -71,10 +75,7 @@ fn main() -> Result<()> {
 
     println!("Found {} oscilloscope device(s):", audio_devices.len());
     for (i, dev) in audio_devices.iter().enumerate() {
-        println!(
-            "  [{}] {} (sample rate: {} Hz)",
-            i, dev.name, dev.caps.pps_max
-        );
+        println!("  [{}] {}", i, dev.name);
     }
     println!();
 
@@ -97,14 +98,12 @@ fn main() -> Result<()> {
     println!("Using: {} ({})", selected.name, selected.id);
 
     let device = open_device(&selected.id)?;
-    let sample_rate = device.caps().pps_max;
 
-    println!("Sample rate: {} Hz", sample_rate);
+    println!("PPS: {} (resampled to audio sample rate)", args.pps);
     println!("Shape: {}", args.shape.name());
     println!();
 
-    // For oscilloscope, PPS must equal the sample rate
-    let config = StreamConfig::new(sample_rate);
+    let config = StreamConfig::new(args.pps);
     let (stream, info) = device.start_stream(config)?;
 
     println!("Streaming {} to {}...", args.shape.name(), info.name);

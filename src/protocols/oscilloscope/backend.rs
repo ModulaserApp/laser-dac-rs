@@ -83,7 +83,7 @@ impl OscilloscopeBackend {
             device_name,
             sample_rate,
             config: OscilloscopeConfig::default(),
-            caps: super::default_capabilities(sample_rate),
+            caps: super::default_capabilities(),
             runtime: None,
             audio_thread: None,
             sample_buffer: Vec::new(),
@@ -399,8 +399,22 @@ impl DacBackend for OscilloscopeBackend {
     }
 }
 
+/// Calculate the number of output samples when resampling `input_len` points
+/// from `from_rate` to `to_rate`.
+fn resampled_len(input_len: usize, from_rate: u32, to_rate: u32) -> usize {
+    if input_len == 0 {
+        return 0;
+    }
+    (input_len as u64 * to_rate as u64).div_ceil(from_rate as u64) as usize
+}
+
+/// Linearly interpolate two stereo sample pairs.
+fn lerp_samples(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
+    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+}
+
 impl FifoBackend for OscilloscopeBackend {
-    fn try_write_points(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let runtime = self
             .runtime
             .as_ref()
@@ -410,11 +424,22 @@ impl FifoBackend for OscilloscopeBackend {
             return Err(Error::disconnected("Not connected"));
         }
 
-        if !runtime.has_capacity_for(points.len()) {
+        if points.is_empty() {
+            return Ok(WriteOutcome::Written);
+        }
+
+        // Check capacity before doing any conversion work.
+        let resampling = pps != self.sample_rate;
+        if resampling {
+            let output_len = resampled_len(points.len(), pps, self.sample_rate);
+            if !runtime.has_capacity_for(output_len) {
+                return Ok(WriteOutcome::WouldBlock);
+            }
+        } else if !runtime.has_capacity_for(points.len()) {
             return Ok(WriteOutcome::WouldBlock);
         }
 
-        // Convert points using pre-allocated buffer
+        // Convert points to stereo samples.
         self.sample_buffer.clear();
         self.sample_buffer.extend(
             points
@@ -422,9 +447,30 @@ impl FifoBackend for OscilloscopeBackend {
                 .map(|p| Self::point_to_samples(p, &self.config)),
         );
 
-        for &sample in &self.sample_buffer {
-            // Capacity was checked above; push should not fail
-            let _ = runtime.queue.push(sample);
+        if resampling {
+            let output_len = resampled_len(self.sample_buffer.len(), pps, self.sample_rate);
+            let last_src_idx = (self.sample_buffer.len() - 1) as f32;
+            let step = if output_len > 1 {
+                last_src_idx / (output_len - 1) as f32
+            } else {
+                0.0
+            };
+
+            for i in 0..output_len {
+                let src_pos = i as f32 * step;
+                let idx = (src_pos as usize).min(self.sample_buffer.len() - 1);
+                let next = (idx + 1).min(self.sample_buffer.len() - 1);
+                let t = src_pos - idx as f32;
+                let _ = runtime.queue.push(lerp_samples(
+                    self.sample_buffer[idx],
+                    self.sample_buffer[next],
+                    t,
+                ));
+            }
+        } else {
+            for &sample in &self.sample_buffer {
+                let _ = runtime.queue.push(sample);
+            }
         }
 
         Ok(WriteOutcome::Written)

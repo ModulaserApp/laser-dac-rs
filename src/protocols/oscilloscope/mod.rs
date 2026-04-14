@@ -26,9 +26,7 @@
 //!         .expect("No oscilloscope device found");
 //!
 //!     let device = open_device(&osc_device.id)?;
-//!     let sample_rate = device.caps().pps_max; // PPS = sample rate
-//!
-//!     let (mut stream, _) = device.start_stream(StreamConfig::new(sample_rate))?;
+//!     let (mut stream, _) = device.start_stream(StreamConfig::new(30_000))?;
 //!     Ok(())
 //! }
 //! ```
@@ -62,14 +60,14 @@ impl Default for OscilloscopeConfig {
     }
 }
 
-/// Returns default capabilities for an oscilloscope device at the given sample rate.
+/// Returns default capabilities for an oscilloscope device.
 ///
-/// The key constraint is that `pps_min == pps_max == sample_rate`, enforcing
-/// that the stream PPS matches the audio sample rate.
-pub fn default_capabilities(sample_rate: u32) -> DacCapabilities {
+/// PPS is unconstrained because the backend resamples from the user's PPS
+/// to the audio device sample rate, just like the AVB backend.
+pub fn default_capabilities() -> DacCapabilities {
     DacCapabilities {
-        pps_min: sample_rate,
-        pps_max: sample_rate,
+        pps_min: 1,
+        pps_max: 100_000,
         max_points_per_chunk: 4096,
         output_model: OutputModel::NetworkFifo,
     }
