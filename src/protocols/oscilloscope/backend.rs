@@ -9,6 +9,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig as CpalStreamConfig};
 use crossbeam_queue::ArrayQueue;
 
+use crate::resample::{catmull_rom, resampled_len};
+
 use super::OscilloscopeConfig;
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
@@ -399,18 +401,18 @@ impl DacBackend for OscilloscopeBackend {
     }
 }
 
-/// Calculate the number of output samples when resampling `input_len` points
-/// from `from_rate` to `to_rate`.
-fn resampled_len(input_len: usize, from_rate: u32, to_rate: u32) -> usize {
-    if input_len == 0 {
-        return 0;
-    }
-    (input_len as u64 * to_rate as u64).div_ceil(from_rate as u64) as usize
-}
-
-/// Linearly interpolate two stereo sample pairs.
-fn lerp_samples(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
-    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+/// Interpolate two stereo sample pairs using 4-point Catmull-Rom.
+fn catmull_rom_samples(
+    s0: (f32, f32),
+    s1: (f32, f32),
+    s2: (f32, f32),
+    s3: (f32, f32),
+    t: f32,
+) -> (f32, f32) {
+    (
+        catmull_rom(s0.0, s1.0, s2.0, s3.0, t),
+        catmull_rom(s0.1, s1.1, s2.1, s3.1, t),
+    )
 }
 
 impl FifoBackend for OscilloscopeBackend {
@@ -456,16 +458,16 @@ impl FifoBackend for OscilloscopeBackend {
                 0.0
             };
 
+            let last = self.sample_buffer.len() - 1;
             for i in 0..output_len {
                 let src_pos = i as f32 * step;
-                let idx = (src_pos as usize).min(self.sample_buffer.len() - 1);
-                let next = (idx + 1).min(self.sample_buffer.len() - 1);
+                let idx = (src_pos as usize).min(last);
                 let t = src_pos - idx as f32;
-                let _ = runtime.queue.push(lerp_samples(
-                    self.sample_buffer[idx],
-                    self.sample_buffer[next],
-                    t,
-                ));
+                let s0 = self.sample_buffer[idx.saturating_sub(1)];
+                let s1 = self.sample_buffer[idx];
+                let s2 = self.sample_buffer[(idx + 1).min(last)];
+                let s3 = self.sample_buffer[(idx + 2).min(last)];
+                let _ = runtime.queue.push(catmull_rom_samples(s0, s1, s2, s3, t));
             }
         } else {
             for &sample in &self.sample_buffer {

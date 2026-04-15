@@ -94,6 +94,8 @@ mod net_utils;
 pub mod presentation;
 pub mod protocols;
 pub(crate) mod reconnect;
+#[cfg(any(feature = "avb", feature = "oscilloscope"))]
+pub(crate) mod resample;
 mod scheduler;
 pub mod stream;
 pub mod types;

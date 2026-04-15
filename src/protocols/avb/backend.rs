@@ -3,6 +3,7 @@
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::error::{Error, Result};
 use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
+use crate::resample::{catmull_rom, resampled_len};
 use crate::types::{DacCapabilities, DacType, LaserPoint};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
@@ -717,24 +718,21 @@ fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome
     WriteOutcome::Written
 }
 
-/// Calculate the number of output samples when resampling `input_len` points
-/// from `from_rate` to `to_rate`.
-fn resampled_len(input_len: usize, from_rate: u32, to_rate: u32) -> usize {
-    if input_len == 0 {
-        return 0;
-    }
-    (input_len as u64 * to_rate as u64).div_ceil(from_rate as u64) as usize
-}
-
-/// Linearly interpolate all fields of two `StreamPoint`s.
-fn lerp_stream_point(a: &StreamPoint, b: &StreamPoint, t: f32) -> StreamPoint {
+/// Interpolate all fields of four `StreamPoint`s using 4-point Catmull-Rom.
+fn catmull_rom_stream_point(
+    s0: &StreamPoint,
+    s1: &StreamPoint,
+    s2: &StreamPoint,
+    s3: &StreamPoint,
+    t: f32,
+) -> StreamPoint {
     StreamPoint {
-        x: a.x + (b.x - a.x) * t,
-        y: a.y + (b.y - a.y) * t,
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        i: a.i + (b.i - a.i) * t,
+        x: catmull_rom(s0.x, s1.x, s2.x, s3.x, t),
+        y: catmull_rom(s0.y, s1.y, s2.y, s3.y, t),
+        r: catmull_rom(s0.r, s1.r, s2.r, s3.r, t),
+        g: catmull_rom(s0.g, s1.g, s2.g, s3.g, t),
+        b: catmull_rom(s0.b, s1.b, s2.b, s3.b, t),
+        i: catmull_rom(s0.i, s1.i, s2.i, s3.i, t),
     }
 }
 
@@ -756,12 +754,16 @@ fn enqueue_resampled(runtime: &RuntimeState, points: &[LaserPoint], pps: u32) ->
         0.0
     };
 
+    let last = src.len() - 1;
     for i in 0..output_len {
         let src_pos = i as f32 * step;
-        let idx = (src_pos as usize).min(src.len() - 1);
-        let next = (idx + 1).min(src.len() - 1);
+        let idx = (src_pos as usize).min(last);
         let t = src_pos - idx as f32;
-        runtime.push_point(lerp_stream_point(&src[idx], &src[next], t));
+        let s0 = &src[idx.saturating_sub(1)];
+        let s1 = &src[idx];
+        let s2 = &src[(idx + 1).min(last)];
+        let s3 = &src[(idx + 2).min(last)];
+        runtime.push_point(catmull_rom_stream_point(s0, s1, s2, s3, t));
     }
 
     WriteOutcome::Written
@@ -1448,25 +1450,6 @@ mod tests {
         let _ = writer.join();
 
         assert!(elapsed < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn resampled_len_upsample() {
-        // 3 points at 30k → ceil(3 * 48000 / 30000) = ceil(4.8) = 5
-        assert_eq!(resampled_len(3, 30_000, 48_000), 5);
-    }
-
-    #[test]
-    fn resampled_len_downsample() {
-        // 5 points at 60k → ceil(5 * 48000 / 60000) = ceil(4.0) = 4
-        assert_eq!(resampled_len(5, 60_000, 48_000), 4);
-    }
-
-    #[test]
-    fn resampled_len_passthrough() {
-        assert_eq!(resampled_len(10, 48_000, 48_000), 10);
-        assert_eq!(resampled_len(1, 48_000, 48_000), 1);
-        assert_eq!(resampled_len(0, 48_000, 48_000), 0);
     }
 
     #[test]
