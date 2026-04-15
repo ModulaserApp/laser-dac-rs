@@ -83,7 +83,7 @@ impl OscilloscopeBackend {
             device_name,
             sample_rate,
             config: OscilloscopeConfig::default(),
-            caps: super::default_capabilities(),
+            caps: super::capabilities(sample_rate),
             runtime: None,
             audio_thread: None,
             sample_buffer: Vec::new(),
@@ -115,7 +115,7 @@ impl OscilloscopeBackend {
 
     /// Ring buffer capacity: ~100ms of audio at the sample rate.
     fn buffer_capacity(&self) -> usize {
-        (self.sample_rate as usize / 10).max(4096)
+        super::buffer_capacity(self.sample_rate)
     }
 
     /// Start the audio thread.

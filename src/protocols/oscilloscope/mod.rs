@@ -60,15 +60,25 @@ impl Default for OscilloscopeConfig {
     }
 }
 
-/// Returns default capabilities for an oscilloscope device.
+/// Returns capabilities for an oscilloscope device at the given sample rate.
 ///
 /// PPS is unconstrained because the backend resamples from the user's PPS
 /// to the audio device sample rate, just like the AVB backend.
-pub fn default_capabilities() -> DacCapabilities {
+///
+/// `max_points_per_chunk` is set to the ring-buffer capacity (~100ms of
+/// audio) so the scheduler can submit up to a full buffer's worth at once.
+/// Unlike laser DACs there is no hardware packet/frame limit — the ring
+/// buffer is the only constraint.
+pub fn capabilities(sample_rate: u32) -> DacCapabilities {
     DacCapabilities {
         pps_min: 1,
         pps_max: 100_000,
-        max_points_per_chunk: 4096,
+        max_points_per_chunk: buffer_capacity(sample_rate),
         output_model: OutputModel::NetworkFifo,
     }
+}
+
+/// Ring buffer capacity: ~100ms of audio at the given sample rate (min 4096).
+fn buffer_capacity(sample_rate: u32) -> usize {
+    (sample_rate as usize / 10).max(4096)
 }

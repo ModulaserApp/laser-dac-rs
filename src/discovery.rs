@@ -207,8 +207,8 @@ impl DiscoveredDevice {
     pub fn caps(&self) -> crate::types::DacCapabilities {
         match &self.inner {
             #[cfg(feature = "oscilloscope")]
-            DiscoveredDeviceInner::Oscilloscope { .. } => {
-                crate::protocols::oscilloscope::default_capabilities()
+            DiscoveredDeviceInner::Oscilloscope { info } => {
+                crate::protocols::oscilloscope::capabilities(info.sample_rate)
             }
             _ => crate::types::caps_for_dac_type(&self.dac_type),
         }
