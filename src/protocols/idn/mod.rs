@@ -28,8 +28,11 @@
 
 pub mod backend;
 pub mod dac;
+mod discovery;
 pub mod error;
 pub mod protocol;
+
+pub use discovery::IdnDiscoverer;
 
 use dac::{RelayInfo, ServerInfo, ServiceInfo};
 use log::debug;

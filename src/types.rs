@@ -261,6 +261,16 @@ impl EnabledDacTypes {
         self.types.iter().cloned()
     }
 
+    /// Returns a copy with the given DAC type removed.
+    ///
+    /// Useful in conjunction with `DacDiscovery::register` to replace a
+    /// built-in discoverer with a custom-configured one (e.g., IDN with
+    /// specific scan addresses for testing).
+    pub fn without(mut self, dac_type: DacType) -> Self {
+        self.types.remove(&dac_type);
+        self
+    }
+
     /// Returns true if no DAC types are enabled.
     pub fn is_empty(&self) -> bool {
         self.types.is_empty()

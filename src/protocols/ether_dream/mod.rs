@@ -32,12 +32,14 @@
 
 pub mod backend;
 pub mod dac;
+mod discovery;
 pub mod protocol;
 
 pub use self::protocol::{
     DacBroadcast, DacPoint, DacResponse, DacStatus, ReadBytes, SizeBytes, WriteBytes,
 };
 pub use backend::EtherDreamBackend;
+pub use discovery::EtherDreamDiscoverer;
 
 use crate::types::{DacCapabilities, OutputModel};
 use std::{io, net};

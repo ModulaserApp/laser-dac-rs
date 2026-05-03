@@ -31,10 +31,12 @@
 //! ```
 
 pub mod backend;
+mod discovery;
 mod frame;
 mod native;
 
 pub use backend::HeliosBackend;
+pub use discovery::HeliosDiscoverer;
 pub use frame::*;
 pub use native::*;
 

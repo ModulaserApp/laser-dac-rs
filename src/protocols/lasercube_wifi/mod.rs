@@ -31,10 +31,12 @@
 
 pub mod backend;
 pub mod dac;
+mod discovery;
 pub mod error;
 pub mod protocol;
 
 pub use backend::LasercubeWifiBackend;
+pub use discovery::LasercubeWifiDiscoverer;
 
 use crate::types::{DacCapabilities, OutputModel};
 use dac::buffer_estimator::LATENCY_POINT_ADJUSTMENT;

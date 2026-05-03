@@ -35,7 +35,7 @@ mod backend;
 mod discovery;
 
 pub use backend::OscilloscopeBackend;
-pub use discovery::{OscilloscopeDeviceInfo, OscilloscopeDiscovery};
+pub use discovery::{OscilloscopeDeviceInfo, OscilloscopeDiscoverer};
 
 use crate::types::{DacCapabilities, OutputModel};
 
