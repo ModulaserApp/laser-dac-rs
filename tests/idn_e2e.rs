@@ -33,14 +33,13 @@ fn connect_dac(
     discovery: &mut laser_dac::DacDiscovery,
     device: laser_dac::DiscoveredDevice,
 ) -> Dac {
-    let info = device.info();
-    let dac_type = device.dac_type();
+    let info = device.info().clone();
     let backend = discovery.connect(device).expect("Should connect");
     let dac_info = DacInfo::new(
-        info.stable_id(),
-        info.name(),
-        dac_type.clone(),
-        caps_for_dac_type(&dac_type),
+        info.stable_id().to_string(),
+        info.name().to_string(),
+        info.dac_type.clone(),
+        caps_for_dac_type(&info.dac_type),
     );
     Dac::new(dac_info, backend)
 }
@@ -260,7 +259,7 @@ fn test_scanner_direct() {
 
 #[test]
 fn test_idn_discovery_direct() {
-    use laser_dac::discovery::IdnDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
 
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
@@ -268,7 +267,7 @@ fn test_idn_discovery_direct() {
 
     thread::sleep(Duration::from_millis(50));
 
-    let mut idn_discovery = IdnDiscovery::new();
+    let mut idn_discovery = IdnDiscoverer::new();
     let devices = idn_discovery.scan_address(server_addr);
 
     eprintln!("Found {} devices", devices.len());
@@ -278,13 +277,14 @@ fn test_idn_discovery_direct() {
 
     assert!(
         !devices.is_empty(),
-        "IdnDiscovery should find the mock server"
+        "IdnDiscoverer should find the mock server"
     );
 }
 
 #[test]
 fn test_discover_and_connect() {
     use laser_dac::discovery::DacDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
 
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
@@ -294,8 +294,10 @@ fn test_discover_and_connect() {
     thread::sleep(Duration::from_millis(50));
 
     eprintln!("Creating discovery...");
-    let mut discovery = DacDiscovery::new(idn_only());
-    discovery.set_idn_scan_addresses(vec![server_addr]);
+    let mut discovery = DacDiscovery::new(idn_only().without(DacType::Idn));
+    discovery.register(Box::new(IdnDiscoverer::with_scan_addresses(vec![
+        server_addr,
+    ])));
 
     eprintln!("Waiting for discovery...");
     for i in 0..10 {
@@ -324,6 +326,7 @@ fn test_discover_and_connect() {
 #[test]
 fn test_send_frame() {
     use laser_dac::discovery::DacDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let handle = test_server("TestDAC").unwrap();
@@ -331,8 +334,10 @@ fn test_send_frame() {
 
     thread::sleep(Duration::from_millis(50));
 
-    let mut discovery = DacDiscovery::new(idn_only());
-    discovery.set_idn_scan_addresses(vec![server_addr]);
+    let mut discovery = DacDiscovery::new(idn_only().without(DacType::Idn));
+    discovery.register(Box::new(IdnDiscoverer::with_scan_addresses(vec![
+        server_addr,
+    ])));
 
     let device = discovery
         .scan()
@@ -383,6 +388,7 @@ fn test_send_frame() {
 #[test]
 fn test_connection_loss_detection() {
     use laser_dac::discovery::DacDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let handle = test_server("TestDAC").unwrap();
@@ -390,8 +396,10 @@ fn test_connection_loss_detection() {
 
     thread::sleep(Duration::from_millis(50));
 
-    let mut discovery = DacDiscovery::new(idn_only());
-    discovery.set_idn_scan_addresses(vec![server_addr]);
+    let mut discovery = DacDiscovery::new(idn_only().without(DacType::Idn));
+    discovery.register(Box::new(IdnDiscoverer::with_scan_addresses(vec![
+        server_addr,
+    ])));
 
     let device = discovery
         .scan()
@@ -452,14 +460,17 @@ fn test_connection_loss_detection() {
 #[test]
 fn test_full_lifecycle() {
     use laser_dac::discovery::DacDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
 
     let handle = test_server("TestDAC").unwrap();
     let server_addr = handle.addr();
 
     thread::sleep(Duration::from_millis(50));
 
-    let mut discovery = DacDiscovery::new(idn_only());
-    discovery.set_idn_scan_addresses(vec![server_addr]);
+    let mut discovery = DacDiscovery::new(idn_only().without(DacType::Idn));
+    discovery.register(Box::new(IdnDiscoverer::with_scan_addresses(vec![
+        server_addr,
+    ])));
 
     // Phase 1: Initial connection
     let device = discovery
@@ -712,7 +723,7 @@ fn test_parsed_relays_and_services() {
 
 #[test]
 fn test_discovered_device_info_metadata() {
-    use laser_dac::discovery::IdnDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
     use std::net::IpAddr;
 
     let handle = TestServerBuilder::new("DiscoveryTest")
@@ -724,7 +735,7 @@ fn test_discovered_device_info_metadata() {
     let server_addr = handle.addr();
     thread::sleep(Duration::from_millis(50));
 
-    let mut idn_discovery = IdnDiscovery::new();
+    let mut idn_discovery = IdnDiscoverer::new();
     let devices = idn_discovery.scan_address(server_addr);
 
     assert_eq!(devices.len(), 1, "Should discover one device");
@@ -764,7 +775,7 @@ fn test_discovered_device_info_metadata() {
 
 #[test]
 fn test_server_never_responds_timeout() {
-    use laser_dac::discovery::IdnDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
     use laser_dac::protocols::idn::ServerScanner;
 
     // Create a silent mock server that receives but never responds
@@ -795,22 +806,22 @@ fn test_server_never_responds_timeout() {
 
     // Test 2: IdnDiscovery should also return empty results
     handle.clear_received_packets();
-    let mut idn_discovery = IdnDiscovery::new();
+    let mut idn_discovery = IdnDiscoverer::new();
     let devices = idn_discovery.scan_address(server_addr);
 
     assert!(
         devices.is_empty(),
-        "IdnDiscovery should return empty for silent server"
+        "IdnDiscoverer should return empty for silent server"
     );
     assert!(
         handle.received_packet_count() > 0,
-        "Silent server should receive IdnDiscovery packets"
+        "Silent server should receive IdnDiscoverer packets"
     );
 }
 
 #[test]
 fn test_connection_to_nonexistent_server() {
-    use laser_dac::discovery::IdnDiscovery;
+    use laser_dac::protocols::idn::IdnDiscoverer;
     use laser_dac::protocols::idn::ServerScanner;
 
     // Use a high port that definitely has no server listening
@@ -828,12 +839,12 @@ fn test_connection_to_nonexistent_server() {
     );
 
     // Test 2: IdnDiscovery should also gracefully handle no server
-    let mut idn_discovery = IdnDiscovery::new();
+    let mut idn_discovery = IdnDiscoverer::new();
     let discovered = idn_discovery.scan_address(nonexistent_addr);
 
     assert!(
         discovered.is_empty(),
-        "IdnDiscovery should return empty for nonexistent server"
+        "IdnDiscoverer should return empty for nonexistent server"
     );
 }
 

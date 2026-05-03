@@ -1698,19 +1698,27 @@ struct FilterReconnectFrameSwapDiscoverer {
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
 }
 
-impl crate::discovery::ExternalDiscoverer for FilterReconnectFrameSwapDiscoverer {
+impl crate::discovery::Discoverer for FilterReconnectFrameSwapDiscoverer {
     fn dac_type(&self) -> crate::types::DacType {
         crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
     }
 
-    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
-        let mut device = crate::discovery::ExternalDevice::new(());
-        device.ip_address = Some("10.0.0.77".parse().unwrap());
-        device.hardware_name = Some("Filter Reconnect FrameSwap".into());
-        vec![device]
+    fn prefix(&self) -> &str {
+        "filterreconnectframeswap"
     }
 
-    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            crate::types::DacType::Custom("FilterReconnectFrameSwap".into()),
+            "filterreconnectframeswap:10.0.0.77",
+            "Filter Reconnect FrameSwap",
+        )
+        .with_ip("10.0.0.77".parse().unwrap())
+        .with_hardware_name("Filter Reconnect FrameSwap");
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
+    }
+
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
         Ok(BackendKind::FrameSwap(Box::new(
             ReconnectFrameSwapBackend::new(self.writes.clone()),
         )))
@@ -1722,24 +1730,32 @@ struct DelayedReconnectFrameSwapDiscoverer {
     empty_scans_remaining: Arc<AtomicUsize>,
 }
 
-impl crate::discovery::ExternalDiscoverer for DelayedReconnectFrameSwapDiscoverer {
+impl crate::discovery::Discoverer for DelayedReconnectFrameSwapDiscoverer {
     fn dac_type(&self) -> crate::types::DacType {
         crate::types::DacType::Custom("DelayedReconnectFrameSwap".into())
     }
 
-    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
+    fn prefix(&self) -> &str {
+        "delayedreconnectframeswap"
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
         if self.empty_scans_remaining.load(Ordering::SeqCst) > 0 {
             self.empty_scans_remaining.fetch_sub(1, Ordering::SeqCst);
             return vec![];
         }
 
-        let mut device = crate::discovery::ExternalDevice::new(());
-        device.ip_address = Some("10.0.0.88".parse().unwrap());
-        device.hardware_name = Some("Delayed Reconnect FrameSwap".into());
-        vec![device]
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            crate::types::DacType::Custom("DelayedReconnectFrameSwap".into()),
+            "delayedreconnectframeswap:10.0.0.88",
+            "Delayed Reconnect FrameSwap",
+        )
+        .with_ip("10.0.0.88".parse().unwrap())
+        .with_hardware_name("Delayed Reconnect FrameSwap");
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
     }
 
-    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
         Ok(BackendKind::FrameSwap(Box::new(
             ReconnectFrameSwapBackend::new(self.writes.clone()),
         )))

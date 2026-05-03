@@ -1,156 +1,78 @@
 //! DAC device discovery.
 //!
-//! Provides a DAC interface for discovering and connecting to laser DAC devices
-//! from multiple manufacturers.
+//! Defines the [`Discoverer`] trait — the seam where each protocol plugs in
+//! its own scanning, identity formatting, and connect-time setup — plus the
+//! [`DacDiscovery`] registry that aggregates them.
 
 use std::any::Any;
-#[cfg(feature = "lasercube-wifi")]
-use std::io;
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
-#[cfg(any(feature = "ether-dream", feature = "idn", feature = "lasercube-wifi"))]
-use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result};
-use crate::types::{DacType, EnabledDacTypes};
+use crate::types::{caps_for_dac_type, DacCapabilities, DacType, EnabledDacTypes};
 
 // =============================================================================
-// External Discoverer Support
+// Discoverer trait
 // =============================================================================
 
-/// Trait for external DAC discovery implementations.
+/// A protocol-owned object that locates DACs of one [`DacType`] and produces
+/// [`DiscoveredDevice`]s for them.
 ///
-/// External crates implement this to integrate their DAC discovery
-/// with the unified `DacDiscovery` system.
+/// Built-in and external (downstream) protocols both implement the same trait.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use laser_dac::{
-///     DacDiscovery, ExternalDiscoverer, ExternalDevice,
-///     BackendKind, DacType, EnabledDacTypes, Result,
+///     BackendKind, DacCapabilities, DacType, DiscoveredDevice,
+///     DiscoveredDeviceInfo, Discoverer, Result,
 /// };
 /// use std::any::Any;
 ///
 /// struct MyClosedDacDiscoverer { /* ... */ }
 ///
-/// impl ExternalDiscoverer for MyClosedDacDiscoverer {
+/// struct MyConnectData { /* ... */ }
+///
+/// impl Discoverer for MyClosedDacDiscoverer {
 ///     fn dac_type(&self) -> DacType {
 ///         DacType::Custom("MyClosedDAC".into())
 ///     }
 ///
-///     fn scan(&mut self) -> Vec<ExternalDevice> {
-///         // Your discovery logic here
+///     fn prefix(&self) -> &str { "myclosed" }
+///
+///     fn scan(&mut self) -> Vec<DiscoveredDevice> {
+///         // build DiscoveredDevice with stable_id and caps populated
 ///         vec![]
 ///     }
 ///
-///     fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind> {
-///         // Your connection logic here
+///     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
 ///         todo!()
 ///     }
 /// }
 /// ```
-pub trait ExternalDiscoverer: Send {
-    /// Returns the DAC type this discoverer handles.
+pub trait Discoverer: Send {
+    /// The DAC type this discoverer handles.
     fn dac_type(&self) -> DacType;
 
-    /// Scan for devices. Called during `DacDiscovery::scan()`.
-    fn scan(&mut self) -> Vec<ExternalDevice>;
-
-    /// Connect to a previously discovered device.
-    /// The `opaque_data` is the same data returned in `ExternalDevice`.
-    fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind>;
-}
-
-/// Device info returned by external discoverers.
-///
-/// This struct contains the common fields that `DacDiscovery` uses to create
-/// a `DiscoveredDevice`. The `opaque_data` field stores protocol-specific
-/// connection information that will be passed back to `connect()`.
-pub struct ExternalDevice {
-    /// IP address for network devices.
-    pub ip_address: Option<IpAddr>,
-    /// MAC address if available.
-    pub mac_address: Option<[u8; 6]>,
-    /// Hostname if available.
-    pub hostname: Option<String>,
-    /// USB address (e.g., "bus:device") for USB devices.
-    pub usb_address: Option<String>,
-    /// Hardware/device name if available.
-    pub hardware_name: Option<String>,
-    /// Disambiguation index when multiple identical devices are present.
-    pub device_index: Option<u16>,
-    /// Opaque data passed back to `connect()`.
-    /// Store whatever your protocol needs to establish a connection.
-    pub opaque_data: Box<dyn Any + Send>,
-}
-
-impl ExternalDevice {
-    /// Create a new external device with the given opaque data.
+    /// Stable-id prefix this discoverer's devices use, e.g. `"etherdream"`.
     ///
-    /// All other fields default to `None`.
-    pub fn new<T: Any + Send + 'static>(opaque_data: T) -> Self {
-        Self {
-            ip_address: None,
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-            opaque_data: Box::new(opaque_data),
-        }
-    }
+    /// Used by `open_by_id` to narrow scans to a single discoverer when the
+    /// caller's id has a known prefix. Must be unique across registered
+    /// discoverers; [`DacDiscovery::register`] panics on duplicates.
+    fn prefix(&self) -> &str;
+
+    /// Locate reachable DACs on the system / network.
+    ///
+    /// Each returned [`DiscoveredDevice`] must have its `stable_id` and `caps`
+    /// populated by the implementer.
+    fn scan(&mut self) -> Vec<DiscoveredDevice>;
+
+    /// Open a connection to a previously-scanned device.
+    ///
+    /// `opaque` is the connect-time data the discoverer attached to the
+    /// `DiscoveredDevice`. Implementations downcast it to their internal type.
+    fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind>;
 }
-
-// Feature-gated imports from internal protocol modules
-
-#[cfg(feature = "helios")]
-use crate::backend::HeliosBackend;
-#[cfg(feature = "helios")]
-use crate::protocols::helios::{HeliosDac, HeliosDacController};
-
-#[cfg(feature = "ether-dream")]
-use crate::backend::EtherDreamBackend;
-#[cfg(feature = "ether-dream")]
-use crate::protocols::ether_dream::protocol::DacBroadcast as EtherDreamBroadcast;
-#[cfg(feature = "ether-dream")]
-use crate::protocols::ether_dream::recv_dac_broadcasts;
-
-#[cfg(feature = "idn")]
-use crate::backend::IdnBackend;
-#[cfg(feature = "idn")]
-use crate::protocols::idn::dac::ServerInfo as IdnServerInfo;
-#[cfg(feature = "idn")]
-use crate::protocols::idn::dac::ServiceInfo as IdnServiceInfo;
-#[cfg(feature = "idn")]
-use crate::protocols::idn::scan_for_servers;
-#[cfg(all(feature = "idn", feature = "testutils"))]
-use crate::protocols::idn::ServerScanner;
-#[cfg(all(feature = "idn", feature = "testutils"))]
-use std::net::SocketAddr;
-
-#[cfg(feature = "lasercube-wifi")]
-use crate::backend::LasercubeWifiBackend;
-#[cfg(feature = "lasercube-wifi")]
-use crate::protocols::lasercube_wifi::dac::Addressed as LasercubeAddressed;
-#[cfg(feature = "lasercube-wifi")]
-use crate::protocols::lasercube_wifi::discover_dacs as discover_lasercube_wifi;
-#[cfg(feature = "lasercube-wifi")]
-use crate::protocols::lasercube_wifi::protocol::DeviceInfo as LasercubeDeviceInfo;
-
-#[cfg(feature = "lasercube-usb")]
-use crate::backend::LasercubeUsbBackend;
-#[cfg(feature = "lasercube-usb")]
-use crate::protocols::lasercube_usb::rusb;
-#[cfg(feature = "lasercube-usb")]
-use crate::protocols::lasercube_usb::DacController as LasercubeUsbController;
-
-#[cfg(feature = "oscilloscope")]
-use crate::protocols::oscilloscope::{OscilloscopeDeviceInfo, OscilloscopeDiscovery};
-
-#[cfg(feature = "avb")]
-use crate::backend::AvbBackend;
-#[cfg(feature = "avb")]
-use crate::protocols::avb::{discover_device_selectors as discover_avb_selectors, AvbSelector};
 
 // =============================================================================
 // DiscoveredDevice
@@ -158,196 +80,170 @@ use crate::protocols::avb::{discover_device_selectors as discover_avb_selectors,
 
 /// A discovered but not-yet-connected DAC device.
 ///
-/// Use `DacDiscovery::connect()` to establish a connection and get a backend.
+/// Use [`DacDiscovery::connect`] to establish a connection and get a backend.
 pub struct DiscoveredDevice {
-    dac_type: DacType,
-    ip_address: Option<IpAddr>,
-    mac_address: Option<[u8; 6]>,
-    hostname: Option<String>,
-    usb_address: Option<String>,
-    hardware_name: Option<String>,
-    device_index: Option<u16>,
-    inner: DiscoveredDeviceInner,
+    info: DiscoveredDeviceInfo,
+    caps: DacCapabilities,
+    discoverer_index: Option<usize>,
+    connect_data: Box<dyn Any + Send>,
 }
 
 impl DiscoveredDevice {
-    /// Create a new discovered device with the given type and inner data.
-    ///
-    /// All identification fields default to `None`.
-    fn new(dac_type: DacType, inner: DiscoveredDeviceInner) -> Self {
+    /// Build a device with capabilities derived from `info.dac_type` via
+    /// [`caps_for_dac_type`]. Use [`with_caps`](Self::with_caps) when caps
+    /// must be authored from runtime data (e.g., oscilloscope sample rate).
+    pub fn new(info: DiscoveredDeviceInfo, connect_data: Box<dyn Any + Send>) -> Self {
+        let caps = caps_for_dac_type(&info.dac_type);
+        Self {
+            info,
+            caps,
+            discoverer_index: None,
+            connect_data,
+        }
+    }
+
+    /// Override the auto-derived capabilities. Chainable from [`new`](Self::new).
+    pub fn with_caps(mut self, caps: DacCapabilities) -> Self {
+        self.caps = caps;
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.info.name
+    }
+
+    pub fn dac_type(&self) -> &DacType {
+        &self.info.dac_type
+    }
+
+    pub fn caps(&self) -> &DacCapabilities {
+        &self.caps
+    }
+
+    pub fn info(&self) -> &DiscoveredDeviceInfo {
+        &self.info
+    }
+}
+
+/// Lightweight info about a discovered device.
+///
+/// Cloneable and used for filtering, logging, and display without consuming
+/// the original [`DiscoveredDevice`]. Equality and hashing consider only
+/// [`stable_id`](Self::stable_id) — IP/MAC/hostname drift between scans
+/// does not change identity.
+#[derive(Debug, Clone)]
+pub struct DiscoveredDeviceInfo {
+    /// The DAC type.
+    pub dac_type: DacType,
+    /// Canonical, namespaced identifier set by the producing [`Discoverer`].
+    pub stable_id: String,
+    /// Human-readable name set by the producing [`Discoverer`].
+    pub name: String,
+    /// IP address for network devices.
+    pub ip_address: Option<IpAddr>,
+    /// MAC address (Ether Dream).
+    pub mac_address: Option<[u8; 6]>,
+    /// Hostname (IDN).
+    pub hostname: Option<String>,
+    /// USB bus:address (LaserCube USB).
+    pub usb_address: Option<String>,
+    /// Hardware/serial name (Helios, LaserCube USB, AVB).
+    pub hardware_name: Option<String>,
+    /// Disambiguation index when multiple identical devices are present (AVB).
+    pub device_index: Option<u16>,
+}
+
+impl DiscoveredDeviceInfo {
+    /// Build a minimal info with all identifier hints set to `None`.
+    /// Use the `with_*` chainable setters to populate the protocol-relevant
+    /// fields.
+    pub fn new(dac_type: DacType, stable_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             dac_type,
+            stable_id: stable_id.into(),
+            name: name.into(),
             ip_address: None,
             mac_address: None,
             hostname: None,
             usb_address: None,
             hardware_name: None,
             device_index: None,
-            inner,
         }
     }
 
-    /// Returns the device name (unique identifier).
-    /// For network devices: IP address.
-    /// For USB devices: hardware name or bus:address.
-    pub fn name(&self) -> String {
-        self.info().name()
+    pub fn with_ip(mut self, ip: IpAddr) -> Self {
+        self.ip_address = Some(ip);
+        self
     }
 
-    /// Returns the DAC type.
-    pub fn dac_type(&self) -> DacType {
-        self.dac_type.clone()
+    pub fn with_mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac_address = Some(mac);
+        self
     }
 
-    /// Returns device-specific capabilities.
-    ///
-    /// For most DAC types this delegates to `caps_for_dac_type`. For audio
-    /// devices, the capabilities are derived from the actual sample rate
-    /// discovered during scanning (since audio caps depend on the device).
-    pub fn caps(&self) -> crate::types::DacCapabilities {
-        match &self.inner {
-            #[cfg(feature = "oscilloscope")]
-            DiscoveredDeviceInner::Oscilloscope { info } => {
-                crate::protocols::oscilloscope::capabilities(info.sample_rate)
-            }
-            _ => crate::types::caps_for_dac_type(&self.dac_type),
-        }
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
+        self
     }
 
-    /// Returns a lightweight, cloneable info struct for this device.
-    pub fn info(&self) -> DiscoveredDeviceInfo {
-        DiscoveredDeviceInfo {
-            dac_type: self.dac_type.clone(),
-            ip_address: self.ip_address,
-            mac_address: self.mac_address,
-            hostname: self.hostname.clone(),
-            usb_address: self.usb_address.clone(),
-            hardware_name: self.hardware_name.clone(),
-            device_index: self.device_index,
-        }
+    pub fn with_usb_address(mut self, addr: impl Into<String>) -> Self {
+        self.usb_address = Some(addr.into());
+        self
+    }
+
+    pub fn with_hardware_name(mut self, name: impl Into<String>) -> Self {
+        self.hardware_name = Some(name.into());
+        self
+    }
+
+    pub fn with_device_index(mut self, index: u16) -> Self {
+        self.device_index = Some(index);
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The id is prefixed with the protocol slug (`etherdream:`, `idn:`,
+    /// `helios:`, …) and is stable across IP/USB re-enumerations where the
+    /// protocol can compute one.
+    pub fn stable_id(&self) -> &str {
+        &self.stable_id
     }
 }
 
-/// Lightweight info about a discovered device.
+impl PartialEq for DiscoveredDeviceInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.stable_id == other.stable_id
+    }
+}
+
+impl Eq for DiscoveredDeviceInfo {}
+
+impl Hash for DiscoveredDeviceInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.stable_id.hash(state);
+    }
+}
+
+/// Downcast the connect-data box passed to [`Discoverer::connect`] back to
+/// the producing protocol's concrete type. Returns `Error::invalid_config`
+/// with `protocol` interpolated when the type doesn't match.
+pub fn downcast_connect_data<T: 'static>(
+    opaque: Box<dyn Any + Send>,
+    protocol: &str,
+) -> Result<Box<T>> {
+    opaque
+        .downcast::<T>()
+        .map_err(|_| Error::invalid_config(format!("Invalid connect data for {}", protocol)))
+}
+
+/// Slug a free-form device name into an ASCII-safe id segment.
 ///
-/// This struct is Clone-able and can be used for filtering and reporting
-/// without consuming the original `DiscoveredDevice`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DiscoveredDeviceInfo {
-    /// The DAC type.
-    pub dac_type: DacType,
-    /// IP address for network devices, None for USB devices.
-    pub ip_address: Option<IpAddr>,
-    /// MAC address (Ether Dream only).
-    pub mac_address: Option<[u8; 6]>,
-    /// Hostname (IDN only).
-    pub hostname: Option<String>,
-    /// USB bus:address (LaserCube USB only).
-    pub usb_address: Option<String>,
-    /// Device name from hardware (Helios only).
-    pub hardware_name: Option<String>,
-    /// Disambiguation index when multiple identical devices are present.
-    pub device_index: Option<u16>,
-}
-
-impl DiscoveredDeviceInfo {
-    /// Returns the device name (human-readable).
-    /// For network devices: IP address.
-    /// For USB devices: hardware name or bus:address.
-    pub fn name(&self) -> String {
-        self.ip_address
-            .map(|ip| ip.to_string())
-            .or_else(|| self.hardware_name.clone())
-            .or_else(|| self.usb_address.clone())
-            .unwrap_or_else(|| "Unknown".into())
-    }
-
-    /// Returns a stable, namespaced identifier for the device.
-    ///
-    /// The ID is prefixed with the protocol name to avoid cross-protocol collisions:
-    /// - Ether Dream: `etherdream:<mac>` (survives IP changes)
-    /// - IDN: `idn:<hostname>` (mDNS name, survives IP changes)
-    /// - Helios: `helios:<hardware_name>` (USB serial if available)
-    /// - LaserCube USB: `lasercube-usb:<serial|bus:addr>`
-    /// - LaserCube WiFi: `lasercube-wifi:<ip>` (best available)
-    /// - AVB: `avb:<device-slug>:<n>` (slugged audio device name + duplicate index)
-    ///
-    /// This is used for device tracking/deduplication.
-    pub fn stable_id(&self) -> String {
-        match &self.dac_type {
-            DacType::EtherDream => {
-                if let Some(mac) = self.mac_address {
-                    return format!(
-                        "etherdream:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-                    );
-                }
-                if let Some(ip) = self.ip_address {
-                    return format!("etherdream:{}", ip);
-                }
-            }
-            DacType::Idn => {
-                if let Some(ref hostname) = self.hostname {
-                    return format!("idn:{}", hostname);
-                }
-                if let Some(ip) = self.ip_address {
-                    return format!("idn:{}", ip);
-                }
-            }
-            DacType::Helios => {
-                if let Some(ref hw_name) = self.hardware_name {
-                    return format!("helios:{}", hw_name);
-                }
-                if let Some(ref usb_addr) = self.usb_address {
-                    return format!("helios:{}", usb_addr);
-                }
-            }
-            DacType::LasercubeUsb => {
-                if let Some(ref hw_name) = self.hardware_name {
-                    return format!("lasercube-usb:{}", hw_name);
-                }
-                if let Some(ref usb_addr) = self.usb_address {
-                    return format!("lasercube-usb:{}", usb_addr);
-                }
-            }
-            DacType::LasercubeWifi => {
-                if let Some(ip) = self.ip_address {
-                    return format!("lasercube-wifi:{}", ip);
-                }
-            }
-            #[cfg(feature = "oscilloscope")]
-            DacType::Oscilloscope => {
-                if let Some(ref hw_name) = self.hardware_name {
-                    let slug = slugify_device_id(hw_name);
-                    return format!("oscilloscope:{}", slug);
-                }
-            }
-            DacType::Avb => {
-                if let Some(ref hw_name) = self.hardware_name {
-                    let slug = slugify_device_id(hw_name);
-                    if let Some(index) = self.device_index {
-                        return format!("avb:{}:{}", slug, index);
-                    }
-                    return format!("avb:{}", slug);
-                }
-            }
-            DacType::Custom(name) => {
-                // For custom types, use the custom name as prefix
-                if let Some(ip) = self.ip_address {
-                    return format!("{}:{}", name.to_lowercase(), ip);
-                }
-                if let Some(ref hw_name) = self.hardware_name {
-                    return format!("{}:{}", name.to_lowercase(), hw_name);
-                }
-            }
-        }
-
-        // Fallback for unknown configurations
-        format!("unknown:{:?}", self.dac_type)
-    }
-}
-
-fn slugify_device_id(name: &str) -> String {
+/// Used by protocols whose stable id derives from a human-readable device
+/// name (AVB, Oscilloscope).
+pub fn slugify_device_id(name: &str) -> String {
     let normalized = name
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -370,690 +266,174 @@ fn slugify_device_id(name: &str) -> String {
     slug.trim_matches('-').to_string()
 }
 
-/// Internal data needed for connection (opaque to callers).
-enum DiscoveredDeviceInner {
+// =============================================================================
+// DacDiscovery — registry
+// =============================================================================
+
+#[cfg(any(
+    feature = "helios",
+    feature = "ether-dream",
+    feature = "idn",
+    feature = "lasercube-wifi",
+    feature = "lasercube-usb",
+    feature = "oscilloscope",
+    feature = "avb",
+))]
+fn register_builtins(this: &mut DacDiscovery, enabled: &EnabledDacTypes) {
     #[cfg(feature = "helios")]
-    Helios(HeliosDac),
+    if enabled.is_enabled(DacType::Helios) {
+        if let Some(d) = crate::protocols::helios::HeliosDiscoverer::new() {
+            this.register(Box::new(d));
+        }
+    }
     #[cfg(feature = "ether-dream")]
-    EtherDream {
-        broadcast: EtherDreamBroadcast,
-        ip: IpAddr,
-    },
+    if enabled.is_enabled(DacType::EtherDream) {
+        this.register(Box::new(
+            crate::protocols::ether_dream::EtherDreamDiscoverer::new(),
+        ));
+    }
     #[cfg(feature = "idn")]
-    Idn {
-        server: IdnServerInfo,
-        service: IdnServiceInfo,
-    },
+    if enabled.is_enabled(DacType::Idn) {
+        this.register(Box::new(crate::protocols::idn::IdnDiscoverer::new()));
+    }
     #[cfg(feature = "lasercube-wifi")]
-    LasercubeWifi {
-        info: LasercubeDeviceInfo,
-        source_addr: std::net::SocketAddr,
-    },
+    if enabled.is_enabled(DacType::LasercubeWifi) {
+        this.register(Box::new(
+            crate::protocols::lasercube_wifi::LasercubeWifiDiscoverer::new(),
+        ));
+    }
     #[cfg(feature = "lasercube-usb")]
-    LasercubeUsb(rusb::Device<rusb::Context>),
+    if enabled.is_enabled(DacType::LasercubeUsb) {
+        if let Some(d) = crate::protocols::lasercube_usb::LasercubeUsbDiscoverer::new() {
+            this.register(Box::new(d));
+        }
+    }
     #[cfg(feature = "oscilloscope")]
-    Oscilloscope { info: OscilloscopeDeviceInfo },
+    if enabled.is_enabled(DacType::Oscilloscope) {
+        this.register(Box::new(
+            crate::protocols::oscilloscope::OscilloscopeDiscoverer::new(),
+        ));
+    }
     #[cfg(feature = "avb")]
-    Avb(AvbSelector),
-    /// External discoverer device.
-    External {
-        /// Index into `DacDiscovery.external` for the discoverer that found this device.
-        discoverer_index: usize,
-        /// Opaque data passed back to `ExternalDiscoverer::connect()`.
-        opaque_data: Box<dyn Any + Send>,
-    },
-    /// Placeholder variant to ensure enum is not empty when no features are enabled
-    #[cfg(not(any(
-        feature = "helios",
-        feature = "ether-dream",
-        feature = "idn",
-        feature = "lasercube-wifi",
-        feature = "lasercube-usb",
-        feature = "oscilloscope",
-        feature = "avb"
-    )))]
-    _Placeholder,
-}
-
-// =============================================================================
-// Per-DAC Discovery Implementations
-// =============================================================================
-
-/// Discovery for Helios USB DACs.
-#[cfg(feature = "helios")]
-pub struct HeliosDiscovery {
-    controller: HeliosDacController,
-}
-
-#[cfg(feature = "helios")]
-impl HeliosDiscovery {
-    /// Create a new Helios discovery instance.
-    ///
-    /// Returns None if the USB controller fails to initialize.
-    pub fn new() -> Option<Self> {
-        HeliosDacController::new()
-            .ok()
-            .map(|controller| Self { controller })
-    }
-
-    /// Scan for available Helios devices.
-    pub fn scan(&self) -> Vec<DiscoveredDevice> {
-        let Ok(devices) = self.controller.list_devices() else {
-            return Vec::new();
-        };
-
-        let mut discovered = Vec::new();
-        for device in devices {
-            // Only process idle (unopened) devices
-            let HeliosDac::Idle(_) = &device else {
-                continue;
-            };
-
-            // Try to open to get name
-            let opened = match device.open() {
-                Ok(o) => o,
-                Err(_) => continue,
-            };
-
-            let hardware_name = opened.name().unwrap_or_else(|_| "Unknown Helios".into());
-            let mut device =
-                DiscoveredDevice::new(DacType::Helios, DiscoveredDeviceInner::Helios(opened));
-            device.hardware_name = Some(hardware_name);
-            discovered.push(device);
-        }
-        discovered
-    }
-
-    /// Connect to a discovered Helios device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::Helios(dac) = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for Helios"));
-        };
-        Ok(BackendKind::FrameSwap(Box::new(HeliosBackend::from_dac(
-            dac,
-        ))))
+    if enabled.is_enabled(DacType::Avb) {
+        this.register(Box::new(crate::protocols::avb::AvbDiscoverer::new()));
     }
 }
 
-/// Discovery for Ether Dream network DACs.
-#[cfg(feature = "ether-dream")]
-pub struct EtherDreamDiscovery {
-    timeout: Duration,
-}
+#[cfg(not(any(
+    feature = "helios",
+    feature = "ether-dream",
+    feature = "idn",
+    feature = "lasercube-wifi",
+    feature = "lasercube-usb",
+    feature = "oscilloscope",
+    feature = "avb",
+)))]
+fn register_builtins(_this: &mut DacDiscovery, _enabled: &EnabledDacTypes) {}
 
-#[cfg(feature = "ether-dream")]
-impl EtherDreamDiscovery {
-    /// Create a new Ether Dream discovery instance.
-    pub fn new() -> Self {
-        Self {
-            // Ether Dream DACs broadcast once per second, so we need
-            // at least 1.5s to reliably catch a broadcast
-            timeout: Duration::from_millis(1500),
-        }
-    }
-
-    /// Scan for available Ether Dream devices.
-    pub fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let Ok(mut rx) = recv_dac_broadcasts() else {
-            return Vec::new();
-        };
-
-        if rx.set_timeout(Some(self.timeout)).is_err() {
-            return Vec::new();
-        }
-
-        let mut discovered = Vec::new();
-        let mut seen_macs = std::collections::HashSet::new();
-
-        // Only try 3 iterations max - we just need one device
-        for _ in 0..3 {
-            let (broadcast, source_addr) = match rx.next_broadcast() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-
-            let ip = source_addr.ip();
-
-            // Skip duplicate MACs - but keep polling to find other devices
-            let device_mac = broadcast.mac_address;
-            if seen_macs.contains(&device_mac) {
-                continue;
-            }
-            seen_macs.insert(device_mac);
-
-            let mut device = DiscoveredDevice::new(
-                DacType::EtherDream,
-                DiscoveredDeviceInner::EtherDream { broadcast, ip },
-            );
-            device.ip_address = Some(ip);
-            device.mac_address = Some(device_mac);
-            discovered.push(device);
-        }
-        discovered
-    }
-
-    /// Connect to a discovered Ether Dream device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::EtherDream { broadcast, ip } = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for EtherDream"));
-        };
-
-        let backend = EtherDreamBackend::new(broadcast, ip);
-        Ok(BackendKind::Fifo(Box::new(backend)))
-    }
-}
-
-#[cfg(feature = "ether-dream")]
-impl Default for EtherDreamDiscovery {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Discovery for IDN (ILDA Digital Network) DACs.
-#[cfg(feature = "idn")]
-pub struct IdnDiscovery {
-    scan_timeout: Duration,
-}
-
-#[cfg(feature = "idn")]
-impl IdnDiscovery {
-    /// Create a new IDN discovery instance.
-    pub fn new() -> Self {
-        Self {
-            scan_timeout: Duration::from_millis(500),
-        }
-    }
-
-    /// Scan for available IDN devices.
-    pub fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let Ok(servers) = scan_for_servers(self.scan_timeout) else {
-            return Vec::new();
-        };
-        Self::servers_to_devices(servers)
-    }
-
-    /// Connect to a discovered IDN device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::Idn { server, service } = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for IDN"));
-        };
-
-        Ok(BackendKind::Fifo(Box::new(IdnBackend::new(
-            server, service,
-        ))))
-    }
-
-    /// Scan a specific address for IDN devices.
-    ///
-    /// This is useful for testing with mock servers on localhost where
-    /// broadcast won't work.
-    ///
-    /// This method is only available with the `testutils` feature.
-    #[cfg(feature = "testutils")]
-    pub fn scan_address(&mut self, addr: SocketAddr) -> Vec<DiscoveredDevice> {
-        let Ok(mut scanner) = ServerScanner::new(0) else {
-            return Vec::new();
-        };
-
-        let Ok(servers) = scanner.scan_address(addr, self.scan_timeout) else {
-            return Vec::new();
-        };
-
-        Self::servers_to_devices(servers)
-    }
-
-    /// Convert discovered IDN servers into `DiscoveredDevice` entries.
-    fn servers_to_devices(servers: Vec<IdnServerInfo>) -> Vec<DiscoveredDevice> {
-        servers
-            .into_iter()
-            .filter_map(|server| {
-                let service = server.find_laser_projector().cloned()?;
-                let ip_address = server.addresses.first().map(|addr| addr.ip());
-                let hostname = server.hostname.clone();
-                let mut device = DiscoveredDevice::new(
-                    DacType::Idn,
-                    DiscoveredDeviceInner::Idn { server, service },
-                );
-                device.ip_address = ip_address;
-                device.hostname = Some(hostname);
-                Some(device)
-            })
-            .collect()
-    }
-}
-
-#[cfg(feature = "idn")]
-impl Default for IdnDiscovery {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Discovery for LaserCube WiFi DACs.
-#[cfg(feature = "lasercube-wifi")]
-pub struct LasercubeWifiDiscovery {
-    timeout: Duration,
-}
-
-#[cfg(feature = "lasercube-wifi")]
-impl LasercubeWifiDiscovery {
-    /// Create a new LaserCube WiFi discovery instance.
-    pub fn new() -> Self {
-        Self {
-            timeout: Duration::from_millis(100),
-        }
-    }
-
-    /// Scan for available LaserCube WiFi devices.
-    pub fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let Ok(mut discovery) = discover_lasercube_wifi() else {
-            return Vec::new();
-        };
-
-        if discovery.set_timeout(Some(self.timeout)).is_err() {
-            return Vec::new();
-        }
-
-        let mut discovered = Vec::new();
-        for _ in 0..10 {
-            let (device_info, source_addr) = match discovery.next_device() {
-                Ok(d) => d,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => break,
-                Err(_) => continue,
-            };
-
-            let ip_address = source_addr.ip();
-
-            let mut device = DiscoveredDevice::new(
-                DacType::LasercubeWifi,
-                DiscoveredDeviceInner::LasercubeWifi {
-                    info: device_info,
-                    source_addr,
-                },
-            );
-            device.ip_address = Some(ip_address);
-            discovered.push(device);
-        }
-        discovered
-    }
-
-    /// Connect to a discovered LaserCube WiFi device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::LasercubeWifi { info, source_addr } = device.inner else {
-            return Err(Error::invalid_config(
-                "Invalid device type for LaserCube WiFi",
-            ));
-        };
-
-        let addressed = LasercubeAddressed::from_discovery(&info, source_addr);
-        Ok(BackendKind::Fifo(Box::new(LasercubeWifiBackend::new(
-            addressed,
-        ))))
-    }
-}
-
-#[cfg(feature = "lasercube-wifi")]
-impl Default for LasercubeWifiDiscovery {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Discovery for LaserCube USB DACs (LaserDock).
-#[cfg(feature = "lasercube-usb")]
-pub struct LasercubeUsbDiscovery {
-    controller: LasercubeUsbController,
-}
-
-#[cfg(feature = "lasercube-usb")]
-impl LasercubeUsbDiscovery {
-    /// Create a new LaserCube USB discovery instance.
-    ///
-    /// Returns None if the USB controller fails to initialize.
-    pub fn new() -> Option<Self> {
-        LasercubeUsbController::new()
-            .ok()
-            .map(|controller| Self { controller })
-    }
-
-    /// Scan for available LaserCube USB devices.
-    pub fn scan(&self) -> Vec<DiscoveredDevice> {
-        let Ok(devices) = self.controller.list_devices() else {
-            return Vec::new();
-        };
-
-        let mut discovered = Vec::new();
-        for device in devices {
-            let usb_address = format!("{}:{}", device.bus_number(), device.address());
-            let serial = crate::protocols::lasercube_usb::get_serial_number(&device);
-
-            let mut discovered_device = DiscoveredDevice::new(
-                DacType::LasercubeUsb,
-                DiscoveredDeviceInner::LasercubeUsb(device),
-            );
-            discovered_device.usb_address = Some(usb_address);
-            discovered_device.hardware_name = serial;
-            discovered.push(discovered_device);
-        }
-        discovered
-    }
-
-    /// Connect to a discovered LaserCube USB device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::LasercubeUsb(usb_device) = device.inner else {
-            return Err(Error::invalid_config(
-                "Invalid device type for LaserCube USB",
-            ));
-        };
-
-        let backend = LasercubeUsbBackend::new(usb_device);
-        Ok(BackendKind::Fifo(Box::new(backend)))
-    }
-}
-
-/// Discovery for AVB audio-output DACs.
-#[cfg(feature = "avb")]
-pub struct AvbDiscovery;
-
-#[cfg(feature = "avb")]
-impl AvbDiscovery {
-    /// Create a new AVB discovery instance.
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Scan for available AVB output devices.
-    pub fn scan(&self) -> Vec<DiscoveredDevice> {
-        let Ok(selectors) = discover_avb_selectors() else {
-            return Vec::new();
-        };
-
-        selectors
-            .into_iter()
-            .map(|selector| {
-                let hardware_name = selector.name.clone();
-                let index = selector.duplicate_index;
-                let mut device =
-                    DiscoveredDevice::new(DacType::Avb, DiscoveredDeviceInner::Avb(selector));
-                device.hardware_name = Some(hardware_name);
-                device.device_index = Some(index);
-                device
-            })
-            .collect()
-    }
-
-    /// Connect to a discovered AVB output device.
-    pub fn connect(&self, device: DiscoveredDevice) -> Result<BackendKind> {
-        let DiscoveredDeviceInner::Avb(selector) = device.inner else {
-            return Err(Error::invalid_config("Invalid device type for AVB"));
-        };
-
-        Ok(BackendKind::Fifo(Box::new(AvbBackend::from_selector(
-            selector,
-        ))))
-    }
-}
-
-#[cfg(feature = "avb")]
-impl Default for AvbDiscovery {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =============================================================================
-// DAC Discovery
-// =============================================================================
-
-/// DAC discovery coordinator for all DAC types.
+/// DAC discovery coordinator.
 ///
-/// This provides a single entry point for discovering and connecting to any
-/// supported DAC hardware.
+/// Owns a registry of [`Discoverer`] implementations — both built-in and
+/// downstream-registered — and dispatches `scan`/`connect` across them.
+///
+/// Built-in discoverers are registered eagerly by [`DacDiscovery::new`] for
+/// each [`DacType`] enabled in the supplied [`EnabledDacTypes`]. To replace
+/// a built-in with a custom-configured one (e.g., IDN with specific scan
+/// addresses for testing), construct with that type masked out and then
+/// [`register`](Self::register) the custom discoverer.
 pub struct DacDiscovery {
-    #[cfg(feature = "helios")]
-    helios: Option<HeliosDiscovery>,
-    #[cfg(feature = "ether-dream")]
-    etherdream: EtherDreamDiscovery,
-    #[cfg(feature = "idn")]
-    idn: IdnDiscovery,
-    #[cfg(all(feature = "idn", feature = "testutils"))]
-    idn_scan_addresses: Vec<SocketAddr>,
-    #[cfg(feature = "lasercube-wifi")]
-    lasercube_wifi: LasercubeWifiDiscovery,
-    #[cfg(feature = "lasercube-usb")]
-    lasercube_usb: Option<LasercubeUsbDiscovery>,
-    #[cfg(feature = "oscilloscope")]
-    oscilloscope: OscilloscopeDiscovery,
-    #[cfg(feature = "avb")]
-    avb: AvbDiscovery,
-    enabled: EnabledDacTypes,
-    /// External discoverers registered by external crates.
-    external: Vec<Box<dyn ExternalDiscoverer>>,
+    discoverers: Vec<Box<dyn Discoverer>>,
 }
 
 impl DacDiscovery {
     /// Create a new DAC discovery instance.
     ///
-    /// This initializes USB controllers, so it should be called from the main thread.
-    /// If a USB controller fails to initialize, that DAC type will be unavailable
-    /// but other types will still work.
+    /// Eagerly registers all built-in discoverers whose [`DacType`] is in
+    /// `enabled` and whose feature flag is on. USB-backed discoverers
+    /// (Helios, LaserCube USB) are silently skipped if their controller
+    /// fails to initialize.
     pub fn new(enabled: EnabledDacTypes) -> Self {
-        Self {
-            #[cfg(feature = "helios")]
-            helios: HeliosDiscovery::new(),
-            #[cfg(feature = "ether-dream")]
-            etherdream: EtherDreamDiscovery::new(),
-            #[cfg(feature = "idn")]
-            idn: IdnDiscovery::new(),
-            #[cfg(all(feature = "idn", feature = "testutils"))]
-            idn_scan_addresses: Vec::new(),
-            #[cfg(feature = "lasercube-wifi")]
-            lasercube_wifi: LasercubeWifiDiscovery::new(),
-            #[cfg(feature = "lasercube-usb")]
-            lasercube_usb: LasercubeUsbDiscovery::new(),
-            #[cfg(feature = "oscilloscope")]
-            oscilloscope: OscilloscopeDiscovery::new(),
-            #[cfg(feature = "avb")]
-            avb: AvbDiscovery::new(),
-            enabled,
-            external: Vec::new(),
+        let mut this = Self {
+            discoverers: Vec::new(),
+        };
+        register_builtins(&mut this, &enabled);
+        this
+    }
+
+    /// Register a discoverer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another registered discoverer already uses the same
+    /// [`Discoverer::prefix`]. Prefixes must be unique to keep `open_by_id`
+    /// dispatch deterministic.
+    pub fn register(&mut self, discoverer: Box<dyn Discoverer>) {
+        let prefix = discoverer.prefix().to_string();
+        if self.discoverers.iter().any(|d| d.prefix() == prefix) {
+            panic!(
+                "DacDiscovery::register: duplicate discoverer prefix {:?}",
+                prefix
+            );
         }
+        self.discoverers.push(discoverer);
     }
 
-    /// Set specific addresses to scan for IDN servers.
-    ///
-    /// When set, the scanner will scan these specific addresses instead of
-    /// using broadcast discovery. This is useful for testing with mock servers.
-    ///
-    /// This method is only available with the `testutils` feature.
-    #[cfg(all(feature = "idn", feature = "testutils"))]
-    pub fn set_idn_scan_addresses(&mut self, addresses: Vec<SocketAddr>) {
-        self.idn_scan_addresses = addresses;
-    }
-
-    /// Update which DAC types to scan for.
-    pub fn set_enabled(&mut self, enabled: EnabledDacTypes) {
-        self.enabled = enabled;
-    }
-
-    /// Returns the currently enabled DAC types.
-    pub fn enabled(&self) -> &EnabledDacTypes {
-        &self.enabled
-    }
-
-    /// Register an external discoverer.
-    ///
-    /// External discoverers are called during `scan()` to find additional devices
-    /// beyond the built-in DAC types. This allows external crates to integrate
-    /// their own DAC discovery with the unified discovery system.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use laser_dac::{DacDiscovery, EnabledDacTypes};
-    ///
-    /// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    /// discovery.register(Box::new(MyClosedDacDiscoverer::new()));
-    ///
-    /// // Now scan() will include devices from the external discoverer
-    /// let devices = discovery.scan();
-    /// ```
-    pub fn register(&mut self, discoverer: Box<dyn ExternalDiscoverer>) {
-        self.external.push(discoverer);
-    }
-
-    /// Scan for available DAC devices of all enabled types.
-    ///
-    /// Returns a list of discovered devices. Each device can be connected
-    /// using `connect()`.
+    /// Scan for available DAC devices across all registered discoverers.
     pub fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let mut devices = Vec::new();
-
-        // Helios
-        #[cfg(feature = "helios")]
-        if self.enabled.is_enabled(DacType::Helios) {
-            if let Some(ref discovery) = self.helios {
-                devices.extend(discovery.scan());
-            }
+        let mut out = Vec::new();
+        for idx in 0..self.discoverers.len() {
+            out.extend(self.scan_one(idx));
         }
+        out
+    }
 
-        // Ether Dream
-        #[cfg(feature = "ether-dream")]
-        if self.enabled.is_enabled(DacType::EtherDream) {
-            devices.extend(self.etherdream.scan());
+    fn scan_one(&mut self, idx: usize) -> Vec<DiscoveredDevice> {
+        let mut devices = self.discoverers[idx].scan();
+        for device in &mut devices {
+            device.discoverer_index = Some(idx);
         }
-
-        // IDN
-        #[cfg(feature = "idn")]
-        if self.enabled.is_enabled(DacType::Idn) {
-            #[cfg(feature = "testutils")]
-            {
-                if self.idn_scan_addresses.is_empty() {
-                    // Use broadcast discovery
-                    devices.extend(self.idn.scan());
-                } else {
-                    // Scan specific addresses (for testing with mock servers)
-                    for addr in &self.idn_scan_addresses {
-                        devices.extend(self.idn.scan_address(*addr));
-                    }
-                }
-            }
-            #[cfg(not(feature = "testutils"))]
-            {
-                devices.extend(self.idn.scan());
-            }
-        }
-
-        // LaserCube WiFi
-        #[cfg(feature = "lasercube-wifi")]
-        if self.enabled.is_enabled(DacType::LasercubeWifi) {
-            devices.extend(self.lasercube_wifi.scan());
-        }
-
-        // LaserCube USB
-        #[cfg(feature = "lasercube-usb")]
-        if self.enabled.is_enabled(DacType::LasercubeUsb) {
-            if let Some(ref discovery) = self.lasercube_usb {
-                devices.extend(discovery.scan());
-            }
-        }
-
-        // Oscilloscope
-        #[cfg(feature = "oscilloscope")]
-        if self.enabled.is_enabled(DacType::Oscilloscope) {
-            for info in self.oscilloscope.scan() {
-                devices.push(DiscoveredDevice {
-                    dac_type: DacType::Oscilloscope,
-                    ip_address: None,
-                    mac_address: None,
-                    hostname: None,
-                    usb_address: None,
-                    hardware_name: Some(info.name.clone()),
-                    device_index: None,
-                    inner: DiscoveredDeviceInner::Oscilloscope { info },
-                });
-            }
-        }
-
-        // AVB
-        #[cfg(feature = "avb")]
-        if self.enabled.is_enabled(DacType::Avb) {
-            devices.extend(self.avb.scan());
-        }
-
-        // External discoverers
-        for (index, discoverer) in self.external.iter_mut().enumerate() {
-            let dac_type = discoverer.dac_type();
-            for ext_device in discoverer.scan() {
-                let mut device = DiscoveredDevice::new(
-                    dac_type.clone(),
-                    DiscoveredDeviceInner::External {
-                        discoverer_index: index,
-                        opaque_data: ext_device.opaque_data,
-                    },
-                );
-                device.ip_address = ext_device.ip_address;
-                device.mac_address = ext_device.mac_address;
-                device.hostname = ext_device.hostname;
-                device.usb_address = ext_device.usb_address;
-                device.hardware_name = ext_device.hardware_name;
-                device.device_index = ext_device.device_index;
-                devices.push(device);
-            }
-        }
-
         devices
     }
 
-    /// Parse the protocol prefix from a stable ID and return the corresponding `DacType`.
-    ///
-    /// Stable IDs are formatted as `<protocol>:<identifier>`, e.g. `etherdream:01:23:...`.
-    /// Returns `None` if the prefix doesn't match a known built-in type.
-    fn dac_type_from_id_prefix(id: &str) -> Option<DacType> {
-        // Find the first ':' — the prefix is everything before it.
-        // Note: some prefixes contain hyphens (lasercube-usb, lasercube-wifi).
-        let prefix = id.split(':').next()?;
-        match prefix {
-            "etherdream" => Some(DacType::EtherDream),
-            "idn" => Some(DacType::Idn),
-            "helios" => Some(DacType::Helios),
-            "lasercube-usb" => Some(DacType::LasercubeUsb),
-            "lasercube-wifi" => Some(DacType::LasercubeWifi),
-            #[cfg(feature = "oscilloscope")]
-            "oscilloscope" => Some(DacType::Oscilloscope),
-            "avb" => Some(DacType::Avb),
-            _ => None,
-        }
+    /// Connect to a previously discovered device.
+    pub fn connect(&mut self, device: DiscoveredDevice) -> Result<BackendKind> {
+        let idx = device.discoverer_index.ok_or_else(|| {
+            Error::invalid_config(
+                "DiscoveredDevice has no discoverer_index — was it produced by a registry scan?",
+            )
+        })?;
+        let stable_id = &device.info.stable_id;
+        let discoverer = self.discoverers.get_mut(idx).ok_or_else(|| {
+            Error::invalid_config(format!(
+                "discoverer for {} not found in registry",
+                stable_id
+            ))
+        })?;
+        discoverer.connect(device.connect_data)
     }
 
     /// Scan for a device by stable ID, connect, and return a `Dac`.
     ///
-    /// This is a convenience method combining `scan()`, lookup by `stable_id()`,
-    /// and `connect()` into a single call.
-    ///
-    /// When the ID has a known protocol prefix (e.g. `etherdream:`, `idn:`),
-    /// only that protocol is scanned, avoiding unnecessary network timeouts.
+    /// When the ID has a known protocol prefix, only that protocol's
+    /// discoverer is scanned, avoiding unnecessary network timeouts.
     pub(crate) fn open_by_id(&mut self, id: &str) -> Result<crate::stream::Dac> {
-        // Narrow the scan to just the relevant protocol if we can parse the prefix.
-        let discovered = if let Some(dac_type) = Self::dac_type_from_id_prefix(id) {
-            let saved = self.enabled.clone();
-            self.enabled = std::iter::once(dac_type).collect();
-            let result = self.scan();
-            self.enabled = saved;
-            result
-        } else {
-            self.scan()
+        let id_prefix = id.split(':').next().unwrap_or("");
+        let discovered = match self
+            .discoverers
+            .iter()
+            .position(|d| d.prefix() == id_prefix)
+        {
+            Some(idx) => self.scan_one(idx),
+            None => self.scan(),
         };
 
         let device = discovered
             .into_iter()
-            .find(|d| d.info().stable_id() == id)
+            .find(|d| d.info.stable_id == id)
             .ok_or_else(|| Error::disconnected(format!("DAC not found: {}", id)))?;
 
-        let name = device.info().name();
-        let dac_type = device.dac_type();
+        let name = device.info.name.clone();
+        let dac_type = device.info.dac_type.clone();
         let stream_backend = self.connect(device)?;
 
         let dac_info = crate::types::DacInfo {
@@ -1065,183 +445,11 @@ impl DacDiscovery {
 
         Ok(crate::stream::Dac::new(dac_info, stream_backend))
     }
-
-    /// Connect to a discovered device and return a streaming backend.
-    #[allow(unreachable_patterns)]
-    pub fn connect(&mut self, device: DiscoveredDevice) -> Result<BackendKind> {
-        // Handle external devices first (check inner variant)
-        if let DiscoveredDeviceInner::External {
-            discoverer_index,
-            opaque_data,
-        } = device.inner
-        {
-            let backend_kind = self
-                .external
-                .get_mut(discoverer_index)
-                .ok_or_else(|| Error::invalid_config("External discoverer not found"))?
-                .connect(opaque_data)?;
-            return Ok(backend_kind);
-        }
-
-        // Handle built-in DAC types
-        match device.dac_type {
-            #[cfg(feature = "helios")]
-            DacType::Helios => self
-                .helios
-                .as_ref()
-                .ok_or_else(|| Error::disconnected("Helios discovery not available"))?
-                .connect(device),
-            #[cfg(feature = "ether-dream")]
-            DacType::EtherDream => self.etherdream.connect(device),
-            #[cfg(feature = "idn")]
-            DacType::Idn => self.idn.connect(device),
-            #[cfg(feature = "lasercube-wifi")]
-            DacType::LasercubeWifi => self.lasercube_wifi.connect(device),
-            #[cfg(feature = "lasercube-usb")]
-            DacType::LasercubeUsb => self
-                .lasercube_usb
-                .as_ref()
-                .ok_or_else(|| Error::disconnected("LaserCube USB discovery not available"))?
-                .connect(device),
-            #[cfg(feature = "oscilloscope")]
-            DacType::Oscilloscope => {
-                let DiscoveredDeviceInner::Oscilloscope { info } = device.inner else {
-                    return Err(Error::invalid_config(
-                        "Invalid device type for Oscilloscope",
-                    ));
-                };
-                self.oscilloscope.connect(&info.name)
-            }
-            #[cfg(feature = "avb")]
-            DacType::Avb => self.avb.connect(device),
-            _ => Err(Error::invalid_config(format!(
-                "DAC type {:?} not supported in this build",
-                device.dac_type
-            ))),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_stable_id_etherdream_with_mac() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::EtherDream,
-            ip_address: Some("192.168.1.100".parse().unwrap()),
-            mac_address: Some([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]),
-            hostname: None,
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "etherdream:01:23:45:67:89:ab");
-    }
-
-    #[test]
-    fn test_stable_id_idn_with_hostname() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::Idn,
-            ip_address: Some("192.168.1.100".parse().unwrap()),
-            mac_address: None,
-            hostname: Some("laser-projector.local".to_string()),
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "idn:laser-projector.local");
-    }
-
-    #[test]
-    fn test_stable_id_helios_with_hardware_name() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::Helios,
-            ip_address: None,
-            mac_address: None,
-            hostname: None,
-            usb_address: Some("1:5".to_string()),
-            hardware_name: Some("Helios DAC".to_string()),
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "helios:Helios DAC");
-    }
-
-    #[test]
-    fn test_stable_id_lasercube_usb_with_address() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::LasercubeUsb,
-            ip_address: None,
-            mac_address: None,
-            hostname: None,
-            usb_address: Some("2:3".to_string()),
-            hardware_name: None,
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "lasercube-usb:2:3");
-    }
-
-    #[test]
-    fn test_stable_id_lasercube_wifi_with_ip() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::LasercubeWifi,
-            ip_address: Some("192.168.1.50".parse().unwrap()),
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "lasercube-wifi:192.168.1.50");
-    }
-
-    #[test]
-    fn test_stable_id_avb_with_index() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::Avb,
-            ip_address: None,
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: Some("MOTU AVB Main".to_string()),
-            device_index: Some(1),
-        };
-        assert_eq!(info.stable_id(), "avb:motu-avb-main:1");
-    }
-
-    #[test]
-    fn test_stable_id_custom_fallback() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::Custom("MyDAC".to_string()),
-            ip_address: None,
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-        };
-        // Custom with no identifiers falls back to unknown format
-        assert_eq!(info.stable_id(), "unknown:Custom(\"MyDAC\")");
-    }
-
-    #[test]
-    fn test_stable_id_custom_with_ip() {
-        let info = DiscoveredDeviceInfo {
-            dac_type: DacType::Custom("MyDAC".to_string()),
-            ip_address: Some("10.0.0.1".parse().unwrap()),
-            mac_address: None,
-            hostname: None,
-            usb_address: None,
-            hardware_name: None,
-            device_index: None,
-        };
-        assert_eq!(info.stable_id(), "mydac:10.0.0.1");
-    }
-
-    // =========================================================================
-    // External Discoverer Tests
-    // =========================================================================
 
     use crate::backend::{BackendKind, DacBackend, FifoBackend};
     use crate::types::{DacCapabilities, LaserPoint};
@@ -1249,13 +457,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    /// Mock connection info for testing.
+    // -------------------------------------------------------------------------
+    // Mock discoverer for registry tests + canonical example for downstream.
+    // -------------------------------------------------------------------------
+
     #[derive(Debug, Clone)]
     struct MockConnectionInfo {
         _device_id: u32,
     }
 
-    /// Mock backend for testing external discoverers.
     struct MockBackend {
         connected: bool,
     }
@@ -1304,46 +514,65 @@ mod tests {
         }
     }
 
-    /// Mock external discoverer for testing.
-    struct MockExternalDiscoverer {
+    struct MockDiscoverer {
         scan_count: Arc<AtomicUsize>,
         connect_called: Arc<AtomicBool>,
+        prefix: String,
         devices_to_return: Vec<(u32, Option<IpAddr>)>,
     }
 
-    impl MockExternalDiscoverer {
+    impl MockDiscoverer {
         fn new(devices: Vec<(u32, Option<IpAddr>)>) -> Self {
             Self {
                 scan_count: Arc::new(AtomicUsize::new(0)),
                 connect_called: Arc::new(AtomicBool::new(false)),
+                prefix: "mockdac".to_string(),
                 devices_to_return: devices,
             }
         }
+
+        fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+            self.prefix = prefix.into();
+            self
+        }
     }
 
-    impl ExternalDiscoverer for MockExternalDiscoverer {
+    impl Discoverer for MockDiscoverer {
         fn dac_type(&self) -> DacType {
             DacType::Custom("MockDAC".into())
         }
 
-        fn scan(&mut self) -> Vec<ExternalDevice> {
+        fn prefix(&self) -> &str {
+            &self.prefix
+        }
+
+        fn scan(&mut self) -> Vec<DiscoveredDevice> {
             self.scan_count.fetch_add(1, Ordering::SeqCst);
             self.devices_to_return
                 .iter()
                 .map(|(id, ip)| {
-                    let mut device = ExternalDevice::new(MockConnectionInfo { _device_id: *id });
-                    device.ip_address = *ip;
-                    device.hardware_name = Some(format!("Mock Device {}", id));
-                    device
+                    let hardware_name = format!("Mock Device {}", id);
+                    let stable_id = match ip {
+                        Some(addr) => format!("{}:{}", self.prefix, addr),
+                        None => format!("{}:{}", self.prefix, id),
+                    };
+                    let mut info = DiscoveredDeviceInfo::new(
+                        DacType::Custom("MockDAC".into()),
+                        stable_id,
+                        &hardware_name,
+                    )
+                    .with_hardware_name(hardware_name);
+                    if let Some(addr) = ip {
+                        info = info.with_ip(*addr);
+                    }
+                    DiscoveredDevice::new(info, Box::new(MockConnectionInfo { _device_id: *id }))
                 })
                 .collect()
         }
 
-        fn connect(&mut self, opaque_data: Box<dyn Any + Send>) -> Result<BackendKind> {
+        fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
             self.connect_called.store(true, Ordering::SeqCst);
-            let _info = opaque_data
-                .downcast::<MockConnectionInfo>()
-                .map_err(|_| Error::invalid_config("wrong device type"))?;
+            let _ = downcast_connect_data::<MockConnectionInfo>(opaque, "MockDAC")?;
             Ok(BackendKind::Fifo(Box::new(MockBackend {
                 connected: false,
             })))
@@ -1351,8 +580,15 @@ mod tests {
     }
 
     #[test]
-    fn test_external_discoverer_scan_is_called() {
-        let discoverer = MockExternalDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))]);
+    fn slugify_collapses_whitespace_and_punctuation() {
+        assert_eq!(slugify_device_id("MOTU AVB Main"), "motu-avb-main");
+        assert_eq!(slugify_device_id("  Hello, World!  "), "hello-world");
+        assert_eq!(slugify_device_id("Built-in Output"), "built-in-output");
+    }
+
+    #[test]
+    fn discoverer_scan_is_called() {
+        let discoverer = MockDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))]);
         let scan_count = discoverer.scan_count.clone();
 
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
@@ -1365,9 +601,8 @@ mod tests {
     }
 
     #[test]
-    fn test_external_discoverer_device_info() {
-        let discoverer =
-            MockExternalDiscoverer::new(vec![(42, Some("192.168.1.100".parse().unwrap()))]);
+    fn discoverer_device_info_is_populated() {
+        let discoverer = MockDiscoverer::new(vec![(42, Some("192.168.1.100".parse().unwrap()))]);
 
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
         discovery.register(Box::new(discoverer));
@@ -1376,17 +611,18 @@ mod tests {
         assert_eq!(devices.len(), 1);
 
         let device = &devices[0];
-        assert_eq!(device.dac_type(), DacType::Custom("MockDAC".into()));
+        assert_eq!(device.dac_type(), &DacType::Custom("MockDAC".into()));
         assert_eq!(
             device.info().ip_address,
             Some("192.168.1.100".parse().unwrap())
         );
         assert_eq!(device.info().hardware_name, Some("Mock Device 42".into()));
+        assert_eq!(device.info().stable_id, "mockdac:192.168.1.100");
     }
 
     #[test]
-    fn test_external_discoverer_connect() {
-        let discoverer = MockExternalDiscoverer::new(vec![(99, None)]);
+    fn discoverer_connect_dispatches_to_owning_registry() {
+        let discoverer = MockDiscoverer::new(vec![(99, None)]);
         let connect_called = discoverer.connect_called.clone();
 
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
@@ -1405,30 +641,9 @@ mod tests {
     }
 
     #[test]
-    fn test_external_discoverer_multiple_devices() {
-        let discoverer = MockExternalDiscoverer::new(vec![
-            (1, Some("10.0.0.1".parse().unwrap())),
-            (2, Some("10.0.0.2".parse().unwrap())),
-            (3, None),
-        ]);
-
-        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
-        discovery.register(Box::new(discoverer));
-
-        let devices = discovery.scan();
-        assert_eq!(devices.len(), 3);
-
-        // Verify we can connect to any of them
-        for device in devices {
-            let backend = discovery.connect(device);
-            assert!(backend.is_ok());
-        }
-    }
-
-    #[test]
-    fn test_multiple_external_discoverers() {
-        let discoverer1 = MockExternalDiscoverer::new(vec![(1, None)]);
-        let discoverer2 = MockExternalDiscoverer::new(vec![(2, None), (3, None)]);
+    fn multiple_discoverers_with_distinct_prefixes() {
+        let discoverer1 = MockDiscoverer::new(vec![(1, None)]).with_prefix("mock-a");
+        let discoverer2 = MockDiscoverer::new(vec![(2, None), (3, None)]).with_prefix("mock-b");
 
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
         discovery.register(Box::new(discoverer1));
@@ -1436,5 +651,35 @@ mod tests {
 
         let devices = discovery.scan();
         assert_eq!(devices.len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate discoverer prefix")]
+    fn registering_duplicate_prefix_panics() {
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("dup")));
+        discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("dup")));
+    }
+
+    #[test]
+    fn info_eq_and_hash_use_only_stable_id() {
+        let mut a = DiscoveredDeviceInfo::new(DacType::Custom("X".into()), "x:1", "first")
+            .with_ip("10.0.0.1".parse().unwrap());
+        let mut b = a.clone();
+        b.name = "second".into();
+        b.ip_address = Some("10.0.0.2".parse().unwrap());
+        assert_eq!(a, b);
+
+        b.stable_id = "x:2".into();
+        assert_ne!(a, b);
+
+        use std::collections::hash_map::DefaultHasher;
+        a.ip_address = Some("172.16.0.1".parse().unwrap());
+        b.stable_id = a.stable_id.clone();
+        let mut h1 = DefaultHasher::new();
+        a.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        b.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
     }
 }

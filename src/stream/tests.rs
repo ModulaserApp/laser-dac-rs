@@ -3020,7 +3020,7 @@ impl FifoBackend for DisconnectAfterNBackend {
     }
 }
 
-/// Mock ExternalDiscoverer that tracks scan/connect calls and returns
+/// Mock Discoverer that tracks scan/connect calls and returns
 /// a ReconnectFifoBackend on connect. Uses a fixed IP so the stable_id is
 /// deterministic: "trackingtest:10.0.0.99"
 struct TrackingDiscoverer {
@@ -3028,20 +3028,28 @@ struct TrackingDiscoverer {
     connect_count: Arc<AtomicUsize>,
 }
 
-impl crate::discovery::ExternalDiscoverer for TrackingDiscoverer {
+impl crate::discovery::Discoverer for TrackingDiscoverer {
     fn dac_type(&self) -> DacType {
         DacType::Custom("TrackingTest".into())
     }
 
-    fn scan(&mut self) -> Vec<crate::discovery::ExternalDevice> {
-        self.scan_count.fetch_add(1, Ordering::SeqCst);
-        let mut device = crate::discovery::ExternalDevice::new(());
-        device.ip_address = Some("10.0.0.99".parse().unwrap());
-        device.hardware_name = Some("Tracking Test Device".into());
-        vec![device]
+    fn prefix(&self) -> &str {
+        "trackingtest"
     }
 
-    fn connect(&mut self, _opaque_data: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
+        self.scan_count.fetch_add(1, Ordering::SeqCst);
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            DacType::Custom("TrackingTest".into()),
+            "trackingtest:10.0.0.99",
+            "Tracking Test Device",
+        )
+        .with_ip("10.0.0.99".parse().unwrap())
+        .with_hardware_name("Tracking Test Device");
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
+    }
+
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
         Ok(BackendKind::Fifo(Box::new(ReconnectFifoBackend::new())))
     }

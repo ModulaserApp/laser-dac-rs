@@ -4,9 +4,11 @@
 //! Supports 5-channel (XYRGB) and 6-channel (XYRGBI) mapping with auto-detected sample rate.
 
 pub mod backend;
+mod discovery;
 pub mod error;
 
 pub use backend::{discover_device_selectors, AvbBackend, AvbSelector};
+pub use discovery::AvbDiscoverer;
 pub use error::Error;
 
 use crate::types::{DacCapabilities, OutputModel};

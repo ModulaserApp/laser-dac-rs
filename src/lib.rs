@@ -107,9 +107,7 @@ pub use error::{Error, Result};
 pub use backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend, WriteOutcome};
 
 // Discovery types
-pub use discovery::{
-    DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo, ExternalDevice, ExternalDiscoverer,
-};
+pub use discovery::{DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 
 // Core types
 pub use types::{
@@ -209,14 +207,11 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
     let devices = discovery
         .scan()
         .into_iter()
-        .map(|device| {
-            let info = device.info();
-            DacInfo {
-                id: info.stable_id(),
-                name: info.name(),
-                kind: device.dac_type(),
-                caps: device.caps(),
-            }
+        .map(|device| DacInfo {
+            id: device.info().stable_id().to_string(),
+            name: device.info().name().to_string(),
+            kind: device.dac_type().clone(),
+            caps: device.caps().clone(),
         })
         .collect();
 
