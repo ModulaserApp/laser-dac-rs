@@ -26,6 +26,10 @@ impl HeliosDiscoverer {
     }
 }
 
+fn format_stable_id(hardware_name: &str) -> String {
+    format!("{}:{}", PREFIX, hardware_name)
+}
+
 impl Discoverer for HeliosDiscoverer {
     fn dac_type(&self) -> DacType {
         DacType::Helios
@@ -50,7 +54,7 @@ impl Discoverer for HeliosDiscoverer {
                 Err(_) => continue,
             };
             let hardware_name = opened.name().unwrap_or_else(|_| "Unknown Helios".into());
-            let stable_id = format!("{}:{}", PREFIX, hardware_name);
+            let stable_id = format_stable_id(&hardware_name);
 
             let info = DiscoveredDeviceInfo::new(DacType::Helios, stable_id, &hardware_name)
                 .with_hardware_name(hardware_name);
@@ -75,10 +79,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn helios_stable_id_with_hardware_name() {
-        let info = DiscoveredDeviceInfo::new(DacType::Helios, "helios:Helios DAC", "Helios DAC")
-            .with_usb_address("1:5")
-            .with_hardware_name("Helios DAC");
-        assert_eq!(info.stable_id(), "helios:Helios DAC");
+    fn format_stable_id_prefixes_hardware_name() {
+        assert_eq!(format_stable_id("Helios DAC"), "helios:Helios DAC");
+        assert_eq!(format_stable_id("Unknown Helios"), "helios:Unknown Helios");
     }
 }

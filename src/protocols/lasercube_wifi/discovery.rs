@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, LasercubeWifiBackend, Result};
@@ -37,6 +37,10 @@ impl Default for LasercubeWifiDiscoverer {
     }
 }
 
+fn format_stable_id(ip: IpAddr) -> String {
+    format!("{}:{}", PREFIX, ip)
+}
+
 impl Discoverer for LasercubeWifiDiscoverer {
     fn dac_type(&self) -> DacType {
         DacType::LasercubeWifi
@@ -63,7 +67,7 @@ impl Discoverer for LasercubeWifiDiscoverer {
                 Err(_) => continue,
             };
             let ip_address = source_addr.ip();
-            let stable_id = format!("{}:{}", PREFIX, ip_address);
+            let stable_id = format_stable_id(ip_address);
             let info = DiscoveredDeviceInfo::new(
                 DacType::LasercubeWifi,
                 stable_id,
@@ -95,13 +99,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lasercube_wifi_stable_id_uses_ip() {
-        let info = DiscoveredDeviceInfo::new(
-            DacType::LasercubeWifi,
-            format!("{}:192.168.1.50", PREFIX),
-            "192.168.1.50",
-        )
-        .with_ip("192.168.1.50".parse().unwrap());
-        assert_eq!(info.stable_id(), "lasercube-wifi:192.168.1.50");
+    fn format_stable_id_uses_ip() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        assert_eq!(format_stable_id(ip), "lasercube-wifi:192.168.1.50");
+    }
+
+    #[test]
+    fn format_stable_id_handles_ipv6() {
+        let ip: IpAddr = "fe80::1".parse().unwrap();
+        assert_eq!(format_stable_id(ip), "lasercube-wifi:fe80::1");
     }
 }

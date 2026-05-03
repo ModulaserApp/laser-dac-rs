@@ -29,6 +29,10 @@ impl Default for AvbDiscoverer {
     }
 }
 
+fn format_stable_id(name: &str, device_index: u16) -> String {
+    format!("{}:{}:{}", PREFIX, slugify_device_id(name), device_index)
+}
+
 impl Discoverer for AvbDiscoverer {
     fn dac_type(&self) -> DacType {
         DacType::Avb
@@ -46,12 +50,7 @@ impl Discoverer for AvbDiscoverer {
             .into_iter()
             .map(|selector| {
                 let device_index = selector.duplicate_index;
-                let stable_id = format!(
-                    "{}:{}:{}",
-                    PREFIX,
-                    slugify_device_id(&selector.name),
-                    device_index
-                );
+                let stable_id = format_stable_id(&selector.name, device_index);
                 let info = DiscoveredDeviceInfo::new(DacType::Avb, stable_id, &selector.name)
                     .with_hardware_name(&selector.name)
                     .with_device_index(device_index);
@@ -73,15 +72,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn avb_stable_id_uses_slug_and_index() {
-        let slug = slugify_device_id("MOTU AVB Main");
-        let info = DiscoveredDeviceInfo::new(
-            DacType::Avb,
-            format!("{}:{}:1", PREFIX, slug),
-            "MOTU AVB Main",
-        )
-        .with_hardware_name("MOTU AVB Main")
-        .with_device_index(1);
-        assert_eq!(info.stable_id(), "avb:motu-avb-main:1");
+    fn format_stable_id_slugs_name_and_appends_index() {
+        assert_eq!(format_stable_id("MOTU AVB Main", 0), "avb:motu-avb-main:0");
+        assert_eq!(format_stable_id("MOTU AVB Main", 1), "avb:motu-avb-main:1");
+    }
+
+    #[test]
+    fn format_stable_id_collapses_punctuation_and_case() {
+        assert_eq!(
+            format_stable_id("  Built-in Output! ", 0),
+            "avb:built-in-output:0"
+        );
     }
 }

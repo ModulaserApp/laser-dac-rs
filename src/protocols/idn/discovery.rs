@@ -43,8 +43,8 @@ impl IdnDiscoverer {
     #[cfg(feature = "testutils")]
     pub fn with_scan_addresses(addresses: Vec<SocketAddr>) -> Self {
         Self {
-            scan_timeout: Duration::from_millis(500),
             scan_addresses: addresses,
+            ..Self::new()
         }
     }
 
@@ -67,6 +67,10 @@ impl Default for IdnDiscoverer {
     }
 }
 
+fn format_stable_id(hostname: &str) -> String {
+    format!("{}:{}", PREFIX, hostname)
+}
+
 fn servers_to_devices(servers: Vec<ServerInfo>) -> Vec<DiscoveredDevice> {
     servers
         .into_iter()
@@ -75,7 +79,7 @@ fn servers_to_devices(servers: Vec<ServerInfo>) -> Vec<DiscoveredDevice> {
             let ip_address = server.addresses.first().map(|addr| addr.ip());
             let hostname = server.hostname.clone();
 
-            let stable_id = format!("{}:{}", PREFIX, hostname);
+            let stable_id = format_stable_id(&hostname);
             let name = ip_address
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| hostname.clone());
@@ -138,14 +142,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn idn_stable_id_uses_hostname() {
-        let info = DiscoveredDeviceInfo::new(
-            DacType::Idn,
-            format!("{}:laser-projector.local", PREFIX),
-            "192.168.1.100",
-        )
-        .with_ip("192.168.1.100".parse().unwrap())
-        .with_hostname("laser-projector.local");
-        assert_eq!(info.stable_id(), "idn:laser-projector.local");
+    fn format_stable_id_uses_hostname() {
+        assert_eq!(
+            format_stable_id("laser-projector.local"),
+            "idn:laser-projector.local"
+        );
+        assert_eq!(format_stable_id("idn-server-7"), "idn:idn-server-7");
     }
 }

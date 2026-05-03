@@ -210,6 +210,11 @@ Behavioral change:
     (mac/ip/hostname) equality, switch to keying on `stable_id` directly.
 
   - `DacDiscovery::register` panics if two discoverers share the same prefix.
+
+Accessor signature changes:
+  - `DiscoveredDevice::name() -> &str` (was `String`).
+  - `DiscoveredDevice::info() -> &DiscoveredDeviceInfo` (was owned).
+    If you need an owned copy, use `device.info().clone()`.
 ```
 
 ## Transitional Shapes

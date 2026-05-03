@@ -5,6 +5,7 @@
 //! [`DacDiscovery`] registry that aggregates them.
 
 use std::any::Any;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
@@ -125,6 +126,17 @@ impl DiscoveredDevice {
     }
 }
 
+impl fmt::Debug for DiscoveredDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DiscoveredDevice")
+            .field("info", &self.info)
+            .field("caps", &self.caps)
+            .field("discoverer_index", &self.discoverer_index)
+            .field("connect_data", &"<opaque>")
+            .finish()
+    }
+}
+
 /// Lightweight info about a discovered device.
 ///
 /// Cloneable and used for filtering, logging, and display without consuming
@@ -228,15 +240,23 @@ impl Hash for DiscoveredDeviceInfo {
 }
 
 /// Downcast the connect-data box passed to [`Discoverer::connect`] back to
-/// the producing protocol's concrete type. Returns `Error::invalid_config`
-/// with `protocol` interpolated when the type doesn't match.
+/// the producing protocol's concrete type.
+///
+/// A failure here indicates a registry invariant violation: a
+/// `DiscoveredDevice` was routed to a discoverer that did not produce it.
+/// This is unreachable in practice — [`DacDiscovery`] tags every scanned
+/// device with the index of its producing discoverer and dispatches
+/// `connect()` back to that same discoverer.
 pub fn downcast_connect_data<T: 'static>(
     opaque: Box<dyn Any + Send>,
     protocol: &str,
 ) -> Result<Box<T>> {
-    opaque
-        .downcast::<T>()
-        .map_err(|_| Error::invalid_config(format!("Invalid connect data for {}", protocol)))
+    opaque.downcast::<T>().map_err(|_| {
+        Error::invalid_config(format!(
+            "internal: connect data for {} routed to wrong discoverer (registry invariant violation)",
+            protocol
+        ))
+    })
 }
 
 /// Slug a free-form device name into an ASCII-safe id segment.
@@ -270,66 +290,46 @@ pub fn slugify_device_id(name: &str) -> String {
 // DacDiscovery — registry
 // =============================================================================
 
-#[cfg(any(
-    feature = "helios",
-    feature = "ether-dream",
-    feature = "idn",
-    feature = "lasercube-wifi",
-    feature = "lasercube-usb",
-    feature = "oscilloscope",
-    feature = "avb",
-))]
-fn register_builtins(this: &mut DacDiscovery, enabled: &EnabledDacTypes) {
+fn register_builtins(_this: &mut DacDiscovery, _enabled: &EnabledDacTypes) {
     #[cfg(feature = "helios")]
-    if enabled.is_enabled(DacType::Helios) {
+    if _enabled.is_enabled(DacType::Helios) {
         if let Some(d) = crate::protocols::helios::HeliosDiscoverer::new() {
-            this.register(Box::new(d));
+            _this.register(Box::new(d));
         }
     }
     #[cfg(feature = "ether-dream")]
-    if enabled.is_enabled(DacType::EtherDream) {
-        this.register(Box::new(
+    if _enabled.is_enabled(DacType::EtherDream) {
+        _this.register(Box::new(
             crate::protocols::ether_dream::EtherDreamDiscoverer::new(),
         ));
     }
     #[cfg(feature = "idn")]
-    if enabled.is_enabled(DacType::Idn) {
-        this.register(Box::new(crate::protocols::idn::IdnDiscoverer::new()));
+    if _enabled.is_enabled(DacType::Idn) {
+        _this.register(Box::new(crate::protocols::idn::IdnDiscoverer::new()));
     }
     #[cfg(feature = "lasercube-wifi")]
-    if enabled.is_enabled(DacType::LasercubeWifi) {
-        this.register(Box::new(
+    if _enabled.is_enabled(DacType::LasercubeWifi) {
+        _this.register(Box::new(
             crate::protocols::lasercube_wifi::LasercubeWifiDiscoverer::new(),
         ));
     }
     #[cfg(feature = "lasercube-usb")]
-    if enabled.is_enabled(DacType::LasercubeUsb) {
+    if _enabled.is_enabled(DacType::LasercubeUsb) {
         if let Some(d) = crate::protocols::lasercube_usb::LasercubeUsbDiscoverer::new() {
-            this.register(Box::new(d));
+            _this.register(Box::new(d));
         }
     }
     #[cfg(feature = "oscilloscope")]
-    if enabled.is_enabled(DacType::Oscilloscope) {
-        this.register(Box::new(
+    if _enabled.is_enabled(DacType::Oscilloscope) {
+        _this.register(Box::new(
             crate::protocols::oscilloscope::OscilloscopeDiscoverer::new(),
         ));
     }
     #[cfg(feature = "avb")]
-    if enabled.is_enabled(DacType::Avb) {
-        this.register(Box::new(crate::protocols::avb::AvbDiscoverer::new()));
+    if _enabled.is_enabled(DacType::Avb) {
+        _this.register(Box::new(crate::protocols::avb::AvbDiscoverer::new()));
     }
 }
-
-#[cfg(not(any(
-    feature = "helios",
-    feature = "ether-dream",
-    feature = "idn",
-    feature = "lasercube-wifi",
-    feature = "lasercube-usb",
-    feature = "oscilloscope",
-    feature = "avb",
-)))]
-fn register_builtins(_this: &mut DacDiscovery, _enabled: &EnabledDacTypes) {}
 
 /// DAC discovery coordinator.
 ///
@@ -414,17 +414,28 @@ impl DacDiscovery {
 
     /// Scan for a device by stable ID, connect, and return a `Dac`.
     ///
-    /// When the ID has a known protocol prefix, only that protocol's
-    /// discoverer is scanned, avoiding unnecessary network timeouts.
+    /// When the ID carries a protocol prefix (`prefix:rest`), only that
+    /// protocol's discoverer is scanned. If the prefix matches no registered
+    /// discoverer, the call fails fast without scanning. A prefix-less id
+    /// falls back to scanning every registered discoverer.
     pub(crate) fn open_by_id(&mut self, id: &str) -> Result<crate::stream::Dac> {
-        let id_prefix = id.split(':').next().unwrap_or("");
-        let discovered = match self
+        let (id_prefix, has_prefix) = match id.split_once(':') {
+            Some((p, _)) => (p, true),
+            None => ("", false),
+        };
+        let matching = self
             .discoverers
             .iter()
-            .position(|d| d.prefix() == id_prefix)
-        {
-            Some(idx) => self.scan_one(idx),
-            None => self.scan(),
+            .position(|d| d.prefix() == id_prefix);
+        let discovered = match (matching, has_prefix) {
+            (Some(idx), _) => self.scan_one(idx),
+            (None, true) => {
+                return Err(Error::disconnected(format!(
+                    "DAC not found: {} (no discoverer registered for prefix {:?})",
+                    id, id_prefix
+                )));
+            }
+            (None, false) => self.scan(),
         };
 
         let device = discovered

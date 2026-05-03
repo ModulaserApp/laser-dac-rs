@@ -38,6 +38,10 @@ impl Default for OscilloscopeDiscoverer {
     }
 }
 
+fn format_stable_id(name: &str) -> String {
+    format!("{}:{}", PREFIX, slugify_device_id(name))
+}
+
 fn enumerate() -> Vec<OscilloscopeDeviceInfo> {
     let host = cpal::default_host();
     let devices = match host.output_devices() {
@@ -80,7 +84,7 @@ impl Discoverer for OscilloscopeDiscoverer {
         enumerate()
             .into_iter()
             .map(|info| {
-                let stable_id = format!("{}:{}", PREFIX, slugify_device_id(&info.name));
+                let stable_id = format_stable_id(&info.name);
                 let caps = capabilities(info.sample_rate);
                 let device_info =
                     DiscoveredDeviceInfo::new(DacType::Oscilloscope, stable_id, &info.name)
@@ -104,13 +108,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oscilloscope_stable_id_slugs_device_name() {
-        let info = DiscoveredDeviceInfo::new(
-            DacType::Oscilloscope,
-            "oscilloscope:built-in-output",
-            "Built-in Output",
-        )
-        .with_hardware_name("Built-in Output");
-        assert_eq!(info.stable_id(), "oscilloscope:built-in-output");
+    fn format_stable_id_slugs_device_name() {
+        assert_eq!(
+            format_stable_id("Built-in Output"),
+            "oscilloscope:built-in-output"
+        );
+        assert_eq!(
+            format_stable_id("MOTU UltraLite"),
+            "oscilloscope:motu-ultralite"
+        );
     }
 }

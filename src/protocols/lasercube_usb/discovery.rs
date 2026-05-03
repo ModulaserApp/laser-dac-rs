@@ -26,6 +26,16 @@ impl LasercubeUsbDiscoverer {
     }
 }
 
+/// Stable id is the serial number when the device exposes one, otherwise the
+/// USB bus:address (which is not stable across reboots but is the best we can
+/// do).
+fn format_stable_id(serial: Option<&str>, usb_address: &str) -> String {
+    match serial {
+        Some(s) => format!("{}:{}", PREFIX, s),
+        None => format!("{}:{}", PREFIX, usb_address),
+    }
+}
+
 impl Discoverer for LasercubeUsbDiscoverer {
     fn dac_type(&self) -> DacType {
         DacType::LasercubeUsb
@@ -45,10 +55,8 @@ impl Discoverer for LasercubeUsbDiscoverer {
             let usb_address = format!("{}:{}", device.bus_number(), device.address());
             let serial = crate::protocols::lasercube_usb::get_serial_number(&device);
 
-            let (stable_id, name) = match &serial {
-                Some(s) => (format!("{}:{}", PREFIX, s), s.clone()),
-                None => (format!("{}:{}", PREFIX, usb_address), usb_address.clone()),
-            };
+            let stable_id = format_stable_id(serial.as_deref(), &usb_address);
+            let name = serial.clone().unwrap_or_else(|| usb_address.clone());
 
             let mut info = DiscoveredDeviceInfo::new(DacType::LasercubeUsb, stable_id, name)
                 .with_usb_address(usb_address);
@@ -76,9 +84,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lasercube_usb_stable_id_uses_serial_when_present() {
-        let info = DiscoveredDeviceInfo::new(DacType::LasercubeUsb, "lasercube-usb:2:3", "2:3")
-            .with_usb_address("2:3");
-        assert_eq!(info.stable_id(), "lasercube-usb:2:3");
+    fn format_stable_id_prefers_serial_when_present() {
+        assert_eq!(
+            format_stable_id(Some("LC-12345"), "2:3"),
+            "lasercube-usb:LC-12345"
+        );
+    }
+
+    #[test]
+    fn format_stable_id_falls_back_to_usb_address() {
+        assert_eq!(format_stable_id(None, "2:3"), "lasercube-usb:2:3");
     }
 }
