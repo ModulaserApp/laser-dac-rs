@@ -140,9 +140,20 @@ impl fmt::Debug for DiscoveredDevice {
 /// Lightweight info about a discovered device.
 ///
 /// Cloneable and used for filtering, logging, and display without consuming
-/// the original [`DiscoveredDevice`]. Equality and hashing consider only
-/// [`stable_id`](Self::stable_id) — IP/MAC/hostname drift between scans
-/// does not change identity.
+/// the original [`DiscoveredDevice`].
+///
+/// # Identity contract
+///
+/// [`PartialEq`], [`Eq`], and [`Hash`] consider only [`stable_id`](Self::stable_id);
+/// the other fields (IP, MAC, hostname, …) are presentation hints that may
+/// drift between scans and do not affect identity. This is sound for infos
+/// produced by a registered [`Discoverer`] because [`DacDiscovery::register`]
+/// guarantees [`Discoverer::prefix`] is unique, which makes the
+/// `<prefix>:<rest>` namespace globally collision-free across discoverers.
+///
+/// If you construct a `DiscoveredDeviceInfo` manually (outside the registry)
+/// you are responsible for keeping `stable_id` collision-free; otherwise two
+/// distinct devices may compare equal.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDeviceInfo {
     /// The DAC type.
@@ -364,11 +375,16 @@ impl DacDiscovery {
     ///
     /// # Panics
     ///
-    /// Panics if another registered discoverer already uses the same
-    /// [`Discoverer::prefix`]. Prefixes must be unique to keep `open_by_id`
-    /// dispatch deterministic.
+    /// Panics if [`Discoverer::prefix`] is empty, or if another registered
+    /// discoverer already uses the same prefix. Prefixes must be unique and
+    /// non-empty to keep `open_by_id` dispatch deterministic — an empty
+    /// prefix would otherwise capture every prefix-less id.
     pub fn register(&mut self, discoverer: Box<dyn Discoverer>) {
         let prefix = discoverer.prefix().to_string();
+        assert!(
+            !prefix.is_empty(),
+            "DacDiscovery::register: discoverer prefix must not be empty"
+        );
         if self.discoverers.iter().any(|d| d.prefix() == prefix) {
             panic!(
                 "DacDiscovery::register: duplicate discoverer prefix {:?}",
@@ -670,6 +686,13 @@ mod tests {
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
         discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("dup")));
         discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("dup")));
+    }
+
+    #[test]
+    #[should_panic(expected = "prefix must not be empty")]
+    fn registering_empty_prefix_panics() {
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("")));
     }
 
     #[test]

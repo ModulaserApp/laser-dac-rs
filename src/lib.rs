@@ -107,7 +107,10 @@ pub use error::{Error, Result};
 pub use backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend, WriteOutcome};
 
 // Discovery types
-pub use discovery::{DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
+pub use discovery::{
+    downcast_connect_data, slugify_device_id, DacDiscovery, DiscoveredDevice, DiscoveredDeviceInfo,
+    Discoverer,
+};
 
 // Core types
 pub use types::{
