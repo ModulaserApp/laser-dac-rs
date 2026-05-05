@@ -1,6 +1,8 @@
 //! AVB audio DAC backend.
 //!
-//! AVB output is implemented via system audio APIs: CoreAudio on macOS, ASIO on Windows.
+//! AVB output is implemented via system audio APIs: CoreAudio on macOS,
+//! ASIO on Windows by default (disable the `asio` default feature to use
+//! WASAPI instead), and ALSA on Linux.
 //! Supports 5-channel (XYRGB) and 6-channel (XYRGBI) mapping with auto-detected sample rate.
 
 pub mod backend;

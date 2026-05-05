@@ -17,7 +17,7 @@ rust-version = "1.87"
 members = [".", "tools/idn-simulator", "tools/idn-mock-server"]
 
 [features]
-default = ["all-dacs"]
+default = ["all-dacs", "asio"]
 
 # Meta features
 all-dacs = ["usb-dacs", "network-dacs", "audio-dacs"]
@@ -35,6 +35,11 @@ avb = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Oscilloscope XY mode via audio output
 oscilloscope = ["dep:cpal", "dep:crossbeam-queue"]
+
+# Opt-in ASIO support on Windows (requires the Steinberg ASIO SDK and
+# LIBCLANG_PATH / CPAL_ASIO_DIR env vars at build time). Without this feature,
+# AVB and oscilloscope use the cpal default host (WASAPI on Windows).
+asio = ["dep:cpal", "cpal/asio"]
 
 # Optional serialization
 serde = ["dep:serde"]
@@ -58,11 +63,6 @@ socket2 = { version = "0.5", features = ["all"], optional = true }
 
 # Optional serialization
 serde = { version = "1.0", features = ["derive"], optional = true }
-
-# Windows-only: enable ASIO support for AVB backend
-[target.'cfg(windows)'.dependencies]
-cpal = { version = "0.15", features = ["asio"], optional = true }
-
 
 # Unix-only for lasercube-wifi
 [target.'cfg(unix)'.dependencies]

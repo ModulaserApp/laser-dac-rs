@@ -68,7 +68,7 @@
 //! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)
 //! - **LaserCube USB** - USB laser DAC / LaserDock (feature: `lasercube-usb`)
 //! - **Oscilloscope** - XY mode via stereo audio output (feature: `oscilloscope`)
-//! - **AVB Audio Devices** - AVB audio output via CoreAudio/ASIO (feature: `avb`, macOS/Windows)
+//! - **AVB Audio Devices** - AVB audio output via the system audio host: CoreAudio (macOS), WASAPI or ASIO (Windows, ASIO opt-in via the `asio` feature), ALSA (Linux). Feature: `avb`.
 //!
 //! # Features
 //!
@@ -76,6 +76,11 @@
 //! - `usb-dacs`: Enable USB DACs (Helios, LaserCube USB)
 //! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube WiFi)
 //! - `audio-dacs`: Enable audio DACs (Oscilloscope, AVB)
+//! - `asio` (default): ASIO host on Windows for AVB output. Requires the
+//!   Steinberg ASIO SDK plus `LIBCLANG_PATH` and `CPAL_ASIO_DIR` set at
+//!   build time. Disable with `default-features = false` (and re-enable the
+//!   features you want) to fall back to the default cpal host (WASAPI on
+//!   Windows) and skip the SDK requirement.
 //!
 //! # Coordinate System
 //!

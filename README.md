@@ -27,7 +27,7 @@ LaserCube, IDN) work with both Frame and Streaming APIs.
 | IDN (ILDA Digital Network) | Network    | FIFO         | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
 | LaserCube WiFi             | Network    | FIFO         | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
 | LaserCube USB / Laserdock  | USB        | FIFO         | ✅       |
-| AVB Audio Device           | Network    | FIFO         | ✅       | Uses CoreAudio (macOS), ASIO (Windows), ALSA (Linux). Tested with [LaserAnimation Sollinger](https://laseranimation.com). |
+| AVB Audio Device           | Network    | FIFO         | ✅       | Uses CoreAudio (macOS), ASIO on Windows by default (disable the `asio` default feature to use WASAPI and skip the Steinberg SDK), ALSA (Linux). Tested with [LaserAnimation Sollinger](https://laseranimation.com). |
 
 All DACs have been manually verified to work.
 

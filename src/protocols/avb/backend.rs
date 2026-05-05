@@ -25,17 +25,14 @@ fn queue_capacity_for_rate(sample_rate: u32) -> usize {
     (sample_rate as usize * QUEUE_DURATION_MS as usize) / 1000
 }
 
-/// Returns the platform-appropriate cpal audio host.
+/// Returns the cpal audio host to use for AVB output.
 ///
-/// - macOS: default host (CoreAudio)
-/// - Windows: ASIO host (required for reliable 6-channel output)
-/// - Linux: default host (ALSA)
+/// - Windows with the `asio` default feature: the ASIO host (recommended
+///   for reliable multichannel output on pro audio interfaces).
+/// - Otherwise: the cpal default host — CoreAudio on macOS, WASAPI on
+///   Windows (when `asio` is disabled), ALSA on Linux.
 fn get_audio_host() -> Result<cpal::Host> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(cpal::default_host())
-    }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         cpal::host_from_id(cpal::HostId::Asio).map_err(|e| {
             Error::invalid_config(format!(
@@ -44,7 +41,7 @@ fn get_audio_host() -> Result<cpal::Host> {
             ))
         })
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(all(target_os = "windows", feature = "asio")))]
     {
         Ok(cpal::default_host())
     }
