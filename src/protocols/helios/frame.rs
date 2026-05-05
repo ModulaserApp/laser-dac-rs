@@ -2,7 +2,7 @@
 
 use bitflags::bitflags;
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 
 /// A frame to be sent to the Helios DAC.
 #[derive(Debug, Clone, PartialEq)]

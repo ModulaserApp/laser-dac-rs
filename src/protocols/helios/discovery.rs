@@ -3,9 +3,9 @@
 use std::any::Any;
 
 use crate::backend::{BackendKind, Result};
+use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::helios::{HeliosBackend, HeliosDac, HeliosDacController};
-use crate::types::DacType;
 
 const PREFIX: &str = "helios";
 

@@ -6,7 +6,7 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, BE};
 use std::io;
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 
 // -------------------------------------------------------------------------------------------------
 //  Constants
@@ -1237,7 +1237,7 @@ pub mod channel_descriptors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LaserPoint;
+    use crate::point::LaserPoint;
 
     // ==========================================================================
     // PointXyrgbi Conversion Tests - Testing the From<&LaserPoint> implementation

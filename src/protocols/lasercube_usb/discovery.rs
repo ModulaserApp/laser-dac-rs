@@ -3,9 +3,9 @@
 use std::any::Any;
 
 use crate::backend::{BackendKind, LasercubeUsbBackend, Result};
+use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::lasercube_usb::{rusb, DacController};
-use crate::types::DacType;
 
 const PREFIX: &str = "lasercube-usb";
 

@@ -3,11 +3,11 @@
 use std::any::Any;
 
 use crate::backend::{AvbBackend, BackendKind, Result};
+use crate::device::DacType;
 use crate::discovery::{
     downcast_connect_data, slugify_device_id, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer,
 };
 use crate::protocols::avb::{discover_device_selectors, AvbSelector};
-use crate::types::DacType;
 
 const PREFIX: &str = "avb";
 

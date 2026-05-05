@@ -3,7 +3,7 @@
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use std::io;
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 
 pub use self::command::Command;
 
@@ -608,7 +608,7 @@ pub mod command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::LaserPoint;
+    use crate::point::LaserPoint;
 
     // ==========================================================================
     // DacPoint Conversion Tests

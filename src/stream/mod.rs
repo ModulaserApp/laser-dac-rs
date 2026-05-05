@@ -37,13 +37,224 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result, WriteOutcome};
+use crate::config::{IdlePolicy, StreamConfig};
+use crate::device::{DacCapabilities, DacInfo, DacType, OutputModel};
 use crate::discovery::DacDiscovery;
+use crate::point::LaserPoint;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
 use crate::scheduler;
-use crate::types::{
-    ChunkRequest, ChunkResult, DacCapabilities, DacInfo, DacType, IdlePolicy, LaserPoint,
-    OutputModel, RunExit, StreamConfig, StreamInstant, StreamStats, StreamStatus,
-};
+
+// =============================================================================
+// Stream protocol types
+// =============================================================================
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+/// Represents a point in stream time, anchored to estimated playback position.
+///
+/// `StreamInstant` represents the **estimated playback time** of points, not merely
+/// "points sent so far." When used in `ChunkRequest::start`, it represents:
+///
+/// `start` = playhead + buffered
+///
+/// Where:
+/// - `playhead` = stream_epoch + estimated_consumed_points
+/// - `buffered` = points sent but not yet played
+///
+/// This allows callbacks to generate content for the exact time it will be displayed,
+/// enabling accurate audio synchronization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct StreamInstant(pub u64);
+
+impl StreamInstant {
+    /// Create a new stream instant from a point count.
+    pub fn new(points: u64) -> Self {
+        Self(points)
+    }
+
+    /// Returns the number of points since stream start.
+    pub fn points(&self) -> u64 {
+        self.0
+    }
+
+    /// Convert this instant to seconds at the given points-per-second rate.
+    pub fn as_seconds(&self, pps: u32) -> f64 {
+        self.0 as f64 / pps as f64
+    }
+
+    /// Convert to seconds at the given PPS.
+    ///
+    /// This is an alias for `as_seconds()` for consistency with standard Rust
+    /// duration naming conventions (e.g., `Duration::as_secs_f64()`).
+    #[inline]
+    pub fn as_secs_f64(&self, pps: u32) -> f64 {
+        self.as_seconds(pps)
+    }
+
+    /// Create a stream instant from a duration in seconds at the given PPS.
+    pub fn from_seconds(seconds: f64, pps: u32) -> Self {
+        Self((seconds * pps as f64) as u64)
+    }
+
+    /// Add a number of points to this instant.
+    pub fn add_points(&self, points: u64) -> Self {
+        Self(self.0.saturating_add(points))
+    }
+
+    /// Subtract a number of points from this instant (saturating at 0).
+    pub fn sub_points(&self, points: u64) -> Self {
+        Self(self.0.saturating_sub(points))
+    }
+}
+
+impl std::ops::Add<u64> for StreamInstant {
+    type Output = Self;
+    fn add(self, rhs: u64) -> Self::Output {
+        self.add_points(rhs)
+    }
+}
+
+impl std::ops::Sub<u64> for StreamInstant {
+    type Output = Self;
+    fn sub(self, rhs: u64) -> Self::Output {
+        self.sub_points(rhs)
+    }
+}
+
+impl std::ops::AddAssign<u64> for StreamInstant {
+    fn add_assign(&mut self, rhs: u64) {
+        self.0 = self.0.saturating_add(rhs);
+    }
+}
+
+impl std::ops::SubAssign<u64> for StreamInstant {
+    fn sub_assign(&mut self, rhs: u64) {
+        self.0 = self.0.saturating_sub(rhs);
+    }
+}
+
+/// A request to fill a buffer with points for streaming.
+///
+/// This is the streaming API with pure buffer-driven timing.
+/// The callback receives a `ChunkRequest` describing buffer state and requirements,
+/// and fills points into a library-owned buffer.
+///
+/// # Point Tiers
+///
+/// - `min_points`: Minimum points needed to avoid imminent underrun (ceiling rounded)
+/// - `target_points`: Ideal number of points to reach target buffer level (clamped to buffer length)
+/// - `buffer.len()` (passed separately): Maximum points the callback may write
+///
+/// # Rounding Rules
+///
+/// - `min_points`: Always **ceiling** (underrun prevention)
+/// - `target_points`: **ceiling**, then clamped to buffer length
+#[derive(Clone, Debug)]
+pub struct ChunkRequest {
+    /// Estimated playback time when this chunk starts.
+    ///
+    /// Calculated as: playhead + buffered_points
+    /// Use this for audio synchronization.
+    pub start: StreamInstant,
+
+    /// Points per second (current value, may change via `StreamControl::set_pps`).
+    pub pps: u32,
+
+    /// Minimum points needed to avoid imminent underrun.
+    ///
+    /// Calculated with ceiling to prevent underrun: `ceil((min_buffer - buffered) * pps)`
+    /// If 0, buffer is healthy.
+    pub min_points: usize,
+
+    /// Ideal number of points to reach target buffer level.
+    ///
+    /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
+    pub target_points: usize,
+
+    /// Current buffer level in points (for diagnostics/adaptive content).
+    pub buffered_points: u64,
+
+    /// Current buffer level as duration (for audio sync convenience).
+    pub buffered: std::time::Duration,
+
+    /// Raw device queue if available (best-effort, may differ from buffered_points).
+    pub device_queued_points: Option<u64>,
+}
+
+/// Result returned by the fill callback indicating how the buffer was filled.
+///
+/// This enum allows the callback to communicate three distinct states:
+/// - Successfully filled some number of points
+/// - Temporarily unable to provide data (underrun policy applies)
+/// - Stream should end gracefully
+///
+/// # `Filled(0)` Semantics
+///
+/// - If `target_points == 0`: Buffer is full, nothing needed. This is fine.
+/// - If `target_points > 0`: We needed points but got none. Treated as `Starved`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkResult {
+    /// Wrote n points to the buffer.
+    ///
+    /// `n` must be <= `buffer.len()`.
+    /// Partial fills (`n < min_points`) are accepted without padding - useful when
+    /// content is legitimately ending. Return `End` on the next call to signal completion.
+    Filled(usize),
+
+    /// No data available right now.
+    ///
+    /// Underrun policy is applied (repeat last chunk or blank).
+    /// Stream continues; callback will be called again when buffer needs filling.
+    Starved,
+
+    /// Stream is finished. Shutdown sequence:
+    /// 1. Stop calling callback
+    /// 2. Let queued points drain (play out)
+    /// 3. Blank/park the laser at last position
+    /// 4. Return from stream() with `RunExit::ProducerEnded`
+    End,
+}
+
+/// Current status of a stream.
+#[derive(Clone, Debug)]
+pub struct StreamStatus {
+    /// Whether the device is connected.
+    pub connected: bool,
+    /// Library-owned scheduled amount.
+    pub scheduled_ahead_points: u64,
+    /// Best-effort device/backend estimate.
+    pub device_queued_points: Option<u64>,
+    /// Optional statistics for diagnostics.
+    pub stats: Option<StreamStats>,
+}
+
+/// Stream statistics for diagnostics and debugging.
+#[derive(Clone, Debug, Default)]
+pub struct StreamStats {
+    /// Number of times the stream underran.
+    pub underrun_count: u64,
+    /// Number of chunks that arrived late.
+    pub late_chunk_count: u64,
+    /// Number of times the device reconnected.
+    pub reconnect_count: u64,
+    /// Total chunks written since stream start.
+    pub chunks_written: u64,
+    /// Total points written since stream start.
+    pub points_written: u64,
+}
+
+/// How a callback-mode stream run ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunExit {
+    /// Stream was stopped via `StreamControl::stop()`.
+    Stopped,
+    /// Producer returned `None` (graceful completion).
+    ProducerEnded,
+    /// Device disconnected. No auto-reconnect; new streams start disarmed.
+    Disconnected,
+}
 
 // =============================================================================
 // Stream Control

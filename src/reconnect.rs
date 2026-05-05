@@ -6,15 +6,16 @@
 //!
 //! [`Stream`]: crate::stream::Stream
 //! [`FrameSession`]: crate::presentation::FrameSession
-//! [`ReconnectConfig`]: crate::types::ReconnectConfig
+//! [`ReconnectConfig`]: crate::config::ReconnectConfig
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result};
+use crate::config::ReconnectConfig;
+use crate::device::DacInfo;
 use crate::discovery::DacDiscovery;
-use crate::stream::Dac;
-use crate::types::{DacInfo, ReconnectConfig, RunExit};
+use crate::stream::{Dac, RunExit};
 
 type DisconnectCallback = Box<dyn FnMut(&Error) + Send + 'static>;
 type ReconnectCallback = Box<dyn FnMut(&DacInfo) + Send + 'static>;

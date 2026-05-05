@@ -92,10 +92,13 @@
 //! Each backend handles conversion to its native format internally.
 
 pub mod backend;
+pub mod config;
+pub mod device;
 pub mod discovery;
 mod error;
 #[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
 mod net_utils;
+pub mod point;
 pub mod presentation;
 pub mod protocols;
 pub(crate) mod reconnect;
@@ -117,36 +120,27 @@ pub use discovery::{
     Discoverer,
 };
 
-// Core types
-pub use types::{
-    // DAC types
-    caps_for_dac_type,
-    ChunkRequest,
-    ChunkResult,
-    // Streaming types
-    DacCapabilities,
-    DacConnectionState,
-    DacDevice,
-    DacInfo,
-    DacType,
-    EnabledDacTypes,
-    IdlePolicy,
-    LaserPoint,
-    OutputModel,
-    ReconnectConfig,
-    RunExit,
-    StreamConfig,
-    StreamInstant,
-    StreamStats,
-    StreamStatus,
+// Point type
+pub use point::LaserPoint;
+
+// DAC identity, capabilities, discovery filtering
+pub use device::{
+    caps_for_dac_type, DacCapabilities, DacConnectionState, DacDevice, DacInfo, DacType,
+    EnabledDacTypes, OutputModel,
 };
+
+// Configuration
+pub use config::{IdlePolicy, ReconnectConfig, StreamConfig};
 
 // Deprecated alias for backwards compatibility
 #[allow(deprecated)]
-pub use types::UnderrunPolicy;
+pub use config::UnderrunPolicy;
 
 // Stream and Dac types
-pub use stream::{Dac, Stream, StreamControl};
+pub use stream::{
+    ChunkRequest, ChunkResult, Dac, RunExit, Stream, StreamControl, StreamInstant, StreamStats,
+    StreamStatus,
+};
 
 // Presentation types (frame-first API)
 pub use presentation::{

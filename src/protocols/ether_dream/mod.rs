@@ -41,7 +41,7 @@ pub use self::protocol::{
 pub use backend::EtherDreamBackend;
 pub use discovery::EtherDreamDiscoverer;
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 use std::{io, net};
 
 /// Returns the default capabilities for Ether Dream DACs.

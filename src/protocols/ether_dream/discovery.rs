@@ -5,10 +5,10 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::backend::{BackendKind, EtherDreamBackend, Result};
+use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::ether_dream::protocol::DacBroadcast;
 use crate::protocols::ether_dream::recv_dac_broadcasts;
-use crate::types::DacType;
 
 const PREFIX: &str = "etherdream";
 

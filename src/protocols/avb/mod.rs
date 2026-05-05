@@ -13,7 +13,7 @@ pub use backend::{discover_device_selectors, AvbBackend, AvbSelector};
 pub use discovery::AvbDiscoverer;
 pub use error::Error;
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 
 /// Returns default capabilities for AVB DAC output.
 ///

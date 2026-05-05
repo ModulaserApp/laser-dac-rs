@@ -6,12 +6,12 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::backend::{BackendKind, IdnBackend, Result};
+use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::idn::dac::{ServerInfo, ServiceInfo};
 use crate::protocols::idn::scan_for_servers;
 #[cfg(feature = "testutils")]
 use crate::protocols::idn::ServerScanner;
-use crate::types::DacType;
 
 const PREFIX: &str = "idn";
 

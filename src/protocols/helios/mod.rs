@@ -40,7 +40,7 @@ pub use discovery::HeliosDiscoverer;
 pub use frame::*;
 pub use native::*;
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 
 /// Returns the default capabilities for Helios DACs.
 pub fn default_capabilities() -> DacCapabilities {

@@ -1,6 +1,6 @@
 //! PresentationEngine and ColorDelayLine — core frame lifecycle internals.
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 
 use super::{Frame, TransitionFn, TransitionPlan};
 

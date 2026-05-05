@@ -38,7 +38,7 @@ pub mod protocol;
 pub use backend::LasercubeWifiBackend;
 pub use discovery::LasercubeWifiDiscoverer;
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 use dac::buffer_estimator::LATENCY_POINT_ADJUSTMENT;
 use protocol::{command, DeviceInfo, CMD_PORT, DEFAULT_BUFFER_CAPACITY};
 

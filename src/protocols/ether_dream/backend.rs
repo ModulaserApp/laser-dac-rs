@@ -1,10 +1,11 @@
 //! Ether Dream DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::ether_dream::dac::{stream, LightEngine, Playback, PlaybackFlags};
 use crate::protocols::ether_dream::protocol::{DacBroadcast, DacPoint};
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 

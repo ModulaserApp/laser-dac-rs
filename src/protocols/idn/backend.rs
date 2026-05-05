@@ -1,10 +1,11 @@
 //! IDN DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
 use crate::protocols::idn::protocol::PointXyrgbi;
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};

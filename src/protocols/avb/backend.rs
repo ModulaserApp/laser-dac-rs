@@ -1,10 +1,11 @@
 //! AVB DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
 use crate::resample::{catmull_rom, resampled_len};
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;

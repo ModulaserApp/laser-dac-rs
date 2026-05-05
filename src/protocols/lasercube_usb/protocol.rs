@@ -1,6 +1,6 @@
 //! Low-level USB protocol types and constants for LaserCube/LaserDock DAC communication.
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 use std::time::Duration;
 
 /// Timeout for USB control transfers (shared across modules).

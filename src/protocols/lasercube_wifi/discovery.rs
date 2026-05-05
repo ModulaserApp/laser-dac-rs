@@ -6,11 +6,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::backend::{BackendKind, LasercubeWifiBackend, Result};
+use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::lasercube_wifi::dac::Addressed;
 use crate::protocols::lasercube_wifi::discover_dacs;
 use crate::protocols::lasercube_wifi::protocol::DeviceInfo;
-use crate::types::DacType;
 
 const PREFIX: &str = "lasercube-wifi";
 

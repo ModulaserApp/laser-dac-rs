@@ -22,7 +22,7 @@ pub(crate) use engine::PresentationEngine;
 #[cfg(feature = "testutils")]
 pub use engine::PresentationEngine;
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 use std::sync::Arc;
 
 // =============================================================================

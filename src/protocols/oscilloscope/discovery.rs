@@ -6,10 +6,10 @@ use cpal::traits::{DeviceTrait, HostTrait};
 
 use super::{capabilities, OscilloscopeBackend};
 use crate::backend::{BackendKind, Result};
+use crate::device::DacType;
 use crate::discovery::{
     downcast_connect_data, slugify_device_id, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer,
 };
-use crate::types::DacType;
 
 const PREFIX: &str = "oscilloscope";
 

@@ -24,7 +24,7 @@ impl TestBackend {
                 pps_min: 1000,
                 pps_max: 100000,
                 max_points_per_chunk: 1000,
-                output_model: crate::types::OutputModel::NetworkFifo,
+                output_model: crate::device::OutputModel::NetworkFifo,
             },
             connected: false,
             write_count: Arc::new(AtomicUsize::new(0)),
@@ -1815,7 +1815,7 @@ fn test_start_stream_with_reconnect_rejects_invalid_pps() {
     });
 
     // PPS too low
-    let cfg = StreamConfig::new(500).with_reconnect(crate::types::ReconnectConfig::new());
+    let cfg = StreamConfig::new(500).with_reconnect(crate::config::ReconnectConfig::new());
     let result = device.start_stream(cfg);
     assert!(result.is_err());
 }
@@ -1829,7 +1829,7 @@ fn test_start_stream_reconnect_without_target_errors() {
         BackendKind::Fifo(Box::new(backend)),
     );
 
-    let cfg = StreamConfig::new(30_000).with_reconnect(crate::types::ReconnectConfig::new());
+    let cfg = StreamConfig::new(30_000).with_reconnect(crate::config::ReconnectConfig::new());
     let result = device.start_stream(cfg);
     match result {
         Err(e) => {
@@ -1856,7 +1856,7 @@ fn test_start_stream_reconnect_with_target_succeeds() {
         discovery_factory: None,
     });
 
-    let cfg = StreamConfig::new(30_000).with_reconnect(crate::types::ReconnectConfig::new());
+    let cfg = StreamConfig::new(30_000).with_reconnect(crate::config::ReconnectConfig::new());
     let result = device.start_stream(cfg);
     assert!(result.is_ok());
 
@@ -1950,7 +1950,7 @@ fn test_into_dac_preserves_reconnect_target() {
         discovery_factory: None,
     });
 
-    let cfg = StreamConfig::new(30_000).with_reconnect(crate::types::ReconnectConfig::new());
+    let cfg = StreamConfig::new(30_000).with_reconnect(crate::config::ReconnectConfig::new());
     let (stream, _) = device.start_stream(cfg).unwrap();
 
     // into_dac should extract the reconnect target from the policy
@@ -2857,7 +2857,7 @@ fn with_discovery_factory_creates_target_when_none() {
     assert!(device.reconnect_target.is_none());
 
     let device = device.with_discovery_factory(|| {
-        crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+        crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::all())
     });
 
     let target = device.reconnect_target.as_ref().unwrap();
@@ -2877,7 +2877,7 @@ fn with_discovery_factory_replaces_factory_on_existing_target() {
     });
 
     let device = device.with_discovery_factory(|| {
-        crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+        crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::all())
     });
 
     let target = device.reconnect_target.as_ref().unwrap();
@@ -2892,11 +2892,11 @@ fn with_discovery_factory_enables_reconnect_for_frame_session() {
     info.id = "test-session".to_string();
     let device =
         Dac::new(info, BackendKind::Fifo(Box::new(backend))).with_discovery_factory(|| {
-            crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::all())
+            crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::all())
         });
 
     let config = crate::presentation::FrameSessionConfig::new(30_000)
-        .with_reconnect(crate::types::ReconnectConfig::new());
+        .with_reconnect(crate::config::ReconnectConfig::new());
     let result = device.start_frame_session(config);
     assert!(
         result.is_ok(),
@@ -2928,7 +2928,7 @@ impl DacBackend for ReconnectFifoBackend {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 1000,
-            output_model: crate::types::OutputModel::NetworkFifo,
+            output_model: crate::device::OutputModel::NetworkFifo,
         };
         &CAPS
     }
@@ -2985,7 +2985,7 @@ impl DacBackend for DisconnectAfterNBackend {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 1000,
-            output_model: crate::types::OutputModel::NetworkFifo,
+            output_model: crate::device::OutputModel::NetworkFifo,
         };
         &CAPS
     }
@@ -3080,7 +3080,7 @@ fn reconnect_rediscovers_custom_backend_via_factory() {
 
     let device = Dac::new(info, BackendKind::Fifo(Box::new(initial_backend)))
         .with_discovery_factory(move || {
-            let mut d = crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+            let mut d = crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
             d.register(Box::new(TrackingDiscoverer {
                 scan_count: scan_count_factory.clone(),
                 connect_count: connect_count_factory.clone(),
@@ -3089,7 +3089,7 @@ fn reconnect_rediscovers_custom_backend_via_factory() {
         });
 
     let config = crate::presentation::FrameSessionConfig::new(30_000).with_reconnect(
-        crate::types::ReconnectConfig::new()
+        crate::config::ReconnectConfig::new()
             .max_retries(3)
             .backoff(Duration::from_millis(50))
             .on_reconnect(move |_info| {

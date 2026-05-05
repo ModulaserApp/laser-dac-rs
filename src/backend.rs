@@ -9,7 +9,8 @@
 //!
 //! The [`BackendKind`] enum wraps either variant for use in the stream scheduler.
 
-use crate::types::{DacCapabilities, DacType, LaserPoint};
+use crate::device::{DacCapabilities, DacType};
+use crate::point::LaserPoint;
 
 // Re-export error types for backwards compatibility
 pub use crate::error::{Error, Result};

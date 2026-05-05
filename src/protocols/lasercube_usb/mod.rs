@@ -51,7 +51,7 @@ pub use discovery::LasercubeUsbDiscoverer;
 // Re-export rusb for consumers that need the Context type
 pub use rusb;
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 
 /// Returns the default capabilities for LaserCube USB DACs.
 pub fn default_capabilities() -> DacCapabilities {

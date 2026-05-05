@@ -1176,7 +1176,7 @@ fn test_parity_a_to_c_skip() {
 
 use crate::backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend};
 use crate::error::Result as DacResult;
-use crate::types::RunExit;
+use crate::stream::RunExit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -1349,15 +1349,15 @@ impl FifoTestBackend {
 }
 
 impl DacBackend for FifoTestBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("FifoTest".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("FifoTest".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
-        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 1000,
-            output_model: crate::types::OutputModel::NetworkFifo,
+            output_model: crate::device::OutputModel::NetworkFifo,
         };
         &CAPS
     }
@@ -1428,15 +1428,15 @@ impl FrameSwapTestBackend {
 }
 
 impl DacBackend for FrameSwapTestBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("FrameSwapTest".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("FrameSwapTest".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
-        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 4095,
-            output_model: crate::types::OutputModel::UsbFrameSwap,
+            output_model: crate::device::OutputModel::UsbFrameSwap,
         };
         &CAPS
     }
@@ -1481,7 +1481,7 @@ impl FrameSwapBackend for FrameSwapTestBackend {
 
 struct RetryFifoTestBackend {
     connected: bool,
-    caps: crate::types::DacCapabilities,
+    caps: crate::device::DacCapabilities,
     shutter_open: Arc<AtomicBool>,
     block_next_writes: Arc<AtomicUsize>,
     block_next_visible_writes: Arc<AtomicUsize>,
@@ -1492,11 +1492,11 @@ impl RetryFifoTestBackend {
     fn new() -> Self {
         Self {
             connected: false,
-            caps: crate::types::DacCapabilities {
+            caps: crate::device::DacCapabilities {
                 pps_min: 1000,
                 pps_max: 100000,
                 max_points_per_chunk: 20,
-                output_model: crate::types::OutputModel::NetworkFifo,
+                output_model: crate::device::OutputModel::NetworkFifo,
             },
             shutter_open: Arc::new(AtomicBool::new(false)),
             block_next_writes: Arc::new(AtomicUsize::new(0)),
@@ -1507,10 +1507,10 @@ impl RetryFifoTestBackend {
 }
 
 impl DacBackend for RetryFifoTestBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("RetryFifoTest".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("RetryFifoTest".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
         &self.caps
     }
     fn connect(&mut self) -> DacResult<()> {
@@ -1578,15 +1578,15 @@ impl DisconnectAfterNFrameSwapBackend {
 }
 
 impl DacBackend for DisconnectAfterNFrameSwapBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("FilterReconnectFrameSwap".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
-        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 4095,
-            output_model: crate::types::OutputModel::UsbFrameSwap,
+            output_model: crate::device::OutputModel::UsbFrameSwap,
         };
         &CAPS
     }
@@ -1646,15 +1646,15 @@ impl ReconnectFrameSwapBackend {
 }
 
 impl DacBackend for ReconnectFrameSwapBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("FilterReconnectFrameSwap".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
-        static CAPS: crate::types::DacCapabilities = crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
             pps_min: 1000,
             pps_max: 100000,
             max_points_per_chunk: 4095,
-            output_model: crate::types::OutputModel::UsbFrameSwap,
+            output_model: crate::device::OutputModel::UsbFrameSwap,
         };
         &CAPS
     }
@@ -1699,8 +1699,8 @@ struct FilterReconnectFrameSwapDiscoverer {
 }
 
 impl crate::discovery::Discoverer for FilterReconnectFrameSwapDiscoverer {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("FilterReconnectFrameSwap".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("FilterReconnectFrameSwap".into())
     }
 
     fn prefix(&self) -> &str {
@@ -1709,7 +1709,7 @@ impl crate::discovery::Discoverer for FilterReconnectFrameSwapDiscoverer {
 
     fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
         let info = crate::discovery::DiscoveredDeviceInfo::new(
-            crate::types::DacType::Custom("FilterReconnectFrameSwap".into()),
+            crate::device::DacType::Custom("FilterReconnectFrameSwap".into()),
             "filterreconnectframeswap:10.0.0.77",
             "Filter Reconnect FrameSwap",
         )
@@ -1731,8 +1731,8 @@ struct DelayedReconnectFrameSwapDiscoverer {
 }
 
 impl crate::discovery::Discoverer for DelayedReconnectFrameSwapDiscoverer {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("DelayedReconnectFrameSwap".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("DelayedReconnectFrameSwap".into())
     }
 
     fn prefix(&self) -> &str {
@@ -1746,7 +1746,7 @@ impl crate::discovery::Discoverer for DelayedReconnectFrameSwapDiscoverer {
         }
 
         let info = crate::discovery::DiscoveredDeviceInfo::new(
-            crate::types::DacType::Custom("DelayedReconnectFrameSwap".into()),
+            crate::device::DacType::Custom("DelayedReconnectFrameSwap".into()),
             "delayedreconnectframeswap:10.0.0.88",
             "Delayed Reconnect FrameSwap",
         )
@@ -1764,7 +1764,7 @@ impl crate::discovery::Discoverer for DelayedReconnectFrameSwapDiscoverer {
 
 struct RetryFrameSwapTestBackend {
     connected: bool,
-    caps: crate::types::DacCapabilities,
+    caps: crate::device::DacCapabilities,
     shutter_open: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     block_next_writes: Arc<AtomicUsize>,
@@ -1775,11 +1775,11 @@ impl RetryFrameSwapTestBackend {
     fn new() -> Self {
         Self {
             connected: false,
-            caps: crate::types::DacCapabilities {
+            caps: crate::device::DacCapabilities {
                 pps_min: 1000,
                 pps_max: 100000,
                 max_points_per_chunk: 4095,
-                output_model: crate::types::OutputModel::UsbFrameSwap,
+                output_model: crate::device::OutputModel::UsbFrameSwap,
             },
             shutter_open: Arc::new(AtomicBool::new(false)),
             ready: Arc::new(AtomicBool::new(true)),
@@ -1790,10 +1790,10 @@ impl RetryFrameSwapTestBackend {
 }
 
 impl DacBackend for RetryFrameSwapTestBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("RetryFrameSwapTest".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("RetryFrameSwapTest".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
         &self.caps
     }
     fn connect(&mut self) -> DacResult<()> {
@@ -1841,7 +1841,7 @@ impl FrameSwapBackend for RetryFrameSwapTestBackend {
 
 struct RetryUdpTimedTestBackend {
     connected: bool,
-    caps: crate::types::DacCapabilities,
+    caps: crate::device::DacCapabilities,
     shutter_open: Arc<AtomicBool>,
     block_next_writes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
@@ -1851,11 +1851,11 @@ impl RetryUdpTimedTestBackend {
     fn new() -> Self {
         Self {
             connected: false,
-            caps: crate::types::DacCapabilities {
+            caps: crate::device::DacCapabilities {
                 pps_min: 1000,
                 pps_max: 100000,
                 max_points_per_chunk: 3,
-                output_model: crate::types::OutputModel::UdpTimed,
+                output_model: crate::device::OutputModel::UdpTimed,
             },
             shutter_open: Arc::new(AtomicBool::new(false)),
             block_next_writes: Arc::new(AtomicUsize::new(0)),
@@ -1865,10 +1865,10 @@ impl RetryUdpTimedTestBackend {
 }
 
 impl DacBackend for RetryUdpTimedTestBackend {
-    fn dac_type(&self) -> crate::types::DacType {
-        crate::types::DacType::Custom("RetryUdpTimedTest".into())
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("RetryUdpTimedTest".into())
     }
-    fn caps(&self) -> &crate::types::DacCapabilities {
+    fn caps(&self) -> &crate::device::DacCapabilities {
         &self.caps
     }
     fn connect(&mut self) -> DacResult<()> {
@@ -3025,8 +3025,9 @@ fn test_compose_hardware_frame_a_to_b_no_cycling_artifact() {
 
 #[test]
 fn test_frame_session_output_filter_resets_on_reconnect_and_replays_last_frame() {
+    use crate::config::ReconnectConfig;
+    use crate::device::{DacInfo, DacType};
     use crate::stream::Dac;
-    use crate::types::{DacInfo, DacType, ReconnectConfig};
 
     let reconnect_writes = Arc::new(Mutex::new(Vec::new()));
     let reconnect_writes_factory = reconnect_writes.clone();
@@ -3040,7 +3041,7 @@ fn test_frame_session_output_filter_resets_on_reconnect_and_replays_last_frame()
     let device = Dac::new(info, BackendKind::FrameSwap(Box::new(initial_backend)))
         .with_discovery_factory(move || {
             let mut discovery =
-                crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+                crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
             discovery.register(Box::new(FilterReconnectFrameSwapDiscoverer {
                 writes: reconnect_writes_factory.clone(),
             }));
@@ -3093,8 +3094,9 @@ fn test_frame_session_output_filter_resets_on_reconnect_and_replays_last_frame()
 
 #[test]
 fn test_frame_session_metrics_advance_during_reconnect_backoff() {
+    use crate::config::ReconnectConfig;
+    use crate::device::{DacInfo, DacType};
     use crate::stream::Dac;
-    use crate::types::{DacInfo, DacType, ReconnectConfig};
 
     let reconnect_writes = Arc::new(Mutex::new(Vec::new()));
     let reconnect_writes_factory = reconnect_writes.clone();
@@ -3110,7 +3112,7 @@ fn test_frame_session_metrics_advance_during_reconnect_backoff() {
     let device = Dac::new(info, BackendKind::FrameSwap(Box::new(initial_backend)))
         .with_discovery_factory(move || {
             let mut discovery =
-                crate::discovery::DacDiscovery::new(crate::types::EnabledDacTypes::none());
+                crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
             discovery.register(Box::new(DelayedReconnectFrameSwapDiscoverer {
                 writes: reconnect_writes_factory.clone(),
                 empty_scans_remaining: empty_scans_remaining_factory.clone(),
@@ -3272,7 +3274,7 @@ fn test_frame_fifo_buffer_estimation_matches_shared_scheduler_helper() {
 #[test]
 fn test_frame_session_config_with_reconnect() {
     let config = FrameSessionConfig::new(30_000)
-        .with_reconnect(crate::types::ReconnectConfig::new().max_retries(3));
+        .with_reconnect(crate::config::ReconnectConfig::new().max_retries(3));
 
     assert!(config.reconnect.is_some());
     assert_eq!(config.reconnect.as_ref().unwrap().max_retries, Some(3));
@@ -3281,8 +3283,8 @@ fn test_frame_session_config_with_reconnect() {
 #[test]
 fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
     use crate::backend::BackendKind;
+    use crate::device::{DacCapabilities, DacInfo, DacType, OutputModel};
     use crate::stream::Dac;
-    use crate::types::{DacCapabilities, DacInfo, DacType, OutputModel};
 
     // Create a Dac with reconnect target
     let caps = DacCapabilities {
@@ -3345,7 +3347,7 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
     });
 
     // PPS 500 is below pps_min=1000 — should be rejected even with reconnect
-    let config = FrameSessionConfig::new(500).with_reconnect(crate::types::ReconnectConfig::new());
+    let config = FrameSessionConfig::new(500).with_reconnect(crate::config::ReconnectConfig::new());
     let result = device.start_frame_session(config);
     assert!(result.is_err());
 }

@@ -13,8 +13,9 @@ use crate::resample::{catmull_rom, resampled_len};
 
 use super::OscilloscopeConfig;
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
-use crate::types::{DacCapabilities, DacType, LaserPoint};
+use crate::point::LaserPoint;
 
 /// Shared state between the producer (backend) and consumer (audio callback).
 struct RuntimeState {

@@ -1,12 +1,13 @@
 //! LaserCube USB DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
 use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
 use crate::protocols::lasercube_usb::{rusb, DacController};
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// LaserCube USB DAC backend (LaserDock).
 pub struct LasercubeUsbBackend {

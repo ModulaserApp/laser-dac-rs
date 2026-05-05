@@ -1,10 +1,11 @@
 //! LaserCube WiFi DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::lasercube_wifi::dac::{stream, Addressed};
 use crate::protocols::lasercube_wifi::protocol::{DeviceInfo, Point as LasercubePoint};
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 use std::net::SocketAddr;
 
 /// LaserCube WiFi DAC backend.

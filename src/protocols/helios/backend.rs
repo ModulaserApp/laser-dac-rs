@@ -1,12 +1,13 @@
 //! Helios DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FrameSwapBackend, WriteOutcome};
+use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::protocols::helios::{
     encode_frame_into, DeviceStatus, HeliosDac, HeliosDacController, HeliosDacError,
     Point as HeliosPoint, WriteFrameFlags,
 };
-use crate::types::{DacCapabilities, DacType, LaserPoint};
 
 /// Helios DAC backend (USB).
 pub struct HeliosBackend {

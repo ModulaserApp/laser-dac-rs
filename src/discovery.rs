@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
 use crate::backend::{BackendKind, Error, Result};
-use crate::types::{caps_for_dac_type, DacCapabilities, DacType, EnabledDacTypes};
+use crate::device::{caps_for_dac_type, DacCapabilities, DacType, EnabledDacTypes};
 
 // =============================================================================
 // Discoverer trait
@@ -463,7 +463,7 @@ impl DacDiscovery {
         let dac_type = device.info.dac_type.clone();
         let stream_backend = self.connect(device)?;
 
-        let dac_info = crate::types::DacInfo {
+        let dac_info = crate::device::DacInfo {
             id: id.to_string(),
             name,
             kind: dac_type,
@@ -479,7 +479,8 @@ mod tests {
     use super::*;
 
     use crate::backend::{BackendKind, DacBackend, FifoBackend};
-    use crate::types::{DacCapabilities, LaserPoint};
+    use crate::device::DacCapabilities;
+    use crate::point::LaserPoint;
     use crate::WriteOutcome;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -507,7 +508,7 @@ mod tests {
                 pps_min: 1,
                 pps_max: 100_000,
                 max_points_per_chunk: 4096,
-                output_model: crate::types::OutputModel::NetworkFifo,
+                output_model: crate::device::OutputModel::NetworkFifo,
             };
             &CAPS
         }

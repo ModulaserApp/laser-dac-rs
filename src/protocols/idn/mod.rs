@@ -53,7 +53,7 @@ pub use dac::{stream, Addressed, ServiceType};
 pub use error::{CommunicationError, ProtocolError, ResponseError, Result};
 pub use protocol::{AcknowledgeResponse, Point, PointExtended, PointXyrgbHighRes, PointXyrgbi};
 
-use crate::types::{DacCapabilities, OutputModel};
+use crate::device::{DacCapabilities, OutputModel};
 
 /// Returns the default capabilities for IDN DACs.
 ///

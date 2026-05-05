@@ -3,7 +3,7 @@
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use std::io;
 
-use crate::types::LaserPoint;
+use crate::point::LaserPoint;
 
 // Network ports
 /// Command and control port.

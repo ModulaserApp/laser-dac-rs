@@ -7,11 +7,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, WriteOutcome};
+use crate::device::DacInfo;
 use crate::error::{Error, Result};
+use crate::point::LaserPoint;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
 use crate::scheduler;
-use crate::stream::StreamControl;
-use crate::types::{DacInfo, LaserPoint, RunExit};
+use crate::stream::{RunExit, StreamControl};
 
 use super::engine::{ColorDelayLine, PresentationEngine};
 use super::{
@@ -50,13 +51,13 @@ pub struct FrameSessionConfig {
     ///
     /// Set via [`with_reconnect`](Self::with_reconnect) to enable automatic
     /// reconnection when the device disconnects.
-    pub reconnect: Option<crate::types::ReconnectConfig>,
+    pub reconnect: Option<crate::config::ReconnectConfig>,
     /// Policy for what to output when the stream is idle (disarmed).
     ///
-    /// Controls scanner behavior when disarmed. Default: [`Blank`](crate::types::IdlePolicy::Blank)
-    /// (park at origin with laser off). Use [`Park`](crate::types::IdlePolicy::Park) to park at a
+    /// Controls scanner behavior when disarmed. Default: [`Blank`](crate::config::IdlePolicy::Blank)
+    /// (park at origin with laser off). Use [`Park`](crate::config::IdlePolicy::Park) to park at a
     /// specific position.
-    pub idle_policy: crate::types::IdlePolicy,
+    pub idle_policy: crate::config::IdlePolicy,
     /// Optional hook for processing the final presented output.
     pub output_filter: Option<Box<dyn OutputFilter>>,
 }
@@ -73,7 +74,7 @@ impl FrameSessionConfig {
             transition_fn: default_transition(pps),
             startup_blank: std::time::Duration::from_millis(1),
             color_delay_points,
-            idle_policy: crate::types::IdlePolicy::default(),
+            idle_policy: crate::config::IdlePolicy::default(),
             reconnect: None,
             output_filter: None,
         }
@@ -100,15 +101,15 @@ impl FrameSessionConfig {
     /// Enable automatic reconnection (builder pattern).
     ///
     /// Requires the device to have been opened via [`open_device`](crate::open_device).
-    pub fn with_reconnect(mut self, config: crate::types::ReconnectConfig) -> Self {
+    pub fn with_reconnect(mut self, config: crate::config::ReconnectConfig) -> Self {
         self.reconnect = Some(config);
         self
     }
 
     /// Set the idle policy (builder pattern).
     ///
-    /// Controls scanner behavior when disarmed. See [`crate::types::IdlePolicy`].
-    pub fn with_idle_policy(mut self, policy: crate::types::IdlePolicy) -> Self {
+    /// Controls scanner behavior when disarmed. See [`crate::config::IdlePolicy`].
+    pub fn with_idle_policy(mut self, policy: crate::config::IdlePolicy) -> Self {
         self.idle_policy = policy;
         self
     }
@@ -339,7 +340,7 @@ impl FrameSession {
         metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
-        let is_udp_timed = backend.caps().output_model == crate::types::OutputModel::UdpTimed;
+        let is_udp_timed = backend.caps().output_model == crate::device::OutputModel::UdpTimed;
 
         if is_udp_timed {
             Self::run_udp_timed_loop(
@@ -1083,12 +1084,12 @@ impl FrameSession {
         is_armed: bool,
         startup_blank_remaining: &mut usize,
         buffer: &mut [LaserPoint],
-        idle_policy: &crate::types::IdlePolicy,
+        idle_policy: &crate::config::IdlePolicy,
     ) {
         if !is_armed {
             // When disarmed, apply idle policy: park scanners instead of tracing shapes
             let park = match idle_policy {
-                crate::types::IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
+                crate::config::IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
                 // RepeatLast falls back to Blank when disarmed
                 _ => LaserPoint::blanked(0.0, 0.0),
             };
