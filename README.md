@@ -368,13 +368,15 @@ By default, all DAC protocols are enabled via the `all-dacs` feature.
 | `all-dacs`       | Enable all DAC protocols (default)                          |
 | `usb-dacs`       | Enable USB DACs: `helios`, `lasercube-usb`                  |
 | `network-dacs`   | Enable network DACs: `ether-dream`, `idn`, `lasercube-wifi` |
-| `audio-dacs`     | Enable audio DACs: `avb`                                    |
+| `audio-dacs`     | Enable audio DACs: `avb`, `oscilloscope`                    |
 | `helios`         | Helios USB DAC                                              |
 | `lasercube-usb`  | LaserCube USB (LaserDock) DAC                               |
 | `ether-dream`    | Ether Dream network DAC                                     |
 | `idn`            | ILDA Digital Network DAC                                    |
 | `lasercube-wifi` | LaserCube WiFi DAC                                          |
 | `avb`            | AVB audio-device backend (experimental)                     |
+| `oscilloscope`   | Oscilloscope XY-mode output via stereo audio interface      |
+| `asio` (default) | ASIO host on Windows for `avb`/`oscilloscope` (requires the Steinberg ASIO SDK plus `LIBCLANG_PATH` and `CPAL_ASIO_DIR` at build time). Disable to fall back to the cpal default host (WASAPI on Windows). |
 
 For example, to enable only network DACs:
 
