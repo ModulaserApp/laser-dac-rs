@@ -143,7 +143,7 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 ///
 /// `target_points` is the ideal number of points to reach the target buffer
 /// level, clamped to the provided buffer length. Returning fewer points
-/// triggers the configured [`IdlePolicy`](crate::config::IdlePolicy) for the
+/// triggers the configured [`IdlePolicy`] for the
 /// remainder.
 #[derive(Clone, Debug)]
 pub struct ChunkRequest {
