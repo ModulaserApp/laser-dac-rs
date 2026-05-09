@@ -6,19 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendKind, WriteOutcome};
-use crate::device::DacInfo;
+use crate::backend::BackendKind;
+use crate::device::{DacInfo, OutputModel};
 use crate::error::{Error, Result};
-use crate::point::LaserPoint;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
-use crate::scheduler;
-use crate::stream::{RunExit, StreamControl};
+use crate::stream::{ControlMsg, RunExit, StreamControl};
 
-use super::engine::{ColorDelayLine, PresentationEngine};
-use super::{
-    default_transition, Frame, OutputFilter, OutputFilterContext, OutputResetReason,
-    PresentedSliceKind, TransitionFn,
-};
+use super::engine::PresentationEngine;
+use super::output_model::{self, LoopCtx, StepOutcome};
+use super::slice_pipeline::SlicePipeline;
+use super::{default_transition, Frame, OutputResetReason, TransitionFn};
 
 /// Convert a duration to a point count at the given PPS rate.
 fn duration_to_points(d: Duration, pps: u32) -> usize {
@@ -59,7 +56,7 @@ pub struct FrameSessionConfig {
     /// specific position.
     pub idle_policy: crate::config::IdlePolicy,
     /// Optional hook for processing the final presented output.
-    pub output_filter: Option<Box<dyn OutputFilter>>,
+    pub output_filter: Option<Box<dyn super::OutputFilter>>,
 }
 
 impl FrameSessionConfig {
@@ -115,7 +112,7 @@ impl FrameSessionConfig {
     }
 
     /// Install a final-output filter (builder pattern).
-    pub fn with_output_filter(mut self, filter: Box<dyn OutputFilter>) -> Self {
+    pub fn with_output_filter(mut self, filter: Box<dyn super::OutputFilter>) -> Self {
         self.output_filter = Some(filter);
         self
     }
@@ -139,7 +136,7 @@ struct FrameSessionMetricsInner {
 }
 
 impl FrameSessionMetrics {
-    fn new(connected: bool) -> Self {
+    pub(crate) fn new(connected: bool) -> Self {
         let metrics = Self {
             inner: Arc::new(FrameSessionMetricsInner {
                 connected: AtomicBool::new(connected),
@@ -179,13 +176,13 @@ impl FrameSessionMetrics {
         (self.inner.origin.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1)
     }
 
-    fn mark_loop_activity(&self) {
+    pub(super) fn mark_loop_activity(&self) {
         self.inner
             .last_loop_activity_nanos
             .store(self.now_nanos(), Ordering::SeqCst);
     }
 
-    fn mark_write_success(&self) {
+    pub(super) fn mark_write_success(&self) {
         let now = self.now_nanos();
         self.inner
             .last_loop_activity_nanos
@@ -195,7 +192,7 @@ impl FrameSessionMetrics {
             .store(now, Ordering::SeqCst);
     }
 
-    fn set_connected(&self, connected: bool) {
+    pub(super) fn set_connected(&self, connected: bool) {
         self.inner.connected.store(connected, Ordering::SeqCst);
         self.mark_loop_activity();
     }
@@ -242,7 +239,6 @@ impl FrameSession {
         config: FrameSessionConfig,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<Self> {
-        // Connect if needed
         if !backend.is_connected() {
             backend.connect()?;
         }
@@ -258,33 +254,20 @@ impl FrameSession {
         let metrics = FrameSessionMetrics::new(backend.is_connected());
 
         let control_clone = control.clone();
-        let is_frame_swap = backend.is_frame_swap();
         let slot_clone = frame_slot.clone();
         let metrics_clone = metrics.clone();
 
         let thread = std::thread::spawn(move || {
             let _disconnect_guard = MetricsDisconnectGuard(metrics_clone.clone());
-            if is_frame_swap {
-                Self::run_frame_swap_loop(
-                    backend,
-                    config,
-                    control_clone,
-                    control_rx,
-                    slot_clone,
-                    metrics_clone,
-                    reconnect_policy,
-                )
-            } else {
-                Self::run_fifo_loop(
-                    backend,
-                    config,
-                    control_clone,
-                    control_rx,
-                    slot_clone,
-                    metrics_clone,
-                    reconnect_policy,
-                )
-            }
+            Self::run_loop(
+                backend,
+                config,
+                control_clone,
+                control_rx,
+                slot_clone,
+                metrics_clone,
+                reconnect_policy,
+            )
         });
 
         Ok(Self {
@@ -328,654 +311,142 @@ impl FrameSession {
     }
 
     // =========================================================================
-    // FIFO scheduler loop
+    // Driver loop
     // =========================================================================
 
-    fn run_fifo_loop(
-        backend: BackendKind,
-        config: FrameSessionConfig,
-        control: StreamControl,
-        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_slot: Arc<Mutex<Option<Frame>>>,
-        metrics: FrameSessionMetrics,
-        reconnect_policy: Option<ReconnectPolicy>,
-    ) -> Result<RunExit> {
-        let is_udp_timed = backend.caps().output_model == crate::device::OutputModel::UdpTimed;
-
-        if is_udp_timed {
-            Self::run_udp_timed_loop(
-                backend,
-                config,
-                control,
-                control_rx,
-                frame_slot,
-                metrics,
-                reconnect_policy,
-            )
-        } else {
-            Self::run_fifo_estimation_loop(
-                backend,
-                config,
-                control,
-                control_rx,
-                frame_slot,
-                metrics,
-                reconnect_policy,
-            )
-        }
-    }
-
-    /// Fixed-rate loop for UdpTimed backends (LaserCube WiFi).
-    ///
-    /// Sends a fixed chunk every cycle at precise intervals. No buffer
-    /// estimation — just metronomic pacing. This avoids all the overflow
-    /// and estimation issues that plague UDP-based laser DACs.
-    fn run_udp_timed_loop(
+    fn run_loop(
         mut backend: BackendKind,
         config: FrameSessionConfig,
         control: StreamControl,
-        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
+        control_rx: mpsc::Receiver<ControlMsg>,
         frame_slot: Arc<Mutex<Option<Frame>>>,
         metrics: FrameSessionMetrics,
         reconnect_policy: Option<ReconnectPolicy>,
     ) -> Result<RunExit> {
         let FrameSessionConfig {
-            pps: initial_pps,
+            pps: _,
             transition_fn,
             startup_blank,
             color_delay_points,
             idle_policy,
-            reconnect: _,
             output_filter,
+            reconnect: _,
         } = config;
-        let initial_pps_f64 = initial_pps as f64;
-        // Fixed chunk: ~10ms worth of points (small enough to avoid overflow,
-        // large enough for efficient packets). At 30kpps = 300 points = ~2 packets.
-        let mut chunk_points =
-            ((initial_pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
-        let mut chunk_duration = Duration::from_secs_f64(chunk_points as f64 / initial_pps_f64);
 
         let mut engine = PresentationEngine::new(transition_fn);
-        let mut chunk_buffer = vec![LaserPoint::default(); chunk_points];
-        let mut color_delay = ColorDelayLine::new(color_delay_points);
-        let mut shutter_open = false;
-        let mut startup_blank_remaining: usize = 0;
-        let mut last_armed = false;
-        let mut next_send = Instant::now();
-        let mut last_frame: Option<Frame> = None;
-        let mut retry_points: Option<usize> = None;
-        let mut output_filter = output_filter;
+        if backend.is_frame_swap() {
+            engine.set_frame_capacity(backend.frame_capacity());
+        }
 
-        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
+        // Per-OutputModel initial buffer sizing: FIFO bounds by max_points_per_chunk;
+        // frame-swap bounds by frame_capacity (max_points_per_chunk is meaningless there).
+        let initial_buf_capacity = match backend.caps().output_model {
+            OutputModel::UsbFrameSwap => backend.frame_capacity().unwrap_or(0),
+            OutputModel::NetworkFifo | OutputModel::UdpTimed => backend.caps().max_points_per_chunk,
+        };
+        let mut pipeline = SlicePipeline::new(
+            engine,
+            color_delay_points,
+            output_filter,
+            idle_policy,
+            initial_buf_capacity,
+        );
+        pipeline.reset_output_filter(OutputResetReason::SessionStart);
+
+        let mut adapter = output_model::for_backend(&backend);
+
+        let mut shutter_open = false;
+        let mut last_armed = false;
+        let mut last_frame: Option<Frame> = None;
+        let expected_frame_swap = backend.is_frame_swap();
 
         loop {
             metrics.mark_loop_activity();
-            // 1. High-precision wait until next send time
-            Self::sleep_until_precise(
-                &control,
-                &control_rx,
-                next_send,
-                &mut shutter_open,
-                &mut backend,
-                &metrics,
-            )?;
-            next_send += chunk_duration;
-
-            // Catch up if we fell behind (don't accumulate debt)
-            let now = Instant::now();
-            if next_send < now {
-                next_send = now;
-            }
-
-            let pps = control.pps();
-            let pps_f64 = pps as f64;
-            let new_chunk_points =
-                ((pps_f64 * 0.010).ceil() as usize).min(backend.caps().max_points_per_chunk);
-            if new_chunk_points != chunk_points {
-                chunk_points = new_chunk_points;
-                chunk_buffer.resize(chunk_points, LaserPoint::default());
-                chunk_duration = Duration::from_secs_f64(chunk_points as f64 / pps_f64);
-            }
-            let startup_blank_points = duration_to_points(startup_blank, pps);
-            color_delay.resize(duration_to_points(control.color_delay(), pps));
-
-            // 2. Check stop
             if control.is_stop_requested() {
                 return Ok(RunExit::Stopped);
             }
 
-            // 3. Check for new frame (latest-wins slot)
+            let pps = control.pps();
+            let startup_blank_points = duration_to_points(startup_blank, pps);
+            pipeline.resize_color_delay(duration_to_points(control.color_delay(), pps));
+
             if let Some(frame) = frame_slot.lock().unwrap().take() {
                 last_frame = Some(frame.clone());
-                engine.set_pending(frame);
+                pipeline.set_pending(frame);
             }
 
-            // 4. Check connection
             if !backend.is_connected() {
-                if let Some(ref policy) = reconnect_policy {
-                    match Self::try_reconnect(
-                        &mut backend,
-                        policy,
-                        &control,
-                        &mut shutter_open,
-                        &mut last_armed,
-                        &mut engine,
-                        &last_frame,
-                        false,
-                        &metrics,
-                    ) {
-                        Ok(_info) => {
-                            next_send = Instant::now();
-                            color_delay.reset();
-                            Self::reset_output_filter(
-                                &mut output_filter,
-                                OutputResetReason::Reconnect,
-                            );
-                            retry_points = None;
-                            continue;
-                        }
-                        Err(exit) => return Ok(exit),
+                match Self::try_reconnect(
+                    &mut backend,
+                    reconnect_policy.as_ref(),
+                    &control,
+                    &mut shutter_open,
+                    &mut last_armed,
+                    &mut pipeline,
+                    &last_frame,
+                    expected_frame_swap,
+                    &metrics,
+                ) {
+                    Ok(info) => {
+                        adapter.on_reconnect(&info, &mut pipeline, &mut backend);
+                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
+                        continue;
                     }
+                    Err(exit) => return Ok(exit),
                 }
-                return Ok(RunExit::Disconnected);
             }
 
-            // 5. Process control messages
-            if Self::process_control_messages(&control_rx, &mut shutter_open, &mut backend) {
+            if output_model::process_control_messages(&control_rx, &mut shutter_open, &mut backend)
+            {
                 return Ok(RunExit::Stopped);
             }
-
-            // 6. Handle arm/disarm transitions
             let is_armed = control.is_armed();
             if let Some(reason) = Self::handle_shutter_transition(
                 is_armed,
                 &mut last_armed,
                 &mut shutter_open,
-                &mut startup_blank_remaining,
+                &mut pipeline,
                 startup_blank_points,
                 &mut backend,
             ) {
-                Self::reset_output_filter(&mut output_filter, reason);
+                pipeline.reset_output_filter(reason);
             }
 
-            // 7. Fill chunk from engine
-            let n = if let Some(n) = retry_points {
-                n
-            } else {
-                let n = engine.fill_chunk(&mut chunk_buffer, chunk_points);
-                if n == 0 {
-                    continue;
-                }
-
-                // Apply blanking modifications
-                Self::apply_blanking(
+            let outcome = {
+                let mut ctx = LoopCtx {
+                    backend: &mut backend,
+                    pipeline: &mut pipeline,
+                    control: &control,
+                    control_rx: &control_rx,
+                    metrics: &metrics,
+                    shutter_open: &mut shutter_open,
+                    pps,
                     is_armed,
-                    &mut startup_blank_remaining,
-                    &mut chunk_buffer[..n],
-                    &idle_policy,
-                );
-
-                // Apply color delay (stateful — carries across chunks)
-                color_delay.apply(&mut chunk_buffer[..n]);
-                if engine.has_logical_frame() {
-                    Self::apply_output_filter(
-                        &mut output_filter,
-                        &mut chunk_buffer[..n],
-                        OutputFilterContext {
-                            pps,
-                            kind: PresentedSliceKind::FifoChunk,
-                            is_cyclic: false,
-                        },
-                    );
-                }
-                retry_points = Some(n);
-                n
+                };
+                adapter.step(&mut ctx)
             };
 
-            // 8. Write. On backpressure, retry the exact same transmit
-            // buffer next cycle instead of advancing frame state.
-            match backend.try_write(pps, &chunk_buffer[..n]) {
-                Ok(WriteOutcome::Written) => {
-                    metrics.mark_write_success();
-                    retry_points = None;
-                }
-                Ok(WriteOutcome::WouldBlock) => {
-                    metrics.mark_loop_activity();
-                    // Device busy — keep retry_points set and retry next cycle
-                }
-                Err(e) if e.is_disconnected() => {
-                    if let Some(ref policy) = reconnect_policy {
-                        match Self::try_reconnect(
-                            &mut backend,
-                            policy,
-                            &control,
-                            &mut shutter_open,
-                            &mut last_armed,
-                            &mut engine,
-                            &last_frame,
-                            false,
-                            &metrics,
-                        ) {
-                            Ok(_info) => {
-                                next_send = Instant::now();
-                                color_delay.reset();
-                                Self::reset_output_filter(
-                                    &mut output_filter,
-                                    OutputResetReason::Reconnect,
-                                );
-                                retry_points = None;
-                                continue;
-                            }
-                            Err(exit) => return Ok(exit),
-                        }
-                    }
-                    return Ok(RunExit::Disconnected);
-                }
-                Err(_) => {}
-            }
-        }
-    }
-
-    /// Buffer-estimation loop for standard FIFO backends (Ether Dream, IDN, etc).
-    fn run_fifo_estimation_loop(
-        mut backend: BackendKind,
-        config: FrameSessionConfig,
-        control: StreamControl,
-        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_slot: Arc<Mutex<Option<Frame>>>,
-        metrics: FrameSessionMetrics,
-        reconnect_policy: Option<ReconnectPolicy>,
-    ) -> Result<RunExit> {
-        let FrameSessionConfig {
-            transition_fn,
-            startup_blank,
-            color_delay_points,
-            idle_policy,
-            output_filter,
-            ..
-        } = config;
-        let mut max_points = backend.caps().max_points_per_chunk;
-        let target_buffer_secs = 0.020_f64;
-
-        let mut engine = PresentationEngine::new(transition_fn);
-        let mut scheduled_ahead: u64 = 0;
-        let mut fractional_consumed: f64 = 0.0;
-        let mut last_iteration = Instant::now();
-        let mut chunk_buffer = vec![LaserPoint::default(); max_points];
-        let mut color_delay = ColorDelayLine::new(color_delay_points);
-        let mut shutter_open = false;
-        let mut startup_blank_remaining: usize = 0;
-        let mut last_armed = false;
-        let mut last_frame: Option<Frame> = None;
-        let mut output_filter = output_filter;
-
-        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
-
-        loop {
-            metrics.mark_loop_activity();
-            // 1. Check stop
-            if control.is_stop_requested() {
-                return Ok(RunExit::Stopped);
-            }
-
-            let pps = control.pps();
-            let pps_f64 = pps as f64;
-            let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
-            let startup_blank_points = duration_to_points(startup_blank, pps);
-            color_delay.resize(duration_to_points(control.color_delay(), pps));
-
-            // Time-based decay of scheduled_ahead
-            let now = Instant::now();
-            scheduler::advance_scheduled_ahead(
-                &mut scheduled_ahead,
-                &mut fractional_consumed,
-                &mut last_iteration,
-                now,
-                pps_f64,
-            );
-
-            // 2. Check for new frame (latest-wins slot)
-            if let Some(frame) = frame_slot.lock().unwrap().take() {
-                last_frame = Some(frame.clone());
-                engine.set_pending(frame);
-            }
-
-            // 3. Estimate buffer
-            let buffered =
-                scheduler::conservative_buffered_points(scheduled_ahead, backend.queued_points());
-
-            // 4. Sleep if buffer healthy
-            if buffered > target_buffer_points {
-                let excess = buffered - target_buffer_points;
-                let sleep_time = Duration::from_secs_f64(excess as f64 / pps_f64);
-                Self::sleep_with_control_check(
-                    &control,
-                    &control_rx,
-                    sleep_time,
-                    &mut shutter_open,
+            match outcome {
+                StepOutcome::Continue => {}
+                StepOutcome::Stopped => return Ok(RunExit::Stopped),
+                StepOutcome::Disconnected => match Self::try_reconnect(
                     &mut backend,
+                    reconnect_policy.as_ref(),
+                    &control,
+                    &mut shutter_open,
+                    &mut last_armed,
+                    &mut pipeline,
+                    &last_frame,
+                    expected_frame_swap,
                     &metrics,
-                )?;
-                continue;
-            }
-
-            // 5. Check connection
-            if !backend.is_connected() {
-                if let Some(ref policy) = reconnect_policy {
-                    match Self::try_reconnect(
-                        &mut backend,
-                        policy,
-                        &control,
-                        &mut shutter_open,
-                        &mut last_armed,
-                        &mut engine,
-                        &last_frame,
-                        false,
-                        &metrics,
-                    ) {
-                        Ok(info) => {
-                            scheduled_ahead = 0;
-                            fractional_consumed = 0.0;
-                            last_iteration = Instant::now();
-                            max_points = info.caps.max_points_per_chunk;
-                            chunk_buffer.resize(max_points, LaserPoint::default());
-                            color_delay.reset();
-                            Self::reset_output_filter(
-                                &mut output_filter,
-                                OutputResetReason::Reconnect,
-                            );
-                            continue;
-                        }
-                        Err(exit) => return Ok(exit),
+                ) {
+                    Ok(info) => {
+                        adapter.on_reconnect(&info, &mut pipeline, &mut backend);
+                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
+                        continue;
                     }
-                }
-                return Ok(RunExit::Disconnected);
-            }
-
-            // 6. Process control messages
-            if Self::process_control_messages(&control_rx, &mut shutter_open, &mut backend) {
-                return Ok(RunExit::Stopped);
-            }
-
-            // 7. Handle arm/disarm transitions
-            let is_armed = control.is_armed();
-            if let Some(reason) = Self::handle_shutter_transition(
-                is_armed,
-                &mut last_armed,
-                &mut shutter_open,
-                &mut startup_blank_remaining,
-                startup_blank_points,
-                &mut backend,
-            ) {
-                Self::reset_output_filter(&mut output_filter, reason);
-            }
-
-            // 8. Fill chunk from engine
-            let deficit = (target_buffer_secs - buffered as f64 / pps_f64).max(0.0);
-            let target_points = ((deficit * pps_f64).ceil() as usize).min(max_points);
-            if target_points == 0 {
-                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
-                continue;
-            }
-
-            let n = engine.fill_chunk(&mut chunk_buffer, target_points);
-            if n == 0 {
-                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
-                continue;
-            }
-
-            // Apply blanking modifications
-            Self::apply_blanking(
-                is_armed,
-                &mut startup_blank_remaining,
-                &mut chunk_buffer[..n],
-                &idle_policy,
-            );
-
-            // Apply color delay (stateful — carries across chunks)
-            color_delay.apply(&mut chunk_buffer[..n]);
-            if engine.has_logical_frame() {
-                Self::apply_output_filter(
-                    &mut output_filter,
-                    &mut chunk_buffer[..n],
-                    OutputFilterContext {
-                        pps,
-                        kind: PresentedSliceKind::FifoChunk,
-                        is_cyclic: false,
-                    },
-                );
-            }
-
-            // 9. Write to backend with retry on WouldBlock
-            loop {
-                match backend.try_write(pps, &chunk_buffer[..n]) {
-                    Ok(WriteOutcome::Written) => {
-                        metrics.mark_write_success();
-                        scheduled_ahead += n as u64;
-                        break;
-                    }
-                    Ok(WriteOutcome::WouldBlock) => {
-                        metrics.mark_loop_activity();
-                        std::thread::yield_now();
-                        if control.is_stop_requested() {
-                            return Ok(RunExit::Stopped);
-                        }
-                        Self::sleep_and_mark_activity(Duration::from_micros(100), &metrics);
-                    }
-                    Err(e) if e.is_disconnected() => {
-                        if let Some(ref policy) = reconnect_policy {
-                            match Self::try_reconnect(
-                                &mut backend,
-                                policy,
-                                &control,
-                                &mut shutter_open,
-                                &mut last_armed,
-                                &mut engine,
-                                &last_frame,
-                                false,
-                                &metrics,
-                            ) {
-                                Ok(info) => {
-                                    scheduled_ahead = 0;
-                                    fractional_consumed = 0.0;
-                                    last_iteration = Instant::now();
-                                    max_points = info.caps.max_points_per_chunk;
-                                    chunk_buffer.resize(max_points, LaserPoint::default());
-                                    color_delay.reset();
-                                    Self::reset_output_filter(
-                                        &mut output_filter,
-                                        OutputResetReason::Reconnect,
-                                    );
-                                    break;
-                                }
-                                Err(exit) => return Ok(exit),
-                            }
-                        }
-                        return Ok(RunExit::Disconnected);
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // =========================================================================
-    // Frame-swap scheduler loop
-    // =========================================================================
-
-    fn run_frame_swap_loop(
-        mut backend: BackendKind,
-        config: FrameSessionConfig,
-        control: StreamControl,
-        control_rx: mpsc::Receiver<crate::stream::ControlMsg>,
-        frame_slot: Arc<Mutex<Option<Frame>>>,
-        metrics: FrameSessionMetrics,
-        reconnect_policy: Option<ReconnectPolicy>,
-    ) -> Result<RunExit> {
-        let FrameSessionConfig {
-            transition_fn,
-            startup_blank,
-            color_delay_points,
-            idle_policy,
-            output_filter,
-            ..
-        } = config;
-        let mut engine = PresentationEngine::new(transition_fn);
-        engine.set_frame_capacity(backend.frame_capacity());
-        let mut shutter_open = false;
-        let mut startup_blank_remaining: usize = 0;
-        let mut last_armed = false;
-        let mut last_frame: Option<Frame> = None;
-        let mut frame_buf: Vec<LaserPoint> = Vec::new();
-        let mut color_delay = ColorDelayLine::new(color_delay_points);
-        let mut write_pending = false;
-        let mut output_filter = output_filter;
-
-        Self::reset_output_filter(&mut output_filter, OutputResetReason::SessionStart);
-
-        loop {
-            metrics.mark_loop_activity();
-            // 1. Check stop
-            if control.is_stop_requested() {
-                return Ok(RunExit::Stopped);
-            }
-
-            let pps = control.pps();
-            let startup_blank_points = duration_to_points(startup_blank, pps);
-            color_delay.resize(duration_to_points(control.color_delay(), pps));
-
-            // 2. Check for new frame (latest-wins slot)
-            if let Some(frame) = frame_slot.lock().unwrap().take() {
-                last_frame = Some(frame.clone());
-                engine.set_pending(frame);
-            }
-
-            // 3. Check connection
-            if !backend.is_connected() {
-                if let Some(ref policy) = reconnect_policy {
-                    match Self::try_reconnect(
-                        &mut backend,
-                        policy,
-                        &control,
-                        &mut shutter_open,
-                        &mut last_armed,
-                        &mut engine,
-                        &last_frame,
-                        true,
-                        &metrics,
-                    ) {
-                        Ok(_info) => {
-                            engine.set_frame_capacity(backend.frame_capacity());
-                            color_delay.reset();
-                            Self::reset_output_filter(
-                                &mut output_filter,
-                                OutputResetReason::Reconnect,
-                            );
-                            write_pending = false;
-                            continue;
-                        }
-                        Err(exit) => return Ok(exit),
-                    }
-                }
-                return Ok(RunExit::Disconnected);
-            }
-
-            // 4. Process control messages
-            if Self::process_control_messages(&control_rx, &mut shutter_open, &mut backend) {
-                return Ok(RunExit::Stopped);
-            }
-
-            // 5. Handle arm/disarm transitions
-            let is_armed = control.is_armed();
-            if let Some(reason) = Self::handle_shutter_transition(
-                is_armed,
-                &mut last_armed,
-                &mut shutter_open,
-                &mut startup_blank_remaining,
-                startup_blank_points,
-                &mut backend,
-            ) {
-                Self::reset_output_filter(&mut output_filter, reason);
-            }
-
-            // 6. Check if device is ready
-            if !write_pending && !backend.is_ready_for_frame() {
-                Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
-                continue;
-            }
-
-            // 7. Compose frame and copy to reusable buffer
-            if !write_pending {
-                let composed = engine.compose_hardware_frame();
-                if composed.is_empty() {
-                    Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
-                    continue;
-                }
-                frame_buf.clear();
-                frame_buf.extend_from_slice(composed);
-
-                // Apply blanking modifications
-                Self::apply_blanking(
-                    is_armed,
-                    &mut startup_blank_remaining,
-                    &mut frame_buf,
-                    &idle_policy,
-                );
-
-                color_delay.apply(&mut frame_buf);
-                Self::apply_output_filter(
-                    &mut output_filter,
-                    &mut frame_buf,
-                    OutputFilterContext {
-                        pps,
-                        kind: PresentedSliceKind::FrameSwapFrame,
-                        is_cyclic: true,
-                    },
-                );
-            }
-
-            // 8. Write frame
-            match backend.try_write(pps, &frame_buf) {
-                Ok(WriteOutcome::Written) => {
-                    metrics.mark_write_success();
-                    write_pending = false;
-                }
-                Ok(WriteOutcome::WouldBlock) => {
-                    metrics.mark_loop_activity();
-                    write_pending = true;
-                    Self::sleep_and_mark_activity(Duration::from_millis(1), &metrics);
-                }
-                Err(e) if e.is_disconnected() => {
-                    if let Some(ref policy) = reconnect_policy {
-                        match Self::try_reconnect(
-                            &mut backend,
-                            policy,
-                            &control,
-                            &mut shutter_open,
-                            &mut last_armed,
-                            &mut engine,
-                            &last_frame,
-                            true,
-                            &metrics,
-                        ) {
-                            Ok(_info) => {
-                                engine.set_frame_capacity(backend.frame_capacity());
-                                color_delay.reset();
-                                Self::reset_output_filter(
-                                    &mut output_filter,
-                                    OutputResetReason::Reconnect,
-                                );
-                                write_pending = false;
-                                continue;
-                            }
-                            Err(exit) => return Ok(exit),
-                        }
-                    }
-                    return Ok(RunExit::Disconnected);
-                }
-                Err(_) => {}
+                    Err(exit) => return Ok(exit),
+                },
             }
         }
     }
@@ -986,20 +457,24 @@ impl FrameSession {
 
     /// Attempt to reconnect the backend using the reconnection policy.
     ///
-    /// On success, replaces `backend` and resets scheduler state.
-    /// Returns the new `DacInfo` on success.
+    /// On success, replaces `backend`, resets the pipeline (engine + color
+    /// delay + cache), and replays the last frame. Returns the new `DacInfo`.
+    /// If no policy is set, returns `Err(RunExit::Disconnected)`.
     #[allow(clippy::too_many_arguments)]
     fn try_reconnect(
         backend: &mut BackendKind,
-        policy: &ReconnectPolicy,
+        policy: Option<&ReconnectPolicy>,
         control: &StreamControl,
         shutter_open: &mut bool,
         last_armed: &mut bool,
-        engine: &mut PresentationEngine,
+        pipeline: &mut SlicePipeline,
         last_frame: &Option<Frame>,
         expected_frame_swap: bool,
         metrics: &FrameSessionMetrics,
     ) -> std::result::Result<DacInfo, RunExit> {
+        let Some(policy) = policy else {
+            return Err(RunExit::Disconnected);
+        };
         metrics.set_connected(false);
         let current_pps = control.pps();
         let (info, new_backend) = reconnect_backend_with_retry(
@@ -1030,19 +505,17 @@ impl FrameSession {
             || metrics.mark_loop_activity(),
         )?;
 
-        // Swap backend
         *backend = new_backend;
         *shutter_open = false;
         *last_armed = false;
         metrics.set_connected(true);
 
-        // Reset engine and replay last frame
-        engine.reset();
+        pipeline.reset_engine();
+        pipeline.reset_color_delay();
         if let Some(frame) = last_frame {
-            engine.set_pending(frame.clone());
+            pipeline.set_pending(frame.clone());
         }
 
-        // Fire on_reconnect
         if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
             cb(&info);
         }
@@ -1055,12 +528,12 @@ impl FrameSession {
         is_armed: bool,
         last_armed: &mut bool,
         shutter_open: &mut bool,
-        startup_blank_remaining: &mut usize,
+        pipeline: &mut SlicePipeline,
         startup_blank_points: usize,
         backend: &mut BackendKind,
     ) -> Option<OutputResetReason> {
         if !*last_armed && is_armed {
-            *startup_blank_remaining = startup_blank_points;
+            pipeline.arm_startup_blank(startup_blank_points);
             if !*shutter_open {
                 let _ = backend.set_shutter(true);
                 *shutter_open = true;
@@ -1077,148 +550,6 @@ impl FrameSession {
         }
         *last_armed = is_armed;
         None
-    }
-
-    /// Apply disarm blanking and startup blanking to a buffer.
-    fn apply_blanking(
-        is_armed: bool,
-        startup_blank_remaining: &mut usize,
-        buffer: &mut [LaserPoint],
-        idle_policy: &crate::config::IdlePolicy,
-    ) {
-        if !is_armed {
-            // When disarmed, apply idle policy: park scanners instead of tracing shapes
-            let park = match idle_policy {
-                crate::config::IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
-                // RepeatLast falls back to Blank when disarmed
-                _ => LaserPoint::blanked(0.0, 0.0),
-            };
-            buffer.fill(park);
-        } else if *startup_blank_remaining > 0 {
-            let blank_count = buffer.len().min(*startup_blank_remaining);
-            for p in &mut buffer[..blank_count] {
-                p.r = 0;
-                p.g = 0;
-                p.b = 0;
-                p.intensity = 0;
-            }
-            *startup_blank_remaining -= blank_count;
-        }
-    }
-
-    fn process_control_messages(
-        control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,
-        shutter_open: &mut bool,
-        backend: &mut BackendKind,
-    ) -> bool {
-        use std::sync::mpsc::TryRecvError;
-        loop {
-            match control_rx.try_recv() {
-                Ok(crate::stream::ControlMsg::Arm) => {
-                    if !*shutter_open {
-                        let _ = backend.set_shutter(true);
-                        *shutter_open = true;
-                    }
-                }
-                Ok(crate::stream::ControlMsg::Disarm) => {
-                    if *shutter_open {
-                        let _ = backend.set_shutter(false);
-                        *shutter_open = false;
-                    }
-                }
-                Ok(crate::stream::ControlMsg::Stop) => {
-                    return true;
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        false
-    }
-
-    fn reset_output_filter(
-        output_filter: &mut Option<Box<dyn OutputFilter>>,
-        reason: OutputResetReason,
-    ) {
-        if let Some(filter) = output_filter.as_deref_mut() {
-            filter.reset(reason);
-        }
-    }
-
-    fn apply_output_filter(
-        output_filter: &mut Option<Box<dyn OutputFilter>>,
-        points: &mut [LaserPoint],
-        ctx: OutputFilterContext,
-    ) {
-        if let Some(filter) = output_filter.as_deref_mut() {
-            filter.filter(points, &ctx);
-        }
-    }
-
-    fn sleep_with_control_check(
-        control: &StreamControl,
-        control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,
-        duration: std::time::Duration,
-        shutter_open: &mut bool,
-        backend: &mut BackendKind,
-        metrics: &FrameSessionMetrics,
-    ) -> Result<()> {
-        const SLICE: std::time::Duration = std::time::Duration::from_millis(2);
-        let mut remaining = duration;
-        while remaining > std::time::Duration::ZERO {
-            let slice = remaining.min(SLICE);
-            std::thread::sleep(slice);
-            remaining = remaining.saturating_sub(slice);
-            metrics.mark_loop_activity();
-            if control.is_stop_requested() {
-                return Err(Error::Stopped);
-            }
-            Self::process_control_messages(control_rx, shutter_open, backend);
-        }
-        Ok(())
-    }
-
-    /// High-precision sleep for UdpTimed backends.
-    ///
-    /// Uses coarse sleeps first, then busy-waits near the deadline to
-    /// minimize wake-up jitter. Matches `Stream::sleep_until_with_control_check`.
-    fn sleep_until_precise(
-        control: &StreamControl,
-        control_rx: &mpsc::Receiver<crate::stream::ControlMsg>,
-        deadline: std::time::Instant,
-        shutter_open: &mut bool,
-        backend: &mut BackendKind,
-        metrics: &FrameSessionMetrics,
-    ) -> Result<()> {
-        const BUSY_WAIT_THRESHOLD: std::time::Duration = std::time::Duration::from_micros(500);
-        const SLEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
-
-        loop {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Ok(());
-            }
-
-            let remaining = deadline.duration_since(now);
-            if remaining > BUSY_WAIT_THRESHOLD {
-                let slice = remaining
-                    .saturating_sub(BUSY_WAIT_THRESHOLD)
-                    .min(SLEEP_SLICE);
-                std::thread::sleep(slice);
-            } else {
-                std::thread::yield_now();
-            }
-            metrics.mark_loop_activity();
-
-            if control.is_stop_requested() {
-                return Err(Error::Stopped);
-            }
-            Self::process_control_messages(control_rx, shutter_open, backend);
-        }
-    }
-
-    fn sleep_and_mark_activity(duration: Duration, metrics: &FrameSessionMetrics) {
-        std::thread::sleep(duration);
-        metrics.mark_loop_activity();
     }
 }
 

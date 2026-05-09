@@ -223,7 +223,7 @@ impl BackendKind {
 
     /// Returns `true` if this is a frame-swap backend.
     pub fn is_frame_swap(&self) -> bool {
-        matches!(self, BackendKind::FrameSwap(_))
+        self.caps().output_model == crate::device::OutputModel::UsbFrameSwap
     }
 
     /// Returns true if the device is ready to accept a new frame.
@@ -270,3 +270,108 @@ pub use crate::protocols::oscilloscope::OscilloscopeBackend;
 
 #[cfg(feature = "avb")]
 pub use crate::protocols::avb::AvbBackend;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::{DacCapabilities, DacType, OutputModel};
+
+    /// Stub FIFO backend with a configurable `OutputModel`.
+    struct StubFifo {
+        caps: DacCapabilities,
+    }
+    impl DacBackend for StubFifo {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("stub".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, _open: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl FifoBackend for StubFifo {
+        fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+    }
+
+    /// Stub frame-swap backend (always reports `UsbFrameSwap`).
+    struct StubFrameSwap;
+    impl DacBackend for StubFrameSwap {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("stub-fs".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            static CAPS: std::sync::OnceLock<DacCapabilities> = std::sync::OnceLock::new();
+            CAPS.get_or_init(|| DacCapabilities {
+                output_model: OutputModel::UsbFrameSwap,
+                ..DacCapabilities::default()
+            })
+        }
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, _open: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+    impl FrameSwapBackend for StubFrameSwap {
+        fn frame_capacity(&self) -> usize {
+            4096
+        }
+        fn is_ready_for_frame(&mut self) -> bool {
+            true
+        }
+        fn write_frame(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+    }
+
+    #[test]
+    fn is_frame_swap_matches_output_model_usb_frame_swap() {
+        for model in [
+            OutputModel::NetworkFifo,
+            OutputModel::UdpTimed,
+            OutputModel::UsbFrameSwap,
+        ] {
+            let caps = DacCapabilities {
+                output_model: model.clone(),
+                ..DacCapabilities::default()
+            };
+            let kind = BackendKind::Fifo(Box::new(StubFifo { caps }));
+            assert_eq!(
+                kind.is_frame_swap(),
+                model == OutputModel::UsbFrameSwap,
+                "Fifo wrapper with model {:?}",
+                model
+            );
+        }
+
+        let fs = BackendKind::FrameSwap(Box::new(StubFrameSwap));
+        assert!(fs.is_frame_swap(), "FrameSwap wrapper should report true");
+        assert_eq!(fs.caps().output_model, OutputModel::UsbFrameSwap);
+    }
+}

@@ -332,23 +332,13 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
     assert_eq!(stream.config.min_buffer, Duration::from_millis(4));
 }
 
-#[test]
-fn test_device_start_stream_keeps_usb_defaults() {
-    let mut backend = TestBackend::new();
-    backend.caps.output_model = OutputModel::UsbFrameSwap;
-    let device = Dac::new(
-        test_info(backend.caps()),
-        BackendKind::Fifo(Box::new(backend)),
-    );
-
-    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
-
-    assert_eq!(
-        stream.config.target_buffer,
-        StreamConfig::DEFAULT_TARGET_BUFFER
-    );
-    assert_eq!(stream.config.min_buffer, StreamConfig::DEFAULT_MIN_BUFFER);
-}
+// Removed `test_device_start_stream_keeps_usb_defaults`: it constructed an
+// inconsistent backend (BackendKind::Fifo wrapper with output_model=UsbFrameSwap)
+// to exercise the "USB defaults kept" branch of `apply_backend_buffer_defaults`.
+// After locking `is_frame_swap()` to `caps().output_model == UsbFrameSwap`, that
+// state is no longer constructible — frame-swap backends must use the FrameSwap
+// wrapper, and `start_stream` rejects them outright. See the existing test
+// `test_device_start_stream_rejects_frame_swap_backend` below.
 
 #[test]
 fn test_handle_underrun_advances_state() {

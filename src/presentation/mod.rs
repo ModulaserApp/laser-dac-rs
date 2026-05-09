@@ -7,7 +7,9 @@
 //! - [`FrameSession`] / [`FrameSessionConfig`]: public frame-mode API
 
 mod engine;
+mod output_model;
 mod session;
+mod slice_pipeline;
 
 pub use session::FrameSessionMetrics;
 pub use session::{FrameSession, FrameSessionConfig};
