@@ -18,6 +18,16 @@ const ENDPOINT_BULK_OUT: u8 = 0x02;
 const ENDPOINT_INT_OUT: u8 = 0x06;
 const ENDPOINT_INT_IN: u8 = 0x83;
 
+// Init timing — mirrors the official Helios C++ SDK. After
+// `set_alternate_setting`, some devices (notably on macOS) need ~100ms before
+// the first interrupt transfer succeeds; a 16ms first-attempt write usually
+// times out, then succeeds on retry. See `open()` for details.
+const INIT_SETTLE: Duration = Duration::from_millis(100);
+const INIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(5);
+const INIT_INTERRUPT_TIMEOUT: Duration = Duration::from_millis(32);
+const INIT_FW_OUT_ATTEMPTS: usize = 2;
+const INIT_FW_IN_ATTEMPTS: usize = 3;
+
 // Interrupt control bytes
 const CONTROL_STOP: u8 = 0x01;
 const CONTROL_SET_SHUTTER: u8 = 0x02;
@@ -98,21 +108,95 @@ pub enum HeliosDac {
 
 impl HeliosDac {
     /// Open the device for communication.
+    ///
+    /// The init sequence mirrors the official Helios C++ SDK: claim the
+    /// interface, select alt setting 1, sleep 100ms for the device to settle,
+    /// drain any stale interrupt-IN bytes, then probe firmware with retries.
+    /// Without this, the first connection attempt after enumeration usually
+    /// times out on macOS — the device isn't ready to answer interrupt
+    /// transfers immediately after `set_alternate_setting`.
     pub fn open(self) -> Result<Self> {
         match self {
             HeliosDac::Idle(device) => {
                 let handle = device.open()?;
                 handle.claim_interface(0)?;
                 handle.set_alternate_setting(0, 1)?;
-                let device = HeliosDac::Open { device, handle };
 
-                let _ = device.firmware_version()?;
+                std::thread::sleep(INIT_SETTLE);
+
+                // Drain any lingering IN packets from a previous session.
+                let mut drain_buf = [0u8; 32];
+                while handle
+                    .read_interrupt(ENDPOINT_INT_IN, &mut drain_buf, INIT_DRAIN_TIMEOUT)
+                    .is_ok()
+                {}
+
+                let device = HeliosDac::Open { device, handle };
+                let fw = device.probe_firmware_version()?;
+                log::debug!("helios: connected, firmware version {fw}");
                 device.send_sdk_version()?;
 
                 Ok(device)
             }
             open => Ok(open),
         }
+    }
+
+    /// Firmware-version probe used during init. Retries the OUT command up to
+    /// `INIT_FW_OUT_ATTEMPTS` times and the IN response up to
+    /// `INIT_FW_IN_ATTEMPTS` per OUT, all with `INIT_INTERRUPT_TIMEOUT`.
+    fn probe_firmware_version(&self) -> Result<u32> {
+        let handle = self.handle()?;
+        let ctrl_buffer = [CONTROL_GET_FIRMWARE_VERSION, 0];
+        let mut last_err: Option<rusb::Error> = None;
+
+        for out_attempt in 1..=INIT_FW_OUT_ATTEMPTS {
+            match handle.write_interrupt(ENDPOINT_INT_OUT, &ctrl_buffer, INIT_INTERRUPT_TIMEOUT) {
+                Ok(2) => {}
+                Ok(_) => {
+                    last_err = Some(rusb::Error::Io);
+                    log::debug!(
+                        "helios: firmware probe OUT short-write (attempt {out_attempt}/{INIT_FW_OUT_ATTEMPTS})"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    log::debug!(
+                        "helios: firmware probe OUT failed (attempt {out_attempt}/{INIT_FW_OUT_ATTEMPTS}): {e:?}"
+                    );
+                    continue;
+                }
+            }
+
+            for in_attempt in 1..=INIT_FW_IN_ATTEMPTS {
+                let mut buf = [0u8; 32];
+                match handle.read_interrupt(ENDPOINT_INT_IN, &mut buf, INIT_INTERRUPT_TIMEOUT) {
+                    Ok(size) => match &buf[0..size] {
+                        [0x84, b0, b1, b2, b3, ..] => {
+                            return Ok(u32::from_le_bytes([*b0, *b1, *b2, *b3]));
+                        }
+                        _ => {
+                            log::debug!(
+                                "helios: firmware probe IN unexpected reply (out {out_attempt}/{INIT_FW_OUT_ATTEMPTS}, in {in_attempt}/{INIT_FW_IN_ATTEMPTS}): {:?}",
+                                &buf[0..size]
+                            );
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        last_err = Some(e);
+                        log::debug!(
+                            "helios: firmware probe IN failed (out {out_attempt}/{INIT_FW_OUT_ATTEMPTS}, in {in_attempt}/{INIT_FW_IN_ATTEMPTS}): {e:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        Err(HeliosDacError::UsbError(
+            last_err.unwrap_or(rusb::Error::Timeout),
+        ))
     }
 
     /// Best-effort physical USB location, stable across re-enumeration when
