@@ -70,13 +70,9 @@ impl PersistenceBuffer {
     /// Longer lines result in dimmer pixels (energy spread over more pixels).
     pub fn deposit_line(
         &mut self,
-        x0: i32,
-        y0: i32,
-        x1: i32,
-        y1: i32,
-        total_r: f32,
-        total_g: f32,
-        total_b: f32,
+        (x0, y0): (i32, i32),
+        (x1, y1): (i32, i32),
+        total_rgb: [f32; 3],
     ) {
         // Calculate number of steps (pixels) in the line
         let dx = (x1 - x0).abs();
@@ -84,9 +80,9 @@ impl PersistenceBuffer {
         let steps = dx.max(dy) as f32 + 1.0;
 
         // Energy per pixel = total energy / number of pixels
-        let r_per_step = total_r / steps;
-        let g_per_step = total_g / steps;
-        let b_per_step = total_b / steps;
+        let r_per_step = total_rgb[0] / steps;
+        let g_per_step = total_rgb[1] / steps;
+        let b_per_step = total_rgb[2] / steps;
 
         // Bresenham's line algorithm
         let sx = if x0 < x1 { 1 } else { -1 };
@@ -133,7 +129,7 @@ impl PersistenceBuffer {
     /// Uses the internal reusable pixel buffer to avoid allocations.
     /// Applies tone mapping: out = 1 - exp(-gain * energy)
     /// This preserves relative brightness while preventing harsh clipping.
-    pub fn to_color_image(&mut self) -> egui::ColorImage {
+    pub fn render_color_image(&mut self) -> egui::ColorImage {
         // Tone mapping gain - controls how quickly highlights roll off
         // Higher = faster saturation, lower = more headroom
         const GAIN: f32 = 3.0;

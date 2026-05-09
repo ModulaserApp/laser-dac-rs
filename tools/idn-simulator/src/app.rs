@@ -294,7 +294,7 @@ impl eframe::App for SimulatorApp {
             if target_stream_us > self.max_received_stream_us {
                 self.underrun_count += 1;
                 self.underruns_in_window += 1;
-                if self.underrun_count <= 20 || self.underrun_count % 100 == 0 {
+                if self.underrun_count <= 20 || self.underrun_count.is_multiple_of(100) {
                     log::warn!(
                         "underrun #{}: lead={:.2}ms, playback={}us, frontier={}us",
                         self.underrun_count,
@@ -433,7 +433,9 @@ impl eframe::App for SimulatorApp {
                                         .norm_to_pixel(prev.p.x, prev.p.y, invert_y);
                                     // Energy is distributed across all pixels in the line
                                     self.persistence_buffer.deposit_line(
-                                        prev_px, prev_py, px, py, total_r, total_g, total_b,
+                                        (prev_px, prev_py),
+                                        (px, py),
+                                        [total_r, total_g, total_b],
                                     );
                                 } else {
                                     // Previous was blanked, just deposit a dot
@@ -476,13 +478,9 @@ impl eframe::App for SimulatorApp {
                                     .persistence_buffer
                                     .norm_to_pixel(prev.p.x, prev.p.y, invert_y);
                                 self.persistence_buffer.deposit_line(
-                                    prev_px,
-                                    prev_py,
-                                    px,
-                                    py,
-                                    blank_energy,
-                                    blank_energy,
-                                    blank_energy,
+                                    (prev_px, prev_py),
+                                    (px, py),
+                                    [blank_energy, blank_energy, blank_energy],
                                 );
                             }
                         }
@@ -853,12 +851,12 @@ impl eframe::App for SimulatorApp {
                         );
 
                         // Only rebuild texture if something changed (new points or visible decay)
-                        // This avoids expensive to_color_image() and texture upload when idle
+                        // This avoids expensive render_color_image() and texture upload when idle
                         // Use had_content_before_decay to ensure we show the final fade-to-black frame
                         let needs_texture_update = did_integrate_points || had_content_before_decay;
 
                         if needs_texture_update {
-                            let color_image = self.persistence_buffer.to_color_image();
+                            let color_image = self.persistence_buffer.render_color_image();
                             if let Some(texture) = &mut self.texture_handle {
                                 texture.set(color_image, egui::TextureOptions::LINEAR);
                             } else {
