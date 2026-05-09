@@ -5,6 +5,7 @@ use std::time::Duration;
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
+use super::super::content_source::ContentSourceKind;
 use super::super::slice_pipeline::SlicePipeline;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
 
@@ -27,8 +28,12 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
             return StepOutcome::Continue;
         }
 
+        let ContentSourceKind::Frame(source) = &mut ctx.source else {
+            unreachable!("UsbFrameSwapAdapter requires a Frame content source");
+        };
+
         if !self.write_pending {
-            let n = ctx.pipeline.produce_frame_swap(ctx.pps, ctx.is_armed).len();
+            let n = source.produce_frame(ctx.pps, ctx.is_armed).len();
             if n == 0 {
                 ctx.sleep_and_mark_activity(Duration::from_millis(1));
                 return StepOutcome::Continue;
@@ -37,7 +42,7 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
         }
 
         let outcome = {
-            let slice = match ctx.pipeline.cached_slice() {
+            let slice = match source.cached_slice() {
                 Some(s) => s,
                 None => {
                     self.write_pending = false;
@@ -50,7 +55,8 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                ctx.pipeline.invalidate();
+                let n = source.cached_slice().map_or(0, |s| s.len());
+                source.commit_written(n, ctx.is_armed);
                 self.write_pending = false;
             }
             Ok(WriteOutcome::WouldBlock) => {
@@ -87,6 +93,7 @@ mod tests {
     use crate::device::{DacCapabilities, DacType, OutputModel};
     use crate::error::Result as DacResult;
     use crate::point::LaserPoint;
+    use crate::presentation::content_source::{ContentSourceKind, FrameContentSource};
     use crate::presentation::engine::PresentationEngine;
     use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
     use crate::presentation::session::FrameSessionMetrics;
@@ -173,9 +180,10 @@ mod tests {
 
         // Step 1: not ready → 1ms sleep, no produce/write.
         {
+            let source = ContentSourceKind::Frame(&mut pipeline as &mut dyn FrameContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,
@@ -191,9 +199,10 @@ mod tests {
         // Flip ready true. Step 2: produces and writes.
         ready.store(true, Ordering::SeqCst);
         {
+            let source = ContentSourceKind::Frame(&mut pipeline as &mut dyn FrameContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,

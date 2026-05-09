@@ -12,6 +12,7 @@ use crate::backend::BackendKind;
 use crate::device::DacInfo;
 use crate::stream::{ControlMsg, StreamControl};
 
+use super::content_source::ContentSourceKind;
 use super::session::FrameSessionMetrics;
 use super::slice_pipeline::SlicePipeline;
 
@@ -29,7 +30,7 @@ pub(crate) enum StepOutcome {
 /// Shared context borrowed by the adapter for one `step`.
 pub(crate) struct LoopCtx<'a> {
     pub backend: &'a mut BackendKind,
-    pub pipeline: &'a mut SlicePipeline,
+    pub source: ContentSourceKind<'a>,
     pub control: &'a StreamControl,
     pub control_rx: &'a mpsc::Receiver<ControlMsg>,
     pub metrics: &'a FrameSessionMetrics,

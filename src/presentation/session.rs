@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
 use crate::stream::{ControlMsg, RunExit, StreamControl};
 
+use super::content_source::{ContentSourceKind, FifoContentSource, FrameContentSource};
 use super::engine::PresentationEngine;
 use super::output_model::{self, LoopCtx, StepOutcome};
 use super::slice_pipeline::SlicePipeline;
@@ -357,7 +358,6 @@ impl FrameSession {
 
         let mut shutter_open = false;
         let mut last_armed = false;
-        let mut last_frame: Option<Frame> = None;
         let expected_frame_swap = backend.is_frame_swap();
 
         loop {
@@ -371,7 +371,6 @@ impl FrameSession {
             pipeline.resize_color_delay(duration_to_points(control.color_delay(), pps));
 
             if let Some(frame) = frame_slot.lock().unwrap().take() {
-                last_frame = Some(frame.clone());
                 pipeline.set_pending(frame);
             }
 
@@ -383,13 +382,11 @@ impl FrameSession {
                     &mut shutter_open,
                     &mut last_armed,
                     &mut pipeline,
-                    &last_frame,
                     expected_frame_swap,
                     &metrics,
                 ) {
                     Ok(info) => {
                         adapter.on_reconnect(&info, &mut pipeline, &mut backend);
-                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
                         continue;
                     }
                     Err(exit) => return Ok(exit),
@@ -413,9 +410,14 @@ impl FrameSession {
             }
 
             let outcome = {
+                let source = if expected_frame_swap {
+                    ContentSourceKind::Frame(&mut pipeline as &mut dyn FrameContentSource)
+                } else {
+                    ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource)
+                };
                 let mut ctx = LoopCtx {
                     backend: &mut backend,
-                    pipeline: &mut pipeline,
+                    source,
                     control: &control,
                     control_rx: &control_rx,
                     metrics: &metrics,
@@ -436,13 +438,11 @@ impl FrameSession {
                     &mut shutter_open,
                     &mut last_armed,
                     &mut pipeline,
-                    &last_frame,
                     expected_frame_swap,
                     &metrics,
                 ) {
                     Ok(info) => {
                         adapter.on_reconnect(&info, &mut pipeline, &mut backend);
-                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
                         continue;
                     }
                     Err(exit) => return Ok(exit),
@@ -457,9 +457,10 @@ impl FrameSession {
 
     /// Attempt to reconnect the backend using the reconnection policy.
     ///
-    /// On success, replaces `backend`, resets the pipeline (engine + color
-    /// delay + cache), and replays the last frame. Returns the new `DacInfo`.
-    /// If no policy is set, returns `Err(RunExit::Disconnected)`.
+    /// On success, replaces `backend` and asks the source (the pipeline) to
+    /// replay its derived state (engine, color delay, cached pending frame,
+    /// output-filter `Reconnect` reset). Returns the new `DacInfo`. If no
+    /// policy is set, returns `Err(RunExit::Disconnected)`.
     #[allow(clippy::too_many_arguments)]
     fn try_reconnect(
         backend: &mut BackendKind,
@@ -468,7 +469,6 @@ impl FrameSession {
         shutter_open: &mut bool,
         last_armed: &mut bool,
         pipeline: &mut SlicePipeline,
-        last_frame: &Option<Frame>,
         expected_frame_swap: bool,
         metrics: &FrameSessionMetrics,
     ) -> std::result::Result<DacInfo, RunExit> {
@@ -510,10 +510,14 @@ impl FrameSession {
         *last_armed = false;
         metrics.set_connected(true);
 
-        pipeline.reset_engine();
-        pipeline.reset_color_delay();
-        if let Some(frame) = last_frame {
-            pipeline.set_pending(frame.clone());
+        // Source-level reconnect: resets engine + color delay, replays the most
+        // recent frame, fires `OutputResetReason::Reconnect` on the output
+        // filter. Adapter-side reconnect (capacity sizing, etc.) is invoked
+        // separately by the driver.
+        if expected_frame_swap {
+            <SlicePipeline as FrameContentSource>::on_reconnect(pipeline, &info);
+        } else {
+            <SlicePipeline as FifoContentSource>::on_reconnect(pipeline, &info);
         }
 
         if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {

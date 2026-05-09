@@ -34,6 +34,14 @@ The scheduler-relevant pacing model of a [Backend](#backend). Determines how the
 
 `OutputModel` is the discriminant for the per-loop scheduler strategy inside `FrameSession`: each variant has its own adapter owning pacing, slice planning, backpressure, and reconnect-state reset, while the rest of the loop body (frame intake, arm/disarm, blanking, color delay, output filter, reconnect orchestration) is shared.
 
+### ContentSource
+The seam where [Points](#point) enter the per-[OutputModel](#outputmodel) adapter. Two flavours live in `src/presentation/content_source.rs`:
+
+- `FifoContentSource` — produces variable-sized chunks for `NetworkFifo` and `UdpTimed` adapters.
+- `FrameContentSource` — produces whole frames for `UsbFrameSwap`.
+
+`SlicePipeline` (frame-mode, in `src/presentation/slice_pipeline.rs`) implements both today. The shared cache contract is: after `produce_*` returns a non-empty slice the source caches it; on a successful write the adapter calls `commit_written` exactly once; on an explicit reset path (reconnect, stop) the driver calls `discard_cached`. Sources with per-write derived state advance only in `commit_written`.
+
 ### Discoverer
 A protocol-owned object that locates [DACs](#dac) of one [DacType](#dac) on the local system or network and produces [DiscoveredDevices](#discovereddevice) for them.
 

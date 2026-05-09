@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
+use super::super::content_source::ContentSourceKind;
 use super::super::slice_pipeline::SlicePipeline;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
 
@@ -55,12 +56,15 @@ impl OutputModelAdapter for UdpTimedAdapter {
         // pps may have changed during the sleep — re-read from control.
         let pps = ctx.control.pps();
         self.recompute_chunk(pps);
-        ctx.pipeline.reserve_buf(self.chunk_points);
+
+        let ContentSourceKind::Fifo(source) = &mut ctx.source else {
+            unreachable!("UdpTimedAdapter requires a Fifo content source");
+        };
+        source.reserve_buf(self.chunk_points);
 
         if !self.has_retain {
-            let n = ctx
-                .pipeline
-                .produce_fifo_chunk(self.chunk_points, pps, ctx.is_armed)
+            let n = source
+                .produce_chunk(self.chunk_points, pps, ctx.is_armed)
                 .len();
             if n == 0 {
                 return StepOutcome::Continue;
@@ -69,7 +73,7 @@ impl OutputModelAdapter for UdpTimedAdapter {
         }
 
         let outcome = {
-            let slice = match ctx.pipeline.cached_slice() {
+            let slice = match source.cached_slice() {
                 Some(s) => s,
                 None => {
                     self.has_retain = false;
@@ -82,7 +86,8 @@ impl OutputModelAdapter for UdpTimedAdapter {
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                ctx.pipeline.invalidate();
+                let n = source.cached_slice().map_or(0, |s| s.len());
+                source.commit_written(n, ctx.is_armed);
                 self.has_retain = false;
             }
             Ok(WriteOutcome::WouldBlock) => {
@@ -122,6 +127,7 @@ mod tests {
     use crate::device::{DacCapabilities, DacType, OutputModel};
     use crate::error::Result as DacResult;
     use crate::point::LaserPoint;
+    use crate::presentation::content_source::{ContentSourceKind, FifoContentSource};
     use crate::presentation::engine::PresentationEngine;
     use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
     use crate::presentation::session::FrameSessionMetrics;
@@ -228,9 +234,10 @@ mod tests {
         let mut shutter = false;
 
         {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,
@@ -251,9 +258,10 @@ mod tests {
         // Drop pps so a fresh produce would yield a smaller chunk; queue Written next.
         control.set_pps(PPS_AFTER);
         {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,

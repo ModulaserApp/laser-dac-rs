@@ -6,8 +6,21 @@ use std::time::{Duration, Instant};
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
+use super::super::content_source::{ContentSourceKind, FifoContentSource};
 use super::super::slice_pipeline::SlicePipeline;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+
+/// Re-borrow the loop-context source as a `FifoContentSource`. NetworkFifo is
+/// only ever paired with a Fifo source by the driver; mismatch is a programmer
+/// error.
+fn fifo_source<'a>(source: &'a mut ContentSourceKind<'_>) -> &'a mut dyn FifoContentSource {
+    match source {
+        ContentSourceKind::Fifo(s) => &mut **s,
+        ContentSourceKind::Frame(_) => {
+            unreachable!("NetworkFifoAdapter requires a Fifo content source")
+        }
+    }
+}
 
 const TARGET_BUFFER_SECS: f64 = 0.020;
 
@@ -51,9 +64,8 @@ impl OutputModelAdapter for NetworkFifoAdapter {
             return StepOutcome::Continue;
         }
 
-        let n = ctx
-            .pipeline
-            .produce_fifo_chunk(target_points, pps, ctx.is_armed)
+        let n = fifo_source(&mut ctx.source)
+            .produce_chunk(target_points, pps, ctx.is_armed)
             .len();
         if n == 0 {
             ctx.sleep_and_mark_activity(Duration::from_millis(1));
@@ -62,17 +74,14 @@ impl OutputModelAdapter for NetworkFifoAdapter {
 
         // Inner WouldBlock spin: ~100µs hardware drain assumption.
         loop {
-            let outcome = {
-                let slice = match ctx.pipeline.cached_slice() {
-                    Some(s) => s,
-                    None => return StepOutcome::Continue,
-                };
-                ctx.backend.try_write(pps, slice)
+            let outcome = match fifo_source(&mut ctx.source).cached_slice() {
+                Some(slice) => ctx.backend.try_write(pps, slice),
+                None => return StepOutcome::Continue,
             };
             match outcome {
                 Ok(WriteOutcome::Written) => {
                     ctx.metrics.mark_write_success();
-                    ctx.pipeline.invalidate();
+                    fifo_source(&mut ctx.source).commit_written(n, ctx.is_armed);
                     break;
                 }
                 Ok(WriteOutcome::WouldBlock) => {
