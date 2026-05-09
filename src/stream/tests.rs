@@ -511,6 +511,28 @@ fn test_run_buffer_driven_behavior() {
 }
 
 #[test]
+fn test_run_uses_configured_target_buffer() {
+    let cfg = StreamConfig::new(1_000)
+        .with_target_buffer(Duration::from_millis(100))
+        .with_drain_timeout(Duration::ZERO);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_clone = observed.clone();
+
+    let result = stream.run(
+        move |req, _buffer| {
+            observed_clone.store(req.target_points, Ordering::SeqCst);
+            ChunkResult::End
+        },
+        |_e| {},
+    );
+
+    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(observed.load(Ordering::SeqCst), 100);
+}
+
+#[test]
 fn test_run_sleeps_when_buffer_healthy() {
     // Test that run sleeps when buffer is above target
     use std::time::Instant;

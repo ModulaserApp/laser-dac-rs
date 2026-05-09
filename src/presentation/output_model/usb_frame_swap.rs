@@ -186,6 +186,7 @@ mod tests {
                 metrics: &metrics,
                 shutter_open: &mut shutter,
                 error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
             };
@@ -206,6 +207,7 @@ mod tests {
                 metrics: &metrics,
                 shutter_open: &mut shutter,
                 error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
             };

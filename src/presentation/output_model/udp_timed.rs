@@ -249,6 +249,7 @@ mod tests {
                 metrics: &metrics,
                 shutter_open: &mut shutter,
                 error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: PPS_INITIAL,
                 is_armed: true,
             };
@@ -274,6 +275,7 @@ mod tests {
                 metrics: &metrics,
                 shutter_open: &mut shutter,
                 error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: PPS_AFTER,
                 is_armed: true,
             };
@@ -335,6 +337,7 @@ mod tests {
                     metrics: &metrics,
                     shutter_open: &mut shutter,
                     error_sink: &mut |_| {},
+                    target_buffer: std::time::Duration::from_millis(20),
                     pps,
                     is_armed: true,
                 };

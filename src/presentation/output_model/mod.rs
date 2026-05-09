@@ -36,6 +36,7 @@ pub(crate) struct LoopCtx<'a> {
     pub metrics: &'a FrameSessionMetrics,
     pub shutter_open: &'a mut bool,
     pub error_sink: &'a mut dyn FnMut(Error),
+    pub target_buffer: Duration,
     pub pps: u32,
     pub is_armed: bool,
 }

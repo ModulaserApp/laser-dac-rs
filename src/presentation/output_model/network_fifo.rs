@@ -21,8 +21,6 @@ fn fifo_source<'a>(source: &'a mut ContentSourceKind<'_>) -> &'a mut dyn FifoCon
     }
 }
 
-const TARGET_BUFFER_SECS: f64 = 0.020;
-
 pub(crate) struct NetworkFifoAdapter {
     max_points: usize,
 }
@@ -39,7 +37,8 @@ impl OutputModelAdapter for NetworkFifoAdapter {
     fn step(&mut self, ctx: &mut LoopCtx<'_>) -> StepOutcome {
         let pps = ctx.pps;
         let pps_f64 = pps as f64;
-        let target_buffer_points = (TARGET_BUFFER_SECS * pps_f64) as u64;
+        let target_buffer_secs = ctx.target_buffer.as_secs_f64();
+        let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
 
         let now = Instant::now();
         let buffered = ctx
@@ -56,7 +55,7 @@ impl OutputModelAdapter for NetworkFifoAdapter {
             return StepOutcome::Continue;
         }
 
-        let deficit = (TARGET_BUFFER_SECS - buffered as f64 / pps_f64.max(1.0)).max(0.0);
+        let deficit = (target_buffer_secs - buffered as f64 / pps_f64.max(1.0)).max(0.0);
         let target_points = ((deficit * pps_f64).ceil() as usize).min(self.max_points);
         if target_points == 0 {
             ctx.sleep_and_mark_activity(Duration::from_millis(1));

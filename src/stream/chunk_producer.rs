@@ -159,10 +159,9 @@ impl ChunkProducer {
         }
     }
 
-    /// Fill the buffer with the appropriate idle-policy fallback for `n`
-    /// points. Returns `false` if `IdlePolicy::Stop` triggered (the producer
-    /// has marked itself ended); the caller must bail.
-    fn fill_idle(&mut self, n: usize, is_armed: bool) -> bool {
+    /// Fill a range with the appropriate idle-policy fallback. Returns
+    /// `false` if `IdlePolicy::Stop` triggered.
+    fn fill_idle_range(&mut self, range: std::ops::Range<usize>, is_armed: bool) -> bool {
         if is_armed {
             match &self.idle_policy {
                 IdlePolicy::Stop => {
@@ -171,15 +170,15 @@ impl ChunkProducer {
                     return false;
                 }
                 IdlePolicy::RepeatLast if self.last_chunk_len > 0 => {
-                    for i in 0..n {
-                        self.buf[i] = self.last_chunk[i % self.last_chunk_len];
+                    for (offset, i) in range.enumerate() {
+                        self.buf[i] = self.last_chunk[offset % self.last_chunk_len];
                     }
                 }
                 IdlePolicy::Park { x, y } => {
-                    self.buf[..n].fill(LaserPoint::blanked(*x, *y));
+                    self.buf[range].fill(LaserPoint::blanked(*x, *y));
                 }
                 _ => {
-                    self.buf[..n].fill(LaserPoint::blanked(0.0, 0.0));
+                    self.buf[range].fill(LaserPoint::blanked(0.0, 0.0));
                 }
             }
         } else {
@@ -187,9 +186,13 @@ impl ChunkProducer {
                 IdlePolicy::Park { x, y } => LaserPoint::blanked(*x, *y),
                 _ => LaserPoint::blanked(0.0, 0.0),
             };
-            self.buf[..n].fill(park);
+            self.buf[range].fill(park);
         }
         true
+    }
+
+    fn fill_idle(&mut self, n: usize, is_armed: bool) -> bool {
+        self.fill_idle_range(0..n, is_armed)
     }
 }
 
@@ -213,7 +216,19 @@ impl FifoContentSource for ChunkProducer {
         };
 
         let n = match result {
-            ChunkResult::Filled(n) => n.min(target_points),
+            ChunkResult::Filled(filled) => {
+                let filled = filled.min(target_points);
+                if filled == target_points {
+                    filled
+                } else if self.fill_idle_range(filled..target_points, is_armed) {
+                    target_points
+                } else if filled == 0 {
+                    self.invalidate();
+                    return &[];
+                } else {
+                    filled
+                }
+            }
             ChunkResult::Starved => {
                 self.stats.underrun_count += 1;
                 if !self.fill_idle(target_points, is_armed) {
@@ -383,6 +398,28 @@ mod tests {
         assert_eq!(slice.len(), 4);
         for p in &slice {
             assert!(p.intensity > 0, "RepeatLast should reuse last lit chunk");
+        }
+    }
+
+    #[test]
+    fn partial_fill_pads_remainder_with_idle_policy() {
+        let (mut cp, _ctrl) = make_producer(
+            |_req, buf| {
+                buf[0] = lit_point(0.25);
+                ChunkResult::Filled(1)
+            },
+            IdlePolicy::Park { x: 0.5, y: -0.5 },
+        );
+
+        let slice = cp.produce_chunk(4, 30_000, true).to_vec();
+
+        assert_eq!(slice.len(), 4);
+        assert_eq!(slice[0].x, 0.25);
+        for p in &slice[1..] {
+            assert_eq!(
+                (p.x, p.y, p.r, p.g, p.b, p.intensity),
+                (0.5, -0.5, 0, 0, 0, 0)
+            );
         }
     }
 

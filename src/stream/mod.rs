@@ -806,7 +806,7 @@ impl Stream {
             max_points,
         );
 
-        let validator = Self::build_reconnect_validator(self.config.pps);
+        let validator = Self::build_reconnect_validator();
         let metrics = FrameSessionMetrics::new(true);
         // Move the control receiver out of self; the Receiver isn't Clone so we
         // swap in a fresh dummy channel that nothing will drive.
@@ -822,25 +822,26 @@ impl Stream {
             reconnect_policy: self.reconnect_policy.take(),
             validator,
             error_sink: Box::new(on_error),
+            target_buffer: self.config.target_buffer,
             drain_timeout: self.config.drain_timeout,
             pending_frame: None,
         })
     }
 
-    fn build_reconnect_validator(
-        configured_pps: u32,
-    ) -> crate::presentation::driver::ReconnectValidator {
-        Box::new(move |_info: &DacInfo, new_backend: &BackendKind| {
-            if new_backend.is_frame_swap() {
-                log::error!("reconnected device is frame-swap, incompatible with streaming");
-                return Err(RunExit::Disconnected);
-            }
-            if Dac::validate_pps(new_backend.caps(), configured_pps).is_err() {
-                log::error!("reconnected device PPS range incompatible with stream config");
-                return Err(RunExit::Disconnected);
-            }
-            Ok(())
-        })
+    fn build_reconnect_validator() -> crate::presentation::driver::ReconnectValidator {
+        Box::new(
+            move |_info: &DacInfo, new_backend: &BackendKind, pps: u32| {
+                if new_backend.is_frame_swap() {
+                    log::error!("reconnected device is frame-swap, incompatible with streaming");
+                    return Err(RunExit::Disconnected);
+                }
+                if Dac::validate_pps(new_backend.caps(), pps).is_err() {
+                    log::error!("reconnected device PPS range incompatible with stream config");
+                    return Err(RunExit::Disconnected);
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Legacy inline scheduler retained for tests that drive the helpers

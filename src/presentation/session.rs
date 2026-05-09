@@ -352,7 +352,7 @@ impl FrameSession {
             SourceOwned::Fifo(Box::new(pipeline))
         };
 
-        let validator = Self::reconnect_validator(reconnect_policy.as_ref(), &control);
+        let validator = Self::reconnect_validator(reconnect_policy.as_ref());
         if !backend.is_connected() {
             backend.connect()?;
         }
@@ -366,25 +366,22 @@ impl FrameSession {
             reconnect_policy,
             validator,
             error_sink: Box::new(|_e: Error| { /* frame-mode swallows non-fatal errors */ }),
+            target_buffer: Duration::from_millis(20),
             drain_timeout: Duration::ZERO,
             pending_frame: Some(frame_slot),
         })
     }
 
-    fn reconnect_validator(
-        policy: Option<&ReconnectPolicy>,
-        control: &StreamControl,
-    ) -> driver::ReconnectValidator {
+    fn reconnect_validator(policy: Option<&ReconnectPolicy>) -> driver::ReconnectValidator {
         let target_id = policy
             .map(|p| p.target.device_id.clone())
             .unwrap_or_default();
-        let captured_pps = control.pps();
-        Box::new(move |info: &DacInfo, _backend: &BackendKind| {
-            if captured_pps < info.caps.pps_min || captured_pps > info.caps.pps_max {
+        Box::new(move |info: &DacInfo, _backend: &BackendKind, pps: u32| {
+            if pps < info.caps.pps_min || pps > info.caps.pps_max {
                 log::error!(
                     "'{}' PPS {} outside new device range [{}, {}]",
                     target_id,
-                    captured_pps,
+                    pps,
                     info.caps.pps_min,
                     info.caps.pps_max
                 );

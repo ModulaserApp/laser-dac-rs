@@ -113,7 +113,7 @@ pub(crate) type PendingFrame = Arc<Mutex<Option<super::Frame>>>;
 /// Result of the reconnect-validator closure: `Ok(())` accepts the swap,
 /// `Err(RunExit::...)` rejects with the given exit reason.
 pub(crate) type ReconnectValidator =
-    Box<dyn Fn(&DacInfo, &BackendKind) -> std::result::Result<(), RunExit> + Send>;
+    Box<dyn Fn(&DacInfo, &BackendKind, u32) -> std::result::Result<(), RunExit> + Send>;
 
 /// Sink for non-fatal write errors. Stream-mode threads the user's
 /// `on_error`; frame-mode passes a no-op.
@@ -128,6 +128,7 @@ pub(crate) struct DriverInputs {
     pub reconnect_policy: Option<ReconnectPolicy>,
     pub validator: ReconnectValidator,
     pub error_sink: ErrorSink,
+    pub target_buffer: Duration,
     pub drain_timeout: Duration,
     /// Latest-wins frame slot. Frame-mode passes the shared `Arc` so
     /// `FrameSession::send_frame` can write into it; stream-mode passes
@@ -203,6 +204,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 metrics: &inputs.metrics,
                 shutter_open: &mut shutter_open,
                 error_sink: &mut *error_sink,
+                target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
             };
@@ -243,6 +245,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 metrics: &inputs.metrics,
                 shutter_open: &mut shutter_open,
                 error_sink: &mut *error_sink,
+                target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
             };
@@ -280,7 +283,7 @@ fn reconnect(
                 );
                 return Err(RunExit::Disconnected);
             }
-            validator(info, new_backend)
+            validator(info, new_backend, control.pps())
         },
         || metrics.mark_loop_activity(),
     )?;
