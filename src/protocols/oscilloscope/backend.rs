@@ -493,10 +493,6 @@ impl FifoBackend for OscilloscopeBackend {
         Ok(WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        self.runtime.as_ref().map(|rt| rt.queued_points())
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }

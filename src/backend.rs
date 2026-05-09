@@ -83,13 +83,6 @@ pub trait FifoBackend: DacBackend {
     /// 3. Return `Err(...)` only for actual errors (disconnection, protocol errors).
     fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome>;
 
-    /// Best-effort estimate of points currently queued in the device.
-    ///
-    /// Not all devices can report this. Return `None` if unavailable.
-    fn queued_points(&self) -> Option<u64> {
-        None
-    }
-
     /// The protocol-owned [`BufferEstimator`] strategy.
     ///
     /// Read-only: backends mutate their concrete strategy internally through
@@ -219,12 +212,12 @@ impl BackendKind {
     // Query helpers
     // =========================================================================
 
-    /// Best-effort estimate of points currently queued in the device.
+    /// The protocol-owned [`BufferEstimator`] for FIFO backends.
     ///
-    /// Only FIFO backends can report this; frame-swap backends return `None`.
-    pub fn queued_points(&self) -> Option<u64> {
+    /// Frame-swap backends never queue points, so they return `None`.
+    pub fn estimator(&self) -> Option<&dyn BufferEstimator> {
         match self {
-            BackendKind::Fifo(b) => b.queued_points(),
+            BackendKind::Fifo(b) => Some(b.estimator()),
             BackendKind::FrameSwap(_) => None,
         }
     }

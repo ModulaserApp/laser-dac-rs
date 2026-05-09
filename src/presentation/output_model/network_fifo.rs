@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
-use crate::scheduler;
 
 use super::super::slice_pipeline::SlicePipeline;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
@@ -13,18 +12,12 @@ use super::{LoopCtx, OutputModelAdapter, StepOutcome};
 const TARGET_BUFFER_SECS: f64 = 0.020;
 
 pub(crate) struct NetworkFifoAdapter {
-    scheduled_ahead: u64,
-    fractional_consumed: f64,
-    last_iteration: Instant,
     max_points: usize,
 }
 
 impl NetworkFifoAdapter {
     pub fn new(backend: &BackendKind) -> Self {
         Self {
-            scheduled_ahead: 0,
-            fractional_consumed: 0.0,
-            last_iteration: Instant::now(),
             max_points: backend.caps().max_points_per_chunk,
         }
     }
@@ -37,18 +30,10 @@ impl OutputModelAdapter for NetworkFifoAdapter {
         let target_buffer_points = (TARGET_BUFFER_SECS * pps_f64) as u64;
 
         let now = Instant::now();
-        scheduler::advance_scheduled_ahead(
-            &mut self.scheduled_ahead,
-            &mut self.fractional_consumed,
-            &mut self.last_iteration,
-            now,
-            pps_f64,
-        );
-
-        let buffered = scheduler::conservative_buffered_points(
-            self.scheduled_ahead,
-            ctx.backend.queued_points(),
-        );
+        let buffered = ctx
+            .backend
+            .estimator()
+            .map_or(0, |e| e.estimated_fullness(now, pps));
 
         if buffered > target_buffer_points {
             let excess = buffered - target_buffer_points;
@@ -87,7 +72,6 @@ impl OutputModelAdapter for NetworkFifoAdapter {
             match outcome {
                 Ok(WriteOutcome::Written) => {
                     ctx.metrics.mark_write_success();
-                    self.scheduled_ahead += n as u64;
                     ctx.pipeline.invalidate();
                     break;
                 }
@@ -112,9 +96,6 @@ impl OutputModelAdapter for NetworkFifoAdapter {
         pipeline: &mut SlicePipeline,
         _backend: &mut BackendKind,
     ) {
-        self.scheduled_ahead = 0;
-        self.fractional_consumed = 0.0;
-        self.last_iteration = Instant::now();
         self.max_points = info.caps.max_points_per_chunk;
         pipeline.reserve_buf(self.max_points);
     }

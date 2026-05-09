@@ -417,12 +417,6 @@ impl FifoBackend for AvbBackend {
         }
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        // This is host-side queue depth only (pre-callback ring),
-        // not audio driver/AVB hardware buffer occupancy.
-        self.runtime.as_ref().map(|rt| rt.queued_points())
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }

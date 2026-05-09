@@ -1565,10 +1565,6 @@ impl FifoBackend for RetryFifoTestBackend {
         Ok(crate::backend::WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        Some(0)
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }
@@ -3273,24 +3269,6 @@ fn test_color_delay_reset_clears_carry() {
 }
 
 #[test]
-fn test_frame_fifo_buffer_estimation_matches_shared_scheduler_helper() {
-    // Regression guard for the FIFO FrameSession path: its buffered-point
-    // estimate should remain the shared conservative helper.
-    assert_eq!(
-        crate::scheduler::conservative_buffered_points(500, None),
-        500
-    );
-    assert_eq!(
-        crate::scheduler::conservative_buffered_points(500, Some(250)),
-        250
-    );
-    assert_eq!(
-        crate::scheduler::conservative_buffered_points(500, Some(900)),
-        500
-    );
-}
-
-#[test]
 fn test_frame_session_config_with_reconnect() {
     let config = FrameSessionConfig::new(30_000)
         .with_reconnect(crate::config::ReconnectConfig::new().max_retries(3));
@@ -3349,9 +3327,6 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
             _: &[LaserPoint],
         ) -> crate::backend::Result<crate::backend::WriteOutcome> {
             Ok(crate::backend::WriteOutcome::Written)
-        }
-        fn queued_points(&self) -> Option<u64> {
-            None
         }
         fn estimator(&self) -> &dyn BufferEstimator {
             &self.estimator

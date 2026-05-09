@@ -42,7 +42,6 @@ use crate::device::{DacCapabilities, DacInfo, DacType, OutputModel};
 use crate::discovery::DacDiscovery;
 use crate::point::LaserPoint;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
-use crate::scheduler;
 
 // =============================================================================
 // Stream protocol types
@@ -407,12 +406,6 @@ impl StreamControl {
 struct StreamState {
     /// Current position in stream time (points since start).
     current_instant: StreamInstant,
-    /// Points scheduled ahead of current_instant.
-    scheduled_ahead: u64,
-    /// Fractional points consumed but not yet subtracted from scheduled_ahead.
-    /// Accumulates sub-point remainders to prevent stalls when per-iteration
-    /// elapsed time is too small to yield a whole point (the u64 truncation bug).
-    fractional_consumed: f64,
 
     // Pre-allocated buffers (no per-chunk allocation in hot path)
     /// Buffer for callback to fill points into.
@@ -461,8 +454,6 @@ impl StreamState {
         let min_buffer_secs = config.min_buffer.as_secs_f64();
         Self {
             current_instant: StreamInstant::new(0),
-            scheduled_ahead: 0,
-            fractional_consumed: 0.0,
             chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk: vec![LaserPoint::default(); max_points_per_chunk],
             last_chunk_len: 0,
@@ -585,12 +576,11 @@ impl Stream {
 
     /// Returns the current stream status.
     pub fn status(&self) -> Result<StreamStatus> {
-        let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
-
+        let buffered = self.estimate_buffer_points();
         Ok(StreamStatus {
             connected: self.backend.as_ref().is_some_and(|b| b.is_connected()),
-            scheduled_ahead_points: self.state.scheduled_ahead,
-            device_queued_points,
+            scheduled_ahead_points: buffered,
+            device_queued_points: Some(buffered),
             stats: Some(self.state.stats.clone()),
         })
     }
@@ -707,10 +697,7 @@ impl Stream {
     /// Opens a new device, connects, and swaps the backend. Resets timing
     /// state for the new connection. Returns `Err` on non-retriable errors
     /// or if stop is requested.
-    fn handle_reconnect(
-        &mut self,
-        last_iteration: &mut std::time::Instant,
-    ) -> std::result::Result<(), RunExit> {
+    fn handle_reconnect(&mut self) -> std::result::Result<(), RunExit> {
         let policy = self.reconnect_policy.as_ref().unwrap();
 
         let (info, new_backend) = reconnect_backend_with_retry(
@@ -743,7 +730,7 @@ impl Stream {
         self.info = info;
 
         // Reset all runtime state for the new connection
-        self.reset_state_for_reconnect(last_iteration);
+        self.reset_state_for_reconnect();
 
         // Fire on_reconnect callback
         let policy = self.reconnect_policy.as_ref().unwrap();
@@ -755,7 +742,7 @@ impl Stream {
     }
 
     /// Reset all runtime state for a reconnected device.
-    fn reset_state_for_reconnect(&mut self, last_iteration: &mut std::time::Instant) {
+    fn reset_state_for_reconnect(&mut self) {
         let max_points = self.info.caps.max_points_per_chunk;
         self.state
             .chunk_buffer
@@ -764,14 +751,11 @@ impl Stream {
             .last_chunk
             .resize(max_points, LaserPoint::default());
         self.state.last_chunk_len = 0;
-        self.state.scheduled_ahead = 0;
-        self.state.fractional_consumed = 0.0;
         self.state.shutter_open = false;
         self.state.last_armed = false;
         self.state.color_delay_line.clear();
         self.state.startup_blank_remaining = 0;
         self.state.stats.reconnect_count += 1;
-        *last_iteration = std::time::Instant::now();
     }
 
     /// Run the stream with the zero-allocation callback API.
@@ -822,11 +806,6 @@ impl Stream {
         use std::time::Instant;
 
         let mut max_points = self.info.caps.max_points_per_chunk;
-
-        // Track time between iterations to decrement scheduled_ahead for backends
-        // that don't report queued_points(). This prevents stalls when buffered
-        // equals target_points exactly.
-        let mut last_iteration = Instant::now();
         let mut last_stats_log = Instant::now();
 
         loop {
@@ -843,34 +822,20 @@ impl Stream {
                 self.config.pps,
             );
 
-            // Decrement scheduled_ahead based on elapsed time since last iteration.
-            // This is critical for backends without queued_points() - without this,
-            // scheduled_ahead would never decrease and target_points would stay 0.
-            // Use fractional accumulator to avoid the truncation-to-zero bug: when
-            // loop iterations are faster than 1/pps, (elapsed * pps) as u64 rounds
-            // to 0 and scheduled_ahead never decrements, causing a permanent stall.
+            // 2. Estimate buffer state — the protocol-owned BufferEstimator is
+            // authoritative; backends update their estimator from inside
+            // try_write_points so it decays naturally without a separate
+            // scheduler-side timer.
             let now = Instant::now();
-            scheduler::advance_scheduled_ahead(
-                &mut self.state.scheduled_ahead,
-                &mut self.state.fractional_consumed,
-                &mut last_iteration,
-                now,
-                pps,
-            );
-
-            // 2. Estimate buffer state
             let buffered = self.estimate_buffer_points();
             let target_points = self.scheduler_target_buffer_points();
 
             // Log scheduler state periodically (~2Hz)
             if now.duration_since(last_stats_log) >= Duration::from_millis(500) {
-                let lead_ms = self.state.scheduled_ahead as f64 / pps * 1000.0;
                 let target_ms = target_points as f64 / pps * 1000.0;
                 log::debug!(
-                    "scheduler: lead={:.1}ms target={:.1}ms ahead={} buffered={} target_pts={}",
-                    lead_ms,
+                    "scheduler: target={:.1}ms buffered={} target_pts={}",
                     target_ms,
-                    self.state.scheduled_ahead,
                     buffered,
                     target_points,
                 );
@@ -900,7 +865,7 @@ impl Stream {
             };
             if disconnected {
                 if self.reconnect_policy.is_some() {
-                    match self.handle_reconnect(&mut last_iteration) {
+                    match self.handle_reconnect() {
                         Ok(()) => {
                             max_points = self.info.caps.max_points_per_chunk;
                             continue;
@@ -942,7 +907,7 @@ impl Stream {
                         match self.write_fill_points(n, &mut on_error) {
                             Ok(()) => {}
                             Err(e) if e.is_disconnected() && self.reconnect_policy.is_some() => {
-                                match self.handle_reconnect(&mut last_iteration) {
+                                match self.handle_reconnect() {
                                     Ok(()) => {
                                         max_points = self.info.caps.max_points_per_chunk;
                                         continue;
@@ -1171,6 +1136,9 @@ impl Stream {
     }
 
     /// Record a successful write: update last_chunk, timebase, and stats.
+    ///
+    /// Buffer-fullness bookkeeping lives inside the backend's `BufferEstimator`
+    /// (driven from `try_write_points`), so this method does not touch it.
     fn record_write(&mut self, n: usize, is_armed: bool) {
         if is_armed {
             debug_assert!(
@@ -1183,7 +1151,6 @@ impl Stream {
             self.state.last_chunk_len = n;
         }
         self.state.current_instant += n as u64;
-        self.state.scheduled_ahead += n as u64;
         self.state.stats.chunks_written += 1;
         self.state.stats.points_written += n as u64;
     }
@@ -1229,21 +1196,19 @@ impl Stream {
         false
     }
 
-    /// Estimate the current buffer level in points using conservative estimation.
+    /// Estimate the current buffer level in points via the backend's
+    /// [`BufferEstimator`].
     ///
-    /// Uses `min(hardware, software)` to prevent underruns:
-    /// - If hardware reports fewer points than software estimates, hardware is truth
-    /// - Using `max` would overestimate buffer → underrequest points → underrun
-    /// - Conservative (lower) estimate is safer: we might overfill slightly, but won't underrun
-    ///
-    /// # Returns
-    ///
-    /// The estimated number of points currently buffered (points sent but not yet played).
+    /// Each FIFO backend owns a strategy (status-anchored, dual-track ACK,
+    /// runtime-authority, or pure software) and updates it from inside its
+    /// own protocol code. The scheduler trusts that single source of truth.
     fn estimate_buffer_points(&self) -> u64 {
-        scheduler::conservative_buffered_points(
-            self.state.scheduled_ahead,
-            self.backend.as_ref().and_then(|b| b.queued_points()),
-        )
+        let pps = self.config.pps;
+        let now = std::time::Instant::now();
+        self.backend
+            .as_ref()
+            .and_then(|b| b.estimator())
+            .map_or(0, |e| e.estimated_fullness(now, pps))
     }
 
     /// Build a ChunkRequest with calculated buffer state and point requirements.
@@ -1265,7 +1230,6 @@ impl Stream {
         let buffered_secs = buffered_points as f64 / pps_f64;
         let buffered = Duration::from_secs_f64(buffered_secs);
         let start = self.state.current_instant;
-        let device_queued_points = self.backend.as_ref().and_then(|b| b.queued_points());
 
         let (min_points, target_points) = if self.info.caps.output_model == OutputModel::UdpTimed {
             // UdpTimed: always request a full packet
@@ -1289,7 +1253,7 @@ impl Stream {
             target_points,
             buffered_points,
             buffered,
-            device_queued_points,
+            device_queued_points: Some(buffered_points),
         }
     }
 
@@ -1297,11 +1261,8 @@ impl Stream {
     ///
     /// Called on graceful shutdown (`ChunkResult::End`) to let buffered content
     /// play out before stopping. Uses `drain_timeout` from config to cap the wait.
-    ///
-    /// - If `queued_points()` is available: polls until queue empties or timeout
-    /// - If `queued_points()` is `None`: sleeps for estimated buffer duration, capped by timeout
-    ///
-    /// After drain (or timeout), closes shutter and outputs blank points.
+    /// Polls the backend's [`BufferEstimator`] until the estimated fullness
+    /// reaches zero or the timeout elapses.
     fn drain_and_blank(&mut self) {
         use std::time::Instant;
 
@@ -1313,53 +1274,18 @@ impl Stream {
         }
 
         let deadline = Instant::now() + timeout;
-        let pps = self.config.pps;
-
-        // Check if backend supports queue depth reporting
-        let has_queue_depth = self
-            .backend
-            .as_ref()
-            .and_then(|b| b.queued_points())
-            .is_some();
-
-        if has_queue_depth {
-            // Poll until queue empties or timeout
-            const POLL_INTERVAL: Duration = Duration::from_millis(5);
-            while Instant::now() < deadline {
-                if let Some(queued) = self.backend.as_ref().and_then(|b| b.queued_points()) {
-                    if queued == 0 {
-                        break;
-                    }
-                } else {
-                    // Backend disconnected or stopped reporting
-                    break;
-                }
-
-                // Process control messages during drain (allow stop to interrupt)
-                if self.process_control_messages() {
-                    break;
-                }
-
-                std::thread::sleep(POLL_INTERVAL);
+        const POLL_INTERVAL: Duration = Duration::from_millis(5);
+        while Instant::now() < deadline {
+            if self.estimate_buffer_points() == 0 {
+                break;
             }
-        } else {
-            // No queue depth available: sleep for estimated buffer time, capped by timeout
-            let estimated_drain =
-                Duration::from_secs_f64(self.state.scheduled_ahead as f64 / pps as f64);
-            let wait_time = estimated_drain.min(timeout);
 
-            // Sleep in slices to allow control message processing
-            const SLEEP_SLICE: Duration = Duration::from_millis(10);
-            let mut remaining = wait_time;
-            while remaining > Duration::ZERO && Instant::now() < deadline {
-                let slice = remaining.min(SLEEP_SLICE);
-                std::thread::sleep(slice);
-                remaining = remaining.saturating_sub(slice);
-
-                if self.process_control_messages() {
-                    break;
-                }
+            // Process control messages during drain (allow stop to interrupt)
+            if self.process_control_messages() {
+                break;
             }
+
+            std::thread::sleep(POLL_INTERVAL);
         }
 
         self.blank_and_close_shutter();

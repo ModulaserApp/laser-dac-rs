@@ -163,10 +163,6 @@ impl FifoBackend for LasercubeUsbBackend {
         }
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        None
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }

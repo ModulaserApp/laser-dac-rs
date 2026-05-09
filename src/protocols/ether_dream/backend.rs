@@ -228,14 +228,6 @@ impl FifoBackend for EtherDreamBackend {
         Ok(WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        self.stream.as_ref().map(|s| {
-            let raw = s.dac().status.buffer_fullness;
-            let cap = s.dac().buffer_capacity;
-            decay_fullness(raw, cap, self.last_status_time, self.last_point_rate) as u64
-        })
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }
@@ -243,9 +235,10 @@ impl FifoBackend for EtherDreamBackend {
 
 /// Decay a raw buffer fullness value based on elapsed time since last status.
 ///
-/// Free function so [`EtherDreamBackend::queued_points`] (Phase 1) and
-/// historical tests can both reach it. Phase 2 retires this in favour of the
-/// status-anchored estimator.
+/// Used inside `try_write_points` to compute headroom against the device's
+/// authoritative buffer capacity. The new [`StatusDecayEstimator`] mirrors the
+/// same anchor-and-decay shape; this helper stays because the admission check
+/// also needs the saturating clamp against `capacity`.
 fn decay_fullness(
     raw: u16,
     capacity: u16,

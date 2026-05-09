@@ -182,10 +182,6 @@ mod tests {
             Ok(outcome)
         }
 
-        fn queued_points(&self) -> Option<u64> {
-            Some(0)
-        }
-
         fn estimator(&self) -> &dyn BufferEstimator {
             &self.estimator
         }

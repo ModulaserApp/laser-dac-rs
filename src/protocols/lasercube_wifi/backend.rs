@@ -109,12 +109,6 @@ impl FifoBackend for LasercubeWifiBackend {
         Ok(WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        self.stream
-            .as_ref()
-            .map(|s| s.estimated_buffer_fullness() as u64)
-    }
-
     fn estimator(&self) -> &dyn BufferEstimator {
         match &self.stream {
             Some(s) => s.buffer_estimator(),
