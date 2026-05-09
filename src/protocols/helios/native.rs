@@ -115,6 +115,16 @@ impl HeliosDac {
         }
     }
 
+    /// Best-effort physical USB location, stable across re-enumeration when
+    /// the DAC stays on the same hub/port path.
+    pub fn usb_location(&self) -> String {
+        match self {
+            HeliosDac::Idle(device) | HeliosDac::Open { device, .. } => format_usb_location(device),
+            #[cfg(test)]
+            HeliosDac::MockOpen(_) => "mock".into(),
+        }
+    }
+
     /// Returns a reference to the open USB handle, or an error if the device is not opened.
     fn handle(&self) -> Result<&rusb::DeviceHandle<rusb::Context>> {
         match self {
@@ -264,6 +274,21 @@ impl HeliosDac {
 impl From<rusb::Device<rusb::Context>> for HeliosDac {
     fn from(device: Device<Context>) -> Self {
         HeliosDac::Idle(device)
+    }
+}
+
+fn format_usb_location<T: UsbContext>(device: &Device<T>) -> String {
+    let bus = device.bus_number();
+    match device.port_numbers() {
+        Ok(ports) if !ports.is_empty() => {
+            let path = ports
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
+            format!("{bus}:{path}")
+        }
+        _ => format!("{}:{}", bus, device.address()),
     }
 }
 

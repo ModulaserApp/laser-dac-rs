@@ -395,6 +395,11 @@ laser-dac = { version = "*", default-features = false, features = ["network-dacs
 
 USB DACs (`helios`, `lasercube-usb`) use [rusb](https://crates.io/crates/rusb) which requires CMake to build.
 
+On macOS Tahoe, Helios USB discovery is disabled by default because Apple's
+`IOUSBHostFamily` can kernel panic when libusb claims or switches the Helios
+USB interface. Prefer Helios IDN/network output on macOS. To opt in to Helios
+USB scanning for local testing, set `LASER_DAC_HELIOS_ENABLE_MACOS_SCAN=1`.
+
 ## Development Tools
 
 ### IDN Simulator

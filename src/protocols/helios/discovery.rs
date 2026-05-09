@@ -8,6 +8,8 @@ use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDevice
 use crate::protocols::helios::{HeliosBackend, HeliosDac, HeliosDacController};
 
 const PREFIX: &str = "helios";
+#[cfg(target_os = "macos")]
+const MACOS_SCAN_ENV: &str = "LASER_DAC_HELIOS_ENABLE_MACOS_SCAN";
 
 struct ConnectData {
     dac: HeliosDac,
@@ -26,8 +28,28 @@ impl HeliosDiscoverer {
     }
 }
 
-fn format_stable_id(hardware_name: &str) -> String {
-    format!("{}:{}", PREFIX, hardware_name)
+fn format_stable_id(hardware_name: Option<&str>, usb_location: &str) -> String {
+    match hardware_name {
+        Some(name) => format!("{}:{}", PREFIX, name),
+        None => format!("{}:usb:{}", PREFIX, usb_location),
+    }
+}
+
+fn format_display_name(usb_location: &str) -> String {
+    format!("Helios DAC ({usb_location})")
+}
+
+#[cfg(target_os = "macos")]
+fn scan_enabled() -> bool {
+    matches!(
+        std::env::var(MACOS_SCAN_ENV).as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_enabled() -> bool {
+    true
 }
 
 impl Discoverer for HeliosDiscoverer {
@@ -40,27 +62,29 @@ impl Discoverer for HeliosDiscoverer {
     }
 
     fn scan(&mut self) -> Vec<DiscoveredDevice> {
+        if !scan_enabled() {
+            log::warn!(
+                "Helios USB discovery disabled on macOS; set {}=1 to opt in",
+                MACOS_SCAN_ENV
+            );
+            return Vec::new();
+        }
+
         let Ok(devices) = self.controller.list_devices() else {
             return Vec::new();
         };
 
         let mut discovered = Vec::new();
         for device in devices {
-            let HeliosDac::Idle(_) = &device else {
-                continue;
-            };
-            let opened = match device.open() {
-                Ok(o) => o,
-                Err(_) => continue,
-            };
-            let hardware_name = opened.name().unwrap_or_else(|_| "Unknown Helios".into());
-            let stable_id = format_stable_id(&hardware_name);
+            let usb_location = device.usb_location();
+            let stable_id = format_stable_id(None, &usb_location);
+            let display_name = format_display_name(&usb_location);
 
-            let info = DiscoveredDeviceInfo::new(DacType::Helios, stable_id, &hardware_name)
-                .with_hardware_name(hardware_name);
+            let info = DiscoveredDeviceInfo::new(DacType::Helios, stable_id, display_name)
+                .with_usb_address(usb_location);
             discovered.push(DiscoveredDevice::new(
                 info,
-                Box::new(ConnectData { dac: opened }),
+                Box::new(ConnectData { dac: device }),
             ));
         }
         discovered
@@ -80,7 +104,29 @@ mod tests {
 
     #[test]
     fn format_stable_id_prefixes_hardware_name() {
-        assert_eq!(format_stable_id("Helios DAC"), "helios:Helios DAC");
-        assert_eq!(format_stable_id("Unknown Helios"), "helios:Unknown Helios");
+        assert_eq!(
+            format_stable_id(Some("Helios DAC"), "1:2.3"),
+            "helios:Helios DAC"
+        );
+        assert_eq!(
+            format_stable_id(Some("Unknown Helios"), "1:2.3"),
+            "helios:Unknown Helios"
+        );
+    }
+
+    #[test]
+    fn format_stable_id_falls_back_to_usb_location() {
+        assert_eq!(format_stable_id(None, "1:2.3"), "helios:usb:1:2.3");
+    }
+
+    #[test]
+    fn format_display_name_includes_usb_location() {
+        assert_eq!(format_display_name("1:2.3"), "Helios DAC (1:2.3)");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn scan_is_enabled_by_default_off_macos() {
+        assert!(scan_enabled());
     }
 }
