@@ -1,6 +1,7 @@
 //! LaserCube WiFi DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, DualTrackAckEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -15,16 +16,22 @@ pub struct LasercubeWifiBackend {
     caps: DacCapabilities,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
     point_buffer: Vec<LasercubePoint>,
+    /// Estimator returned when the stream is not connected. The live
+    /// estimator inside `stream::Stream` is the authoritative one once
+    /// connected; this empty placeholder keeps the trait getter total.
+    fallback_estimator: DualTrackAckEstimator,
 }
 
 impl LasercubeWifiBackend {
     pub fn new(addressed: Addressed) -> Self {
         let caps = super::capabilities_for_buffer(addressed.max_buffer_space);
+        let max_buffer_space = addressed.max_buffer_space;
         Self {
             addressed,
             stream: None,
             caps,
             point_buffer: Vec::new(),
+            fallback_estimator: DualTrackAckEstimator::new(max_buffer_space, 30_000),
         }
     }
 
@@ -106,5 +113,12 @@ impl FifoBackend for LasercubeWifiBackend {
         self.stream
             .as_ref()
             .map(|s| s.estimated_buffer_fullness() as u64)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        match &self.stream {
+            Some(s) => s.buffer_estimator(),
+            None => &self.fallback_estimator,
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! LaserCube USB DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -8,6 +9,7 @@ use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
 use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
 use crate::protocols::lasercube_usb::{rusb, DacController};
+use std::time::Instant;
 
 /// LaserCube USB DAC backend (LaserDock).
 pub struct LasercubeUsbBackend {
@@ -16,6 +18,9 @@ pub struct LasercubeUsbBackend {
     caps: DacCapabilities,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
     point_buffer: Vec<LasercubeUsbSample>,
+    /// Software-only buffer estimator. Driven by `record_send` from inside
+    /// `try_write_points`; not yet consulted by the adapter (Phase 1).
+    estimator: SoftwareDecayEstimator,
 }
 
 impl LasercubeUsbBackend {
@@ -25,6 +30,7 @@ impl LasercubeUsbBackend {
             stream: None,
             caps: super::default_capabilities(),
             point_buffer: Vec::new(),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 
@@ -34,6 +40,7 @@ impl LasercubeUsbBackend {
             stream: Some(stream),
             caps: super::default_capabilities(),
             point_buffer: Vec::new(),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 
@@ -146,13 +153,21 @@ impl FifoBackend for LasercubeUsbBackend {
         self.point_buffer
             .extend(points.iter().map(LasercubeUsbSample::from));
 
+        let n = self.point_buffer.len();
         match stream.write_frame(&self.point_buffer, pps) {
-            Ok(()) => Ok(WriteOutcome::Written),
+            Ok(()) => {
+                self.estimator.record_send(Instant::now(), n as u64, pps);
+                Ok(WriteOutcome::Written)
+            }
             Err(e) => self.handle_stream_error(e),
         }
     }
 
     fn queued_points(&self) -> Option<u64> {
         None
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }

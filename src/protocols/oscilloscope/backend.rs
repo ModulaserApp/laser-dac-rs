@@ -13,6 +13,7 @@ use crate::resample::{catmull_rom, resampled_len};
 
 use super::OscilloscopeConfig;
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, QueueDepthSource, RuntimeAuthorityEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -53,6 +54,12 @@ impl RuntimeState {
     }
 }
 
+impl QueueDepthSource for RuntimeState {
+    fn queued_points(&self) -> u64 {
+        RuntimeState::queued_points(self)
+    }
+}
+
 /// Handle to the audio thread.
 struct AudioThread {
     handle: JoinHandle<()>,
@@ -77,6 +84,9 @@ pub struct OscilloscopeBackend {
     audio_thread: Option<AudioThread>,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
     sample_buffer: Vec<(f32, f32)>,
+    /// Runtime-authoritative buffer estimator. Source is set on connect and
+    /// cleared on disconnect; reports zero in between.
+    estimator: RuntimeAuthorityEstimator,
 }
 
 impl OscilloscopeBackend {
@@ -90,6 +100,7 @@ impl OscilloscopeBackend {
             runtime: None,
             audio_thread: None,
             sample_buffer: Vec::new(),
+            estimator: RuntimeAuthorityEstimator::new(),
         }
     }
 
@@ -356,6 +367,8 @@ impl DacBackend for OscilloscopeBackend {
             thread::sleep(Duration::from_millis(10));
         }
 
+        self.estimator
+            .set_source(Arc::clone(&runtime) as Arc<dyn QueueDepthSource>);
         self.runtime = Some(runtime);
         self.audio_thread = Some(audio_thread);
 
@@ -377,6 +390,7 @@ impl DacBackend for OscilloscopeBackend {
         if let Some(runtime) = self.runtime.take() {
             runtime.clear_queue();
         }
+        self.estimator.clear_source();
 
         Ok(())
     }
@@ -481,5 +495,9 @@ impl FifoBackend for OscilloscopeBackend {
 
     fn queued_points(&self) -> Option<u64> {
         self.runtime.as_ref().map(|rt| rt.queued_points())
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }

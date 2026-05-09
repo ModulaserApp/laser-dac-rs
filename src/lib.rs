@@ -92,6 +92,7 @@
 //! Each backend handles conversion to its native format internally.
 
 pub mod backend;
+pub mod buffer_estimate;
 pub mod config;
 pub mod device;
 pub mod discovery;

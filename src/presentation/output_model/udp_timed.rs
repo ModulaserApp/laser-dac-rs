@@ -117,6 +117,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+    use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
     use crate::config::IdlePolicy;
     use crate::device::{DacCapabilities, DacType, OutputModel};
     use crate::error::Result as DacResult;
@@ -134,6 +135,7 @@ mod tests {
         caps: DacCapabilities,
         next_outcomes: Arc<Mutex<Vec<WriteOutcome>>>,
         writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+        estimator: SoftwareDecayEstimator,
     }
 
     impl DacBackend for FakeFifo {
@@ -183,6 +185,10 @@ mod tests {
         fn queued_points(&self) -> Option<u64> {
             Some(0)
         }
+
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
     }
 
     fn frame_with_points(n: usize) -> Frame {
@@ -215,6 +221,7 @@ mod tests {
             },
             next_outcomes: Arc::clone(&outcomes),
             writes: Arc::clone(&writes),
+            estimator: SoftwareDecayEstimator::new(),
         };
         let mut backend = BackendKind::Fifo(Box::new(backend));
         let mut adapter = UdpTimedAdapter::new(&backend);

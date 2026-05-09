@@ -38,8 +38,8 @@ pub mod protocol;
 pub use backend::LasercubeWifiBackend;
 pub use discovery::LasercubeWifiDiscoverer;
 
+use crate::buffer_estimate::LATENCY_POINT_ADJUSTMENT;
 use crate::device::{DacCapabilities, OutputModel};
-use dac::buffer_estimator::LATENCY_POINT_ADJUSTMENT;
 use protocol::{command, DeviceInfo, CMD_PORT, DEFAULT_BUFFER_CAPACITY};
 
 /// Returns capabilities for a LaserCube WiFi DAC with the given buffer capacity.

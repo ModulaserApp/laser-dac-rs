@@ -1,6 +1,6 @@
 //! UDP streaming interface for LaserCube WiFi DAC communication.
 
-use crate::protocols::lasercube_wifi::dac::buffer_estimator::BufferEstimator;
+use crate::buffer_estimate::DualTrackAckEstimator;
 use crate::protocols::lasercube_wifi::dac::Addressed;
 use crate::protocols::lasercube_wifi::error::CommunicationError;
 use crate::protocols::lasercube_wifi::protocol::{
@@ -46,7 +46,15 @@ pub struct Stream {
     /// Reusable buffer for receiving responses.
     recv_buffer: [u8; 1500],
     /// Dual-estimate buffer tracker.
-    buffer_estimator: BufferEstimator,
+    buffer_estimator: DualTrackAckEstimator,
+}
+
+impl Stream {
+    /// Read-only access to the buffer estimator (used by the backend's
+    /// `FifoBackend::estimator` getter).
+    pub fn buffer_estimator(&self) -> &DualTrackAckEstimator {
+        &self.buffer_estimator
+    }
 }
 
 impl Stream {
@@ -75,7 +83,7 @@ impl Stream {
         data_socket.connect(data_addr)?;
 
         let mut stream = Stream {
-            buffer_estimator: BufferEstimator::new(dac.max_buffer_space, INITIAL_POINT_RATE),
+            buffer_estimator: DualTrackAckEstimator::new(dac.max_buffer_space, INITIAL_POINT_RATE),
             dac: dac.clone(),
             cmd_socket,
             data_socket,
@@ -149,7 +157,7 @@ impl Stream {
                 if let Ok(status) = BufferStatus::from_response(&self.recv_buffer[..len]) {
                     let now = Instant::now();
                     self.buffer_estimator
-                        .record_ack(status.message_number, status.free_space, now);
+                        .record_ack(now, status.message_number, status.free_space);
                     self.dac.status.free_buffer_space = status.free_space;
                     return Ok(Some(status));
                 }
@@ -194,7 +202,7 @@ impl Stream {
             // Record the send in the buffer estimator
             let now = Instant::now();
             self.buffer_estimator
-                .record_send(self.message_number, chunk.len() as u16, now);
+                .record_send(now, self.message_number, chunk.len() as u16);
 
             // Update counters
             self.message_number = self.message_number.wrapping_add(1);

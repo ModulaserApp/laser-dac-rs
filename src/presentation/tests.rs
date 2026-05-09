@@ -1175,6 +1175,7 @@ fn test_parity_a_to_c_skip() {
 // =========================================================================
 
 use crate::backend::{BackendKind, DacBackend, FifoBackend, FrameSwapBackend};
+use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::error::Result as DacResult;
 use crate::stream::RunExit;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1334,6 +1335,7 @@ struct FifoTestBackend {
     points_written: Arc<AtomicUsize>,
     shutter_open: Arc<AtomicBool>,
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl FifoTestBackend {
@@ -1344,6 +1346,7 @@ impl FifoTestBackend {
             points_written: Arc::new(AtomicUsize::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
             writes: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -1392,6 +1395,10 @@ impl FifoBackend for FifoTestBackend {
         self.points_written
             .fetch_add(points.len(), Ordering::SeqCst);
         Ok(crate::backend::WriteOutcome::Written)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
@@ -1486,6 +1493,7 @@ struct RetryFifoTestBackend {
     block_next_writes: Arc<AtomicUsize>,
     block_next_visible_writes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl RetryFifoTestBackend {
@@ -1502,6 +1510,7 @@ impl RetryFifoTestBackend {
             block_next_writes: Arc::new(AtomicUsize::new(0)),
             block_next_visible_writes: Arc::new(AtomicUsize::new(0)),
             writes: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -1558,6 +1567,10 @@ impl FifoBackend for RetryFifoTestBackend {
 
     fn queued_points(&self) -> Option<u64> {
         Some(0)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
@@ -1845,6 +1858,7 @@ struct RetryUdpTimedTestBackend {
     shutter_open: Arc<AtomicBool>,
     block_next_writes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl RetryUdpTimedTestBackend {
@@ -1860,6 +1874,7 @@ impl RetryUdpTimedTestBackend {
             shutter_open: Arc::new(AtomicBool::new(false)),
             block_next_writes: Arc::new(AtomicUsize::new(0)),
             writes: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -1905,6 +1920,10 @@ impl FifoBackend for RetryUdpTimedTestBackend {
             return Ok(crate::backend::WriteOutcome::WouldBlock);
         }
         Ok(crate::backend::WriteOutcome::Written)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
@@ -3297,6 +3316,7 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
     struct MinimalBackend {
         caps: DacCapabilities,
         connected: bool,
+        estimator: SoftwareDecayEstimator,
     }
     impl crate::backend::DacBackend for MinimalBackend {
         fn dac_type(&self) -> DacType {
@@ -3333,11 +3353,15 @@ fn test_frame_session_start_frame_session_rejects_invalid_pps_with_reconnect() {
         fn queued_points(&self) -> Option<u64> {
             None
         }
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
     }
 
     let backend = MinimalBackend {
         caps: caps.clone(),
         connected: false,
+        estimator: SoftwareDecayEstimator::new(),
     };
     let info = DacInfo::new("test", "Test", DacType::Custom("Test".into()), caps);
     let mut device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));

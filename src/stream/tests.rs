@@ -1,5 +1,6 @@
 use super::*;
 use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,8 @@ struct TestBackend {
     queued: Arc<AtomicU64>,
     /// Track shutter state for testing
     shutter_open: Arc<AtomicBool>,
+    /// Placeholder estimator for the FifoBackend trait getter; not consulted today.
+    estimator: SoftwareDecayEstimator,
 }
 
 impl TestBackend {
@@ -31,6 +34,7 @@ impl TestBackend {
             would_block_count: Arc::new(AtomicUsize::new(0)),
             queued: Arc::new(AtomicU64::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 
@@ -127,6 +131,10 @@ impl FifoBackend for NoQueueTestBackend {
     fn queued_points(&self) -> Option<u64> {
         None
     }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        self.inner.estimator()
+    }
 }
 
 impl DacBackend for TestBackend {
@@ -179,6 +187,10 @@ impl FifoBackend for TestBackend {
 
     fn queued_points(&self) -> Option<u64> {
         Some(self.queued.load(Ordering::SeqCst))
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
@@ -1641,6 +1653,10 @@ fn test_stream_with_mock_backend_disconnect() {
         fn queued_points(&self) -> Option<u64> {
             self.inner.queued_points()
         }
+
+        fn estimator(&self) -> &dyn BufferEstimator {
+            self.inner.estimator()
+        }
     }
 
     let backend = DisconnectingBackend {
@@ -1774,6 +1790,10 @@ impl FifoBackend for FailingWriteBackend {
         } else {
             None
         }
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        self.inner.estimator()
     }
 }
 
@@ -2901,11 +2921,15 @@ fn with_discovery_factory_enables_reconnect_for_frame_session() {
 /// Minimal FIFO backend for reconnection tests — accepts all writes.
 struct ReconnectFifoBackend {
     connected: bool,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl ReconnectFifoBackend {
     fn new() -> Self {
-        Self { connected: false }
+        Self {
+            connected: false,
+            estimator: SoftwareDecayEstimator::new(),
+        }
     }
 }
 
@@ -2945,6 +2969,10 @@ impl FifoBackend for ReconnectFifoBackend {
     fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
         Ok(WriteOutcome::Written)
     }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
 }
 
 /// FIFO backend that returns Error::Disconnected after N writes.
@@ -2954,6 +2982,7 @@ struct DisconnectAfterNBackend {
     connected: bool,
     fail_after: usize,
     write_count: AtomicUsize,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl DisconnectAfterNBackend {
@@ -2962,6 +2991,7 @@ impl DisconnectAfterNBackend {
             connected: false,
             fail_after,
             write_count: AtomicUsize::new(0),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -3007,6 +3037,10 @@ impl FifoBackend for DisconnectAfterNBackend {
         } else {
             Ok(WriteOutcome::Written)
         }
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
