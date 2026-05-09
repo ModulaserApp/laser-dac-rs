@@ -7,8 +7,7 @@ use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
 use super::super::content_source::{ContentSourceKind, FifoContentSource};
-use super::super::slice_pipeline::SlicePipeline;
-use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+use super::{blank_and_close_shutter, LoopCtx, OutputModelAdapter, StepOutcome};
 
 /// Re-borrow the loop-context source as a `FifoContentSource`. NetworkFifo is
 /// only ever paired with a Fifo source by the driver; mismatch is a programmer
@@ -92,20 +91,28 @@ impl OutputModelAdapter for NetworkFifoAdapter {
                     }
                     ctx.sleep_and_mark_activity(Duration::from_micros(100));
                 }
-                Err(e) if e.is_disconnected() => return StepOutcome::Disconnected,
-                Err(_) => break,
+                Err(e) if e.is_stopped() => return StepOutcome::Stopped,
+                Err(e) if e.is_disconnected() => {
+                    (ctx.error_sink)(e);
+                    return StepOutcome::Disconnected;
+                }
+                Err(e) => {
+                    log::warn!("write error, disconnecting backend: {e}");
+                    let _ = ctx.backend.disconnect();
+                    (ctx.error_sink)(e);
+                    return StepOutcome::Disconnected;
+                }
             }
         }
         StepOutcome::Continue
     }
 
-    fn on_reconnect(
-        &mut self,
-        info: &DacInfo,
-        pipeline: &mut SlicePipeline,
-        _backend: &mut BackendKind,
-    ) {
+    fn on_reconnect(&mut self, info: &DacInfo, _backend: &mut BackendKind) {
         self.max_points = info.caps.max_points_per_chunk;
-        pipeline.reserve_buf(self.max_points);
+    }
+
+    fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
+        super::drain_via_estimator(ctx, timeout);
+        blank_and_close_shutter(ctx);
     }
 }

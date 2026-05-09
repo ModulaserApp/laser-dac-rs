@@ -16,7 +16,6 @@ use common::{make_producer, Shape};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use laser_dac::{ChunkRequest, ChunkResult, LaserPoint, StreamInstant};
 use std::path::PathBuf;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(about = "Generate AVB-mapped 6-channel WAV test files")]
@@ -86,11 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let req = ChunkRequest {
             start: StreamInstant::new(current),
             pps: args.pps,
-            min_points: 0,
             target_points: n_points,
-            buffered_points: 0,
-            buffered: Duration::ZERO,
-            device_queued_points: None,
         };
 
         let mut points = vec![LaserPoint::default(); n_points];

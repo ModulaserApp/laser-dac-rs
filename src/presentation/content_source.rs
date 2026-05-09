@@ -21,7 +21,10 @@
 //! [`discard_cached`]: FifoContentSource::discard_cached
 
 use crate::device::DacInfo;
+use crate::error::Error;
 use crate::point::LaserPoint;
+
+use super::{Frame, OutputResetReason};
 
 /// Variable-chunk source. Implemented by `SlicePipeline` and (phase 4)
 /// `ChunkProducer`. Used by `NetworkFifoAdapter` and `UdpTimedAdapter`.
@@ -56,6 +59,39 @@ pub(crate) trait FifoContentSource: Send {
     /// Wired up by the unified driver in phase 4.
     #[allow(dead_code)]
     fn is_ended(&self) -> bool;
+
+    /// Submit a frame for replay. No-op for sources that don't compose frames
+    /// (e.g. `ChunkProducer`).
+    #[allow(dead_code)]
+    fn submit_frame(&mut self, _frame: Frame) {}
+
+    /// Re-arm the startup-blank window using the current pps. No-op for
+    /// sources that don't track startup blanking.
+    #[allow(dead_code)]
+    fn arm_startup_blank(&mut self, _pps: u32) {}
+
+    /// Disarm-edge hook; sources that hold per-write state (color delay
+    /// line) clear it here.
+    #[allow(dead_code)]
+    fn on_disarm(&mut self) {}
+
+    /// Forward an `OutputResetReason` to any installed output filter. No-op
+    /// for sources without a filter.
+    #[allow(dead_code)]
+    fn reset_output_filter(&mut self, _reason: OutputResetReason) {}
+
+    /// Resize the color-delay line for the current pps. Sources that read
+    /// the delay via an atomic on each chunk (`ChunkProducer`) ignore this.
+    #[allow(dead_code)]
+    fn resize_color_delay_micros(&mut self, _micros: u64, _pps: u32) {}
+
+    /// If the source ended because of `IdlePolicy::Stop`, return the
+    /// matching error so the driver can propagate it as `Err(Error::Stopped)`
+    /// rather than a graceful `Ok(RunExit::ProducerEnded)`.
+    #[allow(dead_code)]
+    fn take_stop_error(&mut self) -> Option<Error> {
+        None
+    }
 }
 
 /// Whole-frame source. Implemented by `SlicePipeline`. Used by
@@ -78,6 +114,31 @@ pub(crate) trait FrameContentSource: Send {
 
     /// Reset derived state on reconnect.
     fn on_reconnect(&mut self, info: &DacInfo);
+
+    /// Update the frame capacity hint after reconnect. Default no-op for
+    /// sources that don't compose hardware frames.
+    #[allow(dead_code)]
+    fn set_frame_capacity(&mut self, _cap: Option<usize>) {}
+
+    /// Submit a frame for replay.
+    #[allow(dead_code)]
+    fn submit_frame(&mut self, _frame: Frame) {}
+
+    /// Re-arm the startup-blank window.
+    #[allow(dead_code)]
+    fn arm_startup_blank(&mut self, _pps: u32) {}
+
+    /// Disarm-edge hook.
+    #[allow(dead_code)]
+    fn on_disarm(&mut self) {}
+
+    /// Forward an `OutputResetReason` to any installed output filter.
+    #[allow(dead_code)]
+    fn reset_output_filter(&mut self, _reason: OutputResetReason) {}
+
+    /// Resize the color-delay line for the current pps.
+    #[allow(dead_code)]
+    fn resize_color_delay_micros(&mut self, _micros: u64, _pps: u32) {}
 }
 
 /// Erased borrow of a source for the per-iteration loop context. Adapters

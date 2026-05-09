@@ -43,6 +43,8 @@ use crate::discovery::DacDiscovery;
 use crate::point::LaserPoint;
 use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy, ReconnectTarget};
 
+pub(crate) mod chunk_producer;
+
 // =============================================================================
 // Stream protocol types
 // =============================================================================
@@ -136,50 +138,27 @@ impl std::ops::SubAssign<u64> for StreamInstant {
 
 /// A request to fill a buffer with points for streaming.
 ///
-/// This is the streaming API with pure buffer-driven timing.
-/// The callback receives a `ChunkRequest` describing buffer state and requirements,
-/// and fills points into a library-owned buffer.
+/// The callback receives a `ChunkRequest` describing the next chunk's timing
+/// requirements and fills points into a library-owned buffer.
 ///
-/// # Point Tiers
-///
-/// - `min_points`: Minimum points needed to avoid imminent underrun (ceiling rounded)
-/// - `target_points`: Ideal number of points to reach target buffer level (clamped to buffer length)
-/// - `buffer.len()` (passed separately): Maximum points the callback may write
-///
-/// # Rounding Rules
-///
-/// - `min_points`: Always **ceiling** (underrun prevention)
-/// - `target_points`: **ceiling**, then clamped to buffer length
+/// `target_points` is the ideal number of points to reach the target buffer
+/// level, clamped to the provided buffer length. Returning fewer points
+/// triggers the configured [`IdlePolicy`](crate::config::IdlePolicy) for the
+/// remainder.
 #[derive(Clone, Debug)]
 pub struct ChunkRequest {
     /// Estimated playback time when this chunk starts.
     ///
-    /// Calculated as: playhead + buffered_points
     /// Use this for audio synchronization.
     pub start: StreamInstant,
 
     /// Points per second (current value, may change via `StreamControl::set_pps`).
     pub pps: u32,
 
-    /// Minimum points needed to avoid imminent underrun.
-    ///
-    /// Calculated with ceiling to prevent underrun: `ceil((min_buffer - buffered) * pps)`
-    /// If 0, buffer is healthy.
-    pub min_points: usize,
-
     /// Ideal number of points to reach target buffer level.
     ///
     /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
     pub target_points: usize,
-
-    /// Current buffer level in points (for diagnostics/adaptive content).
-    pub buffered_points: u64,
-
-    /// Current buffer level as duration (for audio sync convenience).
-    pub buffered: std::time::Duration,
-
-    /// Raw device queue if available (best-effort, may differ from buffered_points).
-    pub device_queued_points: Option<u64>,
 }
 
 /// Result returned by the fill callback indicating how the buffer was filled.
@@ -197,9 +176,8 @@ pub struct ChunkRequest {
 pub enum ChunkResult {
     /// Wrote n points to the buffer.
     ///
-    /// `n` must be <= `buffer.len()`.
-    /// Partial fills (`n < min_points`) are accepted without padding - useful when
-    /// content is legitimately ending. Return `End` on the next call to signal completion.
+    /// `n` must be <= `buffer.len()`. Partial fills (`n < target_points`) are
+    /// accepted; the remainder is filled by the configured idle policy.
     Filled(usize),
 
     /// No data available right now.
@@ -403,6 +381,10 @@ impl StreamControl {
 // Stream State
 // =============================================================================
 
+/// Legacy state shared by the in-Stream helpers retained for tests. The
+/// production path lives entirely in [`crate::presentation::driver::run`]
+/// via [`chunk_producer::ChunkProducer`].
+#[allow(dead_code)]
 struct StreamState {
     /// Current position in stream time (points since start).
     current_instant: StreamInstant,
@@ -426,8 +408,6 @@ struct StreamState {
     // Cached config-derived values (avoid recomputing per-iteration float math)
     /// target_buffer as seconds (cached from config).
     target_buffer_secs: f64,
-    /// min_buffer as seconds (cached from config).
-    min_buffer_secs: f64,
     /// target_buffer as points (cached from config + pps).
     target_buffer_points: u64,
 
@@ -451,7 +431,6 @@ impl StreamState {
     ) -> Self {
         let pps = config.pps as f64;
         let target_buffer_secs = config.target_buffer.as_secs_f64();
-        let min_buffer_secs = config.min_buffer.as_secs_f64();
         Self {
             current_instant: StreamInstant::new(0),
             chunk_buffer: vec![LaserPoint::default(); max_points_per_chunk],
@@ -461,7 +440,6 @@ impl StreamState {
             startup_blank_remaining: 0,
             startup_blank_points,
             target_buffer_secs,
-            min_buffer_secs,
             target_buffer_points: (target_buffer_secs * pps) as u64,
             stats: StreamStats::default(),
             last_armed: false,
@@ -500,6 +478,9 @@ pub struct Stream {
     pub(crate) reconnect_target: Option<ReconnectTarget>,
 }
 
+// Inherent helpers retained for the test surface (see `run_legacy`); the
+// production `Stream::run` body lives in [`crate::presentation::driver::run`].
+#[allow(dead_code)]
 impl Stream {
     /// Convert a duration in microseconds to a point count at the given PPS, rounding up.
     fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
@@ -762,7 +743,7 @@ impl Stream {
     ///
     /// This method uses **pure buffer-driven timing**:
     /// - Callback is invoked when `buffered <= target_buffer`
-    /// - Points requested varies based on buffer headroom (`min_points`, `target_points`)
+    /// - Points requested varies based on buffer headroom (`target_points`)
     /// - Callback fills a library-owned buffer (zero allocations in hot path)
     ///
     /// # Callback Contract
@@ -798,7 +779,76 @@ impl Stream {
     ///     |err| eprintln!("Error: {}", err),
     /// )?;
     /// ```
-    pub fn run<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
+    pub fn run<F, E>(mut self, producer: F, on_error: E) -> Result<RunExit>
+    where
+        F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        use crate::presentation::driver::{self, DriverInputs, SourceOwned};
+        use crate::presentation::FrameSessionMetrics;
+
+        let backend = self
+            .backend
+            .take()
+            .ok_or_else(|| Error::disconnected("backend already consumed"))?;
+        if backend.is_frame_swap() {
+            return Err(Error::invalid_config(
+                "Stream::run is FIFO-only; use start_frame_session for frame-swap DACs",
+            ));
+        }
+
+        let max_points = self.info.caps.max_points_per_chunk;
+        let chunk_producer = chunk_producer::ChunkProducer::new(
+            producer,
+            self.control.clone(),
+            self.config.idle_policy.clone(),
+            self.config.startup_blank,
+            max_points,
+        );
+
+        let validator = Self::build_reconnect_validator(self.config.pps);
+        let metrics = FrameSessionMetrics::new(true);
+        // Move the control receiver out of self; the Receiver isn't Clone so we
+        // swap in a fresh dummy channel that nothing will drive.
+        let (_dummy_tx, dummy_rx) = mpsc::channel();
+        let control_rx = std::mem::replace(&mut self.control_rx, dummy_rx);
+
+        driver::run(DriverInputs {
+            backend,
+            source: SourceOwned::Fifo(Box::new(chunk_producer)),
+            control: self.control.clone(),
+            control_rx,
+            metrics,
+            reconnect_policy: self.reconnect_policy.take(),
+            validator,
+            error_sink: Box::new(on_error),
+            drain_timeout: self.config.drain_timeout,
+            pending_frame: None,
+        })
+    }
+
+    fn build_reconnect_validator(
+        configured_pps: u32,
+    ) -> crate::presentation::driver::ReconnectValidator {
+        Box::new(move |_info: &DacInfo, new_backend: &BackendKind| {
+            if new_backend.is_frame_swap() {
+                log::error!("reconnected device is frame-swap, incompatible with streaming");
+                return Err(RunExit::Disconnected);
+            }
+            if Dac::validate_pps(new_backend.caps(), configured_pps).is_err() {
+                log::error!("reconnected device PPS range incompatible with stream config");
+                return Err(RunExit::Disconnected);
+            }
+            Ok(())
+        })
+    }
+
+    /// Legacy inline scheduler retained for tests that drive the helpers
+    /// directly. Phase 4 routes the production path through the unified
+    /// driver above; this body is unreachable from `run`.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn run_legacy<F, E>(mut self, mut producer: F, mut on_error: E) -> Result<RunExit>
     where
         F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
         E: FnMut(Error) + Send + 'static,
@@ -1211,49 +1261,26 @@ impl Stream {
             .map_or(0, |e| e.estimated_fullness(now, pps))
     }
 
-    /// Build a ChunkRequest with calculated buffer state and point requirements.
-    ///
-    /// Calculates:
-    /// - `buffered_points`: Conservative estimate of points in buffer
-    /// - `buffered`: Buffer level as Duration
-    /// - `start`: Estimated playback time (playhead + buffered)
-    /// - `min_points`: Minimum points to avoid underrun (ceiling rounded)
-    /// - `target_points`: Ideal points to reach target buffer (clamped to max)
-    ///
-    /// # Arguments
-    ///
-    /// * `max_points` - Maximum points the callback can write (buffer length)
-    /// * `buffered_points` - Pre-computed buffer estimate from `estimate_buffer_points()`
+    /// Build a `ChunkRequest` with the calculated `target_points` for the
+    /// next chunk. Retained for the legacy in-`Stream` test helpers; the
+    /// production path lives in [`crate::presentation::driver::run`].
     fn build_fill_request(&self, max_points: usize, buffered_points: u64) -> ChunkRequest {
         let pps = self.config.pps;
         let pps_f64 = pps as f64;
-        let buffered_secs = buffered_points as f64 / pps_f64;
-        let buffered = Duration::from_secs_f64(buffered_secs);
         let start = self.state.current_instant;
 
-        let (min_points, target_points) = if self.info.caps.output_model == OutputModel::UdpTimed {
-            // UdpTimed: always request a full packet
-            (max_points, max_points)
+        let target_points = if self.info.caps.output_model == OutputModel::UdpTimed {
+            max_points
         } else {
-            // target_points: ceil((target_buffer - buffered) * pps), clamped to max_points
+            let buffered_secs = buffered_points as f64 / pps_f64;
             let deficit_target = (self.state.target_buffer_secs - buffered_secs).max(0.0);
-            let target_points = ((deficit_target * pps_f64).ceil() as usize).min(max_points);
-
-            // min_points: ceil((min_buffer - buffered) * pps) - minimum to avoid underrun
-            let deficit_min = (self.state.min_buffer_secs - buffered_secs).max(0.0);
-            let min_points = ((deficit_min * pps_f64).ceil() as usize).min(max_points);
-
-            (min_points, target_points)
+            ((deficit_target * pps_f64).ceil() as usize).min(max_points)
         };
 
         ChunkRequest {
             start,
             pps,
-            min_points,
             target_points,
-            buffered_points,
-            buffered,
-            device_queued_points: Some(buffered_points),
         }
     }
 
@@ -1515,17 +1542,13 @@ impl Dac {
         caps: &DacCapabilities,
         mut cfg: StreamConfig,
     ) -> StreamConfig {
-        let untouched_defaults = cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER
-            && cfg.min_buffer == StreamConfig::DEFAULT_MIN_BUFFER;
-
-        if untouched_defaults
+        if cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER
             && matches!(
                 caps.output_model,
                 OutputModel::NetworkFifo | OutputModel::UdpTimed
             )
         {
             cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
-            cfg.min_buffer = StreamConfig::NETWORK_DEFAULT_MIN_BUFFER;
         }
 
         cfg

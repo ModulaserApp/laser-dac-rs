@@ -279,10 +279,6 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
         stream.config.target_buffer,
         StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
     );
-    assert_eq!(
-        stream.config.min_buffer,
-        StreamConfig::NETWORK_DEFAULT_MIN_BUFFER
-    );
 }
 
 #[test]
@@ -294,13 +290,10 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
         BackendKind::Fifo(Box::new(backend)),
     );
 
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(12))
-        .with_min_buffer(Duration::from_millis(4));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(12));
     let (stream, _info) = device.start_stream(cfg).unwrap();
 
     assert_eq!(stream.config.target_buffer, Duration::from_millis(12));
-    assert_eq!(stream.config.min_buffer, Duration::from_millis(4));
 }
 
 // Removed `test_device_start_stream_keeps_usb_defaults`: it constructed an
@@ -327,11 +320,7 @@ fn test_handle_underrun_advances_state() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 100,
         target_points: 100,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
     stream.handle_underrun(&req).unwrap();
 
@@ -421,11 +410,7 @@ fn test_handle_underrun_blanks_when_disarmed() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 100,
         target_points: 100,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
 
     // Handle underrun while disarmed
@@ -494,9 +479,7 @@ fn test_run_buffer_driven_behavior() {
     let write_count = backend.write_count.clone();
 
     // Use short target buffer for testing
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(10))
-        .with_min_buffer(Duration::from_millis(5));
+    let cfg = StreamConfig::new(30000).with_target_buffer(Duration::from_millis(10));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -535,7 +518,6 @@ fn test_run_sleeps_when_buffer_healthy() {
     // Very small target buffer, skip drain
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(5))
-        .with_min_buffer(Duration::from_millis(2))
         .with_drain_timeout(Duration::ZERO);
     let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
@@ -725,73 +707,27 @@ fn test_estimate_buffer_reads_backend_estimator() {
 }
 
 #[test]
-fn test_build_fill_request_uses_estimator_for_buffered_state() {
-    let backend = TestBackend::new().with_initial_queue(200);
-
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    assert_eq!(req.buffered_points, 200);
-    assert_eq!(req.device_queued_points, Some(200));
-}
-
-#[test]
-fn test_build_fill_request_calculates_min_and_target_points() {
-    // Verify that min_points and target_points are calculated correctly
-    // based on buffer state.
-    // 30000 PPS, target_buffer = 40ms, min_buffer = 10ms
-    // target_buffer = 40ms * 30000 = 1200 points
-    // min_buffer = 10ms * 30000 = 300 points
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
+fn test_build_fill_request_calculates_target_points() {
+    // 30000 PPS, target_buffer = 40ms → 1200 points
+    let cfg = StreamConfig::new(30000).with_target_buffer(Duration::from_millis(40));
     let backend = TestBackend::new();
     let estimator = backend.estimator.clone();
     let stream = make_test_stream_with_cfg(backend, cfg);
 
-    // Empty buffer: need full target
+    // Empty buffer: need full target (clamped to max_points)
     estimator.seed(0, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
     assert_eq!(req.target_points, 1000);
-    assert_eq!(req.min_points, 300);
 
-    // Buffer at 500 points (16.67ms): below target (40ms), above min (10ms)
+    // Buffer at 500 points (16.67ms): below target (40ms)
     estimator.seed(500, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
     assert_eq!(req.target_points, 700);
-    assert_eq!(req.min_points, 0);
 
     // Buffer full at 1200 points (40ms): at target
     estimator.seed(1200, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
     assert_eq!(req.target_points, 0);
-    assert_eq!(req.min_points, 0);
-}
-
-#[test]
-fn test_build_fill_request_ceiling_rounds_min_points() {
-    // Verify that min_points uses ceiling to prevent underrun
-    // min_buffer = 10ms at 30000 PPS = 300 points exactly
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
-    let backend = TestBackend::new();
-    let estimator = backend.estimator.clone();
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    // Buffer at 299 points: 1 point below min_buffer
-    estimator.seed(299, 30_000);
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // min_points should be ceil(300 - 299) = ceil(1) = 1
-    assert!(
-        req.min_points >= 1,
-        "min_points should be at least 1 to reach min_buffer"
-    );
 }
 
 // =========================================================================
@@ -1474,11 +1410,7 @@ fn test_disarm_underrun_respects_park_policy() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 50,
         target_points: 50,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
 
     stream.handle_underrun(&req).unwrap();
@@ -2540,9 +2472,7 @@ fn test_udp_timed_prefills_to_max_points_per_chunk() {
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
     let estimator = backend.estimator.clone();
-    let cfg = StreamConfig::new(1000)
-        .with_target_buffer(Duration::from_millis(500))
-        .with_min_buffer(Duration::from_millis(100));
+    let cfg = StreamConfig::new(1000).with_target_buffer(Duration::from_millis(500));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // UdpTimed target = max_points_per_chunk = 179
@@ -2586,7 +2516,6 @@ fn test_udp_timed_build_fill_request_uses_full_packet() {
     let req = stream.build_fill_request(179, 120);
 
     assert_eq!(req.target_points, 179);
-    assert_eq!(req.min_points, 179);
 }
 
 #[test]
@@ -2615,9 +2544,7 @@ fn test_network_fifo_lasercube_default_target_requests_topup() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(50))
-        .with_min_buffer(Duration::from_millis(20));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(50));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
@@ -2635,9 +2562,7 @@ fn test_network_fifo_lasercube_large_target_uses_more_capacity() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(200))
-        .with_min_buffer(Duration::from_millis(50));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(200));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let buffered = stream.estimate_buffer_points();

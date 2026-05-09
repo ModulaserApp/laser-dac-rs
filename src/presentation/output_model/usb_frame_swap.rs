@@ -6,7 +6,6 @@ use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
 use super::super::content_source::ContentSourceKind;
-use super::super::slice_pipeline::SlicePipeline;
 use super::{LoopCtx, OutputModelAdapter, StepOutcome};
 
 pub(crate) struct UsbFrameSwapAdapter {
@@ -33,29 +32,24 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
         };
 
         if !self.write_pending {
-            let n = source.produce_frame(ctx.pps, ctx.is_armed).len();
-            if n == 0 {
+            if source.produce_frame(ctx.pps, ctx.is_armed).is_empty() {
                 ctx.sleep_and_mark_activity(Duration::from_millis(1));
                 return StepOutcome::Continue;
             }
             self.write_pending = true;
         }
 
-        let outcome = {
-            let slice = match source.cached_slice() {
-                Some(s) => s,
-                None => {
-                    self.write_pending = false;
-                    return StepOutcome::Continue;
-                }
-            };
-            ctx.backend.try_write(ctx.pps, slice)
+        let (n, outcome) = match source.cached_slice() {
+            Some(slice) => (slice.len(), ctx.backend.try_write(ctx.pps, slice)),
+            None => {
+                self.write_pending = false;
+                return StepOutcome::Continue;
+            }
         };
 
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                let n = source.cached_slice().map_or(0, |s| s.len());
                 source.commit_written(n, ctx.is_armed);
                 self.write_pending = false;
             }
@@ -63,22 +57,25 @@ impl OutputModelAdapter for UsbFrameSwapAdapter {
                 ctx.metrics.mark_loop_activity();
                 ctx.sleep_and_mark_activity(Duration::from_millis(1));
             }
+            Err(e) if e.is_stopped() => {
+                return StepOutcome::Stopped;
+            }
             Err(e) if e.is_disconnected() => {
+                (ctx.error_sink)(e);
                 return StepOutcome::Disconnected;
             }
-            Err(_) => {}
+            Err(e) => {
+                log::warn!("frame write error, disconnecting backend: {e}");
+                let _ = ctx.backend.disconnect();
+                (ctx.error_sink)(e);
+                return StepOutcome::Disconnected;
+            }
         }
         StepOutcome::Continue
     }
 
-    fn on_reconnect(
-        &mut self,
-        _info: &DacInfo,
-        pipeline: &mut SlicePipeline,
-        backend: &mut BackendKind,
-    ) {
+    fn on_reconnect(&mut self, _info: &DacInfo, _backend: &mut BackendKind) {
         self.write_pending = false;
-        pipeline.set_frame_capacity(backend.frame_capacity());
     }
 }
 
@@ -188,6 +185,7 @@ mod tests {
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
                 pps: 30_000,
                 is_armed: true,
             };
@@ -207,6 +205,7 @@ mod tests {
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
                 pps: 30_000,
                 is_armed: true,
             };

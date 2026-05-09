@@ -18,13 +18,14 @@ pub trait QueueDepthSource: Send + Sync {
 /// The optional source is set when the backend connects and cleared on
 /// disconnect. With no source, the estimator reports zero — the same value
 /// the underlying runtime would return when no queue exists yet.
+#[derive(Default)]
 pub struct RuntimeAuthorityEstimator {
     source: Option<Arc<dyn QueueDepthSource>>,
 }
 
 impl RuntimeAuthorityEstimator {
     pub fn new() -> Self {
-        Self { source: None }
+        Self::default()
     }
 
     pub fn with_source(source: Arc<dyn QueueDepthSource>) -> Self {
@@ -39,12 +40,6 @@ impl RuntimeAuthorityEstimator {
 
     pub fn clear_source(&mut self) {
         self.source = None;
-    }
-}
-
-impl Default for RuntimeAuthorityEstimator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

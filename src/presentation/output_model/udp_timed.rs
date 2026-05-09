@@ -6,8 +6,9 @@ use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
 use super::super::content_source::ContentSourceKind;
-use super::super::slice_pipeline::SlicePipeline;
-use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+use super::{
+    blank_and_close_shutter, drain_via_estimator, LoopCtx, OutputModelAdapter, StepOutcome,
+};
 
 const CHUNK_SECS: f64 = 0.010;
 
@@ -63,30 +64,26 @@ impl OutputModelAdapter for UdpTimedAdapter {
         source.reserve_buf(self.chunk_points);
 
         if !self.has_retain {
-            let n = source
+            if source
                 .produce_chunk(self.chunk_points, pps, ctx.is_armed)
-                .len();
-            if n == 0 {
+                .is_empty()
+            {
                 return StepOutcome::Continue;
             }
             self.has_retain = true;
         }
 
-        let outcome = {
-            let slice = match source.cached_slice() {
-                Some(s) => s,
-                None => {
-                    self.has_retain = false;
-                    return StepOutcome::Continue;
-                }
-            };
-            ctx.backend.try_write(pps, slice)
+        let (n, outcome) = match source.cached_slice() {
+            Some(slice) => (slice.len(), ctx.backend.try_write(pps, slice)),
+            None => {
+                self.has_retain = false;
+                return StepOutcome::Continue;
+            }
         };
 
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                let n = source.cached_slice().map_or(0, |s| s.len());
                 source.commit_written(n, ctx.is_armed);
                 self.has_retain = false;
             }
@@ -94,25 +91,34 @@ impl OutputModelAdapter for UdpTimedAdapter {
                 ctx.metrics.mark_loop_activity();
                 // leave cache; retry on next deadline
             }
+            Err(e) if e.is_stopped() => {
+                return StepOutcome::Stopped;
+            }
             Err(e) if e.is_disconnected() => {
+                (ctx.error_sink)(e);
                 return StepOutcome::Disconnected;
             }
-            Err(_) => {}
+            Err(e) => {
+                log::warn!("write error, disconnecting backend: {e}");
+                let _ = ctx.backend.disconnect();
+                (ctx.error_sink)(e);
+                return StepOutcome::Disconnected;
+            }
         }
         StepOutcome::Continue
     }
 
-    fn on_reconnect(
-        &mut self,
-        info: &DacInfo,
-        _pipeline: &mut SlicePipeline,
-        _backend: &mut BackendKind,
-    ) {
+    fn on_reconnect(&mut self, info: &DacInfo, _backend: &mut BackendKind) {
         self.next_send = Instant::now();
         self.has_retain = false;
         self.max_points_per_chunk = info.caps.max_points_per_chunk;
         // Force a recompute on next step.
         self.chunk_points = 0;
+    }
+
+    fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
+        drain_via_estimator(ctx, timeout);
+        blank_and_close_shutter(ctx);
     }
 }
 
@@ -242,6 +248,7 @@ mod tests {
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
                 pps: PPS_INITIAL,
                 is_armed: true,
             };
@@ -266,6 +273,7 @@ mod tests {
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
                 pps: PPS_AFTER,
                 is_armed: true,
             };
@@ -276,5 +284,72 @@ mod tests {
         let writes_v = writes.lock().unwrap();
         assert_eq!(writes_v.len(), 1);
         assert_eq!(writes_v[0].len(), expected_initial_chunk);
+    }
+
+    /// Phase 4 lock-in: UdpTimed produces fixed 10ms slices sized
+    /// `ceil(pps * 0.010)` and clamped to `max_points_per_chunk`. Asserted
+    /// across both small-MTU (LC-WiFi-shaped: 140) and large-MTU (IDN-shaped:
+    /// 4096) caps so the unification is auditable for either device class.
+    #[test]
+    fn chunk_size_is_ten_millis_clamped_to_max() {
+        for (pps, max, expected) in [
+            (30_000_u32, 140_usize, 140_usize), // LC-WiFi shape: clamped
+            (30_000, 4_096, 300),               // IDN shape: ceil(30k*0.010)
+            (20_000, 4_096, 200),
+            (60_000, 4_096, 600),
+        ] {
+            let mut engine =
+                PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            engine.set_pending(frame_with_points(8_000));
+            let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let backend = FakeFifo {
+                caps: DacCapabilities {
+                    pps_min: 1_000,
+                    pps_max: 100_000,
+                    max_points_per_chunk: max,
+                    output_model: OutputModel::UdpTimed,
+                },
+                next_outcomes: Arc::new(Mutex::new(Vec::new())),
+                writes: Arc::clone(&writes),
+                estimator: SoftwareDecayEstimator::new(),
+            };
+            let mut backend = BackendKind::Fifo(Box::new(backend));
+            let mut adapter = UdpTimedAdapter::new(&backend);
+
+            let (tx, rx) = mpsc::channel::<ControlMsg>();
+            let control = StreamControl::new(tx, std::time::Duration::ZERO, pps);
+            let metrics = FrameSessionMetrics::new(true);
+            let mut shutter = false;
+
+            // Two steps so the second produces a fresh chunk after the first
+            // commits its retain.
+            for _ in 0..2 {
+                let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+                let mut ctx = LoopCtx {
+                    backend: &mut backend,
+                    source,
+                    control: &control,
+                    control_rx: &rx,
+                    metrics: &metrics,
+                    shutter_open: &mut shutter,
+                    error_sink: &mut |_| {},
+                    pps,
+                    is_armed: true,
+                };
+                assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
+            }
+
+            let writes_v = writes.lock().unwrap();
+            assert!(!writes_v.is_empty(), "no writes for pps={pps} max={max}");
+            for chunk in writes_v.iter() {
+                assert_eq!(
+                    chunk.len(),
+                    expected,
+                    "pps={pps} max={max}: expected {expected}-point slice"
+                );
+            }
+        }
     }
 }

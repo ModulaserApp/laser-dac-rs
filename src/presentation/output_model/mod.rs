@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
 use crate::device::DacInfo;
+use crate::error::Error;
 use crate::stream::{ControlMsg, StreamControl};
 
 use super::content_source::ContentSourceKind;
 use super::session::FrameSessionMetrics;
-use super::slice_pipeline::SlicePipeline;
 
 mod network_fifo;
 mod udp_timed;
@@ -35,6 +35,7 @@ pub(crate) struct LoopCtx<'a> {
     pub control_rx: &'a mpsc::Receiver<ControlMsg>,
     pub metrics: &'a FrameSessionMetrics,
     pub shutter_open: &'a mut bool,
+    pub error_sink: &'a mut dyn FnMut(Error),
     pub pps: u32,
     pub is_armed: bool,
 }
@@ -134,13 +135,57 @@ pub(crate) trait OutputModelAdapter: Send {
     /// Run one step of the variable scheduler work.
     fn step(&mut self, ctx: &mut LoopCtx<'_>) -> StepOutcome;
 
-    /// Called by the driver after a successful reconnect.
-    fn on_reconnect(
-        &mut self,
-        info: &DacInfo,
-        pipeline: &mut SlicePipeline,
-        backend: &mut BackendKind,
-    );
+    /// Called by the driver after a successful reconnect. Adapters update
+    /// their own pacing state and may reach into the backend; source-side
+    /// reset (re-pending the last frame, resetting buffers, frame capacity)
+    /// is performed by the driver against the `ContentSource` separately.
+    fn on_reconnect(&mut self, info: &DacInfo, backend: &mut BackendKind);
+
+    /// Wait for queued points to drain, then output a small blank chunk and
+    /// close the shutter. Called by the driver on graceful end-of-stream.
+    /// Default is a best-effort blank-and-close — FIFO models override to
+    /// poll the estimator until empty or `timeout` elapses; UsbFrameSwap
+    /// uses the default (no queue to drain).
+    fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, _timeout: Duration) {
+        blank_and_close_shutter(ctx);
+    }
+}
+
+/// Output a small blank chunk and close the shutter. Best-effort safety
+/// shutdown shared between drain paths.
+pub(crate) fn blank_and_close_shutter(ctx: &mut LoopCtx<'_>) {
+    use crate::point::LaserPoint;
+    let _ = ctx.backend.set_shutter(false);
+    *ctx.shutter_open = false;
+    let blank = [LaserPoint::blanked(0.0, 0.0); 16];
+    let _ = ctx.backend.try_write(ctx.pps, &blank);
+}
+
+/// Poll the backend's [`BufferEstimator`] until it reports an empty queue or
+/// the timeout elapses. Used by FIFO/UdpTimed `drain_and_blank`.
+pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + timeout;
+    const POLL: Duration = Duration::from_millis(5);
+    while Instant::now() < deadline {
+        let buffered = ctx
+            .backend
+            .estimator()
+            .map_or(0, |e| e.estimated_fullness(Instant::now(), ctx.pps));
+        if buffered == 0 {
+            break;
+        }
+        if ctx.control.is_stop_requested() {
+            break;
+        }
+        if process_control_messages(ctx.control_rx, ctx.shutter_open, ctx.backend) {
+            break;
+        }
+        std::thread::sleep(POLL);
+        ctx.metrics.mark_loop_activity();
+    }
 }
 
 /// Construct the adapter for a backend's output model.
