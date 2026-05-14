@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
-use super::super::slice_pipeline::SlicePipeline;
-use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+use super::super::content_source::ContentSourceKind;
+use super::{
+    blank_and_close_shutter, drain_via_estimator, LoopCtx, OutputModelAdapter, StepOutcome,
+};
 
 const CHUNK_SECS: f64 = 0.010;
 
@@ -55,59 +57,68 @@ impl OutputModelAdapter for UdpTimedAdapter {
         // pps may have changed during the sleep — re-read from control.
         let pps = ctx.control.pps();
         self.recompute_chunk(pps);
-        ctx.pipeline.reserve_buf(self.chunk_points);
+
+        let ContentSourceKind::Fifo(source) = &mut ctx.source else {
+            unreachable!("UdpTimedAdapter requires a Fifo content source");
+        };
+        source.reserve_buf(self.chunk_points);
 
         if !self.has_retain {
-            let n = ctx
-                .pipeline
-                .produce_fifo_chunk(self.chunk_points, pps, ctx.is_armed)
-                .len();
-            if n == 0 {
+            if source
+                .produce_chunk(self.chunk_points, pps, ctx.is_armed)
+                .is_empty()
+            {
                 return StepOutcome::Continue;
             }
             self.has_retain = true;
         }
 
-        let outcome = {
-            let slice = match ctx.pipeline.cached_slice() {
-                Some(s) => s,
-                None => {
-                    self.has_retain = false;
-                    return StepOutcome::Continue;
-                }
-            };
-            ctx.backend.try_write(pps, slice)
+        let (n, outcome) = match source.cached_slice() {
+            Some(slice) => (slice.len(), ctx.backend.try_write(pps, slice)),
+            None => {
+                self.has_retain = false;
+                return StepOutcome::Continue;
+            }
         };
 
         match outcome {
             Ok(WriteOutcome::Written) => {
                 ctx.metrics.mark_write_success();
-                ctx.pipeline.invalidate();
+                source.commit_written(n, ctx.is_armed);
                 self.has_retain = false;
             }
             Ok(WriteOutcome::WouldBlock) => {
                 ctx.metrics.mark_loop_activity();
                 // leave cache; retry on next deadline
             }
+            Err(e) if e.is_stopped() => {
+                return StepOutcome::Stopped;
+            }
             Err(e) if e.is_disconnected() => {
+                (ctx.error_sink)(e);
                 return StepOutcome::Disconnected;
             }
-            Err(_) => {}
+            Err(e) => {
+                log::warn!("write error, disconnecting backend: {e}");
+                let _ = ctx.backend.disconnect();
+                (ctx.error_sink)(e);
+                return StepOutcome::Disconnected;
+            }
         }
         StepOutcome::Continue
     }
 
-    fn on_reconnect(
-        &mut self,
-        info: &DacInfo,
-        _pipeline: &mut SlicePipeline,
-        _backend: &mut BackendKind,
-    ) {
+    fn on_reconnect(&mut self, info: &DacInfo, _backend: &mut BackendKind) {
         self.next_send = Instant::now();
         self.has_retain = false;
         self.max_points_per_chunk = info.caps.max_points_per_chunk;
         // Force a recompute on next step.
         self.chunk_points = 0;
+    }
+
+    fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
+        drain_via_estimator(ctx, timeout);
+        blank_and_close_shutter(ctx);
     }
 }
 
@@ -117,10 +128,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+    use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
     use crate::config::IdlePolicy;
     use crate::device::{DacCapabilities, DacType, OutputModel};
     use crate::error::Result as DacResult;
     use crate::point::LaserPoint;
+    use crate::presentation::content_source::{ContentSourceKind, FifoContentSource};
     use crate::presentation::engine::PresentationEngine;
     use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
     use crate::presentation::session::FrameSessionMetrics;
@@ -134,6 +147,7 @@ mod tests {
         caps: DacCapabilities,
         next_outcomes: Arc<Mutex<Vec<WriteOutcome>>>,
         writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+        estimator: SoftwareDecayEstimator,
     }
 
     impl DacBackend for FakeFifo {
@@ -180,8 +194,8 @@ mod tests {
             Ok(outcome)
         }
 
-        fn queued_points(&self) -> Option<u64> {
-            Some(0)
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
         }
     }
 
@@ -215,6 +229,7 @@ mod tests {
             },
             next_outcomes: Arc::clone(&outcomes),
             writes: Arc::clone(&writes),
+            estimator: SoftwareDecayEstimator::new(),
         };
         let mut backend = BackendKind::Fifo(Box::new(backend));
         let mut adapter = UdpTimedAdapter::new(&backend);
@@ -225,13 +240,16 @@ mod tests {
         let mut shutter = false;
 
         {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: PPS_INITIAL,
                 is_armed: true,
             };
@@ -248,13 +266,16 @@ mod tests {
         // Drop pps so a fresh produce would yield a smaller chunk; queue Written next.
         control.set_pps(PPS_AFTER);
         {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
             let mut ctx = LoopCtx {
                 backend: &mut backend,
-                pipeline: &mut pipeline,
+                source,
                 control: &control,
                 control_rx: &rx,
                 metrics: &metrics,
                 shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
                 pps: PPS_AFTER,
                 is_armed: true,
             };
@@ -265,5 +286,73 @@ mod tests {
         let writes_v = writes.lock().unwrap();
         assert_eq!(writes_v.len(), 1);
         assert_eq!(writes_v[0].len(), expected_initial_chunk);
+    }
+
+    /// Phase 4 lock-in: UdpTimed produces fixed 10ms slices sized
+    /// `ceil(pps * 0.010)` and clamped to `max_points_per_chunk`. Asserted
+    /// across both small-MTU (LC-WiFi-shaped: 140) and large-MTU (IDN-shaped:
+    /// 4096) caps so the unification is auditable for either device class.
+    #[test]
+    fn chunk_size_is_ten_millis_clamped_to_max() {
+        for (pps, max, expected) in [
+            (30_000_u32, 140_usize, 140_usize), // LC-WiFi shape: clamped
+            (30_000, 4_096, 300),               // IDN shape: ceil(30k*0.010)
+            (20_000, 4_096, 200),
+            (60_000, 4_096, 600),
+        ] {
+            let mut engine =
+                PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+            engine.set_pending(frame_with_points(8_000));
+            let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let backend = FakeFifo {
+                caps: DacCapabilities {
+                    pps_min: 1_000,
+                    pps_max: 100_000,
+                    max_points_per_chunk: max,
+                    output_model: OutputModel::UdpTimed,
+                },
+                next_outcomes: Arc::new(Mutex::new(Vec::new())),
+                writes: Arc::clone(&writes),
+                estimator: SoftwareDecayEstimator::new(),
+            };
+            let mut backend = BackendKind::Fifo(Box::new(backend));
+            let mut adapter = UdpTimedAdapter::new(&backend);
+
+            let (tx, rx) = mpsc::channel::<ControlMsg>();
+            let control = StreamControl::new(tx, std::time::Duration::ZERO, pps);
+            let metrics = FrameSessionMetrics::new(true);
+            let mut shutter = false;
+
+            // Two steps so the second produces a fresh chunk after the first
+            // commits its retain.
+            for _ in 0..2 {
+                let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+                let mut ctx = LoopCtx {
+                    backend: &mut backend,
+                    source,
+                    control: &control,
+                    control_rx: &rx,
+                    metrics: &metrics,
+                    shutter_open: &mut shutter,
+                    error_sink: &mut |_| {},
+                    target_buffer: std::time::Duration::from_millis(20),
+                    pps,
+                    is_armed: true,
+                };
+                assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
+            }
+
+            let writes_v = writes.lock().unwrap();
+            assert!(!writes_v.is_empty(), "no writes for pps={pps} max={max}");
+            for chunk in writes_v.iter() {
+                assert_eq!(
+                    chunk.len(),
+                    expected,
+                    "pps={pps} max={max}: expected {expected}-point slice"
+                );
+            }
+        }
     }
 }

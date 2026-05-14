@@ -9,22 +9,13 @@ use std::time::{Duration, Instant};
 use crate::backend::BackendKind;
 use crate::device::{DacInfo, OutputModel};
 use crate::error::{Error, Result};
-use crate::reconnect::{reconnect_backend_with_retry, ReconnectPolicy};
+use crate::reconnect::ReconnectPolicy;
 use crate::stream::{ControlMsg, RunExit, StreamControl};
 
+use super::driver::{self, DriverInputs, SourceOwned};
 use super::engine::PresentationEngine;
-use super::output_model::{self, LoopCtx, StepOutcome};
 use super::slice_pipeline::SlicePipeline;
 use super::{default_transition, Frame, OutputResetReason, TransitionFn};
-
-/// Convert a duration to a point count at the given PPS rate.
-fn duration_to_points(d: Duration, pps: u32) -> usize {
-    if d.is_zero() {
-        0
-    } else {
-        (d.as_secs_f64() * pps as f64).ceil() as usize
-    }
-}
 
 // =============================================================================
 // FrameSessionConfig
@@ -344,212 +335,60 @@ impl FrameSession {
             OutputModel::UsbFrameSwap => backend.frame_capacity().unwrap_or(0),
             OutputModel::NetworkFifo | OutputModel::UdpTimed => backend.caps().max_points_per_chunk,
         };
-        let mut pipeline = SlicePipeline::new(
+        let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
             color_delay_points,
             output_filter,
             idle_policy,
             initial_buf_capacity,
+            startup_blank,
         );
         pipeline.reset_output_filter(OutputResetReason::SessionStart);
 
-        let mut adapter = output_model::for_backend(&backend);
-
-        let mut shutter_open = false;
-        let mut last_armed = false;
-        let mut last_frame: Option<Frame> = None;
         let expected_frame_swap = backend.is_frame_swap();
-
-        loop {
-            metrics.mark_loop_activity();
-            if control.is_stop_requested() {
-                return Ok(RunExit::Stopped);
-            }
-
-            let pps = control.pps();
-            let startup_blank_points = duration_to_points(startup_blank, pps);
-            pipeline.resize_color_delay(duration_to_points(control.color_delay(), pps));
-
-            if let Some(frame) = frame_slot.lock().unwrap().take() {
-                last_frame = Some(frame.clone());
-                pipeline.set_pending(frame);
-            }
-
-            if !backend.is_connected() {
-                match Self::try_reconnect(
-                    &mut backend,
-                    reconnect_policy.as_ref(),
-                    &control,
-                    &mut shutter_open,
-                    &mut last_armed,
-                    &mut pipeline,
-                    &last_frame,
-                    expected_frame_swap,
-                    &metrics,
-                ) {
-                    Ok(info) => {
-                        adapter.on_reconnect(&info, &mut pipeline, &mut backend);
-                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
-                        continue;
-                    }
-                    Err(exit) => return Ok(exit),
-                }
-            }
-
-            if output_model::process_control_messages(&control_rx, &mut shutter_open, &mut backend)
-            {
-                return Ok(RunExit::Stopped);
-            }
-            let is_armed = control.is_armed();
-            if let Some(reason) = Self::handle_shutter_transition(
-                is_armed,
-                &mut last_armed,
-                &mut shutter_open,
-                &mut pipeline,
-                startup_blank_points,
-                &mut backend,
-            ) {
-                pipeline.reset_output_filter(reason);
-            }
-
-            let outcome = {
-                let mut ctx = LoopCtx {
-                    backend: &mut backend,
-                    pipeline: &mut pipeline,
-                    control: &control,
-                    control_rx: &control_rx,
-                    metrics: &metrics,
-                    shutter_open: &mut shutter_open,
-                    pps,
-                    is_armed,
-                };
-                adapter.step(&mut ctx)
-            };
-
-            match outcome {
-                StepOutcome::Continue => {}
-                StepOutcome::Stopped => return Ok(RunExit::Stopped),
-                StepOutcome::Disconnected => match Self::try_reconnect(
-                    &mut backend,
-                    reconnect_policy.as_ref(),
-                    &control,
-                    &mut shutter_open,
-                    &mut last_armed,
-                    &mut pipeline,
-                    &last_frame,
-                    expected_frame_swap,
-                    &metrics,
-                ) {
-                    Ok(info) => {
-                        adapter.on_reconnect(&info, &mut pipeline, &mut backend);
-                        pipeline.reset_output_filter(OutputResetReason::Reconnect);
-                        continue;
-                    }
-                    Err(exit) => return Ok(exit),
-                },
-            }
-        }
-    }
-
-    // =========================================================================
-    // Shared helpers
-    // =========================================================================
-
-    /// Attempt to reconnect the backend using the reconnection policy.
-    ///
-    /// On success, replaces `backend`, resets the pipeline (engine + color
-    /// delay + cache), and replays the last frame. Returns the new `DacInfo`.
-    /// If no policy is set, returns `Err(RunExit::Disconnected)`.
-    #[allow(clippy::too_many_arguments)]
-    fn try_reconnect(
-        backend: &mut BackendKind,
-        policy: Option<&ReconnectPolicy>,
-        control: &StreamControl,
-        shutter_open: &mut bool,
-        last_armed: &mut bool,
-        pipeline: &mut SlicePipeline,
-        last_frame: &Option<Frame>,
-        expected_frame_swap: bool,
-        metrics: &FrameSessionMetrics,
-    ) -> std::result::Result<DacInfo, RunExit> {
-        let Some(policy) = policy else {
-            return Err(RunExit::Disconnected);
+        let source: SourceOwned = if expected_frame_swap {
+            SourceOwned::Frame(Box::new(pipeline))
+        } else {
+            SourceOwned::Fifo(Box::new(pipeline))
         };
-        metrics.set_connected(false);
-        let current_pps = control.pps();
-        let (info, new_backend) = reconnect_backend_with_retry(
-            policy,
-            || control.is_stop_requested(),
-            |info, new_backend| {
-                if current_pps < info.caps.pps_min || current_pps > info.caps.pps_max {
-                    log::error!(
-                        "'{}' PPS {} outside new device range [{}, {}]",
-                        policy.target.device_id,
-                        current_pps,
-                        info.caps.pps_min,
-                        info.caps.pps_max
-                    );
-                    return Err(RunExit::Disconnected);
-                }
 
-                if new_backend.is_frame_swap() != expected_frame_swap {
-                    log::error!(
-                        "'{}' reconnected device has incompatible backend type",
-                        policy.target.device_id
-                    );
-                    return Err(RunExit::Disconnected);
-                }
-
-                Ok(())
-            },
-            || metrics.mark_loop_activity(),
-        )?;
-
-        *backend = new_backend;
-        *shutter_open = false;
-        *last_armed = false;
-        metrics.set_connected(true);
-
-        pipeline.reset_engine();
-        pipeline.reset_color_delay();
-        if let Some(frame) = last_frame {
-            pipeline.set_pending(frame.clone());
+        let validator = Self::reconnect_validator(reconnect_policy.as_ref());
+        if !backend.is_connected() {
+            backend.connect()?;
         }
 
-        if let Some(cb) = policy.on_reconnect.lock().unwrap().as_mut() {
-            cb(&info);
-        }
-
-        Ok(info)
+        driver::run(DriverInputs {
+            backend,
+            source,
+            control,
+            control_rx,
+            metrics,
+            reconnect_policy,
+            validator,
+            error_sink: Box::new(|_e: Error| { /* frame-mode swallows non-fatal errors */ }),
+            target_buffer: Duration::from_millis(20),
+            drain_timeout: Duration::ZERO,
+            pending_frame: Some(frame_slot),
+        })
     }
 
-    /// Handle arm/disarm shutter transitions.
-    fn handle_shutter_transition(
-        is_armed: bool,
-        last_armed: &mut bool,
-        shutter_open: &mut bool,
-        pipeline: &mut SlicePipeline,
-        startup_blank_points: usize,
-        backend: &mut BackendKind,
-    ) -> Option<OutputResetReason> {
-        if !*last_armed && is_armed {
-            pipeline.arm_startup_blank(startup_blank_points);
-            if !*shutter_open {
-                let _ = backend.set_shutter(true);
-                *shutter_open = true;
+    fn reconnect_validator(policy: Option<&ReconnectPolicy>) -> driver::ReconnectValidator {
+        let target_id = policy
+            .map(|p| p.target.device_id.clone())
+            .unwrap_or_default();
+        Box::new(move |info: &DacInfo, _backend: &BackendKind, pps: u32| {
+            if pps < info.caps.pps_min || pps > info.caps.pps_max {
+                log::error!(
+                    "'{}' PPS {} outside new device range [{}, {}]",
+                    target_id,
+                    pps,
+                    info.caps.pps_min,
+                    info.caps.pps_max
+                );
+                return Err(RunExit::Disconnected);
             }
-            *last_armed = is_armed;
-            return Some(OutputResetReason::Arm);
-        } else if *last_armed && !is_armed {
-            if *shutter_open {
-                let _ = backend.set_shutter(false);
-                *shutter_open = false;
-            }
-            *last_armed = is_armed;
-            return Some(OutputResetReason::Disarm);
-        }
-        *last_armed = is_armed;
-        None
+            Ok(())
+        })
     }
 }
 

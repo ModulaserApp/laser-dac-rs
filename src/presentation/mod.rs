@@ -6,6 +6,8 @@
 //! - `PresentationEngine`: core frame lifecycle manager (internal)
 //! - [`FrameSession`] / [`FrameSessionConfig`]: public frame-mode API
 
+pub(crate) mod content_source;
+pub(crate) mod driver;
 mod engine;
 mod output_model;
 mod session;

@@ -5,9 +5,13 @@
 //! invariant in one place so adapters with retain semantics can ask for the
 //! cached, already-filtered slice on `WouldBlock`.
 
+use std::time::Duration;
+
 use crate::config::IdlePolicy;
+use crate::device::DacInfo;
 use crate::point::LaserPoint;
 
+use super::content_source::{FifoContentSource, FrameContentSource};
 use super::engine::{ColorDelayLine, PresentationEngine};
 use super::{Frame, OutputFilter, OutputFilterContext, OutputResetReason, PresentedSliceKind};
 
@@ -24,15 +28,39 @@ pub(crate) struct SlicePipeline {
     /// has not yet been written.
     cached: bool,
     startup_blank_remaining: usize,
+    /// Configured startup-blank duration; converted to points on each arm.
+    startup_blank: Duration,
+    /// Most recently submitted frame, retained so `on_reconnect` can re-prime
+    /// the engine after the driver replaces the backend.
+    last_pending_frame: Option<Frame>,
 }
 
 impl SlicePipeline {
+    #[cfg(test)]
     pub fn new(
         engine: PresentationEngine,
         color_delay_points: usize,
         output_filter: Option<Box<dyn OutputFilter>>,
         idle_policy: IdlePolicy,
         initial_buf_capacity: usize,
+    ) -> Self {
+        Self::with_startup_blank(
+            engine,
+            color_delay_points,
+            output_filter,
+            idle_policy,
+            initial_buf_capacity,
+            Duration::ZERO,
+        )
+    }
+
+    pub fn with_startup_blank(
+        engine: PresentationEngine,
+        color_delay_points: usize,
+        output_filter: Option<Box<dyn OutputFilter>>,
+        idle_policy: IdlePolicy,
+        initial_buf_capacity: usize,
+        startup_blank: Duration,
     ) -> Self {
         Self {
             engine,
@@ -43,12 +71,15 @@ impl SlicePipeline {
             cached_len: 0,
             cached: false,
             startup_blank_remaining: 0,
+            startup_blank,
+            last_pending_frame: None,
         }
     }
 
     // === pass-throughs ===
 
     pub fn set_pending(&mut self, frame: Frame) {
+        self.last_pending_frame = Some(frame.clone());
         self.engine.set_pending(frame);
     }
 
@@ -194,6 +225,129 @@ impl SlicePipeline {
     pub fn invalidate(&mut self) {
         self.cached = false;
         self.cached_len = 0;
+    }
+
+    /// Shared body for `on_reconnect` across both [`FifoContentSource`] and
+    /// [`FrameContentSource`] impls: reset engine + color delay + cache,
+    /// re-pend the most recent frame, fire the filter `Reconnect` reset.
+    fn replay_after_reconnect(&mut self) {
+        self.reset_engine();
+        self.reset_color_delay();
+        if let Some(frame) = self.last_pending_frame.clone() {
+            self.engine.set_pending(frame);
+        }
+        self.reset_output_filter(OutputResetReason::Reconnect);
+    }
+}
+
+impl FifoContentSource for SlicePipeline {
+    fn produce_chunk(&mut self, target_points: usize, pps: u32, is_armed: bool) -> &[LaserPoint] {
+        self.produce_fifo_chunk(target_points, pps, is_armed)
+    }
+
+    fn cached_slice(&self) -> Option<&[LaserPoint]> {
+        SlicePipeline::cached_slice(self)
+    }
+
+    fn commit_written(&mut self, _n: usize, _is_armed: bool) {
+        // Frame composition has no per-write derived state to advance for
+        // SlicePipeline; clearing the cache is sufficient.
+        self.invalidate();
+    }
+
+    fn discard_cached(&mut self) {
+        self.invalidate();
+    }
+
+    fn reserve_buf(&mut self, n: usize) {
+        SlicePipeline::reserve_buf(self, n);
+    }
+
+    fn on_reconnect(&mut self, _info: &DacInfo) {
+        self.replay_after_reconnect();
+    }
+
+    fn is_ended(&self) -> bool {
+        // Frame intake never ends from the source side.
+        false
+    }
+
+    fn submit_frame(&mut self, frame: Frame) {
+        self.set_pending(frame);
+    }
+
+    fn arm_startup_blank(&mut self, pps: u32) {
+        let points = duration_to_points(self.startup_blank, pps);
+        SlicePipeline::arm_startup_blank(self, points);
+    }
+
+    fn reset_output_filter(&mut self, reason: OutputResetReason) {
+        SlicePipeline::reset_output_filter(self, reason);
+    }
+
+    fn resize_color_delay_micros(&mut self, micros: u64, pps: u32) {
+        let points = duration_micros_to_points(micros, pps);
+        self.resize_color_delay(points);
+    }
+}
+
+impl FrameContentSource for SlicePipeline {
+    fn produce_frame(&mut self, pps: u32, is_armed: bool) -> &[LaserPoint] {
+        self.produce_frame_swap(pps, is_armed)
+    }
+
+    fn cached_slice(&self) -> Option<&[LaserPoint]> {
+        SlicePipeline::cached_slice(self)
+    }
+
+    fn commit_written(&mut self, _n: usize, _is_armed: bool) {
+        self.invalidate();
+    }
+
+    fn discard_cached(&mut self) {
+        self.invalidate();
+    }
+
+    fn on_reconnect(&mut self, _info: &DacInfo) {
+        self.replay_after_reconnect();
+    }
+
+    fn set_frame_capacity(&mut self, cap: Option<usize>) {
+        SlicePipeline::set_frame_capacity(self, cap);
+    }
+
+    fn submit_frame(&mut self, frame: Frame) {
+        self.set_pending(frame);
+    }
+
+    fn arm_startup_blank(&mut self, pps: u32) {
+        let points = duration_to_points(self.startup_blank, pps);
+        SlicePipeline::arm_startup_blank(self, points);
+    }
+
+    fn reset_output_filter(&mut self, reason: OutputResetReason) {
+        SlicePipeline::reset_output_filter(self, reason);
+    }
+
+    fn resize_color_delay_micros(&mut self, micros: u64, pps: u32) {
+        let points = duration_micros_to_points(micros, pps);
+        self.resize_color_delay(points);
+    }
+}
+
+fn duration_to_points(d: Duration, pps: u32) -> usize {
+    if d.is_zero() || pps == 0 {
+        0
+    } else {
+        (d.as_secs_f64() * pps as f64).ceil() as usize
+    }
+}
+
+fn duration_micros_to_points(micros: u64, pps: u32) -> usize {
+    if micros == 0 || pps == 0 {
+        0
+    } else {
+        (micros as f64 * pps as f64 / 1_000_000.0).ceil() as usize
     }
 }
 

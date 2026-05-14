@@ -1,6 +1,7 @@
 //! AVB DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, QueueDepthSource, RuntimeAuthorityEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -118,7 +119,15 @@ impl RuntimeState {
     fn queued_points(&self) -> u64 {
         self.queue.len() as u64
     }
+}
 
+impl QueueDepthSource for RuntimeState {
+    fn queued_points(&self) -> u64 {
+        RuntimeState::queued_points(self)
+    }
+}
+
+impl RuntimeState {
     fn remaining_capacity(&self) -> usize {
         self.queue.capacity().saturating_sub(self.queue.len())
     }
@@ -219,6 +228,9 @@ pub struct AvbBackend {
     engine: Arc<dyn AudioEngine>,
     caps: DacCapabilities,
     desired_shutter_open: bool,
+    /// Runtime-authoritative buffer estimator. Source is set on connect and
+    /// cleared on disconnect; reports zero in between.
+    estimator: RuntimeAuthorityEstimator,
 }
 
 impl AvbBackend {
@@ -231,6 +243,7 @@ impl AvbBackend {
             engine,
             caps: super::default_capabilities(),
             desired_shutter_open: false,
+            estimator: RuntimeAuthorityEstimator::new(),
         }
     }
 
@@ -320,6 +333,8 @@ impl DacBackend for AvbBackend {
                     self.selector.duplicate_index,
                     stream_config.sample_rate
                 );
+                self.estimator
+                    .set_source(Arc::clone(&runtime) as Arc<dyn QueueDepthSource>);
                 self.runtime = Some(runtime);
                 self.stop_tx = Some(stop_tx);
                 self.worker_handle = Some(handle);
@@ -355,6 +370,7 @@ impl DacBackend for AvbBackend {
         if let Some(runtime) = self.runtime.take() {
             runtime.clear_queue();
         }
+        self.estimator.clear_source();
 
         log::info!("AVB: disconnected from {:?}", self.selector.name);
         Ok(())
@@ -401,10 +417,8 @@ impl FifoBackend for AvbBackend {
         }
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        // This is host-side queue depth only (pre-callback ring),
-        // not audio driver/AVB hardware buffer occupancy.
-        self.runtime.as_ref().map(|rt| rt.queued_points())
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 

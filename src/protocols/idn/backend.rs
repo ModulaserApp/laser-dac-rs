@@ -1,6 +1,7 @@
 //! IDN DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -10,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 const IDN_WORKER_QUEUE_CAPACITY: usize = 8;
 
@@ -73,6 +75,9 @@ pub struct IdnBackend {
     caps: DacCapabilities,
     /// Conversion buffer moved into each chunk (capacity reused across writes).
     point_buffer: Vec<PointXyrgbi>,
+    /// Software-only buffer estimator. Driven by `record_send` from inside
+    /// `try_write_points`; not yet consulted by the adapter (Phase 1).
+    estimator: SoftwareDecayEstimator,
 }
 
 impl IdnBackend {
@@ -83,6 +88,7 @@ impl IdnBackend {
             runtime: None,
             caps: super::default_capabilities(),
             point_buffer: Vec::new(),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -161,13 +167,17 @@ impl FifoBackend for IdnBackend {
         self.point_buffer
             .extend(points.iter().map(PointXyrgbi::from));
 
+        let n = self.point_buffer.len();
         let chunk = QueuedChunk {
             pps,
             points: std::mem::take(&mut self.point_buffer),
         };
 
         match runtime.tx.try_send(WorkerCommand::Chunk(chunk)) {
-            Ok(()) => Ok(WriteOutcome::Written),
+            Ok(()) => {
+                self.estimator.record_send(Instant::now(), n as u64, pps);
+                Ok(WriteOutcome::Written)
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 log::debug!("idn worker queue full, back-pressuring scheduler");
                 Ok(WriteOutcome::WouldBlock)
@@ -176,6 +186,10 @@ impl FifoBackend for IdnBackend {
                 Err(Error::disconnected("IDN sender thread disconnected"))
             }
         }
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 

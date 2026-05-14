@@ -19,14 +19,13 @@ use crate::device::DacInfo;
 ///
 /// The streaming API uses pure buffer-driven timing:
 /// - `target_buffer`: Target buffer level to maintain (default baseline: 20ms)
-/// - `min_buffer`: Minimum buffer before requesting urgent fill (default baseline: 8ms)
 ///
 /// The callback is invoked when `buffered < target_buffer`. The callback receives
-/// a `ChunkRequest` with `min_points` and `target_points` calculated from these
-/// durations and the current buffer state.
+/// a `ChunkRequest` with `target_points` calculated from this duration and the
+/// current buffer state.
 ///
-/// `Dac::start_stream()` may promote untouched defaults to safer network values
-/// for `NetworkFifo` / `UdpTimed` backends.
+/// `Dac::start_stream()` may promote an untouched default to a safer network
+/// value for `NetworkFifo` / `UdpTimed` backends.
 ///
 /// To reduce perceived latency, reduce `target_buffer`.
 #[derive(Debug)]
@@ -41,12 +40,6 @@ pub struct StreamConfig {
     /// The callback is invoked when the buffer drops below this level.
     #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
     pub target_buffer: std::time::Duration,
-
-    /// Minimum buffer before requesting urgent fill (default: 8ms).
-    ///
-    /// When buffer drops below this, `min_points` in `ChunkRequest` will be non-zero.
-    #[cfg_attr(feature = "serde", serde(with = "duration_millis"))]
-    pub min_buffer: std::time::Duration,
 
     /// What to do when the stream is idle (underrun or disarmed).
     pub idle_policy: IdlePolicy,
@@ -131,7 +124,6 @@ impl Default for StreamConfig {
         Self {
             pps: 30_000,
             target_buffer: Self::DEFAULT_TARGET_BUFFER,
-            min_buffer: Self::DEFAULT_MIN_BUFFER,
             idle_policy: IdlePolicy::default(),
             drain_timeout: std::time::Duration::from_secs(1),
             color_delay: std::time::Duration::ZERO,
@@ -144,14 +136,9 @@ impl Default for StreamConfig {
 impl StreamConfig {
     /// Baseline default target buffer used by `StreamConfig::new()`.
     pub const DEFAULT_TARGET_BUFFER: std::time::Duration = std::time::Duration::from_millis(20);
-    /// Baseline default minimum buffer used by `StreamConfig::new()`.
-    pub const DEFAULT_MIN_BUFFER: std::time::Duration = std::time::Duration::from_millis(8);
     /// Safer default target buffer for network DACs when caller leaves defaults untouched.
     pub const NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
         std::time::Duration::from_millis(50);
-    /// Safer default minimum buffer for network DACs when caller leaves defaults untouched.
-    pub const NETWORK_DEFAULT_MIN_BUFFER: std::time::Duration =
-        std::time::Duration::from_millis(20);
 
     /// Create a new stream configuration with the given PPS.
     pub fn new(pps: u32) -> Self {
@@ -167,14 +154,6 @@ impl StreamConfig {
     /// Lower values reduce perceived latency.
     pub fn with_target_buffer(mut self, duration: std::time::Duration) -> Self {
         self.target_buffer = duration;
-        self
-    }
-
-    /// Set the minimum buffer level before urgent fill (builder pattern).
-    ///
-    /// Default: 8ms. When buffer drops below this, `min_points` will be non-zero.
-    pub fn with_min_buffer(mut self, duration: std::time::Duration) -> Self {
-        self.min_buffer = duration;
         self
     }
 
@@ -352,7 +331,6 @@ mod tests {
         let config = StreamConfig {
             pps: 45000,
             target_buffer: Duration::from_millis(50),
-            min_buffer: Duration::from_millis(12),
             idle_policy: IdlePolicy::Park { x: 0.5, y: -0.3 },
             drain_timeout: Duration::from_secs(2),
             color_delay: Duration::from_micros(150),
@@ -366,7 +344,6 @@ mod tests {
 
         assert_eq!(restored.pps, config.pps);
         assert_eq!(restored.target_buffer, config.target_buffer);
-        assert_eq!(restored.min_buffer, config.min_buffer);
         assert_eq!(restored.drain_timeout, config.drain_timeout);
         assert_eq!(restored.color_delay, config.color_delay);
         assert_eq!(restored.startup_blank, config.startup_blank);

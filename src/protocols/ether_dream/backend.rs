@@ -1,6 +1,7 @@
 //! Ether Dream DAC streaming backend implementation.
 
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, StatusDecayEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
@@ -21,6 +22,9 @@ pub struct EtherDreamBackend {
     last_point_rate: u32,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
     point_buffer: Vec<DacPoint>,
+    /// Status-anchored buffer estimator. Fed authoritative status reports and
+    /// per-send rebases; not yet consulted by the adapter (Phase 1).
+    estimator: StatusDecayEstimator,
 }
 
 impl EtherDreamBackend {
@@ -33,22 +37,7 @@ impl EtherDreamBackend {
             last_status_time: None,
             last_point_rate: 0,
             point_buffer: Vec::new(),
-        }
-    }
-
-    /// Decay a raw buffer fullness value based on elapsed time since last status.
-    fn decay_fullness(
-        raw: u16,
-        capacity: u16,
-        last_status_time: Option<Instant>,
-        point_rate: u32,
-    ) -> u16 {
-        if let Some(last_time) = last_status_time {
-            let elapsed_secs = last_time.elapsed().as_secs_f64();
-            let consumed = (elapsed_secs * point_rate as f64) as u16;
-            raw.saturating_sub(consumed).min(capacity)
-        } else {
-            raw
+            estimator: StatusDecayEstimator::new(),
         }
     }
 }
@@ -129,7 +118,10 @@ impl FifoBackend for EtherDreamBackend {
                     ));
                 }
                 // Status is now fresh from the ping response.
-                self.last_status_time = Some(Instant::now());
+                let now = Instant::now();
+                self.last_status_time = Some(now);
+                self.estimator
+                    .record_status(now, stream.dac().status.buffer_fullness as u64);
             }
             LightEngine::Warmup | LightEngine::Cooldown => {
                 return Ok(WriteOutcome::WouldBlock);
@@ -139,7 +131,7 @@ impl FifoBackend for EtherDreamBackend {
 
         let buffer_capacity = stream.dac().buffer_capacity;
         let raw_fullness = stream.dac().status.buffer_fullness;
-        let fullness = Self::decay_fullness(
+        let fullness = decay_fullness(
             raw_fullness,
             buffer_capacity,
             self.last_status_time,
@@ -223,16 +215,41 @@ impl FifoBackend for EtherDreamBackend {
                 .map_err(Error::backend)?;
         }
 
-        self.last_status_time = Some(Instant::now());
+        let now = Instant::now();
+        self.last_status_time = Some(now);
         self.last_point_rate = point_rate;
+        // Feed the new estimator: the underlying status response handler in
+        // ether_dream's library updates dac().status as part of submit(), so
+        // buffer_fullness reflects the latest authoritative read.
+        self.estimator
+            .record_status(now, stream.dac().status.buffer_fullness as u64);
+        // record_send tracks the actually-accepted count (not points.len()).
+        self.estimator.record_send(now, count as u64, point_rate);
         Ok(WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        self.stream.as_ref().map(|s| {
-            let raw = s.dac().status.buffer_fullness;
-            let cap = s.dac().buffer_capacity;
-            Self::decay_fullness(raw, cap, self.last_status_time, self.last_point_rate) as u64
-        })
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+}
+
+/// Decay a raw buffer fullness value based on elapsed time since last status.
+///
+/// Used inside `try_write_points` to compute headroom against the device's
+/// authoritative buffer capacity. The new [`StatusDecayEstimator`] mirrors the
+/// same anchor-and-decay shape; this helper stays because the admission check
+/// also needs the saturating clamp against `capacity`.
+fn decay_fullness(
+    raw: u16,
+    capacity: u16,
+    last_status_time: Option<Instant>,
+    point_rate: u32,
+) -> u16 {
+    if let Some(last_time) = last_status_time {
+        let elapsed_secs = last_time.elapsed().as_secs_f64();
+        let consumed = (elapsed_secs * point_rate as f64) as u16;
+        raw.saturating_sub(consumed).min(capacity)
+    } else {
+        raw
     }
 }

@@ -9,6 +9,7 @@
 //!
 //! The [`BackendKind`] enum wraps either variant for use in the stream scheduler.
 
+use crate::buffer_estimate::BufferEstimator;
 use crate::device::{DacCapabilities, DacType};
 use crate::point::LaserPoint;
 
@@ -82,12 +83,12 @@ pub trait FifoBackend: DacBackend {
     /// 3. Return `Err(...)` only for actual errors (disconnection, protocol errors).
     fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome>;
 
-    /// Best-effort estimate of points currently queued in the device.
+    /// The protocol-owned [`BufferEstimator`] strategy.
     ///
-    /// Not all devices can report this. Return `None` if unavailable.
-    fn queued_points(&self) -> Option<u64> {
-        None
-    }
+    /// Read-only: backends mutate their concrete strategy internally through
+    /// protocol-specific event hooks. Adapters (and any other observers) only
+    /// query estimated fullness via this getter.
+    fn estimator(&self) -> &dyn BufferEstimator;
 }
 
 // =============================================================================
@@ -211,12 +212,12 @@ impl BackendKind {
     // Query helpers
     // =========================================================================
 
-    /// Best-effort estimate of points currently queued in the device.
+    /// The protocol-owned [`BufferEstimator`] for FIFO backends.
     ///
-    /// Only FIFO backends can report this; frame-swap backends return `None`.
-    pub fn queued_points(&self) -> Option<u64> {
+    /// Frame-swap backends never queue points, so they return `None`.
+    pub fn estimator(&self) -> Option<&dyn BufferEstimator> {
         match self {
-            BackendKind::Fifo(b) => b.queued_points(),
+            BackendKind::Fifo(b) => Some(b.estimator()),
             BackendKind::FrameSwap(_) => None,
         }
     }
@@ -279,6 +280,7 @@ mod tests {
     /// Stub FIFO backend with a configurable `OutputModel`.
     struct StubFifo {
         caps: DacCapabilities,
+        estimator: crate::buffer_estimate::SoftwareDecayEstimator,
     }
     impl DacBackend for StubFifo {
         fn dac_type(&self) -> DacType {
@@ -306,6 +308,10 @@ mod tests {
     impl FifoBackend for StubFifo {
         fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
             Ok(WriteOutcome::Written)
+        }
+
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
         }
     }
 
@@ -361,7 +367,10 @@ mod tests {
                 output_model: model.clone(),
                 ..DacCapabilities::default()
             };
-            let kind = BackendKind::Fifo(Box::new(StubFifo { caps }));
+            let kind = BackendKind::Fifo(Box::new(StubFifo {
+                caps,
+                estimator: crate::buffer_estimate::SoftwareDecayEstimator::new(),
+            }));
             assert_eq!(
                 kind.is_frame_swap(),
                 model == OutputModel::UsbFrameSwap,

@@ -92,6 +92,7 @@
 //! Each backend handles conversion to its native format internally.
 
 pub mod backend;
+pub mod buffer_estimate;
 pub mod config;
 pub mod device;
 pub mod discovery;
@@ -104,7 +105,6 @@ pub mod protocols;
 pub(crate) mod reconnect;
 #[cfg(any(feature = "avb", feature = "oscilloscope"))]
 pub(crate) mod resample;
-mod scheduler;
 pub mod stream;
 pub mod types;
 

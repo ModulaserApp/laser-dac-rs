@@ -1,0 +1,150 @@
+//! Software-only buffer fullness estimator.
+//!
+//! Anchor-based: holds the last known fullness and the time it was set.
+//! Reads compute `fullness_at_anchor − elapsed × pps` from a fixed anchor —
+//! truncation does not accumulate across calls.
+
+use std::time::Instant;
+
+use super::BufferEstimator;
+
+/// Pure software estimator with no device telemetry.
+pub struct SoftwareDecayEstimator {
+    fullness_at_anchor: u64,
+    anchor_time: Instant,
+}
+
+impl SoftwareDecayEstimator {
+    pub fn new() -> Self {
+        Self {
+            fullness_at_anchor: 0,
+            anchor_time: Instant::now(),
+        }
+    }
+
+    /// Drop all tracking state (e.g. on reconnect or stop).
+    pub fn reset(&mut self, now: Instant) {
+        self.fullness_at_anchor = 0;
+        self.anchor_time = now;
+    }
+
+    /// Record that `n` points were just sent at `pps`. Rebases the anchor:
+    /// the new fullness is `current(now, pps) + n`.
+    pub fn record_send(&mut self, now: Instant, n: u64, pps: u32) {
+        let current = self.read_at(now, pps);
+        self.fullness_at_anchor = current.saturating_add(n);
+        self.anchor_time = now;
+    }
+
+    fn read_at(&self, now: Instant, pps: u32) -> u64 {
+        let elapsed_secs = now
+            .saturating_duration_since(self.anchor_time)
+            .as_secs_f64();
+        let consumed = (elapsed_secs * pps as f64) as u64;
+        self.fullness_at_anchor.saturating_sub(consumed)
+    }
+}
+
+impl Default for SoftwareDecayEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BufferEstimator for SoftwareDecayEstimator {
+    fn estimated_fullness(&self, now: Instant, pps: u32) -> u64 {
+        self.read_at(now, pps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn new_estimator_starts_empty() {
+        let est = SoftwareDecayEstimator::new();
+        assert_eq!(est.estimated_fullness(Instant::now(), 30_000), 0);
+    }
+
+    #[test]
+    fn record_send_increases_fullness() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t = Instant::now();
+        est.record_send(t, 1000, 30_000);
+        assert_eq!(est.estimated_fullness(t, 30_000), 1000);
+    }
+
+    #[test]
+    fn fullness_decays_over_time() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 3000, 30_000);
+
+        // After 50ms at 30000 pps: 3000 − 1500 = 1500.
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(est.estimated_fullness(t1, 30_000), 1500);
+    }
+
+    #[test]
+    fn fullness_clamps_to_zero() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 100, 30_000);
+
+        let t_far = t0 + Duration::from_secs(10);
+        assert_eq!(est.estimated_fullness(t_far, 30_000), 0);
+    }
+
+    #[test]
+    fn record_send_rebases_from_decayed_current() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 3000, 30_000);
+
+        // 50ms later, current = 1500. Add 500 more, then total = 2000.
+        let t1 = t0 + Duration::from_millis(50);
+        est.record_send(t1, 500, 30_000);
+        assert_eq!(est.estimated_fullness(t1, 30_000), 2000);
+    }
+
+    #[test]
+    fn anchor_reads_avoid_fractional_truncation_drift() {
+        // Equivalent to the old scheduler's
+        // `advance_scheduled_ahead_accumulates_fractional_consumption` test
+        // (10 pts at 10 pps), but anchor-based.
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 10, 10);
+
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(est.estimated_fullness(t1, 10), 10); // 10 − 0.5 → 9 (floor)? actually 0.5 truncates to 0
+                                                        // 0.05s × 10pps = 0.5 → truncates to 0 consumed → still 10.
+
+        let t2 = t0 + Duration::from_millis(100);
+        // 0.1 × 10 = 1.0 → 1 consumed → 9.
+        assert_eq!(est.estimated_fullness(t2, 10), 9);
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 1000, 30_000);
+
+        let t1 = t0 + Duration::from_millis(1);
+        est.reset(t1);
+        assert_eq!(est.estimated_fullness(t1, 30_000), 0);
+    }
+
+    #[test]
+    fn zero_pps_no_decay() {
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.record_send(t0, 500, 0);
+
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(est.estimated_fullness(later, 0), 500);
+    }
+}

@@ -1,7 +1,42 @@
 use super::*;
 use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Shared `SoftwareDecayEstimator` test wrapper. Backends update it from
+/// inside `try_write_points`; tests mutate it via cloned handles to seed the
+/// buffer state under inspection.
+#[derive(Clone)]
+struct SharedEstimator(Arc<Mutex<SoftwareDecayEstimator>>);
+
+impl SharedEstimator {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(SoftwareDecayEstimator::new())))
+    }
+
+    /// Replace the inner estimator with one that reports `n` points right
+    /// now. Equivalent to "the device buffer holds `n` points as of this
+    /// instant"; subsequent reads decay naturally.
+    fn seed(&self, n: u64, pps: u32) {
+        let mut g = self.0.lock().unwrap();
+        *g = SoftwareDecayEstimator::new();
+        if n > 0 {
+            g.record_send(Instant::now(), n, pps);
+        }
+    }
+
+    fn record_send(&self, now: Instant, n: u64, pps: u32) {
+        self.0.lock().unwrap().record_send(now, n, pps);
+    }
+}
+
+impl BufferEstimator for SharedEstimator {
+    fn estimated_fullness(&self, now: Instant, pps: u32) -> u64 {
+        self.0.lock().unwrap().estimated_fullness(now, pps)
+    }
+}
 
 /// A test backend for unit testing stream behavior.
 struct TestBackend {
@@ -11,10 +46,13 @@ struct TestBackend {
     write_count: Arc<AtomicUsize>,
     /// Number of WouldBlock responses to return before accepting writes
     would_block_count: Arc<AtomicUsize>,
-    /// Simulated queue depth
+    /// Cumulative count of points the backend has accepted (test write counter
+    /// — independent of the estimator, which decays).
     queued: Arc<AtomicU64>,
     /// Track shutter state for testing
     shutter_open: Arc<AtomicBool>,
+    /// Decaying estimator the stream consults; tests can seed via `estimator.seed()`.
+    estimator: SharedEstimator,
 }
 
 impl TestBackend {
@@ -31,6 +69,7 @@ impl TestBackend {
             would_block_count: Arc::new(AtomicUsize::new(0)),
             queued: Arc::new(AtomicU64::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
+            estimator: SharedEstimator::new(),
         }
     }
 
@@ -49,83 +88,13 @@ impl TestBackend {
         self
     }
 
-    /// Set the initial queue depth for testing buffer estimation.
-    fn with_initial_queue(mut self, queue: u64) -> Self {
-        self.queued = Arc::new(AtomicU64::new(queue));
+    /// Seed the estimator and write counter to a starting buffer depth.
+    /// At test PPS (30k), estimator decay is irrelevant for prompt assertions.
+    fn with_initial_queue(self, queue: u64) -> Self {
+        self.queued.store(queue, Ordering::SeqCst);
+        // Default test PPS used across the suite.
+        self.estimator.seed(queue, 30_000);
         self
-    }
-}
-
-/// A test backend that does NOT report hardware queue depth (`queued_points()` returns `None`).
-///
-/// Use this backend to test software-only buffer estimation, which is the fallback path
-/// for real backends like `HeliosBackend` that don't implement `queued_points()`.
-///
-/// **When to use which test backend:**
-/// - `TestBackend`: Simulates DACs with hardware queue reporting (e.g., Ether Dream, IDN).
-///   Use for testing buffer estimation with hardware feedback.
-/// - `NoQueueTestBackend`: Simulates DACs without queue reporting (e.g., Helios).
-///   Use for testing the time-based `scheduled_ahead` decrement logic.
-struct NoQueueTestBackend {
-    inner: TestBackend,
-}
-
-impl NoQueueTestBackend {
-    fn new() -> Self {
-        Self {
-            inner: TestBackend::new(),
-        }
-    }
-
-    fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
-        self.inner = self.inner.with_max_points_per_chunk(max_points_per_chunk);
-        self
-    }
-
-    fn with_output_model(mut self, model: OutputModel) -> Self {
-        self.inner = self.inner.with_output_model(model);
-        self
-    }
-}
-
-impl DacBackend for NoQueueTestBackend {
-    fn dac_type(&self) -> DacType {
-        self.inner.dac_type()
-    }
-
-    fn caps(&self) -> &DacCapabilities {
-        self.inner.caps()
-    }
-
-    fn connect(&mut self) -> Result<()> {
-        self.inner.connect()
-    }
-
-    fn disconnect(&mut self) -> Result<()> {
-        self.inner.disconnect()
-    }
-
-    fn is_connected(&self) -> bool {
-        self.inner.is_connected()
-    }
-
-    fn stop(&mut self) -> Result<()> {
-        self.inner.stop()
-    }
-
-    fn set_shutter(&mut self, open: bool) -> Result<()> {
-        self.inner.set_shutter(open)
-    }
-}
-
-impl FifoBackend for NoQueueTestBackend {
-    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        self.inner.try_write_points(pps, points)
-    }
-
-    /// Returns None - simulates a DAC that cannot report queue depth
-    fn queued_points(&self) -> Option<u64> {
-        None
     }
 }
 
@@ -163,7 +132,7 @@ impl DacBackend for TestBackend {
 }
 
 impl FifoBackend for TestBackend {
-    fn try_write_points(&mut self, _pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+    fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         self.write_count.fetch_add(1, Ordering::SeqCst);
 
         // Return WouldBlock until count reaches 0
@@ -174,11 +143,13 @@ impl FifoBackend for TestBackend {
         }
 
         self.queued.fetch_add(points.len() as u64, Ordering::SeqCst);
+        self.estimator
+            .record_send(Instant::now(), points.len() as u64, pps);
         Ok(WriteOutcome::Written)
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        Some(self.queued.load(Ordering::SeqCst))
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 
@@ -308,10 +279,6 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
         stream.config.target_buffer,
         StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
     );
-    assert_eq!(
-        stream.config.min_buffer,
-        StreamConfig::NETWORK_DEFAULT_MIN_BUFFER
-    );
 }
 
 #[test]
@@ -323,13 +290,10 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
         BackendKind::Fifo(Box::new(backend)),
     );
 
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(12))
-        .with_min_buffer(Duration::from_millis(4));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(12));
     let (stream, _info) = device.start_stream(cfg).unwrap();
 
     assert_eq!(stream.config.target_buffer, Duration::from_millis(12));
-    assert_eq!(stream.config.min_buffer, Duration::from_millis(4));
 }
 
 // Removed `test_device_start_stream_keeps_usb_defaults`: it constructed an
@@ -342,11 +306,13 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
 
 #[test]
 fn test_handle_underrun_advances_state() {
-    let mut stream = make_test_stream(TestBackend::new());
+    let backend = TestBackend::new();
+    let queued = backend.queued.clone();
+    let mut stream = make_test_stream(backend);
 
     // Record initial state
     let initial_instant = stream.state.current_instant;
-    let initial_scheduled = stream.state.scheduled_ahead;
+    let initial_queued = queued.load(Ordering::SeqCst);
     let initial_chunks = stream.state.stats.chunks_written;
     let initial_points = stream.state.stats.points_written;
 
@@ -354,17 +320,14 @@ fn test_handle_underrun_advances_state() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 100,
         target_points: 100,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
     stream.handle_underrun(&req).unwrap();
 
     // State should have advanced
     assert!(stream.state.current_instant > initial_instant);
-    assert!(stream.state.scheduled_ahead > initial_scheduled);
+    // Backend queue (the new authority) reflects the underrun-fill write.
+    assert!(queued.load(Ordering::SeqCst) > initial_queued);
     assert_eq!(stream.state.stats.chunks_written, initial_chunks + 1);
     assert_eq!(stream.state.stats.points_written, initial_points + 100);
     assert_eq!(stream.state.stats.underrun_count, 1);
@@ -447,11 +410,7 @@ fn test_handle_underrun_blanks_when_disarmed() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 100,
         target_points: 100,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
 
     // Handle underrun while disarmed
@@ -516,14 +475,11 @@ fn test_arm_disarm_arm_cycle() {
 #[test]
 fn test_run_buffer_driven_behavior() {
     // Test that run uses buffer-driven timing
-    // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
-    let backend = NoQueueTestBackend::new();
-    let write_count = backend.inner.write_count.clone();
+    let backend = TestBackend::new();
+    let write_count = backend.write_count.clone();
 
     // Use short target buffer for testing
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(10))
-        .with_min_buffer(Duration::from_millis(5));
+    let cfg = StreamConfig::new(30000).with_target_buffer(Duration::from_millis(10));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -555,17 +511,37 @@ fn test_run_buffer_driven_behavior() {
 }
 
 #[test]
+fn test_run_uses_configured_target_buffer() {
+    let cfg = StreamConfig::new(1_000)
+        .with_target_buffer(Duration::from_millis(100))
+        .with_drain_timeout(Duration::ZERO);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_clone = observed.clone();
+
+    let result = stream.run(
+        move |req, _buffer| {
+            observed_clone.store(req.target_points, Ordering::SeqCst);
+            ChunkResult::End
+        },
+        |_e| {},
+    );
+
+    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    assert_eq!(observed.load(Ordering::SeqCst), 100);
+}
+
+#[test]
 fn test_run_sleeps_when_buffer_healthy() {
     // Test that run sleeps when buffer is above target
-    // Use NoQueueTestBackend so we rely on software estimate (which decrements properly)
     use std::time::Instant;
 
     // Very small target buffer, skip drain
     let cfg = StreamConfig::new(30000)
         .with_target_buffer(Duration::from_millis(5))
-        .with_min_buffer(Duration::from_millis(2))
         .with_drain_timeout(Duration::ZERO);
-    let stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
@@ -740,153 +716,40 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
 // =========================================================================
 
 #[test]
-fn test_estimate_buffer_uses_software_when_no_hardware() {
-    // When hardware doesn't report queue depth, use software estimate
-    let mut stream = make_test_stream(NoQueueTestBackend::new());
-
-    // Set software estimate to 500 points
-    stream.state.scheduled_ahead = 500;
-
-    // Should use software estimate since hardware returns None
-    let estimate = stream.estimate_buffer_points();
-    assert_eq!(estimate, 500);
-}
-
-#[test]
-fn test_estimate_buffer_uses_min_of_hardware_and_software() {
-    // When hardware reports queue depth, use min(hardware, software)
+fn test_estimate_buffer_reads_backend_estimator() {
+    // The protocol-owned BufferEstimator is the single source of truth.
     let backend = TestBackend::new().with_initial_queue(300);
-    let queued = backend.queued.clone();
-    let mut stream = make_test_stream(backend);
+    let estimator = backend.estimator.clone();
+    let stream = make_test_stream(backend);
 
-    // Software says 500, hardware says 300 -> should use 300 (conservative)
-    stream.state.scheduled_ahead = 500;
-    let estimate = stream.estimate_buffer_points();
-    assert_eq!(
-        estimate, 300,
-        "Should use hardware (300) when it's less than software (500)"
-    );
+    assert_eq!(stream.estimate_buffer_points(), 300);
 
-    // Now set hardware higher than software
-    queued.store(800, Ordering::SeqCst);
-    let estimate = stream.estimate_buffer_points();
-    assert_eq!(
-        estimate, 500,
-        "Should use software (500) when it's less than hardware (800)"
-    );
+    estimator.seed(800, stream.config.pps);
+    assert_eq!(stream.estimate_buffer_points(), 800);
 }
 
 #[test]
-fn test_estimate_buffer_conservative_prevents_underrun() {
-    // Verify that conservative estimation (using min) prevents underruns
-    // by ensuring we never overestimate the buffer
-    let backend = TestBackend::new().with_initial_queue(100);
-    let queued = backend.queued.clone();
-    let mut stream = make_test_stream(backend);
+fn test_build_fill_request_calculates_target_points() {
+    // 30000 PPS, target_buffer = 40ms → 1200 points
+    let cfg = StreamConfig::new(30000).with_target_buffer(Duration::from_millis(40));
+    let backend = TestBackend::new();
+    let estimator = backend.estimator.clone();
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
-    // Simulate: software thinks 1000 points scheduled, but hardware only has 100
-    // This can happen if hardware consumed points faster than expected
-    stream.state.scheduled_ahead = 1000;
-
-    let estimate = stream.estimate_buffer_points();
-
-    // Should use the conservative (lower) estimate to avoid underrun
-    assert_eq!(
-        estimate, 100,
-        "Should use conservative estimate (100) not optimistic (1000)"
-    );
-
-    // Now simulate the opposite: hardware reports more than software
-    // This can happen due to timing/synchronization issues
-    queued.store(2000, Ordering::SeqCst);
-    stream.state.scheduled_ahead = 500;
-
-    let estimate = stream.estimate_buffer_points();
-    assert_eq!(
-        estimate, 500,
-        "Should use conservative estimate (500) not hardware (2000)"
-    );
-}
-
-#[test]
-fn test_build_fill_request_uses_conservative_estimation() {
-    // Verify that build_fill_request uses conservative buffer estimation
-    let backend = TestBackend::new().with_initial_queue(200);
-
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
-    let mut stream = make_test_stream_with_cfg(backend, cfg);
-
-    // Set software estimate higher than hardware
-    stream.state.scheduled_ahead = 500;
-
+    // Empty buffer: need full target (clamped to max_points)
+    estimator.seed(0, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // Should use conservative estimate (hardware = 200)
-    assert_eq!(req.buffered_points, 200);
-    assert_eq!(req.device_queued_points, Some(200));
-}
-
-#[test]
-fn test_build_fill_request_calculates_min_and_target_points() {
-    // Verify that min_points and target_points are calculated correctly
-    // based on buffer state. Use NoQueueTestBackend so software estimate is used directly.
-    // 30000 PPS, target_buffer = 40ms, min_buffer = 10ms
-    // target_buffer = 40ms * 30000 = 1200 points
-    // min_buffer = 10ms * 30000 = 300 points
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
-    let mut stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
-
-    // Empty buffer: need full target
-    stream.state.scheduled_ahead = 0;
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // target_points should be clamped to max_points (1000)
     assert_eq!(req.target_points, 1000);
-    // min_points should be 300 (10ms * 30000), clamped to 1000
-    assert_eq!(req.min_points, 300);
 
-    // Buffer at 500 points (16.67ms): below target (40ms), above min (10ms)
-    stream.state.scheduled_ahead = 500;
+    // Buffer at 500 points (16.67ms): below target (40ms)
+    estimator.seed(500, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // target_points = (1200 - 500) = 700
     assert_eq!(req.target_points, 700);
-    // min_points = (300 - 500) = 0 (buffer above min)
-    assert_eq!(req.min_points, 0);
 
     // Buffer full at 1200 points (40ms): at target
-    stream.state.scheduled_ahead = 1200;
+    estimator.seed(1200, 30_000);
     let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // target_points = 0 (at target)
     assert_eq!(req.target_points, 0);
-    // min_points = 0 (well above min)
-    assert_eq!(req.min_points, 0);
-}
-
-#[test]
-fn test_build_fill_request_ceiling_rounds_min_points() {
-    // Verify that min_points uses ceiling to prevent underrun
-    // min_buffer = 10ms at 30000 PPS = 300 points exactly
-    let cfg = StreamConfig::new(30000)
-        .with_target_buffer(Duration::from_millis(40))
-        .with_min_buffer(Duration::from_millis(10));
-    let mut stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
-
-    // Buffer at 299 points: 1 point below min_buffer
-    stream.state.scheduled_ahead = 299;
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-
-    // min_points should be ceil(300 - 299) = ceil(1) = 1
-    // Actually it's ceil((10ms - 299/30000) * 30000) = ceil(300 - 299) = 1
-    assert!(
-        req.min_points >= 1,
-        "min_points should be at least 1 to reach min_buffer"
-    );
 }
 
 // =========================================================================
@@ -1569,11 +1432,7 @@ fn test_disarm_underrun_respects_park_policy() {
     let req = ChunkRequest {
         start: StreamInstant::new(0),
         pps: 30000,
-        min_points: 50,
         target_points: 50,
-        buffered_points: 0,
-        buffered: Duration::ZERO,
-        device_queued_points: None,
     };
 
     stream.handle_underrun(&req).unwrap();
@@ -1638,8 +1497,8 @@ fn test_stream_with_mock_backend_disconnect() {
             self.inner.try_write_points(pps, points)
         }
 
-        fn queued_points(&self) -> Option<u64> {
-            self.inner.queued_points()
+        fn estimator(&self) -> &dyn BufferEstimator {
+            self.inner.estimator()
         }
     }
 
@@ -1693,7 +1552,6 @@ struct FailingWriteBackend {
     disconnect_called: Arc<AtomicBool>,
     error_kind: std::io::ErrorKind,
     error_message: &'static str,
-    report_queue_depth: bool,
 }
 
 impl FailingWriteBackend {
@@ -1706,7 +1564,6 @@ impl FailingWriteBackend {
             disconnect_called: Arc::new(AtomicBool::new(false)),
             error_kind: std::io::ErrorKind::BrokenPipe,
             error_message: "simulated write failure",
-            report_queue_depth: true,
         }
     }
 
@@ -1714,12 +1571,6 @@ impl FailingWriteBackend {
     fn with_error(mut self, kind: std::io::ErrorKind, message: &'static str) -> Self {
         self.error_kind = kind;
         self.error_message = message;
-        self
-    }
-
-    /// Don't report queue depth (Helios-like behavior).
-    fn without_queue_depth(mut self) -> Self {
-        self.report_queue_depth = false;
         self
     }
 }
@@ -1768,12 +1619,8 @@ impl FifoBackend for FailingWriteBackend {
         }
     }
 
-    fn queued_points(&self) -> Option<u64> {
-        if self.report_queue_depth {
-            self.inner.queued_points()
-        } else {
-            None
-        }
+    fn estimator(&self) -> &dyn BufferEstimator {
+        self.inner.estimator()
     }
 }
 
@@ -1866,13 +1713,11 @@ fn test_reset_state_for_reconnect_resizes_buffers() {
 
     // Simulate reconnect to a device with different capabilities
     stream.info.caps.max_points_per_chunk = 500;
-    let mut last_iter = std::time::Instant::now();
-    stream.reset_state_for_reconnect(&mut last_iter);
+    stream.reset_state_for_reconnect();
 
     assert_eq!(stream.state.chunk_buffer.len(), 500);
     assert_eq!(stream.state.last_chunk.len(), 500);
     assert_eq!(stream.state.last_chunk_len, 0);
-    assert_eq!(stream.state.scheduled_ahead, 0);
     assert_eq!(stream.state.stats.reconnect_count, 1);
 }
 
@@ -1882,23 +1727,16 @@ fn test_reset_state_for_reconnect_clears_timing() {
     let mut stream = make_test_stream(backend);
 
     // Set some state
-    stream.state.scheduled_ahead = 5000;
-    stream.state.fractional_consumed = 0.5;
     stream.state.shutter_open = true;
     stream.state.last_armed = true;
     stream.state.startup_blank_remaining = 10;
 
-    let mut last_iter = std::time::Instant::now() - Duration::from_secs(10);
-    stream.reset_state_for_reconnect(&mut last_iter);
+    stream.reset_state_for_reconnect();
 
-    assert_eq!(stream.state.scheduled_ahead, 0);
-    assert_eq!(stream.state.fractional_consumed, 0.0);
     assert!(!stream.state.shutter_open);
     assert!(!stream.state.last_armed);
     assert_eq!(stream.state.startup_blank_remaining, 0);
     assert!(stream.state.color_delay_line.is_empty());
-    // last_iteration should be reset to approximately now
-    assert!(last_iter.elapsed() < Duration::from_millis(100));
 }
 
 #[test]
@@ -2086,14 +1924,12 @@ fn test_backend_write_error_immediate_fail() {
 // with TimedOut error kind and no queue depth reporting.
 // =========================================================================
 
-/// Create a Helios-like backend: TimedOut error, no queue depth.
+/// Create a Helios-like backend: TimedOut error.
 fn helios_like_backend(fail_after: usize) -> FailingWriteBackend {
-    FailingWriteBackend::new(fail_after)
-        .with_error(
-            std::io::ErrorKind::TimedOut,
-            "usb connection error: Operation timed out",
-        )
-        .without_queue_depth()
+    FailingWriteBackend::new(fail_after).with_error(
+        std::io::ErrorKind::TimedOut,
+        "usb connection error: Operation timed out",
+    )
 }
 
 #[test]
@@ -2211,14 +2047,25 @@ fn test_fill_result_end_drains_with_queue_depth() {
 
 #[test]
 fn test_fill_result_end_respects_drain_timeout() {
-    // Test that drain respects timeout and doesn't block forever
+    // Test that drain respects timeout and doesn't block forever.
+    // Producer reports a still-full buffer on End so drain has to poll until
+    // the timeout fires.
     use std::time::Instant;
 
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(50));
-    let stream = make_test_stream_with_cfg(TestBackend::new().with_initial_queue(100000), cfg);
+    let backend = TestBackend::new();
+    let estimator = backend.estimator.clone();
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let start = Instant::now();
-    let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
+    let result = stream.run(
+        move |_req, _buffer| {
+            // Pretend the device buffer is far from drained when End fires.
+            estimator.seed(100_000, 30_000);
+            ChunkResult::End
+        },
+        |_e| {},
+    );
 
     let elapsed = start.elapsed();
 
@@ -2233,14 +2080,23 @@ fn test_fill_result_end_respects_drain_timeout() {
 
 #[test]
 fn test_fill_result_end_skips_drain_with_zero_timeout() {
-    // Test that drain is skipped when timeout is zero
+    // Test that drain is skipped when timeout is zero, even with a non-empty
+    // estimator at End time.
     use std::time::Instant;
 
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::ZERO);
-    let stream = make_test_stream_with_cfg(TestBackend::new().with_initial_queue(100000), cfg);
+    let backend = TestBackend::new();
+    let estimator = backend.estimator.clone();
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     let start = Instant::now();
-    let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
+    let result = stream.run(
+        move |_req, _buffer| {
+            estimator.seed(100_000, 30_000);
+            ChunkResult::End
+        },
+        |_e| {},
+    );
 
     let elapsed = start.elapsed();
 
@@ -2254,12 +2110,12 @@ fn test_fill_result_end_skips_drain_with_zero_timeout() {
 }
 
 #[test]
-fn test_fill_result_end_drains_without_queue_depth() {
-    // Test drain behavior when queued_points() returns None
+fn test_fill_result_end_drains_with_empty_estimator() {
+    // Test drain returns quickly when the estimator already reads as empty.
     use std::time::Instant;
 
     let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
-    let stream = make_test_stream_with_cfg(NoQueueTestBackend::new(), cfg);
+    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
 
     let start = Instant::now();
     let result = stream.run(|_req, _buffer| ChunkResult::End, |_e| {});
@@ -2582,7 +2438,7 @@ fn test_startup_blank_zero_is_noop() {
 }
 
 // =========================================================================
-// OutputModel coverage: scheduled_ahead accumulation
+// OutputModel coverage
 // =========================================================================
 
 #[test]
@@ -2607,9 +2463,11 @@ fn test_device_start_stream_rejects_frame_swap_backend() {
 }
 
 #[test]
-fn test_network_fifo_accumulates_scheduled_ahead() {
+fn test_network_fifo_accumulates_via_estimator() {
     let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+    let backend = TestBackend::new();
+    let queued = backend.queued.clone();
+    let mut stream = make_test_stream_with_cfg(backend, cfg);
 
     // Arm and write two chunks of 50 points each
     stream.control.arm().unwrap();
@@ -2624,30 +2482,30 @@ fn test_network_fifo_accumulates_scheduled_ahead() {
         stream.write_fill_points(n, &mut on_error).unwrap();
     }
 
-    // NetworkFifo: scheduled_ahead should ACCUMULATE to 2n
-    assert_eq!(stream.state.scheduled_ahead, 2 * n as u64);
+    // The backend's queue (which now drives the estimator) accumulates across writes.
+    assert_eq!(queued.load(Ordering::SeqCst), 2 * n as u64);
     assert_eq!(stream.state.stats.chunks_written, 2);
     assert_eq!(stream.state.stats.points_written, 2 * n as u64);
 }
 
 #[test]
 fn test_udp_timed_prefills_to_max_points_per_chunk() {
-    let backend = NoQueueTestBackend::new()
+    let backend = TestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
-    let cfg = StreamConfig::new(1000)
-        .with_target_buffer(Duration::from_millis(500))
-        .with_min_buffer(Duration::from_millis(100));
-    let mut stream = make_test_stream_with_cfg(backend, cfg);
+    let estimator = backend.estimator.clone();
+    let cfg = StreamConfig::new(1000).with_target_buffer(Duration::from_millis(500));
+    let stream = make_test_stream_with_cfg(backend, cfg);
 
     // UdpTimed target = max_points_per_chunk = 179
     // One write of 179 exceeds the target → stops after 1 write
     let mut writes = 0;
-    while stream.state.scheduled_ahead <= stream.scheduler_target_buffer_points() {
+    while stream.estimate_buffer_points() <= stream.scheduler_target_buffer_points() {
         let buffered = stream.estimate_buffer_points();
         let req = stream.build_fill_request(179, buffered);
         assert_eq!(req.target_points, 179);
-        stream.record_write(req.target_points, false);
+        // Simulate the write reaching the device queue.
+        estimator.record_send(Instant::now(), req.target_points as u64, stream.config.pps);
         writes += 1;
     }
 
@@ -2659,7 +2517,7 @@ fn test_udp_timed_prefills_to_max_points_per_chunk() {
 
 #[test]
 fn test_udp_timed_uses_max_points_per_chunk_for_lead() {
-    let backend = NoQueueTestBackend::new()
+    let backend = TestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
     let stream = make_test_stream(backend);
@@ -2670,16 +2528,16 @@ fn test_udp_timed_uses_max_points_per_chunk_for_lead() {
 
 #[test]
 fn test_udp_timed_build_fill_request_uses_full_packet() {
-    let backend = NoQueueTestBackend::new()
+    let backend = TestBackend::new()
         .with_output_model(OutputModel::UdpTimed)
         .with_max_points_per_chunk(179);
-    let mut stream = make_test_stream(backend);
-    stream.state.scheduled_ahead = 120;
+    let estimator = backend.estimator.clone();
+    let stream = make_test_stream(backend);
+    estimator.seed(120, stream.config.pps);
 
     let req = stream.build_fill_request(179, 120);
 
     assert_eq!(req.target_points, 179);
-    assert_eq!(req.min_points, 179);
 }
 
 #[test]
@@ -2708,9 +2566,7 @@ fn test_network_fifo_lasercube_default_target_requests_topup() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(50))
-        .with_min_buffer(Duration::from_millis(20));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(50));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
@@ -2728,9 +2584,7 @@ fn test_network_fifo_lasercube_large_target_uses_more_capacity() {
     let backend = TestBackend::new()
         .with_output_model(OutputModel::NetworkFifo)
         .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000)
-        .with_target_buffer(Duration::from_millis(200))
-        .with_min_buffer(Duration::from_millis(50));
+    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(200));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     let buffered = stream.estimate_buffer_points();
@@ -2784,59 +2638,11 @@ fn test_validate_config_avb_accepts_standard_pps() {
     assert!(Dac::validate_pps(&caps, 30_000).is_ok());
 }
 
-// =========================================================================
-// Fractional consumed accumulator: prevent scheduled_ahead stall
-// =========================================================================
-
-#[test]
-fn test_fractional_consumed_prevents_stall() {
-    // Regression test: when scheduled_ahead equals target_buffer_points
-    // exactly, the run loop used to stall because (elapsed * pps) as u64
-    // truncated to 0 on sub-microsecond iterations. The fractional
-    // accumulator ensures sub-point remainders carry over until they add
-    // up to a whole point.
-    use std::thread;
-    use std::time::Duration;
-
-    let backend = NoQueueTestBackend::new();
-    let write_count = backend.inner.write_count.clone();
-    let stream = make_test_stream(backend);
-    let control = stream.control();
-
-    // Run the stream in a thread. If the bug regresses, the stream
-    // stalls in a tight loop and never writes after the initial burst.
-    let handle = thread::spawn(move || {
-        stream.run(
-            |req, buffer| {
-                let n = req.target_points.min(buffer.len()).min(100);
-                for pt in buffer.iter_mut().take(n) {
-                    *pt = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            },
-            |_err| {},
-        )
-    });
-
-    // Wait enough for the target buffer to be filled AND for subsequent
-    // writes to happen (proving the stream isn't stalled).
-    thread::sleep(Duration::from_millis(800));
-
-    let writes = write_count.load(Ordering::SeqCst);
-
-    // At 30 kpps with 500ms target buffer, the initial burst is ~15
-    // writes of 1000 points. After 800ms, the buffer should have
-    // drained enough for many more writes. If stalled, writes would
-    // be stuck at ~15.
-    assert!(
-        writes > 20,
-        "expected >20 writes after 800ms, got {writes} — stream likely stalled"
-    );
-
-    control.stop().unwrap();
-    let exit = handle.join().unwrap().unwrap();
-    assert_eq!(exit, RunExit::Stopped);
-}
+// The old `test_fractional_consumed_prevents_stall` regression test asserted
+// that the scheduler's software accumulator carried sub-point remainders so a
+// no-telemetry backend would not stall. After the BufferEstimator migration
+// that decay logic moved into anchor-based estimators; see
+// `software_decay::tests::anchor_reads_avoid_fractional_truncation_drift`.
 
 #[test]
 fn with_discovery_factory_creates_target_when_none() {
@@ -2901,11 +2707,15 @@ fn with_discovery_factory_enables_reconnect_for_frame_session() {
 /// Minimal FIFO backend for reconnection tests — accepts all writes.
 struct ReconnectFifoBackend {
     connected: bool,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl ReconnectFifoBackend {
     fn new() -> Self {
-        Self { connected: false }
+        Self {
+            connected: false,
+            estimator: SoftwareDecayEstimator::new(),
+        }
     }
 }
 
@@ -2945,6 +2755,10 @@ impl FifoBackend for ReconnectFifoBackend {
     fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
         Ok(WriteOutcome::Written)
     }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
 }
 
 /// FIFO backend that returns Error::Disconnected after N writes.
@@ -2954,6 +2768,7 @@ struct DisconnectAfterNBackend {
     connected: bool,
     fail_after: usize,
     write_count: AtomicUsize,
+    estimator: SoftwareDecayEstimator,
 }
 
 impl DisconnectAfterNBackend {
@@ -2962,6 +2777,7 @@ impl DisconnectAfterNBackend {
             connected: false,
             fail_after,
             write_count: AtomicUsize::new(0),
+            estimator: SoftwareDecayEstimator::new(),
         }
     }
 }
@@ -3007,6 +2823,10 @@ impl FifoBackend for DisconnectAfterNBackend {
         } else {
             Ok(WriteOutcome::Written)
         }
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
     }
 }
 

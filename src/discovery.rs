@@ -496,6 +496,7 @@ mod tests {
 
     struct MockBackend {
         connected: bool,
+        estimator: crate::buffer_estimate::SoftwareDecayEstimator,
     }
 
     impl DacBackend for MockBackend {
@@ -539,6 +540,10 @@ mod tests {
     impl FifoBackend for MockBackend {
         fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
             Ok(WriteOutcome::Written)
+        }
+
+        fn estimator(&self) -> &dyn crate::buffer_estimate::BufferEstimator {
+            &self.estimator
         }
     }
 
@@ -603,6 +608,7 @@ mod tests {
             let _ = downcast_connect_data::<MockConnectionInfo>(opaque, "MockDAC")?;
             Ok(BackendKind::Fifo(Box::new(MockBackend {
                 connected: false,
+                estimator: crate::buffer_estimate::SoftwareDecayEstimator::new(),
             })))
         }
     }

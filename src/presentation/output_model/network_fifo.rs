@@ -5,26 +5,29 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
-use crate::scheduler;
 
-use super::super::slice_pipeline::SlicePipeline;
-use super::{LoopCtx, OutputModelAdapter, StepOutcome};
+use super::super::content_source::{ContentSourceKind, FifoContentSource};
+use super::{blank_and_close_shutter, LoopCtx, OutputModelAdapter, StepOutcome};
 
-const TARGET_BUFFER_SECS: f64 = 0.020;
+/// Re-borrow the loop-context source as a `FifoContentSource`. NetworkFifo is
+/// only ever paired with a Fifo source by the driver; mismatch is a programmer
+/// error.
+fn fifo_source<'a>(source: &'a mut ContentSourceKind<'_>) -> &'a mut dyn FifoContentSource {
+    match source {
+        ContentSourceKind::Fifo(s) => &mut **s,
+        ContentSourceKind::Frame(_) => {
+            unreachable!("NetworkFifoAdapter requires a Fifo content source")
+        }
+    }
+}
 
 pub(crate) struct NetworkFifoAdapter {
-    scheduled_ahead: u64,
-    fractional_consumed: f64,
-    last_iteration: Instant,
     max_points: usize,
 }
 
 impl NetworkFifoAdapter {
     pub fn new(backend: &BackendKind) -> Self {
         Self {
-            scheduled_ahead: 0,
-            fractional_consumed: 0.0,
-            last_iteration: Instant::now(),
             max_points: backend.caps().max_points_per_chunk,
         }
     }
@@ -34,21 +37,14 @@ impl OutputModelAdapter for NetworkFifoAdapter {
     fn step(&mut self, ctx: &mut LoopCtx<'_>) -> StepOutcome {
         let pps = ctx.pps;
         let pps_f64 = pps as f64;
-        let target_buffer_points = (TARGET_BUFFER_SECS * pps_f64) as u64;
+        let target_buffer_secs = ctx.target_buffer.as_secs_f64();
+        let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
 
         let now = Instant::now();
-        scheduler::advance_scheduled_ahead(
-            &mut self.scheduled_ahead,
-            &mut self.fractional_consumed,
-            &mut self.last_iteration,
-            now,
-            pps_f64,
-        );
-
-        let buffered = scheduler::conservative_buffered_points(
-            self.scheduled_ahead,
-            ctx.backend.queued_points(),
-        );
+        let buffered = ctx
+            .backend
+            .estimator()
+            .map_or(0, |e| e.estimated_fullness(now, pps));
 
         if buffered > target_buffer_points {
             let excess = buffered - target_buffer_points;
@@ -59,16 +55,15 @@ impl OutputModelAdapter for NetworkFifoAdapter {
             return StepOutcome::Continue;
         }
 
-        let deficit = (TARGET_BUFFER_SECS - buffered as f64 / pps_f64.max(1.0)).max(0.0);
+        let deficit = (target_buffer_secs - buffered as f64 / pps_f64.max(1.0)).max(0.0);
         let target_points = ((deficit * pps_f64).ceil() as usize).min(self.max_points);
         if target_points == 0 {
             ctx.sleep_and_mark_activity(Duration::from_millis(1));
             return StepOutcome::Continue;
         }
 
-        let n = ctx
-            .pipeline
-            .produce_fifo_chunk(target_points, pps, ctx.is_armed)
+        let n = fifo_source(&mut ctx.source)
+            .produce_chunk(target_points, pps, ctx.is_armed)
             .len();
         if n == 0 {
             ctx.sleep_and_mark_activity(Duration::from_millis(1));
@@ -77,18 +72,14 @@ impl OutputModelAdapter for NetworkFifoAdapter {
 
         // Inner WouldBlock spin: ~100µs hardware drain assumption.
         loop {
-            let outcome = {
-                let slice = match ctx.pipeline.cached_slice() {
-                    Some(s) => s,
-                    None => return StepOutcome::Continue,
-                };
-                ctx.backend.try_write(pps, slice)
+            let outcome = match fifo_source(&mut ctx.source).cached_slice() {
+                Some(slice) => ctx.backend.try_write(pps, slice),
+                None => return StepOutcome::Continue,
             };
             match outcome {
                 Ok(WriteOutcome::Written) => {
                     ctx.metrics.mark_write_success();
-                    self.scheduled_ahead += n as u64;
-                    ctx.pipeline.invalidate();
+                    fifo_source(&mut ctx.source).commit_written(n, ctx.is_armed);
                     break;
                 }
                 Ok(WriteOutcome::WouldBlock) => {
@@ -99,23 +90,28 @@ impl OutputModelAdapter for NetworkFifoAdapter {
                     }
                     ctx.sleep_and_mark_activity(Duration::from_micros(100));
                 }
-                Err(e) if e.is_disconnected() => return StepOutcome::Disconnected,
-                Err(_) => break,
+                Err(e) if e.is_stopped() => return StepOutcome::Stopped,
+                Err(e) if e.is_disconnected() => {
+                    (ctx.error_sink)(e);
+                    return StepOutcome::Disconnected;
+                }
+                Err(e) => {
+                    log::warn!("write error, disconnecting backend: {e}");
+                    let _ = ctx.backend.disconnect();
+                    (ctx.error_sink)(e);
+                    return StepOutcome::Disconnected;
+                }
             }
         }
         StepOutcome::Continue
     }
 
-    fn on_reconnect(
-        &mut self,
-        info: &DacInfo,
-        pipeline: &mut SlicePipeline,
-        _backend: &mut BackendKind,
-    ) {
-        self.scheduled_ahead = 0;
-        self.fractional_consumed = 0.0;
-        self.last_iteration = Instant::now();
+    fn on_reconnect(&mut self, info: &DacInfo, _backend: &mut BackendKind) {
         self.max_points = info.caps.max_points_per_chunk;
-        pipeline.reserve_buf(self.max_points);
+    }
+
+    fn drain_and_blank(&mut self, ctx: &mut LoopCtx<'_>, timeout: Duration) {
+        super::drain_via_estimator(ctx, timeout);
+        blank_and_close_shutter(ctx);
     }
 }
