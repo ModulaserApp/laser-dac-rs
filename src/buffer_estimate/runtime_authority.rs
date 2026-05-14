@@ -47,6 +47,10 @@ impl BufferEstimator for RuntimeAuthorityEstimator {
     fn estimated_fullness(&self, _now: Instant, _pps: u32) -> u64 {
         self.source.as_ref().map_or(0, |s| s.queued_points())
     }
+
+    fn needs_clock(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
