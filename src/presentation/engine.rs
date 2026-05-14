@@ -141,12 +141,6 @@ impl PresentationEngine {
                     && self.pending_base.is_some()
                     && self.transition_cursor == 0
                 {
-                    // Stale self-loop transition: discard and promote now.
-                    // Only safe when nothing has been emitted yet
-                    // (cursor == 0); a partial emission has already moved
-                    // toward `current.first`, and computing a fresh
-                    // transition that begins at `current.last` would emit
-                    // a backward jump that downstream motion safety flags.
                     self.transition_buf.clear();
                     self.transition_is_self_loop = false;
                     self.promote_pending();

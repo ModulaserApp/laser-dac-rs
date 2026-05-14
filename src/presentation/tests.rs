@@ -857,14 +857,12 @@ fn test_fifo_partial_self_loop_completes_before_promotion() {
     // back past `current.last` that downstream motion safety slew-limits.
     let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
         // 4 evenly-spaced interpolation points (excluding `from`).
-        let mut pts = Vec::with_capacity(4);
-        for i in 1..=4 {
-            let t = i as f32 / 4.0;
-            pts.push(LaserPoint::blanked(
-                from.x + (to.x - from.x) * t,
-                from.y + (to.y - from.y) * t,
-            ));
-        }
+        let pts = (1..=4)
+            .map(|i| {
+                let t = i as f32 / 4.0;
+                LaserPoint::blanked(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+            })
+            .collect();
         TransitionPlan::Transition(pts)
     }));
 
