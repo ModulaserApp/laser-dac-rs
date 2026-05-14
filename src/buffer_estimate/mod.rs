@@ -39,4 +39,12 @@ pub trait BufferEstimator: Send {
     /// playback rate. Strategies that don't need `pps` (e.g.
     /// [`RuntimeAuthorityEstimator`]) ignore it.
     fn estimated_fullness(&self, now: Instant, pps: u32) -> u64;
+
+    /// Whether [`estimated_fullness`](Self::estimated_fullness) actually
+    /// consults `now`. Defaults to `true`; estimators that ignore the
+    /// timestamp (e.g. [`RuntimeAuthorityEstimator`]) override to `false` so
+    /// the caller can skip the `Instant::now()` query on hot paths.
+    fn needs_clock(&self) -> bool {
+        true
+    }
 }

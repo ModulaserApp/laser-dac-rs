@@ -1,13 +1,15 @@
 //! NetworkFifo adapter — buffer-estimation pacing for FIFO-style DACs
 //! (Ether Dream, IDN, LaserCube, AVB).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::backend::{BackendKind, WriteOutcome};
 use crate::device::DacInfo;
 
 use super::super::content_source::{ContentSourceKind, FifoContentSource};
-use super::{blank_and_close_shutter, LoopCtx, OutputModelAdapter, StepOutcome};
+use super::{
+    blank_and_close_shutter, estimator_fullness, LoopCtx, OutputModelAdapter, StepOutcome,
+};
 
 /// Re-borrow the loop-context source as a `FifoContentSource`. NetworkFifo is
 /// only ever paired with a Fifo source by the driver; mismatch is a programmer
@@ -40,11 +42,7 @@ impl OutputModelAdapter for NetworkFifoAdapter {
         let target_buffer_secs = ctx.target_buffer.as_secs_f64();
         let target_buffer_points = (target_buffer_secs * pps_f64) as u64;
 
-        let now = Instant::now();
-        let buffered = ctx
-            .backend
-            .estimator()
-            .map_or(0, |e| e.estimated_fullness(now, pps));
+        let buffered = estimator_fullness(ctx.backend.estimator(), pps);
 
         if buffered > target_buffer_points {
             let excess = buffered - target_buffer_points;

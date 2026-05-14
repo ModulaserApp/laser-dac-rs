@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
+use crate::buffer_estimate::BufferEstimator;
 use crate::device::DacInfo;
 use crate::error::Error;
 use crate::stream::{ControlMsg, StreamControl};
@@ -162,19 +163,41 @@ pub(crate) fn blank_and_close_shutter(ctx: &mut LoopCtx<'_>) {
     let _ = ctx.backend.try_write(ctx.pps, &blank);
 }
 
+/// Query an optional [`BufferEstimator`] for queued points, skipping the
+/// `Instant::now()` clock query when the estimator ignores it
+/// ([`RuntimeAuthorityEstimator`] for AVB/Oscilloscope). The sentinel is a
+/// thread-local cached `Instant` — safe because estimators that ignore `now`
+/// never read it.
+pub(crate) fn estimator_fullness(estimator: Option<&dyn BufferEstimator>, pps: u32) -> u64 {
+    estimator.map_or(0, |e| {
+        let now = if e.needs_clock() {
+            Instant::now()
+        } else {
+            sentinel_instant()
+        };
+        e.estimated_fullness(now, pps)
+    })
+}
+
+fn sentinel_instant() -> Instant {
+    thread_local! {
+        static SENTINEL: Instant = Instant::now();
+    }
+    SENTINEL.with(|t| *t)
+}
+
 /// Poll the backend's [`BufferEstimator`] until it reports an empty queue or
 /// the timeout elapses. Used by FIFO/UdpTimed `drain_and_blank`.
 pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
     if timeout.is_zero() {
         return;
     }
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
     const POLL: Duration = Duration::from_millis(5);
-    while Instant::now() < deadline {
-        let buffered = ctx
-            .backend
-            .estimator()
-            .map_or(0, |e| e.estimated_fullness(Instant::now(), ctx.pps));
+    let mut now = start;
+    while now < deadline {
+        let buffered = estimator_fullness(ctx.backend.estimator(), ctx.pps);
         if buffered == 0 {
             break;
         }
@@ -186,6 +209,7 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
         }
         std::thread::sleep(POLL);
         ctx.metrics.mark_loop_activity();
+        now = Instant::now();
     }
 }
 
