@@ -845,6 +845,66 @@ fn test_fifo_stale_self_loop_discarded_across_chunks() {
     assert_eq!(buf2[2].intensity, 65535);
 }
 
+#[test]
+fn test_fifo_partial_self_loop_completes_before_promotion() {
+    // P1 regression: when a self-loop transition has *partially* drained
+    // (transition_cursor > 0) and a pending frame arrives, the in-flight
+    // transit must finish before the A→B transition is computed.
+    //
+    // Discarding mid-transition would compute a fresh transition starting
+    // at `current.last`, while the previously-emitted self-loop sample was
+    // already heading toward `current.first` — producing a forward jump
+    // back past `current.last` that downstream motion safety slew-limits.
+    let mut engine = PresentationEngine::new(Box::new(|from: &LaserPoint, to: &LaserPoint| {
+        // 4 evenly-spaced interpolation points (excluding `from`).
+        let pts = (1..=4)
+            .map(|i| {
+                let t = i as f32 / 4.0;
+                LaserPoint::blanked(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+            })
+            .collect();
+        TransitionPlan::Transition(pts)
+    }));
+
+    let frame_a = make_frame(vec![make_point(0.0, 0.0), make_point(8.0, 0.0)]);
+    engine.set_pending(frame_a);
+
+    // First chunk: emit A's two points (0, 8), then 1 of the 4 self-loop
+    // transition points (x=6, heading from A.last=8 back toward A.first=0).
+    // Leaves transition_buf=[6,4,2,0] with transition_cursor=1.
+    let mut buf1 = vec![LaserPoint::default(); 3];
+    engine.fill_chunk(&mut buf1, 3);
+    assert_eq!(buf1[0].x, 0.0);
+    assert_eq!(buf1[1].x, 8.0);
+    assert_eq!(
+        buf1[2].x, 6.0,
+        "first self-loop transition point should head toward A.first"
+    );
+    assert_eq!(buf1[2].intensity, 0);
+
+    // B arrives mid-transition.
+    let frame_b = make_frame(vec![make_point(16.0, 0.0)]);
+    engine.set_pending(frame_b);
+
+    let mut buf2 = vec![LaserPoint::default(); 4];
+    engine.fill_chunk(&mut buf2, 4);
+
+    // The next sample must continue the in-flight self-loop (x=4).
+    // The buggy path would discard and emit a fresh A→B transition starting
+    // at A.last=8, putting x=10 here — a forward jump from the previously
+    // emitted x=6.
+    assert_eq!(
+        buf2[0].x, 4.0,
+        "in-flight self-loop transition must finish before promotion"
+    );
+    assert_eq!(buf2[0].intensity, 0);
+    assert_eq!(buf2[1].x, 2.0);
+    assert_eq!(buf2[2].x, 0.0);
+    // Self-loop done — A's drawable replays before the seam promotes to B.
+    assert_eq!(buf2[3].x, 0.0);
+    assert_eq!(buf2[3].intensity, 65535);
+}
+
 // =========================================================================
 // FIFO Coalesce tests
 // =========================================================================

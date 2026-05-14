@@ -130,12 +130,18 @@ impl PresentationEngine {
         while written < max_points {
             // Drain pending transition points — but if they are stale
             // self-loop points and a pending frame has arrived, discard
-            // them and promote immediately.
+            // them and promote immediately. Only safe when nothing has been
+            // emitted yet (cursor == 0); a partial emission has already
+            // started moving toward `current.last`'s self-loop destination,
+            // and promoting now would compute a fresh transition starting
+            // at `current.last` — creating a backward jump in the output
+            // stream that downstream motion safety will slew-limit.
             if self.transition_cursor < self.transition_buf.len() {
-                if self.transition_is_self_loop && self.pending_base.is_some() {
-                    // Stale self-loop transition: discard and promote now
+                if self.transition_is_self_loop
+                    && self.pending_base.is_some()
+                    && self.transition_cursor == 0
+                {
                     self.transition_buf.clear();
-                    self.transition_cursor = 0;
                     self.transition_is_self_loop = false;
                     self.promote_pending();
 
