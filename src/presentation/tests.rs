@@ -1853,6 +1853,7 @@ struct RetryUdpTimedTestBackend {
     caps: crate::device::DacCapabilities,
     shutter_open: Arc<AtomicBool>,
     block_next_writes: Arc<AtomicUsize>,
+    block_next_visible_writes: Arc<AtomicUsize>,
     writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
     estimator: SoftwareDecayEstimator,
 }
@@ -1869,6 +1870,7 @@ impl RetryUdpTimedTestBackend {
             },
             shutter_open: Arc::new(AtomicBool::new(false)),
             block_next_writes: Arc::new(AtomicUsize::new(0)),
+            block_next_visible_writes: Arc::new(AtomicUsize::new(0)),
             writes: Arc::new(Mutex::new(Vec::new())),
             estimator: SoftwareDecayEstimator::new(),
         }
@@ -1909,6 +1911,13 @@ impl FifoBackend for RetryUdpTimedTestBackend {
         points: &[LaserPoint],
     ) -> DacResult<crate::backend::WriteOutcome> {
         self.writes.lock().unwrap().push(points.to_vec());
+        let visible = points.iter().any(|point| point.intensity != 0);
+        let remaining_visible = self.block_next_visible_writes.load(Ordering::SeqCst);
+        if visible && remaining_visible > 0 {
+            self.block_next_visible_writes
+                .store(remaining_visible - 1, Ordering::SeqCst);
+            return Ok(crate::backend::WriteOutcome::WouldBlock);
+        }
         let remaining = self.block_next_writes.load(Ordering::SeqCst);
         if remaining > 0 {
             self.block_next_writes
@@ -2187,7 +2196,7 @@ fn test_frame_session_frame_swap_inflight_frame_stays_sticky_until_accepted() {
 fn test_frame_session_udp_timed_retries_same_transition_chunk_on_wouldblock() {
     let backend = RetryUdpTimedTestBackend::new();
     let writes = backend.writes.clone();
-    let block_next_writes = backend.block_next_writes.clone();
+    let block_next_visible_writes = backend.block_next_visible_writes.clone();
     let backend_kind = BackendKind::Fifo(Box::new(backend));
 
     let config = FrameSessionConfig::new(1_000)
@@ -2201,7 +2210,7 @@ fn test_frame_session_udp_timed_retries_same_transition_chunk_on_wouldblock() {
     wait_for_writes(&writes, 1, std::time::Duration::from_millis(200));
 
     let before = writes.lock().unwrap().len();
-    block_next_writes.store(1, Ordering::SeqCst);
+    block_next_visible_writes.store(1, Ordering::SeqCst);
     session.send_frame(Frame::new(vec![make_point(5.0, 0.0)]));
     wait_for_writes(&writes, before + 8, std::time::Duration::from_millis(400));
 
