@@ -231,6 +231,10 @@ pub struct AvbBackend {
     /// Runtime-authoritative buffer estimator. Source is set on connect and
     /// cleared on disconnect; reports zero in between.
     estimator: RuntimeAuthorityEstimator,
+    /// Reusable scratch buffer for resampled `StreamPoint` conversion. Lives
+    /// on the backend so the realtime `try_write_points` path doesn't allocate
+    /// a fresh `Vec` per call.
+    resample_scratch: Vec<StreamPoint>,
 }
 
 impl AvbBackend {
@@ -244,6 +248,7 @@ impl AvbBackend {
             caps: super::default_capabilities(),
             desired_shutter_open: false,
             estimator: RuntimeAuthorityEstimator::new(),
+            resample_scratch: Vec::new(),
         }
     }
 
@@ -413,7 +418,12 @@ impl FifoBackend for AvbBackend {
         if pps == runtime.sample_rate {
             Ok(enqueue_points(runtime, points))
         } else {
-            Ok(enqueue_resampled(runtime, points, pps))
+            Ok(enqueue_resampled(
+                runtime,
+                points,
+                pps,
+                &mut self.resample_scratch,
+            ))
         }
     }
 
@@ -751,14 +761,23 @@ fn catmull_rom_stream_point(
 /// Resample `points` from `pps` to `sample_rate` and enqueue directly.
 ///
 /// Caller must ensure `points` is non-empty (the `try_write_points` fast path handles this).
-fn enqueue_resampled(runtime: &RuntimeState, points: &[LaserPoint], pps: u32) -> WriteOutcome {
+/// `scratch` is a reusable buffer for the `StreamPoint` conversion of `points`; it's cleared
+/// on entry and refilled, allowing the realtime caller to amortize the allocation across calls.
+fn enqueue_resampled(
+    runtime: &RuntimeState,
+    points: &[LaserPoint],
+    pps: u32,
+    scratch: &mut Vec<StreamPoint>,
+) -> WriteOutcome {
     debug_assert!(!points.is_empty());
     let output_len = resampled_len(points.len(), pps, runtime.sample_rate);
     if !runtime.has_capacity_for(output_len) {
         return WriteOutcome::WouldBlock;
     }
 
-    let src: Vec<StreamPoint> = points.iter().map(StreamPoint::from).collect();
+    scratch.clear();
+    scratch.extend(points.iter().map(StreamPoint::from));
+    let src = scratch.as_slice();
     let last_src_idx = (src.len() - 1) as f32;
     let step = if output_len > 1 {
         last_src_idx / (output_len - 1) as f32
@@ -1472,7 +1491,8 @@ mod tests {
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
         // 2 points at 24k → ceil(2 * 48000 / 24000) = 4 output samples
-        let outcome = enqueue_resampled(&runtime, &points, 24_000);
+        let mut scratch = Vec::new();
+        let outcome = enqueue_resampled(&runtime, &points, 24_000, &mut scratch);
         assert_eq!(outcome, WriteOutcome::Written);
         assert_eq!(runtime.queued_points(), 4);
 
@@ -1511,7 +1531,8 @@ mod tests {
             LaserPoint::new(0.0, 0.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 0, 0, 0, 0),
         ];
-        let outcome = enqueue_resampled(&runtime, &points, 24_000);
+        let mut scratch = Vec::new();
+        let outcome = enqueue_resampled(&runtime, &points, 24_000, &mut scratch);
         assert_eq!(outcome, WriteOutcome::WouldBlock);
     }
 
