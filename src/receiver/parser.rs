@@ -46,6 +46,7 @@ const DESC_USER_2: u16 = 0x5241;
 const DESC_USER_3: u16 = 0x51E8;
 const DESC_X_PRIME: u16 = 0x4201;
 const DESC_PRECISION_16BIT: u16 = 0x4010;
+#[cfg(test)]
 const DESC_NIL: u16 = 0x0000;
 
 /// A parsed point ready for the consumer (sender or simulator).
