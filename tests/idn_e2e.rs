@@ -3,7 +3,7 @@
 //! These tests verify the full discovery -> connect -> stream -> disconnect -> reconnect
 //! lifecycle using a mock UDP server that speaks the IDN protocol.
 
-#![cfg(all(feature = "idn", feature = "testutils"))]
+#![cfg(all(feature = "idn", feature = "testutils", feature = "receiver"))]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use idn_mock_server::{
-    MockIdnServer, MockRelay, MockService, ServerBehavior, ServerConfig, ServerHandle,
-    IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST,
-    IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
+use laser_dac::receiver::{
+    IdnServer, Relay, ServerBehavior, ServerConfig, ServerHandle, Service, IDNCMD_RT_CNLMSG,
+    IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_REQUEST,
+    IDNFLG_STATUS_REALTIME,
 };
 
 use laser_dac::types::{
@@ -190,13 +190,13 @@ impl TestServerBuilder {
     }
 
     /// Set the services this server provides.
-    pub fn services(mut self, services: Vec<MockService>) -> Self {
+    pub fn services(mut self, services: Vec<Service>) -> Self {
         self.config = self.config.with_services(services);
         self
     }
 
     /// Set the relays this server provides.
-    pub fn relays(mut self, relays: Vec<MockRelay>) -> Self {
+    pub fn relays(mut self, relays: Vec<Relay>) -> Self {
         self.config = self.config.with_relays(relays);
         self
     }
@@ -212,7 +212,7 @@ impl TestServerBuilder {
         let disconnected = Arc::clone(&self.behavior.disconnected);
         let received_packets = Arc::clone(&self.behavior.received_packets);
 
-        let server = MockIdnServer::new(self.config, self.behavior)?;
+        let server = IdnServer::new(self.config, self.behavior)?;
         let inner = server.spawn();
 
         Ok(TestServerHandle {
@@ -363,9 +363,7 @@ fn test_send_frame() {
     let result = stream.run(
         move |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
             let n = req.target_points;
-            for i in 0..n {
-                buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535);
-            }
+            buffer[..n].fill(LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535));
             let count = chunks_sent_clone.fetch_add(1, Ordering::SeqCst);
             if count >= 5 {
                 ChunkResult::End
@@ -423,9 +421,7 @@ fn test_connection_loss_detection() {
         stream.run(
             |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
                 let n = req.target_points;
-                for i in 0..n {
-                    buffer[i] = LaserPoint::blanked(0.0, 0.0);
-                }
+                buffer[..n].fill(LaserPoint::blanked(0.0, 0.0));
                 ChunkResult::Filled(n)
             },
             move |_err| {
@@ -494,9 +490,7 @@ fn test_full_lifecycle() {
         stream.run(
             |req: &ChunkRequest, buffer: &mut [LaserPoint]| {
                 let n = req.target_points;
-                for i in 0..n {
-                    buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535);
-                }
+                buffer[..n].fill(LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535));
                 ChunkResult::Filled(n)
             },
             |err| eprintln!("Stream error: {}", err),
@@ -550,9 +544,7 @@ fn test_parsed_server_metadata() {
         .unit_id(unit_id)
         .protocol_version(2, 5)
         .status(0x42)
-        .services(vec![
-            MockService::laser_projector(7, "MainLaser").with_dsid()
-        ])
+        .services(vec![Service::laser_projector(7, "MainLaser").with_dsid()])
         .build()
         .unwrap();
 
@@ -622,9 +614,9 @@ fn test_parsed_multiple_services() {
 
     let handle = TestServerBuilder::new("MultiService")
         .services(vec![
-            MockService::laser_projector(1, "Laser1").with_dsid(),
-            MockService::laser_projector(2, "Laser2"),
-            MockService::dmx512(3, "DMXOut"),
+            Service::laser_projector(1, "Laser1").with_dsid(),
+            Service::laser_projector(2, "Laser2"),
+            Service::dmx512(3, "DMXOut"),
         ])
         .build()
         .unwrap();
@@ -669,13 +661,10 @@ fn test_parsed_relays_and_services() {
     use laser_dac::protocols::idn::{ServerScanner, ServiceType};
 
     let handle = TestServerBuilder::new("RelayTest")
-        .relays(vec![
-            MockRelay::new(1, "Relay1"),
-            MockRelay::new(2, "Relay2"),
-        ])
+        .relays(vec![Relay::new(1, "Relay1"), Relay::new(2, "Relay2")])
         .services(vec![
-            MockService::laser_projector(1, "RootLaser"),
-            MockService::laser_projector(2, "RelayedLaser").with_relay(1),
+            Service::laser_projector(1, "RootLaser"),
+            Service::laser_projector(2, "RelayedLaser").with_relay(1),
         ])
         .build()
         .unwrap();
@@ -728,7 +717,7 @@ fn test_discovered_device_info_metadata() {
 
     let handle = TestServerBuilder::new("DiscoveryTest")
         .protocol_version(1, 2)
-        .services(vec![MockService::laser_projector(5, "TestLaser")])
+        .services(vec![Service::laser_projector(5, "TestLaser")])
         .build()
         .unwrap();
 
@@ -979,6 +968,14 @@ fn connect_stream(handle: &TestServerHandle) -> laser_dac::protocols::idn::dac::
         .expect("Should connect stream")
 }
 
+/// Skip the stream's Drop impl so it doesn't send a CLOSE packet to the
+/// mock server after the test has finished asserting. The test owns the
+/// stream by value, so this is the cleanest way to tear it down without
+/// triggering extra protocol traffic.
+fn drop_stream_without_close(stream: laser_dac::protocols::idn::dac::stream::Stream) {
+    std::mem::forget(stream);
+}
+
 // =============================================================================
 // Low-level E2E tests
 // =============================================================================
@@ -1026,8 +1023,7 @@ fn test_keepalive_sends_void_channel_message() {
         "keepalive content_id chunk type should be VOID (0x00)"
     );
 
-    // Prevent Drop from sending close on the test socket
-    std::mem::forget(stream);
+    drop_stream_without_close(stream);
 }
 
 #[test]
@@ -1063,7 +1059,7 @@ fn test_small_frame_padded_to_minimum() {
         sample_count
     );
 
-    std::mem::forget(stream);
+    drop_stream_without_close(stream);
 }
 
 #[test]
@@ -1100,7 +1096,7 @@ fn test_first_frame_has_nonzero_timestamp() {
         ts
     );
 
-    std::mem::forget(stream);
+    drop_stream_without_close(stream);
 }
 
 #[test]
@@ -1137,7 +1133,7 @@ fn test_close_with_ack() {
         "Server should have received CLOSE_ACKREQ (0x45) packet"
     );
 
-    std::mem::forget(stream);
+    drop_stream_without_close(stream);
 }
 
 #[test]
@@ -1188,5 +1184,5 @@ fn test_get_parameter_uses_correct_command() {
         );
     }
 
-    std::mem::forget(stream);
+    drop_stream_without_close(stream);
 }

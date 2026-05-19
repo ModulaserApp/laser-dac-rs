@@ -7,8 +7,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use idn_mock_server::{
-    MockIdnServer, MockService, ServerBehavior, ServerConfig, IDNFLG_STATUS_EXCLUDED,
+use laser_dac::receiver::{
+    IdnServer, ServerBehavior, ServerConfig, Service, IDNFLG_STATUS_EXCLUDED,
     IDNFLG_STATUS_MALFUNCTION, IDNFLG_STATUS_OCCUPIED, IDNFLG_STATUS_OFFLINE,
     IDNFLG_STATUS_REALTIME,
 };
@@ -33,22 +33,61 @@ pub enum ServerEvent {
     ClientDisconnected,
 }
 
+/// Snapshot of the subset of `SimulatorSettings` that gets read on the hot
+/// per-packet path. Refreshed once per `on_packet_received` so the read-side
+/// `ServerBehavior` methods don't contend with the UI thread.
+#[derive(Clone, Copy)]
+struct SettingsSnapshot {
+    status_offline: bool,
+    status_malfunction: bool,
+    status_excluded: bool,
+    status_occupied: bool,
+    ack_error_code: u8,
+    simulated_latency_ms: u32,
+}
+
+impl SettingsSnapshot {
+    fn from_settings(s: &SimulatorSettings) -> Self {
+        Self {
+            status_offline: s.status_offline,
+            status_malfunction: s.status_malfunction,
+            status_excluded: s.status_excluded,
+            status_occupied: s.status_occupied,
+            ack_error_code: s.ack_error_code,
+            simulated_latency_ms: s.simulated_latency_ms,
+        }
+    }
+}
+
 /// Behavior implementation for the simulator.
 ///
 /// This wraps the shared settings and event channel to integrate with
 /// the egui UI.
 pub struct SimulatorBehavior {
     settings: Arc<RwLock<SimulatorSettings>>,
+    snapshot: RwLock<SettingsSnapshot>,
     event_tx: Sender<ServerEvent>,
 }
 
 impl SimulatorBehavior {
     pub fn new(settings: Arc<RwLock<SimulatorSettings>>, event_tx: Sender<ServerEvent>) -> Self {
-        Self { settings, event_tx }
+        let snapshot = SettingsSnapshot::from_settings(&settings.read().unwrap());
+        Self {
+            settings,
+            snapshot: RwLock::new(snapshot),
+            event_tx,
+        }
     }
 }
 
 impl ServerBehavior for SimulatorBehavior {
+    fn on_packet_received(&mut self, _raw_data: &[u8]) {
+        // Refresh the per-packet snapshot from the shared settings once, so
+        // the read-side methods below avoid contending with the UI thread.
+        let s = self.settings.read().unwrap();
+        *self.snapshot.write().unwrap() = SettingsSnapshot::from_settings(&s);
+    }
+
     fn on_frame_received(&mut self, raw_data: &[u8]) {
         // Parse and forward chunk data with timing info
         if let Some(chunk) = parse_frame_data(raw_data) {
@@ -58,33 +97,33 @@ impl ServerBehavior for SimulatorBehavior {
 
     fn should_respond(&self, _command: u8) -> bool {
         // If offline, don't respond to any commands (device is "invisible")
-        !self.settings.read().unwrap().status_offline
+        !self.snapshot.read().unwrap().status_offline
     }
 
     fn get_status_byte(&self) -> u8 {
-        let settings = self.settings.read().unwrap();
+        let snapshot = self.snapshot.read().unwrap();
         let mut status = IDNFLG_STATUS_REALTIME; // Always realtime capable
-        if settings.status_malfunction {
+        if snapshot.status_malfunction {
             status |= IDNFLG_STATUS_MALFUNCTION;
         }
-        if settings.status_offline {
+        if snapshot.status_offline {
             status |= IDNFLG_STATUS_OFFLINE;
         }
-        if settings.status_excluded {
+        if snapshot.status_excluded {
             status |= IDNFLG_STATUS_EXCLUDED;
         }
-        if settings.status_occupied {
+        if snapshot.status_occupied {
             status |= IDNFLG_STATUS_OCCUPIED;
         }
         status
     }
 
     fn get_ack_result_code(&self) -> u8 {
-        self.settings.read().unwrap().ack_error_code
+        self.snapshot.read().unwrap().ack_error_code
     }
 
     fn get_simulated_latency(&self) -> Duration {
-        let ms = self.settings.read().unwrap().simulated_latency_ms;
+        let ms = self.snapshot.read().unwrap().simulated_latency_ms;
         Duration::from_millis(ms as u64)
     }
 
@@ -101,11 +140,11 @@ impl ServerBehavior for SimulatorBehavior {
     }
 
     fn is_occupied(&self) -> bool {
-        self.settings.read().unwrap().status_occupied
+        self.snapshot.read().unwrap().status_occupied
     }
 
     fn is_excluded(&self) -> bool {
-        self.settings.read().unwrap().status_excluded
+        self.snapshot.read().unwrap().status_excluded
     }
 }
 
@@ -123,7 +162,7 @@ pub fn run_server(
 
     let base_config = ServerConfig::new(&config.hostname)
         .with_services(vec![
-            MockService::laser_projector(1, &config.service_name).with_dsid()
+            Service::laser_projector(1, &config.service_name).with_dsid()
         ])
         .with_link_timeout(link_timeout);
 
@@ -142,7 +181,7 @@ pub fn run_server(
                 .with_unit_id(unit_id)
                 .with_bind_address(format!("0.0.0.0:{}", port).parse().unwrap());
             let behavior = SimulatorBehavior::new(Arc::clone(&settings), event_tx.clone());
-            match MockIdnServer::new(server_config, behavior) {
+            match IdnServer::new(server_config, behavior) {
                 Ok(server) => {
                     result = Some(server);
                     break;

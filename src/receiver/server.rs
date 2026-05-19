@@ -1,4 +1,4 @@
-//! Core mock IDN server implementation.
+//! Core IDN receiver UDP server.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -7,17 +7,26 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::behavior::ServerBehavior;
-use crate::config::ServerConfig;
-use crate::constants::*;
-use crate::packet_builder::*;
+use super::behavior::ServerBehavior;
+use super::config::ServerConfig;
+use super::constants::*;
+use super::packet_builder::*;
+use super::parser::parse_frame_data;
 
-/// A mock IDN server with pluggable behavior.
-pub struct MockIdnServer<B: ServerBehavior> {
+/// Max UDP payload for IDN.
+const RECV_BUFFER_SIZE: usize = 2048;
+
+/// An IDN receiver server with pluggable behavior.
+///
+/// The server tracks exactly one logical client at a time, identified by
+/// source IP address. Additional peers attempting to connect concurrently are
+/// rejected via [`ServerBehavior::is_occupied`] semantics.
+pub struct IdnServer<B: ServerBehavior> {
     socket: UdpSocket,
     config: ServerConfig,
     behavior: B,
     running: Arc<AtomicBool>,
+    local_addr: SocketAddr,
     // Client tracking (by IP address, not port — multiple sockets from the same
     // host are the same logical client)
     last_client_ip: Option<IpAddr>,
@@ -27,19 +36,21 @@ pub struct MockIdnServer<B: ServerBehavior> {
     disconnected_client: Option<(IpAddr, Instant)>,
 }
 
-impl<B: ServerBehavior> MockIdnServer<B> {
-    /// Create a new mock server with the given configuration and behavior.
+impl<B: ServerBehavior> IdnServer<B> {
+    /// Create a new IDN receiver server with the given configuration and behavior.
     pub fn new(config: ServerConfig, behavior: B) -> io::Result<Self> {
         let socket = UdpSocket::bind(config.bind_address)?;
         socket.set_read_timeout(Some(config.read_timeout))?;
+        let local_addr = socket.local_addr()?;
 
-        log::info!("Mock IDN server listening on {}", socket.local_addr()?);
+        log::info!("IDN receiver listening on {}", local_addr);
 
         Ok(Self {
             socket,
             config,
             behavior,
             running: Arc::new(AtomicBool::new(true)),
+            local_addr,
             last_client_ip: None,
             last_client_addr: None,
             last_activity: None,
@@ -49,7 +60,7 @@ impl<B: ServerBehavior> MockIdnServer<B> {
 
     /// Get the server's local address.
     pub fn addr(&self) -> SocketAddr {
-        self.socket.local_addr().unwrap()
+        self.local_addr
     }
 
     /// Get a handle to control the running flag.
@@ -75,7 +86,7 @@ impl<B: ServerBehavior> MockIdnServer<B> {
 
     /// Run the server loop (blocking).
     pub fn run(mut self) {
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; RECV_BUFFER_SIZE];
 
         while self.running.load(Ordering::SeqCst) {
             // Check for force disconnect
@@ -93,9 +104,9 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
             }
 
-            // Clear disconnected client after 3 seconds
+            // Clear disconnected client after the configured window
             if let Some((_, disconnect_time)) = self.disconnected_client {
-                if disconnect_time.elapsed() > std::time::Duration::from_secs(3) {
+                if disconnect_time.elapsed() > self.config.force_disconnect_window {
                     self.disconnected_client = None;
                 }
             }
@@ -111,7 +122,6 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
             }
 
-            // Receive packet
             let (len, src) = match self.socket.recv_from(&mut buf) {
                 Ok(result) => result,
                 Err(e)
@@ -145,7 +155,6 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
             }
 
-            // Notify behavior of packet receipt (before any filtering)
             self.behavior.on_packet_received(&buf[..len]);
 
             let command = buf[0];
@@ -161,7 +170,6 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 src
             );
 
-            // Check if we should respond
             if !self.behavior.should_respond(command) {
                 log::debug!("Ignoring command 0x{:02X} (should_respond=false)", command);
                 continue;
@@ -192,28 +200,27 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
                 IDNCMD_PING_REQUEST => {
                     log::trace!("Received PING_REQUEST from {}", src);
-                    // Copy the payload (everything after the 4-byte header)
                     let payload = &buf[4..len];
                     let response = build_ping_response(flags, sequence, payload);
                     let _ = self.socket.send_to(&response, src);
                 }
                 IDNCMD_RT_CNLMSG | IDNCMD_RT_CNLMSG_ACKREQ => {
-                    // Check if excluded
                     if self.behavior.is_excluded() {
                         if command == IDNCMD_RT_CNLMSG_ACKREQ {
-                            let response = build_ack_response(flags, sequence, 0xED);
+                            let response =
+                                build_ack_response(flags, sequence, IDNVAL_RTACK_ERR_EXCLUDED);
                             let _ = self.socket.send_to(&response, src);
                         }
                         continue;
                     }
 
-                    // Check if occupied by another client (compare by IP)
                     if self.behavior.is_occupied()
                         && self.last_client_ip.is_some()
                         && self.last_client_ip != Some(src.ip())
                     {
                         if command == IDNCMD_RT_CNLMSG_ACKREQ {
-                            let response = build_ack_response(flags, sequence, 0xEC);
+                            let response =
+                                build_ack_response(flags, sequence, IDNVAL_RTACK_ERR_OCCUPIED);
                             let _ = self.socket.send_to(&response, src);
                         }
                         continue;
@@ -224,15 +231,18 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                     if self.last_client_ip != Some(src.ip()) {
                         log::info!("Client connected: {}", src);
                         self.last_client_ip = Some(src.ip());
+                        self.last_client_addr = Some(src);
                         self.behavior.on_client_connected(src);
                     }
-                    self.last_client_addr = Some(src);
                     self.last_activity = Some(Instant::now());
 
-                    // Forward frame data to behavior
+                    // Hand off raw bytes first (for tools that want low-level
+                    // access), then parse and emit points for normal consumers.
                     self.behavior.on_frame_received(&buf[..len]);
+                    if let Some(chunk) = parse_frame_data(&buf[..len]) {
+                        self.behavior.on_points_received(&chunk.points);
+                    }
 
-                    // Send ACK if requested
                     if command == IDNCMD_RT_CNLMSG_ACKREQ {
                         let response = build_ack_response(
                             flags,
@@ -265,7 +275,6 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                 }
                 IDNCMD_UNIT_PARAMS_REQUEST => {
                     log::debug!("Received UNIT_PARAMS_REQUEST from {}", src);
-                    // Parse service_id and param_id from the request
                     let service_id = if len > 4 { buf[4] } else { 0 };
                     let param_id = if len > 7 {
                         u16::from_be_bytes([buf[6], buf[7]])
@@ -276,10 +285,10 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                         flags,
                         sequence,
                         IDNCMD_UNIT_PARAMS_RESPONSE,
-                        0, // success
+                        0,
                         service_id,
                         param_id,
-                        0x12345678, // dummy value
+                        0x12345678,
                     );
                     let _ = self.socket.send_to(&response, src);
                 }
@@ -295,10 +304,10 @@ impl<B: ServerBehavior> MockIdnServer<B> {
                         flags,
                         sequence,
                         IDNCMD_SERVICE_PARAMS_RESPONSE,
-                        0, // success
+                        0,
                         service_id,
                         param_id,
-                        0x12345678, // dummy value
+                        0x12345678,
                     );
                     let _ = self.socket.send_to(&response, src);
                 }
@@ -308,7 +317,7 @@ impl<B: ServerBehavior> MockIdnServer<B> {
             }
         }
 
-        log::info!("Mock IDN server stopped");
+        log::info!("IDN receiver stopped");
     }
 }
 
