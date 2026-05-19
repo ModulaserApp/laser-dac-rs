@@ -69,6 +69,18 @@ pub const IDNVAL_STYPE_UART: u8 = 0x04;
 pub const IDNVAL_STYPE_DMX512: u8 = 0x05;
 pub const IDNVAL_STYPE_LAPRO: u8 = 0x80; // Standard laser projector
 
+// RT-ACK result codes (spec section 6.3.3)
+/// RT-ACK result code: empty close.
+pub const IDNVAL_RTACK_ERR_EMPTY_CLOSE: u8 = 0xEB;
+/// RT-ACK result code: sessions occupied (another client is already connected).
+pub const IDNVAL_RTACK_ERR_OCCUPIED: u8 = 0xEC;
+/// RT-ACK result code: group excluded (server is excluded from this group).
+pub const IDNVAL_RTACK_ERR_EXCLUDED: u8 = 0xED;
+/// RT-ACK result code: invalid payload.
+pub const IDNVAL_RTACK_ERR_INVALID_PAYLOAD: u8 = 0xEE;
+/// RT-ACK result code: processing error.
+pub const IDNVAL_RTACK_ERR_PROCESSING_ERROR: u8 = 0xEF;
+
 // Service map entry flags
 /// Default Service ID flag - indicates this is the default service for its type
 pub const IDNFLG_SERVICEMAP_DSID: u8 = 0x01;

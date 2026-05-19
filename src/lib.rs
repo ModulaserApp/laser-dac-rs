@@ -102,6 +102,8 @@ mod net_utils;
 pub mod point;
 pub mod presentation;
 pub mod protocols;
+#[cfg(feature = "receiver")]
+pub mod receiver;
 pub(crate) mod reconnect;
 #[cfg(any(feature = "avb", feature = "oscilloscope"))]
 pub(crate) mod resample;

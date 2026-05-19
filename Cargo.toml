@@ -14,7 +14,7 @@ documentation = "https://docs.rs/laser-dac"
 rust-version = "1.87"
 
 [workspace]
-members = [".", "tools/idn-simulator", "tools/idn-mock-server"]
+members = [".", "tools/idn-simulator"]
 
 [features]
 default = ["all-dacs", "asio"]
@@ -43,6 +43,9 @@ asio = ["dep:cpal", "cpal/asio"]
 
 # Optional serialization
 serde = ["dep:serde"]
+
+# IDN UDP receiver server (for hosts accepting incoming laser streams)
+receiver = ["idn"]
 
 # Test utilities (exposes additional APIs for testing)
 testutils = []
@@ -74,7 +77,6 @@ ctrlc = "3.4"
 env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-idn-mock-server = { path = "tools/idn-mock-server" }
 cpal = "0.15"
 hound = "3.5"
 

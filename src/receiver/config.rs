@@ -1,13 +1,13 @@
-//! Configuration types for the mock server.
+//! Configuration types for the IDN receiver server.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::constants::{IDNFLG_SERVICEMAP_DSID, IDNVAL_STYPE_DMX512, IDNVAL_STYPE_LAPRO, IDN_PORT};
+use super::constants::{IDNFLG_SERVICEMAP_DSID, IDNVAL_STYPE_DMX512, IDNVAL_STYPE_LAPRO, IDN_PORT};
 
-/// Configuration for a mock service.
+/// Configuration for a service advertised by the receiver.
 #[derive(Clone, Debug)]
-pub struct MockService {
+pub struct Service {
     pub service_id: u8,
     pub service_type: u8,
     pub name: String,
@@ -15,7 +15,7 @@ pub struct MockService {
     pub relay_number: u8,
 }
 
-impl MockService {
+impl Service {
     /// Create a laser projector service.
     pub fn laser_projector(service_id: u8, name: &str) -> Self {
         Self {
@@ -51,14 +51,14 @@ impl MockService {
     }
 }
 
-/// Configuration for a mock relay.
+/// Configuration for a relay advertised by the receiver.
 #[derive(Clone, Debug)]
-pub struct MockRelay {
+pub struct Relay {
     pub relay_number: u8,
     pub name: String,
 }
 
-impl MockRelay {
+impl Relay {
     pub fn new(relay_number: u8, name: &str) -> Self {
         Self {
             relay_number,
@@ -73,11 +73,13 @@ pub struct ServerConfig {
     pub hostname: String,
     pub unit_id: [u8; 16],
     pub protocol_version: u8,
-    pub services: Vec<MockService>,
-    pub relays: Vec<MockRelay>,
+    pub services: Vec<Service>,
+    pub relays: Vec<Relay>,
     pub bind_address: SocketAddr,
     pub read_timeout: Duration,
     pub link_timeout: Duration,
+    /// How long to ignore packets from a force-disconnected client.
+    pub force_disconnect_window: Duration,
 }
 
 impl ServerConfig {
@@ -86,24 +88,25 @@ impl ServerConfig {
     /// Binds to `127.0.0.1:0` by default (ephemeral port for testing).
     pub fn new(hostname: &str) -> Self {
         // Generate unit_id from hostname per spec section 4.1.2:
-        // Format: [length][category][identifier bytes...] zero-padded to 16 bytes
-        // Using category 0x7F for custom/vendor-specific identifiers
+        // Format: [length][category][identifier bytes...] zero-padded to 16 bytes.
+        // Category 0x7F is used for custom/vendor-specific identifiers.
         let mut unit_id = [0u8; 16];
         let bytes = hostname.as_bytes();
-        let id_len = bytes.len().min(14); // Max 14 bytes for identifier (16 - length - category)
-        unit_id[0] = (id_len + 1) as u8; // Length: category byte + identifier bytes
-        unit_id[1] = 0x7F; // Category: vendor-specific/custom
+        let id_len = bytes.len().min(14);
+        unit_id[0] = (id_len + 1) as u8;
+        unit_id[1] = 0x7F;
         unit_id[2..2 + id_len].copy_from_slice(&bytes[..id_len]);
 
         Self {
             hostname: hostname.to_string(),
             unit_id,
             protocol_version: 0x10, // Version 1.0
-            services: vec![MockService::laser_projector(1, "Laser1")],
+            services: vec![Service::laser_projector(1, "Laser1")],
             relays: Vec::new(),
             bind_address: "127.0.0.1:0".parse().unwrap(),
             read_timeout: Duration::from_millis(100),
             link_timeout: Duration::from_millis(1000),
+            force_disconnect_window: Duration::from_secs(3),
         }
     }
 
@@ -125,13 +128,13 @@ impl ServerConfig {
     }
 
     /// Set the services this server provides.
-    pub fn with_services(mut self, services: Vec<MockService>) -> Self {
+    pub fn with_services(mut self, services: Vec<Service>) -> Self {
         self.services = services;
         self
     }
 
     /// Set the relays this server provides.
-    pub fn with_relays(mut self, relays: Vec<MockRelay>) -> Self {
+    pub fn with_relays(mut self, relays: Vec<Relay>) -> Self {
         self.relays = relays;
         self
     }
@@ -151,6 +154,12 @@ impl ServerConfig {
     /// Set the link timeout for client disconnection detection.
     pub fn with_link_timeout(mut self, timeout: Duration) -> Self {
         self.link_timeout = timeout;
+        self
+    }
+
+    /// Set how long to ignore packets from a force-disconnected client.
+    pub fn with_force_disconnect_window(mut self, window: Duration) -> Self {
+        self.force_disconnect_window = window;
         self
     }
 }

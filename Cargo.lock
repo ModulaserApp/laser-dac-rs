@@ -1103,13 +1103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "idn-mock-server"
-version = "0.1.0"
-dependencies = [
- "log",
-]
-
-[[package]]
 name = "idn-simulator"
 version = "0.1.0"
 dependencies = [
@@ -1117,7 +1110,7 @@ dependencies = [
  "clap",
  "eframe",
  "env_logger",
- "idn-mock-server",
+ "laser-dac",
  "log",
  "rustfft",
 ]
@@ -1271,7 +1264,6 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "hound",
- "idn-mock-server",
  "libc",
  "log",
  "rusb",
