@@ -41,12 +41,14 @@ mod packet_builder;
 mod parser;
 mod server;
 
-pub use behavior::{ServerBehavior, SimpleBehavior};
+pub use behavior::{ReceivedChunk, ServerBehavior, SimpleBehavior};
 pub use config::{Relay, ServerConfig, Service};
 pub use constants::{
     IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST,
     IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_EXCLUDED, IDNFLG_STATUS_MALFUNCTION,
     IDNFLG_STATUS_OCCUPIED, IDNFLG_STATUS_OFFLINE, IDNFLG_STATUS_REALTIME,
 };
-pub use parser::{parse_frame_data, ParsedChunk, ReceivedPoint, SampleFormat};
+pub use parser::{
+    parse_frame_data, ChunkType, FrameParser, ParsedChunk, ReceivedPoint, SampleFormat,
+};
 pub use server::{IdnServer, ServerHandle};

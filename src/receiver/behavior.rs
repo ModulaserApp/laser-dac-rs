@@ -4,7 +4,59 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use super::constants::IDNFLG_STATUS_REALTIME;
-use super::parser::ReceivedPoint;
+use super::parser::{ChunkType, ParsedChunk, ReceivedPoint, SampleFormat};
+
+/// Borrowed parsed IDN channel-message data delivered to [`ServerBehavior`].
+///
+/// This preserves the protocol metadata needed to reconstruct logical frames
+/// across multiple UDP packets while keeping the point slice borrowed from the
+/// parser-owned chunk for the duration of the callback.
+#[derive(Clone, Copy, Debug)]
+pub struct ReceivedChunk<'a> {
+    /// UDP source address for this channel message.
+    pub source_addr: SocketAddr,
+    /// Packet sequence number from the IDN packet header.
+    pub sequence: u16,
+    /// Raw channel-message content id.
+    pub content_id: u16,
+    /// Six-bit channel id parsed from the content id.
+    pub channel_id: u8,
+    /// Chunk type parsed from the content id.
+    pub chunk_type: ChunkType,
+    /// Raw state of the CONFIG/LSTFRG content-id bit (`0x4000`).
+    pub config_or_last_fragment: bool,
+    /// Whether this message contains a channel configuration header.
+    pub has_config: bool,
+    /// Whether this chunk completes a discrete frame.
+    pub is_last_fragment: bool,
+    /// Timestamp from the channel message header (u32, microseconds, wraps).
+    pub timestamp_us_u32: u32,
+    /// Duration of this chunk in microseconds.
+    pub duration_us: u32,
+    /// Sample format used for this chunk.
+    pub format: SampleFormat,
+    /// Parsed points in this chunk.
+    pub points: &'a [ReceivedPoint],
+}
+
+impl<'a> ReceivedChunk<'a> {
+    pub(crate) fn new(source_addr: SocketAddr, chunk: &'a ParsedChunk) -> Self {
+        Self {
+            source_addr,
+            sequence: chunk.sequence,
+            content_id: chunk.content_id,
+            channel_id: chunk.channel_id,
+            chunk_type: chunk.chunk_type,
+            config_or_last_fragment: chunk.config_or_last_fragment,
+            has_config: chunk.has_config,
+            is_last_fragment: chunk.is_last_fragment,
+            timestamp_us_u32: chunk.timestamp_us_u32,
+            duration_us: chunk.duration_us,
+            format: chunk.format,
+            points: &chunk.points,
+        }
+    }
+}
 
 /// Behavior hooks for customizing receiver server responses.
 ///
@@ -25,16 +77,27 @@ pub trait ServerBehavior: Send + 'static {
     ///
     /// The raw packet data includes the full packet starting from the command
     /// byte. Production consumers should normally rely on
-    /// [`Self::on_points_received`] instead; this raw hook exists for tools
+    /// [`Self::on_chunk_received`] instead; this raw hook exists for tools
     /// (like the simulator) that want byte-level inspection.
     fn on_frame_received(&mut self, _raw_data: &[u8]) {}
+
+    /// Called once per parsed channel message with protocol metadata and points.
+    ///
+    /// The default implementation preserves the older point-only callback by
+    /// forwarding to [`Self::on_points_received`]. Override this method when a
+    /// receiver needs IDN frame-boundary metadata such as chunk type, channel id,
+    /// sequence, timestamp, duration, or the CONFIG/LSTFRG bit.
+    fn on_chunk_received(&mut self, chunk: ReceivedChunk<'_>) {
+        self.on_points_received(chunk.points);
+    }
 
     /// Called once per channel message with the parsed points.
     ///
     /// Points are normalized (`x`, `y` in `-1.0..=1.0`; `r`, `g`, `b` in
     /// `0.0..=1.0`) with intensity already pre-multiplied into RGB. Frames
     /// that use an unsupported sample format are skipped and don't fire this
-    /// callback.
+    /// callback. New consumers that need frame boundaries should implement
+    /// [`Self::on_chunk_received`] instead.
     fn on_points_received(&mut self, _points: &[ReceivedPoint]) {}
 
     /// Whether to respond to a given command.

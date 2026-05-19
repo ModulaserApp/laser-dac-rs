@@ -8,12 +8,12 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use laser_dac::receiver::{
-    IdnServer, ServerBehavior, ServerConfig, Service, IDNFLG_STATUS_EXCLUDED,
+    IdnServer, ReceivedChunk, ServerBehavior, ServerConfig, Service, IDNFLG_STATUS_EXCLUDED,
     IDNFLG_STATUS_MALFUNCTION, IDNFLG_STATUS_OCCUPIED, IDNFLG_STATUS_OFFLINE,
     IDNFLG_STATUS_REALTIME,
 };
 
-use crate::protocol_handler::{parse_frame_data, ParsedChunk};
+use crate::protocol_handler::{parsed_chunk_from_received, ParsedChunk};
 use crate::settings::SimulatorSettings;
 
 /// Server configuration from command-line arguments.
@@ -88,11 +88,10 @@ impl ServerBehavior for SimulatorBehavior {
         *self.snapshot.write().unwrap() = SettingsSnapshot::from_settings(&s);
     }
 
-    fn on_frame_received(&mut self, raw_data: &[u8]) {
-        // Parse and forward chunk data with timing info
-        if let Some(chunk) = parse_frame_data(raw_data) {
-            let _ = self.event_tx.send(ServerEvent::Chunk(chunk));
-        }
+    fn on_chunk_received(&mut self, chunk: ReceivedChunk<'_>) {
+        let _ = self
+            .event_tx
+            .send(ServerEvent::Chunk(parsed_chunk_from_received(chunk)));
     }
 
     fn should_respond(&self, _command: u8) -> bool {
