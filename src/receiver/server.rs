@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use super::behavior::ServerBehavior;
+use super::behavior::{ReceivedChunk, ServerBehavior};
 use super::config::ServerConfig;
 use super::constants::*;
 use super::packet_builder::*;
-use super::parser::parse_frame_data;
+use super::parser::FrameParser;
 
 /// Max UDP payload for IDN.
-const RECV_BUFFER_SIZE: usize = 2048;
+const RECV_BUFFER_SIZE: usize = 65_535;
 
 /// An IDN receiver server with pluggable behavior.
 ///
@@ -34,6 +34,7 @@ pub struct IdnServer<B: ServerBehavior> {
     last_activity: Option<Instant>,
     /// Client that was force-disconnected (ignore packets from them temporarily)
     disconnected_client: Option<(IpAddr, Instant)>,
+    parser: FrameParser,
 }
 
 impl<B: ServerBehavior> IdnServer<B> {
@@ -55,6 +56,7 @@ impl<B: ServerBehavior> IdnServer<B> {
             last_client_addr: None,
             last_activity: None,
             disconnected_client: None,
+            parser: FrameParser::new(),
         })
     }
 
@@ -100,6 +102,7 @@ impl<B: ServerBehavior> IdnServer<B> {
                     );
                     self.disconnected_client = Some((client_ip, Instant::now()));
                     self.last_activity = None;
+                    self.parser.reset();
                     self.behavior.on_client_disconnected();
                 }
             }
@@ -118,6 +121,7 @@ impl<B: ServerBehavior> IdnServer<B> {
                     self.last_client_ip = None;
                     self.last_client_addr = None;
                     self.last_activity = None;
+                    self.parser.reset();
                     self.behavior.on_client_disconnected();
                 }
             }
@@ -239,8 +243,9 @@ impl<B: ServerBehavior> IdnServer<B> {
                     // Hand off raw bytes first (for tools that want low-level
                     // access), then parse and emit points for normal consumers.
                     self.behavior.on_frame_received(&buf[..len]);
-                    if let Some(chunk) = parse_frame_data(&buf[..len]) {
-                        self.behavior.on_points_received(&chunk.points);
+                    if let Some(chunk) = self.parser.parse_frame_data(src, &buf[..len]) {
+                        self.behavior
+                            .on_chunk_received(ReceivedChunk::new(src, &chunk));
                     }
 
                     if command == IDNCMD_RT_CNLMSG_ACKREQ {
@@ -258,6 +263,7 @@ impl<B: ServerBehavior> IdnServer<B> {
                         self.last_client_ip = None;
                         self.last_client_addr = None;
                         self.last_activity = None;
+                        self.parser.reset();
                         self.behavior.on_client_disconnected();
                     }
                 }
@@ -267,6 +273,7 @@ impl<B: ServerBehavior> IdnServer<B> {
                         self.last_client_ip = None;
                         self.last_client_addr = None;
                         self.last_activity = None;
+                        self.parser.reset();
                         self.behavior.on_client_disconnected();
                     }
                     let response =

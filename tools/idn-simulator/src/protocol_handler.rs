@@ -3,7 +3,7 @@
 //! (behind the `receiver` feature); this file just keeps the simulator's
 //! local `RenderPoint` shape so the rest of the UI doesn't need to change.
 
-use laser_dac::receiver::{parse_frame_data as receiver_parse, ReceivedPoint};
+use laser_dac::receiver::{ReceivedChunk, ReceivedPoint};
 
 /// A point ready for rendering.
 ///
@@ -41,12 +41,11 @@ pub struct ParsedChunk {
     pub points: Vec<RenderPoint>,
 }
 
-/// Parse frame data from an RT_CNLMSG packet via the shared receiver parser.
-pub fn parse_frame_data(data: &[u8]) -> Option<ParsedChunk> {
-    let chunk = receiver_parse(data)?;
-    Some(ParsedChunk {
+/// Convert parsed receiver chunk data for the simulator render layer.
+pub fn parsed_chunk_from_received(chunk: ReceivedChunk<'_>) -> ParsedChunk {
+    ParsedChunk {
         timestamp_us_u32: chunk.timestamp_us_u32,
         duration_us: chunk.duration_us,
         points: chunk.points.iter().map(RenderPoint::from).collect(),
-    })
+    }
 }

@@ -5,16 +5,16 @@
 
 #![cfg(all(feature = "idn", feature = "testutils", feature = "receiver"))]
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use laser_dac::receiver::{
-    IdnServer, Relay, ServerBehavior, ServerConfig, ServerHandle, Service, IDNCMD_RT_CNLMSG,
-    IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST, IDNCMD_UNIT_PARAMS_REQUEST,
-    IDNFLG_STATUS_REALTIME,
+    ChunkType, IdnServer, ReceivedChunk, Relay, ServerBehavior, ServerConfig, ServerHandle,
+    Service, IDNCMD_RT_CNLMSG, IDNCMD_RT_CNLMSG_CLOSE_ACKREQ, IDNCMD_SERVICE_PARAMS_REQUEST,
+    IDNCMD_UNIT_PARAMS_REQUEST, IDNFLG_STATUS_REALTIME,
 };
 
 use laser_dac::types::{
@@ -53,8 +53,40 @@ pub struct TestBehavior {
     pub disconnected: Arc<AtomicBool>,
     pub silent: bool,
     pub received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub received_chunks: Arc<Mutex<Vec<RecordedChunk>>>,
     pub status: u8,
     pub ack_error_code: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedChunk {
+    pub sequence: u16,
+    pub content_id: u16,
+    pub channel_id: u8,
+    pub chunk_type: ChunkType,
+    pub config_or_last_fragment: bool,
+    pub has_config: bool,
+    pub is_last_fragment: bool,
+    pub timestamp_us_u32: u32,
+    pub duration_us: u32,
+    pub point_count: usize,
+}
+
+impl RecordedChunk {
+    fn from_received(chunk: ReceivedChunk<'_>) -> Self {
+        Self {
+            sequence: chunk.sequence,
+            content_id: chunk.content_id,
+            channel_id: chunk.channel_id,
+            chunk_type: chunk.chunk_type,
+            config_or_last_fragment: chunk.config_or_last_fragment,
+            has_config: chunk.has_config,
+            is_last_fragment: chunk.is_last_fragment,
+            timestamp_us_u32: chunk.timestamp_us_u32,
+            duration_us: chunk.duration_us,
+            point_count: chunk.points.len(),
+        }
+    }
 }
 
 impl Default for TestBehavior {
@@ -63,6 +95,7 @@ impl Default for TestBehavior {
             disconnected: Arc::new(AtomicBool::new(false)),
             silent: false,
             received_packets: Arc::new(Mutex::new(Vec::new())),
+            received_chunks: Arc::new(Mutex::new(Vec::new())),
             status: IDNFLG_STATUS_REALTIME,
             ack_error_code: 0x00,
         }
@@ -93,6 +126,13 @@ impl ServerBehavior for TestBehavior {
         // Frame data is already captured in on_packet_received
     }
 
+    fn on_chunk_received(&mut self, chunk: ReceivedChunk<'_>) {
+        self.received_chunks
+            .lock()
+            .unwrap()
+            .push(RecordedChunk::from_received(chunk));
+    }
+
     fn should_respond(&self, _command: u8) -> bool {
         !self.silent && !self.disconnected.load(Ordering::SeqCst)
     }
@@ -115,6 +155,7 @@ pub struct TestServerHandle {
     inner: ServerHandle,
     pub disconnected: Arc<AtomicBool>,
     pub received_packets: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub received_chunks: Arc<Mutex<Vec<RecordedChunk>>>,
 }
 
 impl TestServerHandle {
@@ -141,6 +182,11 @@ impl TestServerHandle {
     /// Clear received packets.
     pub fn clear_received_packets(&self) {
         self.received_packets.lock().unwrap().clear();
+    }
+
+    /// Clear parsed chunks.
+    pub fn clear_received_chunks(&self) {
+        self.received_chunks.lock().unwrap().clear();
     }
 
     /// Check if server received any frame data packets.
@@ -211,6 +257,7 @@ impl TestServerBuilder {
     pub fn build(self) -> std::io::Result<TestServerHandle> {
         let disconnected = Arc::clone(&self.behavior.disconnected);
         let received_packets = Arc::clone(&self.behavior.received_packets);
+        let received_chunks = Arc::clone(&self.behavior.received_chunks);
 
         let server = IdnServer::new(self.config, self.behavior)?;
         let inner = server.spawn();
@@ -219,6 +266,7 @@ impl TestServerBuilder {
             inner,
             disconnected,
             received_packets,
+            received_chunks,
         })
     }
 }
@@ -976,9 +1024,139 @@ fn drop_stream_without_close(stream: laser_dac::protocols::idn::dac::stream::Str
     std::mem::forget(stream);
 }
 
+fn xyrgbi_descriptors() -> [u16; 8] {
+    [
+        0x4200, 0x4010, 0x4210, 0x4010, 0x527E, 0x5214, 0x51CC, 0x5C10,
+    ]
+}
+
+fn xyrgbi_sample(x: i16, y: i16, r: u8, g: u8, b: u8, intensity: u8) -> Vec<u8> {
+    let mut sample = Vec::new();
+    sample.extend_from_slice(&x.to_be_bytes());
+    sample.extend_from_slice(&y.to_be_bytes());
+    sample.extend_from_slice(&[r, g, b, intensity]);
+    sample
+}
+
+fn channel_message_packet(
+    sequence: u16,
+    channel_id: u8,
+    chunk_type: u8,
+    config_or_last_fragment: bool,
+    include_config: bool,
+    timestamp_us_u32: u32,
+    samples: &[u8],
+) -> Vec<u8> {
+    let descriptors = xyrgbi_descriptors();
+    let config_size = if include_config {
+        4 + descriptors.len() * 2
+    } else {
+        0
+    };
+    let total_size = 8 + config_size + 4 + samples.len();
+    let content_id = 0x8000u16
+        | if config_or_last_fragment {
+            0x4000
+        } else {
+            0x0000
+        }
+        | (((channel_id as u16) & 0x3F) << 8)
+        | chunk_type as u16;
+
+    let mut packet = Vec::new();
+    packet.push(IDNCMD_RT_CNLMSG);
+    packet.push(0);
+    packet.extend_from_slice(&sequence.to_be_bytes());
+    packet.extend_from_slice(&(total_size as u16).to_be_bytes());
+    packet.extend_from_slice(&content_id.to_be_bytes());
+    packet.extend_from_slice(&timestamp_us_u32.to_be_bytes());
+
+    if include_config {
+        packet.push((descriptors.len() / 2) as u8);
+        packet.push(0x01); // Routing flag
+        packet.push(channel_id + 1);
+        packet.push(0x02);
+        for descriptor in descriptors {
+            packet.extend_from_slice(&descriptor.to_be_bytes());
+        }
+    }
+
+    packet.extend_from_slice(&1000u32.to_be_bytes());
+    packet.extend_from_slice(samples);
+    packet
+}
+
+fn wait_for_chunks(handle: &TestServerHandle, expected: usize) -> Vec<RecordedChunk> {
+    for _ in 0..20 {
+        let chunks = handle.received_chunks.lock().unwrap().clone();
+        if chunks.len() >= expected {
+            return chunks;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    handle.received_chunks.lock().unwrap().clone()
+}
+
 // =============================================================================
 // Low-level E2E tests
 // =============================================================================
+
+#[test]
+fn test_receiver_exposes_multi_packet_frame_chunk_metadata() {
+    let handle = test_server("ChunkMetadataTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let socket = UdpSocket::bind("127.0.0.1:0").expect("Should bind test sender");
+    let first = channel_message_packet(
+        11,
+        3,
+        0x03,
+        true,
+        true,
+        1_000,
+        &xyrgbi_sample(0, 0, 255, 0, 0, 255),
+    );
+    let last = channel_message_packet(
+        12,
+        3,
+        0xC0,
+        true,
+        false,
+        2_000,
+        &xyrgbi_sample(100, -100, 0, 255, 0, 255),
+    );
+
+    socket
+        .send_to(&first, handle.addr())
+        .expect("Should send first frame chunk");
+    socket
+        .send_to(&last, handle.addr())
+        .expect("Should send last frame chunk");
+
+    let chunks = wait_for_chunks(&handle, 2);
+    assert_eq!(chunks.len(), 2);
+
+    assert_eq!(chunks[0].sequence, 11);
+    assert_eq!(chunks[0].channel_id, 3);
+    assert_eq!(chunks[0].chunk_type, ChunkType::FrameFirst);
+    assert!(chunks[0].config_or_last_fragment);
+    assert!(chunks[0].has_config);
+    assert!(!chunks[0].is_last_fragment);
+    assert_eq!(chunks[0].timestamp_us_u32, 1_000);
+    assert_eq!(chunks[0].duration_us, 1000);
+    assert_eq!(chunks[0].point_count, 1);
+
+    assert_eq!(chunks[1].sequence, 12);
+    assert_eq!(chunks[1].channel_id, 3);
+    assert_eq!(chunks[1].chunk_type, ChunkType::FrameSequel);
+    assert!(chunks[1].config_or_last_fragment);
+    assert!(!chunks[1].has_config);
+    assert!(chunks[1].is_last_fragment);
+    assert_eq!(chunks[1].timestamp_us_u32, 2_000);
+    assert_eq!(chunks[1].duration_us, 1000);
+    assert_eq!(chunks[1].point_count, 1);
+}
 
 #[test]
 fn test_keepalive_sends_void_channel_message() {
