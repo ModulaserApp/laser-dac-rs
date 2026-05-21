@@ -71,6 +71,17 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 
+# Force vendored libusb on macOS and Windows. On macOS, Homebrew libusb 1.0.29
+# can trigger an `IOUSBHostFamily` kernel panic on Apple Silicon / macOS 26.x
+# with the Helios DAC; the bundled 1.0.27 avoids it. On Windows there is no
+# system libusb, so vendoring is required for redistributable builds.
+# Linux keeps dynamic linking against the distro-packaged libusb.
+[target.'cfg(target_os = "macos")'.dependencies]
+rusb = { version = "0.9", optional = true, features = ["vendored"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rusb = { version = "0.9", optional = true, features = ["vendored"] }
+
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3.4"

@@ -395,6 +395,10 @@ laser-dac = { version = "*", default-features = false, features = ["network-dacs
 
 USB DACs (`helios`, `lasercube-usb`) use [rusb](https://crates.io/crates/rusb) which requires CMake to build.
 
+On **macOS** and **Windows** libusb is built from bundled source automatically — no Homebrew/vcpkg/system libusb required. This is also what avoids the `IOUSBHostFamily` kernel panic seen with Helios on macOS 26.x when linking against Homebrew libusb 1.0.29.
+
+On **Linux** the crate links against the distro-packaged `libusb-1.0` (install via your package manager, e.g. `apt install libusb-1.0-0-dev`).
+
 ## Development Tools
 
 ### IDN Simulator
