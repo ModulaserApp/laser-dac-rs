@@ -8,6 +8,8 @@
 
 Unified DAC backend abstraction for laser projectors.
 
+Maintained by [Modulaser](https://modulaser.app/) and used by the Modulaser laser show application.
+
 This crate provides a complete solution for communicating with various laser DAC hardware:
 
 - **Discovery**: Automatically find connected DAC devices (USB and network)
