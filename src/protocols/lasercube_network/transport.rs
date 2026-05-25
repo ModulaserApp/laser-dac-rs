@@ -21,6 +21,21 @@ use super::profiles::{ConnectionProfile, ConnectionType};
 use super::protocol::{Point, CMD_GET_FULL_INFO, CMD_PORT, DATA_PORT, DEFAULT_POINT_RATE};
 use super::status::LaserCubeNetworkStatus;
 
+trait DatagramSocket {
+    fn send(&self, buffer: &[u8]) -> io::Result<usize>;
+    fn recv(&self, buffer: &mut [u8]) -> io::Result<usize>;
+}
+
+impl DatagramSocket for UdpSocket {
+    fn send(&self, buffer: &[u8]) -> io::Result<usize> {
+        UdpSocket::send(self, buffer)
+    }
+
+    fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        UdpSocket::recv(self, buffer)
+    }
+}
+
 const COMMAND_REPEAT_COUNT: usize = 2;
 const POINT_QUEUE_CAPACITY: usize = 128;
 const MAX_ACK_DRAIN_PER_LOOP: usize = 32;
@@ -386,10 +401,10 @@ impl Drop for TransportHandle {
     }
 }
 
-struct TransportWorker {
+struct TransportWorker<S> {
     device: AddressedDevice,
-    cmd_socket: UdpSocket,
-    data_socket: UdpSocket,
+    cmd_socket: S,
+    data_socket: S,
     state: SharedTransportState,
     queue: VecDeque<Point>,
     packet_buffer: Vec<Point>,
@@ -408,11 +423,11 @@ struct TransportWorker {
     running: bool,
 }
 
-impl TransportWorker {
+impl<S: DatagramSocket> TransportWorker<S> {
     fn new(
         device: AddressedDevice,
-        cmd_socket: UdpSocket,
-        data_socket: UdpSocket,
+        cmd_socket: S,
+        data_socket: S,
         state: SharedTransportState,
         generation: Arc<AtomicU64>,
     ) -> Self {
@@ -828,7 +843,7 @@ fn communication_stale(state: &TransportState, now: Instant) -> bool {
     }
 }
 
-fn send_repeated(socket: &UdpSocket, cmd: &[u8]) -> io::Result<()> {
+fn send_repeated<S: DatagramSocket>(socket: &S, cmd: &[u8]) -> io::Result<()> {
     for _ in 0..COMMAND_REPEAT_COUNT {
         socket.send(cmd)?;
     }
@@ -885,7 +900,69 @@ fn would_block(err: &io::Error) -> bool {
 mod tests {
     use super::super::ack::AckSource;
     use super::*;
+    use std::collections::VecDeque;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct FakeSocket {
+        sent: Arc<Mutex<Vec<Vec<u8>>>>,
+        recv_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl FakeSocket {
+        fn push_recv(&self, packet: Vec<u8>) {
+            self.recv_queue.lock().unwrap().push_back(packet);
+        }
+
+        fn sent_packets(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl DatagramSocket for FakeSocket {
+        fn send(&self, buffer: &[u8]) -> io::Result<usize> {
+            self.sent.lock().unwrap().push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn recv(&self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(packet) = self.recv_queue.lock().unwrap().pop_front() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "empty fake socket",
+                ));
+            };
+            let len = packet.len().min(buffer.len());
+            buffer[..len].copy_from_slice(&packet[..len]);
+            Ok(len)
+        }
+    }
+
+    fn fake_worker() -> (TransportWorker<FakeSocket>, FakeSocket, FakeSocket) {
+        let mut status = LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        status.buffer_free = 6000;
+        status.buffer_max = 6000;
+        let profile = ConnectionProfile::unknown_conservative(6000);
+        let device = AddressedDevice {
+            source_addr: "127.0.0.1:45457".parse().unwrap(),
+            status: status.clone(),
+            profile,
+        };
+        let state = SharedTransportState::new(&status, profile);
+        let generation = Arc::new(AtomicU64::new(0));
+        let cmd_socket = FakeSocket::default();
+        let data_socket = FakeSocket::default();
+        let worker = TransportWorker::new(
+            device,
+            cmd_socket.clone(),
+            data_socket.clone(),
+            state,
+            generation,
+        );
+        (worker, cmd_socket, data_socket)
+    }
 
     fn state_with_host_queue(host_queue_len: usize) -> SharedTransportState {
         let mut status = LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1025,5 +1102,59 @@ mod tests {
         assert_eq!(sequence, None);
         assert_eq!(rtt, None);
         assert!(packet_send_times[7].is_some());
+    }
+
+    #[test]
+    fn fake_socket_worker_applies_data_ack() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let now = Instant::now();
+        worker.packet_send_times[9] = Some(now - Duration::from_millis(5));
+        data_socket.push_recv(vec![0x8A, 0x09, 0x34, 0x12]);
+
+        worker.drain_acks(now);
+
+        let diagnostics = worker.state.diagnostics();
+        assert_eq!(diagnostics.last_data_ack_sequence, Some(9));
+        assert_eq!(diagnostics.last_ack_free_space, Some(0x1234));
+        assert_eq!(diagnostics.last_ack_rtt, Some(Duration::from_millis(5)));
+        assert_eq!(diagnostics.acks_received, 1);
+    }
+
+    #[test]
+    fn fake_socket_worker_sends_one_packet_per_due_send() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        worker.queue.extend(vec![Point::blank(); 200]);
+        worker.state.try_reserve_host_queue(200).unwrap();
+        let now = Instant::now();
+        worker.next_send_due = now;
+
+        worker.try_send_due_packet(now);
+
+        let sent = data_socket.sent_packets();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(&sent[0][..4], &[0xA9, 0x00, 0x00, 0x00]);
+        assert_eq!(sent[0].len(), 4 + 80 * 10);
+        assert_eq!(worker.queue.len(), 120);
+        assert_eq!(worker.state.diagnostics().host_queue_len, 120);
+    }
+
+    #[test]
+    fn priority_output_disable_clears_pending_points() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
+        worker.queue.extend(vec![Point::blank(); 5]);
+        worker.state.try_reserve_host_queue(5).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(PriorityCommand::SetOutput {
+            enabled: false,
+            generation: 1,
+        })
+        .unwrap();
+
+        worker.process_priority_commands(&rx);
+
+        assert!(worker.queue.is_empty());
+        assert_eq!(worker.state.diagnostics().host_queue_len, 0);
+        let sent = cmd_socket.sent_packets();
+        assert_eq!(sent, vec![vec![0x80, 0x00], vec![0x80, 0x00]]);
     }
 }
