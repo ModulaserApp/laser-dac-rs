@@ -26,6 +26,10 @@ const POINT_QUEUE_CAPACITY: usize = 128;
 const MAX_ACK_DRAIN_PER_LOOP: usize = 32;
 const MAX_CONTROL_DRAIN_PER_LOOP: usize = 32;
 const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
+const FULL_INFO_POLL_INACTIVE: Duration = Duration::from_millis(250);
+const FULL_INFO_POLL_ACTIVE: Duration = Duration::from_millis(2500);
+const COMMS_STALE_TIMEOUT: Duration = Duration::from_millis(4000);
+const DIAGNOSTIC_LOG_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct AddressedDevice {
@@ -60,6 +64,7 @@ enum PriorityCommand {
 struct TransportState {
     profile: ConnectionProfile,
     connection_type: ConnectionType,
+    status: LaserCubeNetworkStatus,
     host_queue_len: usize,
     host_queue_capacity: usize,
     free_estimate: usize,
@@ -69,9 +74,13 @@ struct TransportState {
     packets_sent: u64,
     samples_sent: u64,
     acks_received: u64,
+    command_successes: u64,
+    command_failures: u64,
     send_errors: u64,
     packet_errors: u8,
     last_ack: Option<Instant>,
+    last_full_info: Option<Instant>,
+    last_comms: Option<Instant>,
     connected: bool,
 }
 
@@ -82,6 +91,7 @@ pub struct SharedTransportState {
 
 impl SharedTransportState {
     fn new(status: &LaserCubeNetworkStatus, profile: ConnectionProfile) -> Self {
+        let now = Instant::now();
         let buffer_total = status
             .buffer_max
             .max(super::protocol::DEFAULT_BUFFER_CAPACITY) as usize;
@@ -90,40 +100,53 @@ impl SharedTransportState {
             inner: Arc::new(Mutex::new(TransportState {
                 profile,
                 connection_type: status.connection_type,
+                status: status.clone(),
                 host_queue_len: 0,
                 host_queue_capacity,
                 free_estimate: status.buffer_free.min(status.buffer_max) as usize,
                 buffer_total,
                 point_rate: status.point_rate.max(DEFAULT_POINT_RATE),
-                last_estimate: Instant::now(),
+                last_estimate: now,
                 packets_sent: 0,
                 samples_sent: 0,
                 acks_received: 0,
+                command_successes: 0,
+                command_failures: 0,
                 send_errors: 0,
                 packet_errors: status.packet_errors,
                 last_ack: None,
+                last_full_info: Some(now),
+                last_comms: Some(now),
                 connected: true,
             })),
         }
     }
 
     pub fn disconnected(profile: ConnectionProfile) -> Self {
+        let now = Instant::now();
         Self {
             inner: Arc::new(Mutex::new(TransportState {
                 profile,
                 connection_type: ConnectionType::Unknown(0),
+                status: LaserCubeNetworkStatus::minimal(
+                    "0.0.0.0".parse().expect("valid default IP"),
+                ),
                 host_queue_len: 0,
                 host_queue_capacity: 0,
                 free_estimate: profile.buffer_total,
                 buffer_total: profile.buffer_total,
                 point_rate: DEFAULT_POINT_RATE,
-                last_estimate: Instant::now(),
+                last_estimate: now,
                 packets_sent: 0,
                 samples_sent: 0,
                 acks_received: 0,
+                command_successes: 0,
+                command_failures: 0,
                 send_errors: 0,
                 packet_errors: 0,
                 last_ack: None,
+                last_full_info: None,
+                last_comms: None,
                 connected: false,
             })),
         }
@@ -172,9 +195,13 @@ impl SharedTransportState {
             .expect("LaserCube transport state poisoned");
         let now = Instant::now();
         let free = decayed_free(&state, now);
+        let last_comms_age = LaserCubeNetworkDiagnostics::age(now, state.last_comms);
         LaserCubeNetworkDiagnostics {
             profile: state.profile,
             connection_type: state.connection_type,
+            status: state.status.clone(),
+            connected: state.connected,
+            communication_stale: communication_stale(&state, now),
             host_queue_len: state.host_queue_len,
             host_queue_capacity: state.host_queue_capacity,
             device_free_estimate: free,
@@ -182,9 +209,13 @@ impl SharedTransportState {
             packets_sent: state.packets_sent,
             samples_sent: state.samples_sent,
             acks_received: state.acks_received,
+            command_successes: state.command_successes,
+            command_failures: state.command_failures,
             send_errors: state.send_errors,
             packet_errors: state.packet_errors,
-            last_ack_age: LaserCubeNetworkDiagnostics::last_ack_age(now, state.last_ack),
+            last_ack_age: LaserCubeNetworkDiagnostics::age(now, state.last_ack),
+            last_full_info_age: LaserCubeNetworkDiagnostics::age(now, state.last_full_info),
+            last_comms_age,
         }
     }
 }
@@ -339,7 +370,10 @@ struct TransportWorker {
     packet_sequence: u8,
     transfer_sequence: u8,
     current_rate: u32,
+    output_enabled: bool,
     next_send_due: Instant,
+    next_full_info_due: Instant,
+    next_diagnostic_log_due: Instant,
     running: bool,
 }
 
@@ -352,6 +386,7 @@ impl TransportWorker {
         generation: Arc<AtomicU64>,
     ) -> Self {
         let current_rate = DEFAULT_POINT_RATE;
+        let now = Instant::now();
         Self {
             device,
             cmd_socket,
@@ -366,7 +401,10 @@ impl TransportWorker {
             packet_sequence: 0,
             transfer_sequence: 0,
             current_rate,
-            next_send_due: Instant::now(),
+            output_enabled: false,
+            next_send_due: now,
+            next_full_info_due: now + FULL_INFO_POLL_INACTIVE,
+            next_diagnostic_log_due: now + DIAGNOSTIC_LOG_PERIOD,
             running: true,
         }
     }
@@ -385,7 +423,9 @@ impl TransportWorker {
             }
             self.drain_acks(now);
             self.decay_free_estimate(now);
+            self.poll_full_info_if_due(now);
             self.try_send_due_packet(now);
+            self.log_diagnostics_if_due(now);
             thread::sleep(self.next_sleep(now));
         }
         let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
@@ -403,16 +443,22 @@ impl TransportWorker {
                     if !enabled {
                         self.clear_pending_points();
                     }
+                    self.output_enabled = enabled;
+                    self.record_output_enabled(enabled);
                     let _ = send_repeated(&self.cmd_socket, &command::set_output(enabled));
                 }
                 Ok(PriorityCommand::StopOutput { generation }) => {
                     self.active_generation = generation;
                     self.clear_pending_points();
+                    self.output_enabled = false;
+                    self.record_output_enabled(false);
                     let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
                 }
                 Ok(PriorityCommand::Shutdown { generation }) => {
                     self.active_generation = generation;
                     self.clear_pending_points();
+                    self.output_enabled = false;
+                    self.record_output_enabled(false);
                     let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
                     self.running = false;
                     break;
@@ -420,6 +466,8 @@ impl TransportWorker {
                 Err(TryRecvError::Disconnected) => {
                     self.active_generation = self.generation.load(Ordering::SeqCst);
                     self.clear_pending_points();
+                    self.output_enabled = false;
+                    self.record_output_enabled(false);
                     let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
                     self.running = false;
                     break;
@@ -473,6 +521,7 @@ impl TransportWorker {
             .lock()
             .expect("LaserCube transport state poisoned");
         state.point_rate = point_rate;
+        state.status.point_rate = point_rate;
         Ok(())
     }
 
@@ -490,13 +539,15 @@ impl TransportWorker {
                             .inner
                             .lock()
                             .expect("LaserCube transport state poisoned");
-                        state.packet_errors = status.packet_errors;
+                        apply_status(&mut state, status, now);
                     }
                 }
                 Ok(len) => {
                     if let Ok(ack) = parse_command_ack(&self.recv_buffer[..len]) {
                         last_ack = Some(ack);
                         ack_count = ack_count.saturating_add(1);
+                    } else {
+                        self.record_command_response(now, &self.recv_buffer[..len]);
                     }
                 }
                 Err(e) if would_block(&e) => break,
@@ -530,6 +581,7 @@ impl TransportWorker {
         state.last_estimate = now;
         state.acks_received = state.acks_received.saturating_add(ack_count);
         state.last_ack = Some(now);
+        state.last_comms = Some(now);
     }
 
     fn decay_free_estimate(&self, now: Instant) {
@@ -614,6 +666,62 @@ impl TransportWorker {
         }
     }
 
+    fn poll_full_info_if_due(&mut self, now: Instant) {
+        if now < self.next_full_info_due {
+            return;
+        }
+        let poll_period = full_info_poll_period(self.output_enabled);
+        self.next_full_info_due = now + poll_period;
+        if self.cmd_socket.send(&command::get_full_info()).is_err() {
+            let mut state = self
+                .state
+                .inner
+                .lock()
+                .expect("LaserCube transport state poisoned");
+            state.send_errors = state.send_errors.saturating_add(1);
+        }
+    }
+
+    fn record_output_enabled(&self, enabled: bool) {
+        let mut state = self
+            .state
+            .inner
+            .lock()
+            .expect("LaserCube transport state poisoned");
+        state.status.output_enabled = enabled;
+    }
+
+    fn record_command_response(&self, now: Instant, buffer: &[u8]) {
+        if buffer.len() < 2 {
+            return;
+        }
+        let mut state = self
+            .state
+            .inner
+            .lock()
+            .expect("LaserCube transport state poisoned");
+        if buffer[1] == 0 {
+            state.command_successes = state.command_successes.saturating_add(1);
+            state.last_comms = Some(now);
+        } else {
+            state.command_failures = state.command_failures.saturating_add(1);
+            state.last_comms = Some(now);
+        }
+    }
+
+    fn log_diagnostics_if_due(&mut self, now: Instant) {
+        if now < self.next_diagnostic_log_due {
+            return;
+        }
+        self.next_diagnostic_log_due = now + DIAGNOSTIC_LOG_PERIOD;
+        if (self.output_enabled || !self.queue.is_empty()) && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "LaserCube network diagnostics: {:?}",
+                self.state.diagnostics()
+            );
+        }
+    }
+
     fn record_send(&self, now: Instant, sent: usize) {
         let mut state = self
             .state
@@ -638,6 +746,36 @@ impl TransportWorker {
             return self.device.profile.wait_buffer_sleep.min(MAX_IDLE_SLEEP);
         }
         MAX_IDLE_SLEEP
+    }
+}
+
+fn full_info_poll_period(output_enabled: bool) -> Duration {
+    if output_enabled {
+        FULL_INFO_POLL_ACTIVE
+    } else {
+        FULL_INFO_POLL_INACTIVE
+    }
+}
+
+fn apply_status(state: &mut TransportState, status: LaserCubeNetworkStatus, now: Instant) {
+    state.connection_type = status.connection_type;
+    state.packet_errors = status.packet_errors;
+    state.buffer_total =
+        (status.buffer_max as usize).max(super::protocol::DEFAULT_BUFFER_CAPACITY as usize);
+    state.free_estimate = (status.buffer_free as usize).min(state.buffer_total);
+    if status.point_rate > 0 {
+        state.point_rate = status.point_rate;
+    }
+    state.last_estimate = now;
+    state.last_full_info = Some(now);
+    state.last_comms = Some(now);
+    state.status = status;
+}
+
+fn communication_stale(state: &TransportState, now: Instant) -> bool {
+    match state.last_comms {
+        Some(last_comms) => now.saturating_duration_since(last_comms) > COMMS_STALE_TIMEOUT,
+        None => state.connected,
     }
 }
 
@@ -707,6 +845,48 @@ mod tests {
         let capacity = state.diagnostics().host_queue_capacity;
         assert!(state.try_reserve_host_queue(capacity).is_ok());
         assert!(state.try_reserve_host_queue(1).is_err());
+    }
+
+    #[test]
+    fn diagnostics_report_comms_stale_after_timeout() {
+        let state = state_with_host_queue(0);
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.last_comms =
+                Some(Instant::now() - COMMS_STALE_TIMEOUT - Duration::from_millis(1));
+        }
+        let diagnostics = state.diagnostics();
+        assert!(diagnostics.communication_stale);
+        assert!(diagnostics.last_comms_age >= Some(COMMS_STALE_TIMEOUT));
+    }
+
+    #[test]
+    fn diagnostics_include_latest_status_snapshot() {
+        let state = state_with_host_queue(0);
+        {
+            let mut inner = state.inner.lock().unwrap();
+            inner.status.firmware_major = 1;
+            inner.status.firmware_minor = 24;
+            inner.status.battery_percent = 255;
+            inner.status.temperature_c = 42;
+            inner.status.interlock_enabled = true;
+            inner.command_successes = 2;
+            inner.command_failures = 1;
+        }
+        let diagnostics = state.diagnostics();
+        assert_eq!(diagnostics.status.firmware_major, 1);
+        assert_eq!(diagnostics.status.firmware_minor, 24);
+        assert!(diagnostics.status.is_plugged_in());
+        assert_eq!(diagnostics.status.temperature_c, 42);
+        assert!(diagnostics.status.interlock_enabled);
+        assert_eq!(diagnostics.command_successes, 2);
+        assert_eq!(diagnostics.command_failures, 1);
+    }
+
+    #[test]
+    fn full_info_poll_period_uses_active_and_inactive_cadence() {
+        assert_eq!(full_info_poll_period(false), FULL_INFO_POLL_INACTIVE);
+        assert_eq!(full_info_poll_period(true), FULL_INFO_POLL_ACTIVE);
     }
 
     #[test]
