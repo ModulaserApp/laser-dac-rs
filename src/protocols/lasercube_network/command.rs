@@ -3,8 +3,8 @@
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::protocol::{
-    CMD_CLEAR_RINGBUFFER, CMD_ENABLE_BUFFER_SIZE_RESPONSE, CMD_GET_FULL_INFO,
-    CMD_SET_DAC_BUFFER_THRESHOLD, CMD_SET_OUTPUT, CMD_SET_RATE,
+    CMD_ENABLE_BUFFER_SIZE_RESPONSE, CMD_GET_FULL_INFO, CMD_SET_DAC_BUFFER_THRESHOLD,
+    CMD_SET_OUTPUT, CMD_SET_RATE,
 };
 use super::status::LaserCubeNetworkStatus;
 
@@ -27,8 +27,9 @@ pub fn set_rate(rate: u32) -> [u8; 5] {
     out
 }
 
+#[cfg(test)]
 pub fn clear_ringbuffer() -> [u8; 1] {
-    [CMD_CLEAR_RINGBUFFER]
+    [0x8D]
 }
 
 pub fn set_dac_buffer_threshold(threshold: u32) -> [u8; 5] {

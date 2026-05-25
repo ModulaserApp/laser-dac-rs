@@ -15,7 +15,6 @@ pub const CMD_ENABLE_BUFFER_SIZE_RESPONSE: u8 = 0x78;
 pub const CMD_SET_OUTPUT: u8 = 0x80;
 pub const CMD_SET_RATE: u8 = 0x82;
 pub const CMD_GET_RINGBUFFER_EMPTY: u8 = 0x8A;
-pub const CMD_CLEAR_RINGBUFFER: u8 = 0x8D;
 pub const CMD_SET_DAC_BUFFER_THRESHOLD: u8 = 0xA0;
 pub const CMD_SAMPLE_DATA: u8 = 0xA9;
 
@@ -35,8 +34,10 @@ pub struct Point {
 }
 
 impl Point {
+    #[cfg(test)]
     pub const CENTER: u16 = 2047;
 
+    #[cfg(test)]
     pub fn blank() -> Self {
         Self {
             x: Self::CENTER,
