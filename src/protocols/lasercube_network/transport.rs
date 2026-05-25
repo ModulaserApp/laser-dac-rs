@@ -77,6 +77,9 @@ struct TransportState {
     command_successes: u64,
     command_failures: u64,
     send_errors: u64,
+    last_data_ack_sequence: Option<u8>,
+    last_ack_free_space: Option<u16>,
+    last_ack_rtt: Option<Duration>,
     packet_errors: u8,
     last_ack: Option<Instant>,
     last_full_info: Option<Instant>,
@@ -118,6 +121,9 @@ impl SharedTransportState {
                 command_successes: 0,
                 command_failures: 0,
                 send_errors: 0,
+                last_data_ack_sequence: None,
+                last_ack_free_space: None,
+                last_ack_rtt: None,
                 packet_errors: status.packet_errors,
                 last_ack: None,
                 last_full_info: Some(now),
@@ -148,6 +154,9 @@ impl SharedTransportState {
                 command_successes: 0,
                 command_failures: 0,
                 send_errors: 0,
+                last_data_ack_sequence: None,
+                last_ack_free_space: None,
+                last_ack_rtt: None,
                 packet_errors: 0,
                 last_ack: None,
                 last_full_info: None,
@@ -217,6 +226,10 @@ impl SharedTransportState {
             command_successes: state.command_successes,
             command_failures: state.command_failures,
             send_errors: state.send_errors,
+            point_rate: state.point_rate,
+            last_data_ack_sequence: state.last_data_ack_sequence,
+            last_ack_free_space: state.last_ack_free_space,
+            last_ack_rtt: state.last_ack_rtt,
             packet_errors: state.packet_errors,
             last_ack_age: LaserCubeNetworkDiagnostics::age(now, state.last_ack),
             last_full_info_age: LaserCubeNetworkDiagnostics::age(now, state.last_full_info),
@@ -386,6 +399,7 @@ struct TransportWorker {
     active_generation: u64,
     packet_sequence: u8,
     transfer_sequence: u8,
+    packet_send_times: [Option<Instant>; 256],
     current_rate: u32,
     output_enabled: bool,
     next_send_due: Instant,
@@ -417,6 +431,7 @@ impl TransportWorker {
             active_generation: 0,
             packet_sequence: 0,
             transfer_sequence: 0,
+            packet_send_times: [None; 256],
             current_rate,
             output_enabled: false,
             next_send_due: now,
@@ -595,7 +610,9 @@ impl TransportWorker {
         }
     }
 
-    fn apply_ack(&self, now: Instant, ack: BufferAck, ack_count: u64) {
+    fn apply_ack(&mut self, now: Instant, ack: BufferAck, ack_count: u64) {
+        let (data_ack_sequence, ack_rtt) =
+            ack_sequence_and_rtt(&mut self.packet_send_times, ack, now);
         let mut state = self
             .state
             .inner
@@ -604,6 +621,13 @@ impl TransportWorker {
         state.free_estimate = (ack.free_space as usize).min(state.buffer_total);
         state.last_estimate = now;
         state.acks_received = state.acks_received.saturating_add(ack_count);
+        state.last_ack_free_space = Some(ack.free_space);
+        if let Some(sequence) = data_ack_sequence {
+            state.last_data_ack_sequence = Some(sequence);
+        }
+        if let Some(rtt) = ack_rtt {
+            state.last_ack_rtt = Some(rtt);
+        }
         state.last_ack = Some(now);
         state.last_comms = Some(now);
     }
@@ -671,6 +695,7 @@ impl TransportWorker {
         .is_ok()
         {
             let sent = self.packet_buffer.len();
+            self.packet_send_times[self.packet_sequence as usize] = Some(now);
             self.record_send(now, sent);
             self.packet_sequence = self.packet_sequence.wrapping_add(1);
             self.transfer_sequence = self.transfer_sequence.wrapping_add(1);
@@ -834,6 +859,21 @@ fn decayed_free(state: &TransportState, now: Instant) -> usize {
         .min(state.buffer_total)
 }
 
+fn ack_sequence_and_rtt(
+    packet_send_times: &mut [Option<Instant>; 256],
+    ack: BufferAck,
+    now: Instant,
+) -> (Option<u8>, Option<Duration>) {
+    let Some(sequence) = ack.packet_sequence else {
+        return (None, None);
+    };
+    let sent_at = packet_send_times[sequence as usize].take();
+    (
+        Some(sequence),
+        sent_at.map(|sent_at| now.saturating_duration_since(sent_at)),
+    )
+}
+
 fn would_block(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -843,6 +883,7 @@ fn would_block(err: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ack::AckSource;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -903,6 +944,10 @@ mod tests {
             inner.status.interlock_enabled = true;
             inner.command_successes = 2;
             inner.command_failures = 1;
+            inner.point_rate = 40_000;
+            inner.last_data_ack_sequence = Some(42);
+            inner.last_ack_free_space = Some(1234);
+            inner.last_ack_rtt = Some(Duration::from_millis(7));
         }
         let diagnostics = state.diagnostics();
         assert_eq!(diagnostics.status.firmware_major, 1);
@@ -912,6 +957,10 @@ mod tests {
         assert!(diagnostics.status.interlock_enabled);
         assert_eq!(diagnostics.command_successes, 2);
         assert_eq!(diagnostics.command_failures, 1);
+        assert_eq!(diagnostics.point_rate, 40_000);
+        assert_eq!(diagnostics.last_data_ack_sequence, Some(42));
+        assert_eq!(diagnostics.last_ack_free_space, Some(1234));
+        assert_eq!(diagnostics.last_ack_rtt, Some(Duration::from_millis(7)));
     }
 
     #[test]
@@ -940,5 +989,41 @@ mod tests {
         let profile = ConnectionProfile::unknown_conservative(6000);
         let commands = startup_commands(&status, profile);
         assert_eq!(commands[2], command::set_rate(20_000).to_vec());
+    }
+
+    #[test]
+    fn data_ack_sequence_records_rtt_and_clears_send_slot() {
+        let now = Instant::now();
+        let mut packet_send_times = [None; 256];
+        packet_send_times[7] = Some(now - Duration::from_millis(12));
+        let ack = BufferAck {
+            source: AckSource::Data,
+            packet_sequence: Some(7),
+            free_space: 1234,
+        };
+
+        let (sequence, rtt) = ack_sequence_and_rtt(&mut packet_send_times, ack, now);
+
+        assert_eq!(sequence, Some(7));
+        assert_eq!(rtt, Some(Duration::from_millis(12)));
+        assert_eq!(packet_send_times[7], None);
+    }
+
+    #[test]
+    fn command_ack_has_no_data_sequence_or_rtt() {
+        let now = Instant::now();
+        let mut packet_send_times = [None; 256];
+        packet_send_times[7] = Some(now - Duration::from_millis(12));
+        let ack = BufferAck {
+            source: AckSource::Command,
+            packet_sequence: None,
+            free_space: 1234,
+        };
+
+        let (sequence, rtt) = ack_sequence_and_rtt(&mut packet_send_times, ack, now);
+
+        assert_eq!(sequence, None);
+        assert_eq!(rtt, None);
+        assert!(packet_send_times[7].is_some());
     }
 }
