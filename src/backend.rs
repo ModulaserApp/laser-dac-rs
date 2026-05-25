@@ -69,7 +69,7 @@ pub trait DacBackend: Send + 'static {
 /// These DACs accept arbitrary-sized chunks of points into a queue or buffer.
 /// The stream scheduler tops up the buffer to maintain a target level.
 ///
-/// Implementations: Ether Dream, IDN, LaserCube USB/WiFi, AVB.
+/// Implementations: Ether Dream, IDN, LaserCube Network, LaserCube USB, AVB.
 pub trait FifoBackend: DacBackend {
     /// Attempt to write points at the given PPS.
     ///
@@ -260,11 +260,11 @@ pub use crate::protocols::ether_dream::EtherDreamBackend;
 #[cfg(feature = "idn")]
 pub use crate::protocols::idn::IdnBackend;
 
-#[cfg(feature = "lasercube-wifi")]
-pub use crate::protocols::lasercube_wifi::LasercubeWifiBackend;
+#[cfg(feature = "lasercube-network")]
+pub use crate::protocols::lasercube_network::LaserCubeNetworkBackend;
 
 #[cfg(feature = "lasercube-usb")]
-pub use crate::protocols::lasercube_usb::LasercubeUsbBackend;
+pub use crate::protocols::lasercube_usb::LaserCubeUsbBackend;
 
 #[cfg(feature = "oscilloscope")]
 pub use crate::protocols::oscilloscope::OscilloscopeBackend;

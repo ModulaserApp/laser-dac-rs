@@ -290,12 +290,12 @@ mod tests {
 
     /// Phase 4 lock-in: UdpTimed produces fixed 10ms slices sized
     /// `ceil(pps * 0.010)` and clamped to `max_points_per_chunk`. Asserted
-    /// across both small-MTU (LC-WiFi-shaped: 140) and large-MTU (IDN-shaped:
-    /// 4096) caps so the unification is auditable for either device class.
+    /// across both small-MTU (140-point) and large-MTU (IDN-shaped: 4096)
+    /// caps so the unification is auditable for either device class.
     #[test]
     fn chunk_size_is_ten_millis_clamped_to_max() {
         for (pps, max, expected) in [
-            (30_000_u32, 140_usize, 140_usize), // LC-WiFi shape: clamped
+            (30_000_u32, 140_usize, 140_usize), // small-MTU shape: clamped
             (30_000, 4_096, 300),               // IDN shape: ceil(30k*0.010)
             (20_000, 4_096, 200),
             (60_000, 4_096, 600),

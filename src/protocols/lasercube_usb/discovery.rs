@@ -2,7 +2,7 @@
 
 use std::any::Any;
 
-use crate::backend::{BackendKind, LasercubeUsbBackend, Result};
+use crate::backend::{BackendKind, LaserCubeUsbBackend, Result};
 use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
 use crate::protocols::lasercube_usb::{rusb, DacController};
@@ -13,11 +13,11 @@ struct ConnectData {
     device: rusb::Device<rusb::Context>,
 }
 
-pub struct LasercubeUsbDiscoverer {
+pub struct LaserCubeUsbDiscoverer {
     controller: DacController,
 }
 
-impl LasercubeUsbDiscoverer {
+impl LaserCubeUsbDiscoverer {
     /// Returns `None` if the USB controller fails to initialize.
     pub fn new() -> Option<Self> {
         DacController::new()
@@ -36,9 +36,9 @@ fn format_stable_id(serial: Option<&str>, usb_address: &str) -> String {
     }
 }
 
-impl Discoverer for LasercubeUsbDiscoverer {
+impl Discoverer for LaserCubeUsbDiscoverer {
     fn dac_type(&self) -> DacType {
-        DacType::LasercubeUsb
+        DacType::LaserCubeUsb
     }
 
     fn prefix(&self) -> &str {
@@ -58,7 +58,7 @@ impl Discoverer for LasercubeUsbDiscoverer {
             let stable_id = format_stable_id(serial.as_deref(), &usb_address);
             let name = serial.clone().unwrap_or_else(|| usb_address.clone());
 
-            let mut info = DiscoveredDeviceInfo::new(DacType::LasercubeUsb, stable_id, name)
+            let mut info = DiscoveredDeviceInfo::new(DacType::LaserCubeUsb, stable_id, name)
                 .with_usb_address(usb_address);
             if let Some(serial) = serial {
                 info = info.with_hardware_name(serial);
@@ -73,7 +73,7 @@ impl Discoverer for LasercubeUsbDiscoverer {
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "LaserCube USB")?;
-        Ok(BackendKind::Fifo(Box::new(LasercubeUsbBackend::new(
+        Ok(BackendKind::Fifo(Box::new(LaserCubeUsbBackend::new(
             data.device,
         ))))
     }

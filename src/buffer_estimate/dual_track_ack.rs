@@ -4,7 +4,7 @@
 //! the last successful send, one on the last ACK — and reports the conservative
 //! maximum. Prevents buffer overruns when ACKs are delayed or lost.
 //!
-//! Lifted from the LaserCube WiFi protocol (`protocols/lasercube_wifi/dac/buffer_estimator.rs`).
+//! Used by UDP-acked network DAC transports.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

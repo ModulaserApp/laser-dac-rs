@@ -12,8 +12,8 @@ pub mod ether_dream;
 #[cfg(feature = "idn")]
 pub mod idn;
 
-#[cfg(feature = "lasercube-wifi")]
-pub mod lasercube_wifi;
+#[cfg(feature = "lasercube-network")]
+pub mod lasercube_network;
 
 #[cfg(feature = "lasercube-usb")]
 pub mod lasercube_usb;

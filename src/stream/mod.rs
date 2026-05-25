@@ -18,7 +18,7 @@
 //! # Hardware Shutter Support
 //!
 //! Shutter control is best-effort and varies by backend:
-//! - **LaserCube USB/WiFi**: Actual hardware control
+//! - **LaserCube USB/Network**: Actual hardware control
 //! - **Helios**: Hardware shutter control via USB interrupt
 //! - **Ether Dream, IDN**: No-op (safety relies on software blanking)
 //!
@@ -531,7 +531,8 @@ impl Stream {
     ///
     /// UdpTimed backends use `max_points_per_chunk` as the target to keep
     /// the device ringbuffer continuously topped up. A lower target creates
-    /// long idle gaps between bursts, causing glitches over WiFi.
+    /// long idle gaps between bursts, causing glitches on latency-sensitive
+    /// network transports.
     fn scheduler_target_buffer_points(&self) -> u64 {
         if self.info.caps.output_model == OutputModel::UdpTimed {
             self.info.caps.max_points_per_chunk as u64
