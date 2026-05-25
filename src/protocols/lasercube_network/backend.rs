@@ -62,7 +62,7 @@ impl DacBackend for LaserCubeNetworkBackend {
     }
 
     fn is_connected(&self) -> bool {
-        self.transport.is_some()
+        self.transport.as_ref().is_some_and(|t| t.is_usable())
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -86,6 +86,11 @@ impl FifoBackend for LaserCubeNetworkBackend {
             .transport
             .as_ref()
             .ok_or_else(|| Error::disconnected("LaserCube network backend is not connected"))?;
+        if !transport.is_usable() {
+            return Err(Error::disconnected(
+                "LaserCube network communication timed out",
+            ));
+        }
 
         self.point_buffer.clear();
         self.point_buffer.extend(points.iter().map(Point::from));

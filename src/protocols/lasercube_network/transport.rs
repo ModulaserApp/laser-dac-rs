@@ -218,6 +218,14 @@ impl SharedTransportState {
             last_comms_age,
         }
     }
+
+    pub(crate) fn is_usable(&self) -> bool {
+        let state = self
+            .inner
+            .lock()
+            .expect("LaserCube transport state poisoned");
+        state.connected && !communication_stale(&state, Instant::now())
+    }
 }
 
 impl BufferEstimator for SharedTransportState {
@@ -336,6 +344,10 @@ impl TransportHandle {
 
     pub fn state(&self) -> &SharedTransportState {
         &self.state
+    }
+
+    pub fn is_usable(&self) -> bool {
+        self.state.is_usable()
     }
 
     pub fn shutdown(&mut self) {
@@ -858,6 +870,13 @@ mod tests {
         let diagnostics = state.diagnostics();
         assert!(diagnostics.communication_stale);
         assert!(diagnostics.last_comms_age >= Some(COMMS_STALE_TIMEOUT));
+        assert!(!state.is_usable());
+    }
+
+    #[test]
+    fn transport_state_is_usable_while_comms_are_fresh() {
+        let state = state_with_host_queue(0);
+        assert!(state.is_usable());
     }
 
     #[test]
