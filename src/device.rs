@@ -25,8 +25,10 @@ pub enum DacType {
     /// IDN laser DAC (ILDA Digital Network, network connection).
     Idn,
     /// LaserCube Network laser DAC (network connection).
+    #[cfg_attr(feature = "serde", serde(alias = "LasercubeWifi"))]
     LaserCubeNetwork,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
+    #[cfg_attr(feature = "serde", serde(alias = "LasercubeUsb"))]
     LaserCubeUsb,
     /// Oscilloscope XY output via stereo audio interface.
     /// Maps LaserPoint.x → Left channel, LaserPoint.y → Right channel.
@@ -402,6 +404,21 @@ mod tests {
         set.insert(DacType::Helios); // Duplicate should not increase count
 
         assert_eq!(set.len(), 1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_dac_type_deserializes_legacy_lasercube_names() {
+        // LasercubeWifi/LasercubeUsb were renamed to LaserCubeNetwork/LaserCubeUsb;
+        // old configs must still parse via serde aliases.
+        assert_eq!(
+            serde_json::from_str::<DacType>("\"LasercubeWifi\"").unwrap(),
+            DacType::LaserCubeNetwork
+        );
+        assert_eq!(
+            serde_json::from_str::<DacType>("\"LasercubeUsb\"").unwrap(),
+            DacType::LaserCubeUsb
+        );
     }
 
     // ==========================================================================
