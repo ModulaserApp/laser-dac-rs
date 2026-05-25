@@ -174,7 +174,7 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
             } else {
                 format!("{} {}", addressed.status.model_name, ip)
             };
-            let caps = super::capabilities_for_profile(addressed.profile);
+            let caps = super::capabilities_for_status(addressed.profile, &addressed.status);
             let info = DiscoveredDeviceInfo::new(DacType::LaserCubeNetwork, stable_id, name)
                 .with_ip(ip)
                 .with_hardware_name(addressed.status.serial_number.clone());

@@ -96,6 +96,11 @@ impl SharedTransportState {
             .buffer_max
             .max(super::protocol::DEFAULT_BUFFER_CAPACITY) as usize;
         let host_queue_capacity = (buffer_total * 2).max(profile.max_udp_samples_per_packet * 8);
+        let point_rate = if status.point_rate > 0 {
+            super::clamp_point_rate(status, status.point_rate)
+        } else {
+            super::clamp_point_rate(status, DEFAULT_POINT_RATE)
+        };
         Self {
             inner: Arc::new(Mutex::new(TransportState {
                 profile,
@@ -105,7 +110,7 @@ impl SharedTransportState {
                 host_queue_capacity,
                 free_estimate: status.buffer_free.min(status.buffer_max) as usize,
                 buffer_total,
-                point_rate: status.point_rate.max(DEFAULT_POINT_RATE),
+                point_rate,
                 last_estimate: now,
                 packets_sent: 0,
                 samples_sent: 0,
@@ -397,7 +402,7 @@ impl TransportWorker {
         state: SharedTransportState,
         generation: Arc<AtomicU64>,
     ) -> Self {
-        let current_rate = DEFAULT_POINT_RATE;
+        let current_rate = super::clamp_point_rate(&device.status, DEFAULT_POINT_RATE);
         let now = Instant::now();
         Self {
             device,
@@ -524,7 +529,14 @@ impl TransportWorker {
     }
 
     fn set_rate(&mut self, point_rate: u32) -> io::Result<()> {
-        let point_rate = point_rate.max(1);
+        let point_rate = {
+            let state = self
+                .state
+                .inner
+                .lock()
+                .expect("LaserCube transport state poisoned");
+            super::clamp_point_rate(&state.status, point_rate)
+        };
         send_repeated(&self.cmd_socket, &command::set_rate(point_rate))?;
         self.current_rate = point_rate;
         let mut state = self
@@ -776,7 +788,7 @@ fn apply_status(state: &mut TransportState, status: LaserCubeNetworkStatus, now:
         (status.buffer_max as usize).max(super::protocol::DEFAULT_BUFFER_CAPACITY as usize);
     state.free_estimate = (status.buffer_free as usize).min(state.buffer_total);
     if status.point_rate > 0 {
-        state.point_rate = status.point_rate;
+        state.point_rate = super::clamp_point_rate(&status, status.point_rate);
     }
     state.last_estimate = now;
     state.last_full_info = Some(now);
@@ -802,7 +814,7 @@ fn startup_commands(status: &LaserCubeNetworkStatus, profile: ConnectionProfile)
     let mut commands = vec![
         command::set_output(false).to_vec(),
         command::enable_buffer_size_response(true).to_vec(),
-        command::set_rate(DEFAULT_POINT_RATE).to_vec(),
+        command::set_rate(super::clamp_point_rate(status, DEFAULT_POINT_RATE)).to_vec(),
     ];
     if command::threshold_supported(status) {
         let threshold = profile.remote_buffer_cutoff;
@@ -919,5 +931,14 @@ mod tests {
         assert_eq!(commands[2], vec![0x82, 0x30, 0x75, 0x00, 0x00]);
         assert!(commands.iter().all(|cmd| cmd.first() != Some(&0x8D)));
         assert!(commands.iter().all(|cmd| cmd.first() != Some(&0xA9)));
+    }
+
+    #[test]
+    fn startup_rate_is_clamped_to_advertised_device_max() {
+        let mut status = LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        status.point_rate_max = 20_000;
+        let profile = ConnectionProfile::unknown_conservative(6000);
+        let commands = startup_commands(&status, profile);
+        assert_eq!(commands[2], command::set_rate(20_000).to_vec());
     }
 }

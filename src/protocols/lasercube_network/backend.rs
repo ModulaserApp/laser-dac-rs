@@ -21,7 +21,7 @@ pub struct LaserCubeNetworkBackend {
 
 impl LaserCubeNetworkBackend {
     pub(crate) fn new(addressed: AddressedDevice) -> Self {
-        let caps = super::capabilities_for_profile(addressed.profile);
+        let caps = super::capabilities_for_status(addressed.profile, &addressed.status);
         Self {
             fallback_estimator: SharedTransportState::disconnected(addressed.profile),
             addressed,
