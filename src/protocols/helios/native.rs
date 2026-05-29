@@ -439,7 +439,7 @@ fn adjusted_frame_params(requested_pps: u32, requested_points: usize) -> (u32, u
 ///
 /// Matches the Helios C++ SDK formula: `8 + (bufferSize >> 5)` ms.
 /// The constant 8ms base ensures a minimum timeout even for tiny frames.
-fn bulk_transfer_timeout(buffer_len: usize) -> Duration {
+pub(crate) fn bulk_transfer_timeout(buffer_len: usize) -> Duration {
     Duration::from_millis((8 + (buffer_len >> 5)) as u64)
 }
 
