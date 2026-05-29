@@ -33,13 +33,9 @@ pub enum ProfileSource {
 pub struct ConnectionProfile {
     pub source: ProfileSource,
     pub connection_type: ConnectionType,
-    pub source_chunk_samples: usize,
     pub remote_buffer_cutoff: usize,
-    pub wait_connect_sleep: Duration,
     pub wait_buffer_sleep: Duration,
-    pub post_send_sleep: Duration,
     pub max_udp_samples_per_packet: usize,
-    pub configured_packets_per_transfer: usize,
     pub buffer_total: usize,
 }
 
@@ -47,12 +43,12 @@ impl ConnectionProfile {
     pub fn for_connection(connection_type: ConnectionType, buffer_total: usize) -> Self {
         match connection_type {
             ConnectionType::WifiServer => {
-                Self::desktop(connection_type, 600, 2000, 12, 4, 10, 140, 20, buffer_total)
+                Self::desktop(connection_type, 2000, 4, 140, buffer_total)
             }
             ConnectionType::EthernetServer
             | ConnectionType::EthernetClient
             | ConnectionType::WifiClient => {
-                Self::desktop(connection_type, 700, 1800, 12, 6, 4, 80, 20, buffer_total)
+                Self::desktop(connection_type, 1800, 6, 80, buffer_total)
             }
             ConnectionType::Unknown(_) => Self::unknown_conservative(buffer_total),
         }
@@ -62,39 +58,26 @@ impl ConnectionProfile {
         Self {
             source: ProfileSource::UnknownConservative,
             connection_type: ConnectionType::Unknown(0),
-            source_chunk_samples: 700,
             remote_buffer_cutoff: 1800.min(buffer_total),
-            wait_connect_sleep: Duration::from_millis(12),
             wait_buffer_sleep: Duration::from_millis(6),
-            post_send_sleep: Duration::from_millis(4),
             max_udp_samples_per_packet: 80,
-            configured_packets_per_transfer: 20,
             buffer_total,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn desktop(
         connection_type: ConnectionType,
-        source_chunk_samples: usize,
         remote_buffer_cutoff: usize,
-        wait_connect_sleep_ms: u64,
         wait_buffer_sleep_ms: u64,
-        post_send_sleep_ms: u64,
         max_udp_samples_per_packet: usize,
-        configured_packets_per_transfer: usize,
         buffer_total: usize,
     ) -> Self {
         Self {
             source: ProfileSource::DesktopNetworkDefault,
             connection_type,
-            source_chunk_samples,
             remote_buffer_cutoff: remote_buffer_cutoff.min(buffer_total),
-            wait_connect_sleep: Duration::from_millis(wait_connect_sleep_ms),
             wait_buffer_sleep: Duration::from_millis(wait_buffer_sleep_ms),
-            post_send_sleep: Duration::from_millis(post_send_sleep_ms),
             max_udp_samples_per_packet,
-            configured_packets_per_transfer,
             buffer_total,
         }
     }
