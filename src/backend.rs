@@ -115,6 +115,15 @@ pub trait FrameSwapBackend: DacBackend {
     /// The caller should check `is_ready_for_frame()` first, but implementations
     /// may still return `WouldBlock` for race conditions.
     fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome>;
+
+    /// Write a complete frame immediately after a successful readiness check.
+    ///
+    /// The default implementation preserves the conservative `write_frame()`
+    /// behavior. Backends with expensive or fragile readiness probes can override
+    /// this to avoid a duplicate readiness check.
+    fn write_frame_ready(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        self.write_frame(pps, points)
+    }
 }
 
 // =============================================================================
@@ -205,6 +214,17 @@ impl BackendKind {
         match self {
             BackendKind::Fifo(b) => b.try_write_points(pps, points),
             BackendKind::FrameSwap(b) => b.write_frame(pps, points),
+        }
+    }
+
+    pub(crate) fn try_write_frame_ready(
+        &mut self,
+        pps: u32,
+        points: &[LaserPoint],
+    ) -> Result<WriteOutcome> {
+        match self {
+            BackendKind::Fifo(b) => b.try_write_points(pps, points),
+            BackendKind::FrameSwap(b) => b.write_frame_ready(pps, points),
         }
     }
 

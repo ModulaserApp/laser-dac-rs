@@ -5,15 +5,18 @@ use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
 use crate::protocols::helios::{
-    encode_frame_into, DeviceStatus, HeliosDac, HeliosDacController, HeliosDacError,
-    Point as HeliosPoint, WriteFrameFlags,
+    bulk_transfer_timeout, encode_frame_into, DeviceStatus, HeliosDac, HeliosDacController,
+    HeliosDacError, Point as HeliosPoint, WriteFrameFlags,
 };
+
+const STATUS_ERROR_LIMIT: u32 = 50;
 
 /// Helios DAC backend (USB).
 pub struct HeliosBackend {
     dac: Option<HeliosDac>,
     device_index: usize,
     caps: DacCapabilities,
+    status_error_count: u32,
     /// Pre-allocated buffer for LaserPoint → HeliosPoint conversion.
     point_buffer: Vec<HeliosPoint>,
     /// Pre-allocated buffer for wire-format frame encoding.
@@ -27,6 +30,7 @@ impl HeliosBackend {
             dac: None,
             device_index,
             caps: super::default_capabilities(),
+            status_error_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -38,6 +42,7 @@ impl HeliosBackend {
             dac: Some(dac),
             device_index: 0,
             caps: super::default_capabilities(),
+            status_error_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -49,9 +54,18 @@ impl HeliosBackend {
         controller.list_devices().map_err(Self::map_err)
     }
 
+    /// Drop any open USB device handle for an orderly disconnect.
+    ///
+    /// Non-fatal transport errors, including USB timeouts, need to release the
+    /// claimed interface so the reconnect path can open the DAC again in the
+    /// same process.
+    fn close_handle(&mut self) {
+        self.dac = None;
+    }
+
     /// Take and leak any open USB device handle to prevent a segfault in
     /// `libusb_close()` on macOS when the device was physically disconnected.
-    /// This is a bounded leak (~200 bytes) per disconnect event.
+    /// This is a bounded leak (~200 bytes) per fatal disconnect event.
     fn leak_handle(&mut self) {
         match self.dac.take() {
             Some(HeliosDac::Open { handle, .. }) => {
@@ -85,6 +99,35 @@ impl HeliosBackend {
             Error::disconnected(format!("USB device error: {e}"))
         } else {
             Error::backend(std::io::Error::other(e.to_string()))
+        }
+    }
+
+    fn map_err_with_context(context: impl Into<String>, e: HeliosDacError) -> Error {
+        let context = context.into();
+        if Self::is_fatal_usb_error(&e) {
+            Error::disconnected(format!("{context}: USB device error: {e}"))
+        } else {
+            Error::backend(std::io::Error::other(format!("{context}: {e}")))
+        }
+    }
+
+    fn mark_status_ok(&mut self) {
+        if self.status_error_count >= 10 {
+            log::debug!(
+                "helios: status polling recovered after {} failed poll(s)",
+                self.status_error_count
+            );
+        }
+        self.status_error_count = 0;
+    }
+
+    fn mark_status_error(&mut self, location: &str, e: &HeliosDacError) {
+        self.status_error_count += 1;
+        if self.status_error_count.is_multiple_of(10) {
+            log::debug!(
+                "helios: {} consecutive status poll failures at {location}: {e}",
+                self.status_error_count
+            );
         }
     }
 }
@@ -124,7 +167,7 @@ impl DacBackend for HeliosBackend {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        self.leak_handle();
+        self.close_handle();
         Ok(())
     }
 
@@ -167,12 +210,29 @@ impl FrameSwapBackend for HeliosBackend {
         let Some(dac) = self.dac.as_mut() else {
             return false;
         };
+        let location = dac.usb_location();
         match dac.status() {
-            Ok(DeviceStatus::Ready) => true,
-            Ok(DeviceStatus::NotReady) => false,
+            Ok(DeviceStatus::Ready) => {
+                self.mark_status_ok();
+                true
+            }
+            Ok(DeviceStatus::NotReady) => {
+                self.mark_status_ok();
+                false
+            }
             Err(e) => {
                 if Self::is_fatal_usb_error(&e) {
+                    log::warn!("helios: fatal status poll failure at {location}: {e}");
                     self.leak_handle();
+                } else {
+                    self.mark_status_error(&location, &e);
+                    if self.status_error_count >= STATUS_ERROR_LIMIT {
+                        log::warn!(
+                            "helios: closing backend after {} consecutive status poll failures at {location}: {e}",
+                            self.status_error_count
+                        );
+                        self.close_handle();
+                    }
                 }
                 false
             }
@@ -185,12 +245,24 @@ impl FrameSwapBackend for HeliosBackend {
             .as_mut()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
-        match dac.status().map_err(Self::map_err)? {
+        match dac
+            .status()
+            .map_err(|e| Self::map_err_with_context("helios write_frame status poll", e))?
+        {
             DeviceStatus::Ready => {}
             DeviceStatus::NotReady => {
                 return Ok(WriteOutcome::WouldBlock);
             }
         }
+
+        self.write_frame_ready(pps, points)
+    }
+
+    fn write_frame_ready(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let dac = self
+            .dac
+            .as_mut()
+            .ok_or_else(|| Error::disconnected("Not connected"))?;
 
         self.point_buffer.clear();
         self.point_buffer
@@ -203,8 +275,17 @@ impl FrameSwapBackend for HeliosBackend {
             &mut self.frame_buffer,
         );
 
-        dac.write_frame_buffer(&self.frame_buffer)
-            .map_err(Self::map_err)?;
+        dac.write_frame_buffer(&self.frame_buffer).map_err(|e| {
+            Self::map_err_with_context(
+                format!(
+                    "helios write_frame bulk transfer (pps={pps}, points={}, bytes={}, timeout_ms={})",
+                    points.len(),
+                    self.frame_buffer.len(),
+                    bulk_transfer_timeout(self.frame_buffer.len()).as_millis()
+                ),
+                e,
+            )
+        })?;
 
         Ok(WriteOutcome::Written)
     }
@@ -222,6 +303,7 @@ mod tests {
             dac: Some(HeliosDac::MockOpen(state)),
             device_index: 0,
             caps: super::super::default_capabilities(),
+            status_error_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -347,6 +429,41 @@ mod tests {
             backend.is_connected(),
             "Timeout is non-fatal — backend should remain connected"
         );
+    }
+
+    #[test]
+    fn repeated_nonfatal_usb_errors_in_is_ready_mark_disconnected() {
+        let state = Arc::new(Mutex::new(
+            MockUsbState::new().with_disconnect_error(|| rusb::Error::Timeout),
+        ));
+        let mut backend = mock_backend(state.clone());
+
+        state.lock().unwrap().connected = false;
+
+        for _ in 0..STATUS_ERROR_LIMIT {
+            assert!(!backend.is_ready_for_frame());
+        }
+
+        assert!(
+            !backend.is_connected(),
+            "Repeated status timeouts should close the backend so reconnect can run"
+        );
+    }
+
+    #[test]
+    fn successful_status_poll_resets_nonfatal_error_count() {
+        let state = Arc::new(Mutex::new(
+            MockUsbState::new().with_disconnect_error(|| rusb::Error::Timeout),
+        ));
+        let mut backend = mock_backend(state.clone());
+
+        state.lock().unwrap().connected = false;
+        assert!(!backend.is_ready_for_frame());
+        assert_eq!(backend.status_error_count, 1);
+
+        state.lock().unwrap().connected = true;
+        assert!(backend.is_ready_for_frame());
+        assert_eq!(backend.status_error_count, 0);
     }
 
     #[test]
