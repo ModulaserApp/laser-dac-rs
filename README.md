@@ -27,8 +27,8 @@ LaserCube, IDN) work with both Frame and Streaming APIs.
 | Helios                     | USB        | Frame-swap   | ✅       | Frame API only                                                                                         |
 | Ether Dream                | Network    | FIFO         | ✅       |
 | IDN (ILDA Digital Network) | Network    | FIFO         | ✅       | IDN is a standardized protocol. We tested with [HeliosPRO](https://bitlasers.com/heliospro-laser-dac/) |
-| LaserCube WiFi             | Network    | FIFO         | ✅       | Recommend to not use through WiFi mode; use LAN only                                                   |
-| LaserCube USB / Laserdock  | USB        | FIFO         | ✅       |
+| LaserCube Network             | Network    | FIFO         | ✅       | Ethernet is recommended for production output                                                          |
+| LaserCube USB / LaserDock  | USB        | FIFO         | ✅       |
 | AVB Audio Device           | Network    | FIFO         | ✅       | Uses CoreAudio (macOS), ASIO on Windows by default (disable the `asio` default feature to use WASAPI and skip the Steinberg SDK), ALSA (Linux). Tested with [LaserAnimation Sollinger](https://laseranimation.com). |
 
 All DACs have been manually verified to work.
@@ -369,13 +369,13 @@ By default, all DAC protocols are enabled via the `all-dacs` feature.
 | ---------------- | ----------------------------------------------------------- |
 | `all-dacs`       | Enable all DAC protocols (default)                          |
 | `usb-dacs`       | Enable USB DACs: `helios`, `lasercube-usb`                  |
-| `network-dacs`   | Enable network DACs: `ether-dream`, `idn`, `lasercube-wifi` |
+| `network-dacs`   | Enable network DACs: `ether-dream`, `idn`, `lasercube-network` |
 | `audio-dacs`     | Enable audio DACs: `avb`, `oscilloscope`                    |
 | `helios`         | Helios USB DAC                                              |
 | `lasercube-usb`  | LaserCube USB (LaserDock) DAC                               |
 | `ether-dream`    | Ether Dream network DAC                                     |
 | `idn`            | ILDA Digital Network DAC                                    |
-| `lasercube-wifi` | LaserCube WiFi DAC                                          |
+| `lasercube-network` | LaserCube Network DAC                                          |
 | `avb`            | AVB audio-device backend (experimental)                     |
 | `oscilloscope`   | Oscilloscope XY-mode output via stereo audio interface      |
 | `asio` (default) | ASIO host on Windows for `avb`/`oscilloscope` (requires the Steinberg ASIO SDK plus `LIBCLANG_PATH` and `CPAL_ASIO_DIR` at build time). Disable to fall back to the cpal default host (WASAPI on Windows). |
@@ -439,7 +439,8 @@ For a simple test, you can run one of our examples: `cargo run --example stream 
 
 - Helios DAC: heavily inspired from [helios-dac](https://github.com/maxjoehnk/helios-dac-rs)
 - Ether Dream DAC: heavily inspired from [ether-dream](https://github.com/nannou-org/ether-dream)
-- Lasercube USB / WIFI: inspired from [ildagen](https://github.com/Grix/ildagen) (ported from C++ to Rust)
+- LaserCube USB / LaserDock: inspired from [ildagen](https://github.com/Grix/ildagen) (ported from C++ to Rust)
+- LaserCube Network: native Rust implementation for LaserCube WiFi/Ethernet devices
 - IDN: inspired from [helios_dac](https://github.com/Grix/helios_dac) (ported from C++ to Rust)
 
 ## License

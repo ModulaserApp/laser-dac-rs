@@ -24,10 +24,12 @@ pub enum DacType {
     EtherDream,
     /// IDN laser DAC (ILDA Digital Network, network connection).
     Idn,
-    /// LaserCube WiFi laser DAC (network connection).
-    LasercubeWifi,
+    /// LaserCube Network laser DAC (network connection).
+    #[cfg_attr(feature = "serde", serde(alias = "LasercubeWifi"))]
+    LaserCubeNetwork,
     /// LaserCube USB laser DAC (USB connection, also known as LaserDock).
-    LasercubeUsb,
+    #[cfg_attr(feature = "serde", serde(alias = "LasercubeUsb"))]
+    LaserCubeUsb,
     /// Oscilloscope XY output via stereo audio interface.
     /// Maps LaserPoint.x → Left channel, LaserPoint.y → Right channel.
     #[cfg(feature = "oscilloscope")]
@@ -46,8 +48,8 @@ impl DacType {
             DacType::Helios,
             DacType::EtherDream,
             DacType::Idn,
-            DacType::LasercubeWifi,
-            DacType::LasercubeUsb,
+            DacType::LaserCubeNetwork,
+            DacType::LaserCubeUsb,
             DacType::Avb,
         ]
     }
@@ -59,8 +61,8 @@ impl DacType {
             DacType::Helios,
             DacType::EtherDream,
             DacType::Idn,
-            DacType::LasercubeWifi,
-            DacType::LasercubeUsb,
+            DacType::LaserCubeNetwork,
+            DacType::LaserCubeUsb,
             DacType::Avb,
             DacType::Oscilloscope,
         ]
@@ -72,8 +74,8 @@ impl DacType {
             DacType::Helios => "Helios",
             DacType::EtherDream => "Ether Dream",
             DacType::Idn => "IDN",
-            DacType::LasercubeWifi => "LaserCube WiFi",
-            DacType::LasercubeUsb => "LaserCube USB (Laserdock)",
+            DacType::LaserCubeNetwork => "LaserCube Network",
+            DacType::LaserCubeUsb => "LaserCube USB (LaserDock)",
             #[cfg(feature = "oscilloscope")]
             DacType::Oscilloscope => "Oscilloscope",
             DacType::Avb => "AVB Audio Device",
@@ -87,8 +89,8 @@ impl DacType {
             DacType::Helios => "USB laser DAC",
             DacType::EtherDream => "Network laser DAC",
             DacType::Idn => "ILDA Digital Network laser DAC",
-            DacType::LasercubeWifi => "WiFi laser DAC",
-            DacType::LasercubeUsb => "USB laser DAC",
+            DacType::LaserCubeNetwork => "LaserCube network DAC",
+            DacType::LaserCubeUsb => "USB laser DAC",
             #[cfg(feature = "oscilloscope")]
             DacType::Oscilloscope => "Oscilloscope XY output via stereo audio",
             DacType::Avb => "AVB audio network output",
@@ -290,15 +292,15 @@ pub fn caps_for_dac_type(dac_type: &DacType) -> DacCapabilities {
         #[cfg(not(feature = "idn"))]
         DacType::Idn => DacCapabilities::default(),
 
-        #[cfg(feature = "lasercube-wifi")]
-        DacType::LasercubeWifi => crate::protocols::lasercube_wifi::default_capabilities(),
-        #[cfg(not(feature = "lasercube-wifi"))]
-        DacType::LasercubeWifi => DacCapabilities::default(),
+        #[cfg(feature = "lasercube-network")]
+        DacType::LaserCubeNetwork => crate::protocols::lasercube_network::default_capabilities(),
+        #[cfg(not(feature = "lasercube-network"))]
+        DacType::LaserCubeNetwork => DacCapabilities::default(),
 
         #[cfg(feature = "lasercube-usb")]
-        DacType::LasercubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
+        DacType::LaserCubeUsb => crate::protocols::lasercube_usb::default_capabilities(),
         #[cfg(not(feature = "lasercube-usb"))]
-        DacType::LasercubeUsb => DacCapabilities::default(),
+        DacType::LaserCubeUsb => DacCapabilities::default(),
 
         #[cfg(feature = "oscilloscope")]
         DacType::Oscilloscope => DacCapabilities::default(), // Caps depend on sample rate, use backend's actual caps
@@ -373,8 +375,8 @@ mod tests {
         assert!(all_types.contains(&DacType::Helios));
         assert!(all_types.contains(&DacType::EtherDream));
         assert!(all_types.contains(&DacType::Idn));
-        assert!(all_types.contains(&DacType::LasercubeWifi));
-        assert!(all_types.contains(&DacType::LasercubeUsb));
+        assert!(all_types.contains(&DacType::LaserCubeNetwork));
+        assert!(all_types.contains(&DacType::LaserCubeUsb));
         assert!(all_types.contains(&DacType::Avb));
         #[cfg(feature = "oscilloscope")]
         assert!(all_types.contains(&DacType::Oscilloscope));
@@ -402,6 +404,21 @@ mod tests {
         set.insert(DacType::Helios); // Duplicate should not increase count
 
         assert_eq!(set.len(), 1);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_dac_type_deserializes_legacy_lasercube_names() {
+        // LasercubeWifi/LasercubeUsb were renamed to LaserCubeNetwork/LaserCubeUsb;
+        // old configs must still parse via serde aliases.
+        assert_eq!(
+            serde_json::from_str::<DacType>("\"LasercubeWifi\"").unwrap(),
+            DacType::LaserCubeNetwork
+        );
+        assert_eq!(
+            serde_json::from_str::<DacType>("\"LasercubeUsb\"").unwrap(),
+            DacType::LaserCubeUsb
+        );
     }
 
     // ==========================================================================

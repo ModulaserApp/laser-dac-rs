@@ -7,23 +7,23 @@ use crate::error::{Error, Result};
 use crate::point::LaserPoint;
 use crate::protocols::lasercube_usb::dac::Stream;
 use crate::protocols::lasercube_usb::error::Error as UsbError;
-use crate::protocols::lasercube_usb::protocol::Sample as LasercubeUsbSample;
+use crate::protocols::lasercube_usb::protocol::Sample as LaserCubeUsbSample;
 use crate::protocols::lasercube_usb::{rusb, DacController};
 use std::time::Instant;
 
 /// LaserCube USB DAC backend (LaserDock).
-pub struct LasercubeUsbBackend {
+pub struct LaserCubeUsbBackend {
     device: Option<rusb::Device<rusb::Context>>,
     stream: Option<Stream<rusb::Context>>,
     caps: DacCapabilities,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
-    point_buffer: Vec<LasercubeUsbSample>,
+    point_buffer: Vec<LaserCubeUsbSample>,
     /// Software-only buffer estimator. Driven by `record_send` from inside
     /// `try_write_points`; not yet consulted by the adapter (Phase 1).
     estimator: SoftwareDecayEstimator,
 }
 
-impl LasercubeUsbBackend {
+impl LaserCubeUsbBackend {
     pub fn new(device: rusb::Device<rusb::Context>) -> Self {
         Self {
             device: Some(device),
@@ -72,9 +72,9 @@ impl LasercubeUsbBackend {
     }
 }
 
-impl DacBackend for LasercubeUsbBackend {
+impl DacBackend for LaserCubeUsbBackend {
     fn dac_type(&self) -> DacType {
-        DacType::LasercubeUsb
+        DacType::LaserCubeUsb
     }
 
     fn caps(&self) -> &DacCapabilities {
@@ -142,7 +142,7 @@ impl DacBackend for LasercubeUsbBackend {
     }
 }
 
-impl FifoBackend for LasercubeUsbBackend {
+impl FifoBackend for LaserCubeUsbBackend {
     fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let stream = self
             .stream
@@ -151,7 +151,7 @@ impl FifoBackend for LasercubeUsbBackend {
 
         self.point_buffer.clear();
         self.point_buffer
-            .extend(points.iter().map(LasercubeUsbSample::from));
+            .extend(points.iter().map(LaserCubeUsbSample::from));
 
         let n = self.point_buffer.len();
         match stream.write_frame(&self.point_buffer, pps) {

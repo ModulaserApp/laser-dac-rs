@@ -45,8 +45,8 @@ pub mod protocol;
 pub use crate::protocols::lasercube_usb::dac::{DeviceInfo, DeviceStatus, FirmwareVersion, Stream};
 pub use crate::protocols::lasercube_usb::error::{Error, Result};
 pub use crate::protocols::lasercube_usb::protocol::Sample;
-pub use backend::LasercubeUsbBackend;
-pub use discovery::LasercubeUsbDiscoverer;
+pub use backend::LaserCubeUsbBackend;
+pub use discovery::LaserCubeUsbDiscoverer;
 
 // Re-export rusb for consumers that need the Context type
 pub use rusb;

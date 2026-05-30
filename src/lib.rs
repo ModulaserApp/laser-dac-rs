@@ -65,7 +65,7 @@
 //! - **Helios** - USB laser DAC, Frame API only (feature: `helios`)
 //! - **Ether Dream** - Network laser DAC (feature: `ether-dream`)
 //! - **IDN** - ILDA Digital Network protocol (feature: `idn`)
-//! - **LaserCube WiFi** - WiFi-connected laser DAC (feature: `lasercube-wifi`)
+//! - **LaserCube Network** - LaserCube network DAC (feature: `lasercube-network`)
 //! - **LaserCube USB** - USB laser DAC / LaserDock (feature: `lasercube-usb`)
 //! - **Oscilloscope** - XY mode via stereo audio output (feature: `oscilloscope`)
 //! - **AVB Audio Devices** - AVB audio output via the system audio host: CoreAudio (macOS), WASAPI or ASIO (Windows, ASIO opt-in via the `asio` feature), ALSA (Linux). Feature: `avb`.
@@ -74,7 +74,7 @@
 //!
 //! - `all-dacs` (default): Enable all DAC protocols
 //! - `usb-dacs`: Enable USB DACs (Helios, LaserCube USB)
-//! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube WiFi)
+//! - `network-dacs`: Enable network DACs (Ether Dream, IDN, LaserCube Network)
 //! - `audio-dacs`: Enable audio DACs (Oscilloscope, AVB)
 //! - `asio` (default): ASIO host on Windows for AVB output. Requires the
 //!   Steinberg ASIO SDK plus `LIBCLANG_PATH` and `CPAL_ASIO_DIR` set at
@@ -97,7 +97,7 @@ pub mod config;
 pub mod device;
 pub mod discovery;
 mod error;
-#[cfg(any(feature = "idn", feature = "lasercube-wifi"))]
+#[cfg(any(feature = "idn", feature = "lasercube-network"))]
 mod net_utils;
 pub mod point;
 pub mod presentation;
@@ -170,15 +170,15 @@ pub use backend::IdnBackend;
 #[cfg(feature = "idn")]
 pub use protocols::idn;
 
-// LaserCube WiFi
-#[cfg(feature = "lasercube-wifi")]
-pub use backend::LasercubeWifiBackend;
-#[cfg(feature = "lasercube-wifi")]
-pub use protocols::lasercube_wifi;
+// LaserCube Network
+#[cfg(feature = "lasercube-network")]
+pub use backend::LaserCubeNetworkBackend;
+#[cfg(feature = "lasercube-network")]
+pub use protocols::lasercube_network;
 
 // LaserCube USB
 #[cfg(feature = "lasercube-usb")]
-pub use backend::LasercubeUsbBackend;
+pub use backend::LaserCubeUsbBackend;
 #[cfg(feature = "lasercube-usb")]
 pub use protocols::lasercube_usb;
 

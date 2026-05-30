@@ -318,15 +318,15 @@ fn register_builtins(_this: &mut DacDiscovery, _enabled: &EnabledDacTypes) {
     if _enabled.is_enabled(DacType::Idn) {
         _this.register(Box::new(crate::protocols::idn::IdnDiscoverer::new()));
     }
-    #[cfg(feature = "lasercube-wifi")]
-    if _enabled.is_enabled(DacType::LasercubeWifi) {
+    #[cfg(feature = "lasercube-network")]
+    if _enabled.is_enabled(DacType::LaserCubeNetwork) {
         _this.register(Box::new(
-            crate::protocols::lasercube_wifi::LasercubeWifiDiscoverer::new(),
+            crate::protocols::lasercube_network::LaserCubeNetworkDiscoverer::new(),
         ));
     }
     #[cfg(feature = "lasercube-usb")]
-    if _enabled.is_enabled(DacType::LasercubeUsb) {
-        if let Some(d) = crate::protocols::lasercube_usb::LasercubeUsbDiscoverer::new() {
+    if _enabled.is_enabled(DacType::LaserCubeUsb) {
+        if let Some(d) = crate::protocols::lasercube_usb::LaserCubeUsbDiscoverer::new() {
             _this.register(Box::new(d));
         }
     }

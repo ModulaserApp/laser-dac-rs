@@ -76,7 +76,7 @@ jobs:
           - "lasercube-usb"
           - "ether-dream"
           - "idn"
-          - "lasercube-wifi"
+          - "lasercube-network"
           - "avb"
           - "usb-dacs"
           - "network-dacs"

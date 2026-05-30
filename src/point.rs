@@ -66,8 +66,8 @@ impl LaserPoint {
 
     /// Convert a coordinate from [-1.0, 1.0] to 12-bit unsigned (0-4095) with axis inversion.
     ///
-    /// Used by Helios and LaserCube WiFi backends.
-    #[cfg(any(feature = "helios", feature = "lasercube-wifi"))]
+    /// Used by Helios and LaserCube Network backends.
+    #[cfg(any(feature = "helios", feature = "lasercube-network"))]
     #[inline]
     pub(crate) fn coord_to_u12_inverted(v: f32) -> u16 {
         ((1.0 - (v + 1.0) / 2.0).clamp(0.0, 1.0) * 4095.0).round() as u16
@@ -75,8 +75,8 @@ impl LaserPoint {
 
     /// Convert a coordinate from [-1.0, 1.0] to 12-bit unsigned (0-4095).
     ///
-    /// Used by LaserCube USB and LaserCube WiFi backends.
-    #[cfg(any(feature = "lasercube-usb", feature = "lasercube-wifi"))]
+    /// Used by LaserCube USB and LaserCube Network backends.
+    #[cfg(any(feature = "lasercube-usb", feature = "lasercube-network"))]
     #[inline]
     pub(crate) fn coord_to_u12(v: f32) -> u16 {
         (((v.clamp(-1.0, 1.0) + 1.0) / 2.0) * 4095.0).round() as u16
@@ -97,7 +97,7 @@ impl LaserPoint {
     }
 
     /// Downscale a u16 color channel (0-65535) to 12-bit (0-4095).
-    #[cfg(feature = "lasercube-wifi")]
+    #[cfg(feature = "lasercube-network")]
     #[inline]
     pub(crate) fn color_to_u12(v: u16) -> u16 {
         v >> 4

@@ -13,7 +13,7 @@
 //! - [`StatusDecayEstimator`] — periodic authoritative status reports decay
 //!   between updates (Ether Dream).
 //! - [`DualTrackAckEstimator`] — UDP send-track + ACK-track, conservative
-//!   maximum (LaserCube WiFi).
+//!   maximum (LaserCube Network).
 //! - [`RuntimeAuthorityEstimator`] — delegated to an external runtime that
 //!   already tracks queue depth (AVB, Oscilloscope).
 
