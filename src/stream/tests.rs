@@ -282,6 +282,22 @@ fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
 }
 
 #[test]
+fn test_device_start_stream_promotes_lasercube_network_default_buffer() {
+    let mut backend = TestBackend::new();
+    backend.caps.output_model = OutputModel::NetworkFifo;
+    let mut info = test_info(backend.caps());
+    info.kind = DacType::LaserCubeNetwork;
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+
+    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+    assert_eq!(
+        stream.config.target_buffer,
+        StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
 fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::UdpTimed;
