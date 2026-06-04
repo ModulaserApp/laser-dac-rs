@@ -139,6 +139,13 @@ impl StreamConfig {
     /// Safer default target buffer for network DACs when caller leaves defaults untouched.
     pub const NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
         std::time::Duration::from_millis(50);
+    /// Default target buffer for LaserCube network devices.
+    ///
+    /// LaserCube Ethernet/client profiles use a device-side cutoff around
+    /// 1800 points, which is already 60ms at 30kpps. This default leaves enough
+    /// host-side cushion for the transport to top up the firmware ringbuffer.
+    pub const LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
+        std::time::Duration::from_millis(120);
 
     /// Create a new stream configuration with the given PPS.
     pub fn new(pps: u32) -> Self {

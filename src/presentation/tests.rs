@@ -1391,6 +1391,7 @@ fn wait_for_filter_reset(
 /// Minimal FIFO test backend for FrameSession tests.
 struct FifoTestBackend {
     connected: bool,
+    dac_type: crate::device::DacType,
     write_count: Arc<AtomicUsize>,
     points_written: Arc<AtomicUsize>,
     shutter_open: Arc<AtomicBool>,
@@ -1402,6 +1403,7 @@ impl FifoTestBackend {
     fn new() -> Self {
         Self {
             connected: false,
+            dac_type: crate::device::DacType::Custom("FifoTest".into()),
             write_count: Arc::new(AtomicUsize::new(0)),
             points_written: Arc::new(AtomicUsize::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
@@ -1409,11 +1411,18 @@ impl FifoTestBackend {
             estimator: SoftwareDecayEstimator::new(),
         }
     }
+
+    fn lasercube_network() -> Self {
+        Self {
+            dac_type: crate::device::DacType::LaserCubeNetwork,
+            ..Self::new()
+        }
+    }
 }
 
 impl DacBackend for FifoTestBackend {
     fn dac_type(&self) -> crate::device::DacType {
-        crate::device::DacType::Custom("FifoTest".into())
+        self.dac_type.clone()
     }
     fn caps(&self) -> &crate::device::DacCapabilities {
         static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
@@ -1460,6 +1469,26 @@ impl FifoBackend for FifoTestBackend {
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }
+}
+
+#[test]
+fn frame_session_uses_lasercube_network_target_buffer() {
+    let backend = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::lasercube_network()));
+
+    assert_eq!(
+        super::session::target_buffer_for_backend(&backend),
+        crate::config::StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn frame_session_keeps_default_target_buffer_for_other_fifo_backends() {
+    let backend = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::new()));
+
+    assert_eq!(
+        super::session::target_buffer_for_backend(&backend),
+        std::time::Duration::from_millis(20)
+    );
 }
 
 /// Minimal FrameSwap test backend.

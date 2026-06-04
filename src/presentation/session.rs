@@ -7,7 +7,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
-use crate::device::{DacInfo, OutputModel};
+use crate::config::StreamConfig;
+use crate::device::{DacInfo, DacType, OutputModel};
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
 use crate::stream::{ControlMsg, RunExit, StreamControl};
@@ -357,6 +358,8 @@ impl FrameSession {
             backend.connect()?;
         }
 
+        let target_buffer = target_buffer_for_backend(&backend);
+
         driver::run(DriverInputs {
             backend,
             source,
@@ -366,7 +369,7 @@ impl FrameSession {
             reconnect_policy,
             validator,
             error_sink: Box::new(|_e: Error| { /* frame-mode swallows non-fatal errors */ }),
-            target_buffer: Duration::from_millis(20),
+            target_buffer,
             drain_timeout: Duration::ZERO,
             pending_frame: Some(frame_slot),
         })
@@ -398,5 +401,13 @@ impl Drop for FrameSession {
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+pub(super) fn target_buffer_for_backend(backend: &BackendKind) -> Duration {
+    if matches!(backend.dac_type(), DacType::LaserCubeNetwork) {
+        StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+    } else {
+        Duration::from_millis(20)
     }
 }

@@ -113,6 +113,8 @@ impl<S: DatagramSocket> TransportWorker<S> {
                         self.clear_pending_points();
                     }
                     self.output_enabled = enabled;
+                    self.next_full_info_due =
+                        Instant::now() + full_info_poll_period(self.output_enabled);
                     self.record_output_enabled(enabled);
                     let _ = send_repeated(&self.cmd_socket, &command::set_output(enabled));
                 }
@@ -296,19 +298,25 @@ impl<S: DatagramSocket> TransportWorker<S> {
             return;
         }
 
-        let budget = {
+        let (budget, free_estimate, buffer_total, remote_buffer_cutoff) = {
             let state = self
                 .state
                 .inner
                 .lock()
                 .expect("LaserCube transport state poisoned");
-            send_budget(PacerInputs {
+            let budget = send_budget(PacerInputs {
                 queue_len: self.queue.len(),
                 free_estimate: state.free_estimate,
                 buffer_total: state.buffer_total,
                 remote_buffer_cutoff: state.profile.remote_buffer_cutoff,
                 per_tick_packet_budget: state.profile.max_udp_samples_per_packet,
-            })
+            });
+            (
+                budget,
+                state.free_estimate,
+                state.buffer_total,
+                state.profile.remote_buffer_cutoff,
+            )
         };
         if budget == 0 {
             return;
@@ -338,7 +346,12 @@ impl<S: DatagramSocket> TransportWorker<S> {
             self.record_send(now, sent);
             self.packet_sequence = self.packet_sequence.wrapping_add(1);
             self.transfer_sequence = self.transfer_sequence.wrapping_add(1);
-            self.next_send_due = now + packet_interval(sent, self.current_rate);
+            self.next_send_due =
+                if should_continue_topup(free_estimate, buffer_total, remote_buffer_cutoff, sent) {
+                    now
+                } else {
+                    now + packet_interval(sent, self.current_rate)
+                };
         } else {
             let mut state = self
                 .state
@@ -473,6 +486,16 @@ fn ack_sequence_and_rtt(
         Some(sequence),
         sent_at.map(|sent_at| now.saturating_duration_since(sent_at)),
     )
+}
+
+fn should_continue_topup(
+    free_estimate_before_send: usize,
+    buffer_total: usize,
+    remote_buffer_cutoff: usize,
+    sent: usize,
+) -> bool {
+    let buffered_before_send = buffer_total.saturating_sub(free_estimate_before_send);
+    buffered_before_send.saturating_add(sent) < remote_buffer_cutoff
 }
 
 #[cfg(test)]
@@ -618,6 +641,41 @@ mod tests {
         assert_eq!(sent[0].len(), 4 + 80 * 10);
         assert_eq!(worker.queue.len(), 120);
         assert_eq!(worker.state.diagnostics().host_queue_len, 120);
+    }
+
+    #[test]
+    fn worker_keeps_send_due_immediate_while_topping_up_remote_buffer() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(200).unwrap();
+        worker.queue.extend(vec![Point::blank(); 200]);
+        reservation.commit();
+        let now = Instant::now();
+        worker.next_send_due = now;
+
+        worker.try_send_due_packet(now);
+
+        assert_eq!(data_socket.sent_packets().len(), 1);
+        assert_eq!(worker.next_send_due, now);
+    }
+
+    #[test]
+    fn worker_paces_after_remote_buffer_reaches_cutoff() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        {
+            let mut state = worker.state.inner.lock().unwrap();
+            state.free_estimate = 6000
+                - (state.profile.remote_buffer_cutoff - state.profile.max_udp_samples_per_packet);
+        }
+        let reservation = worker.state.reserve_host_points(200).unwrap();
+        worker.queue.extend(vec![Point::blank(); 200]);
+        reservation.commit();
+        let now = Instant::now();
+        worker.next_send_due = now;
+
+        worker.try_send_due_packet(now);
+
+        assert_eq!(data_socket.sent_packets().len(), 1);
+        assert!(worker.next_send_due > now);
     }
 
     #[test]

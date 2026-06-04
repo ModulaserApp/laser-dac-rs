@@ -1515,7 +1515,7 @@ impl Dac {
             ));
         }
 
-        let cfg = Self::apply_backend_buffer_defaults(&self.info.caps, cfg);
+        let cfg = Self::apply_backend_buffer_defaults(&self.info, cfg);
 
         Self::validate_pps(&self.info.caps, cfg.pps)?;
 
@@ -1540,17 +1540,16 @@ impl Dac {
         Ok((stream, self.info))
     }
 
-    fn apply_backend_buffer_defaults(
-        caps: &DacCapabilities,
-        mut cfg: StreamConfig,
-    ) -> StreamConfig {
-        if cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER
-            && matches!(
-                caps.output_model,
+    fn apply_backend_buffer_defaults(info: &DacInfo, mut cfg: StreamConfig) -> StreamConfig {
+        if cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER {
+            if matches!(info.kind, DacType::LaserCubeNetwork) {
+                cfg.target_buffer = StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER;
+            } else if matches!(
+                info.caps.output_model,
                 OutputModel::NetworkFifo | OutputModel::UdpTimed
-            )
-        {
-            cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
+            ) {
+                cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
+            }
         }
 
         cfg
