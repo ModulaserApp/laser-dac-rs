@@ -138,7 +138,7 @@ impl ServerScanner {
         let mut endpoints = Vec::new();
         if let Ok(interfaces) = crate::net_utils::get_local_interfaces() {
             for iface in &interfaces {
-                match Self::create_broadcast_socket(iface.ip) {
+                match crate::net_utils::broadcast_socket_bound_to(iface.ip) {
                     Ok(socket) => {
                         endpoints.push(BroadcastEndpoint {
                             socket,
@@ -165,16 +165,6 @@ impl ServerScanner {
             sequence: 0,
             buffer: [0u8; 1500],
         })
-    }
-
-    /// Create a non-blocking UDP socket with broadcast enabled, bound to the given IP.
-    fn create_broadcast_socket(bind_ip: Ipv4Addr) -> io::Result<UdpSocket> {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_broadcast(true)?;
-        socket.set_nonblocking(true)?;
-        let bind_addr = SocketAddrV4::new(bind_ip, 0);
-        socket.bind(&socket2::SockAddr::from(bind_addr))?;
-        Ok(UdpSocket::from(socket))
     }
 
     /// Create a blocking UDP socket with broadcast enabled, bound to 0.0.0.0.
@@ -343,9 +333,14 @@ impl ServerScanner {
         let mut packet = Vec::with_capacity(PacketHeader::SIZE_BYTES);
         packet.write_bytes(header)?;
 
-        // Send on each per-interface socket to its subnet-directed broadcast
+        // Send on each per-interface socket: subnet-directed broadcast, plus a
+        // limited broadcast so devices on a mismatched subnet (e.g. AP mode)
+        // are still reached. Replies land on these sockets, which the scan
+        // loop already polls.
+        let limited_broadcast = SocketAddrV4::new(Ipv4Addr::BROADCAST, IDN_PORT);
         for endpoint in &self.endpoints {
             let _ = endpoint.socket.send_to(&packet, endpoint.broadcast_addr);
+            let _ = endpoint.socket.send_to(&packet, limited_broadcast);
         }
 
         // Fallback: send limited broadcast on unicast socket
