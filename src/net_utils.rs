@@ -3,8 +3,9 @@
 //! Provides a cross-platform way to enumerate local IPv4 network interfaces
 //! and compute subnet-directed broadcast addresses.
 
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 /// A local IPv4 network interface with its IP address and subnet mask.
 #[derive(Debug, Clone)]
@@ -24,62 +25,35 @@ impl NetworkInterface {
 
 /// Enumerate all local IPv4 network interfaces, excluding loopback.
 ///
-/// Returns an empty vec on failure or on unsupported platforms (Windows),
-/// allowing callers to fall back to limited broadcast (255.255.255.255).
+/// Returns an empty vec on failure, allowing callers to fall back to
+/// limited broadcast (255.255.255.255).
 pub fn get_local_interfaces() -> io::Result<Vec<NetworkInterface>> {
-    get_local_interfaces_impl()
-}
-
-#[cfg(unix)]
-fn get_local_interfaces_impl() -> io::Result<Vec<NetworkInterface>> {
-    let mut interfaces = Vec::new();
-
-    unsafe {
-        let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut ifaddrs) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut current = ifaddrs;
-        while !current.is_null() {
-            let ifa = &*current;
-            current = ifa.ifa_next;
-
-            if ifa.ifa_addr.is_null() || ifa.ifa_netmask.is_null() {
-                continue;
+    let interfaces = if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|iface| {
+            if iface.is_loopback() {
+                return None;
             }
-
-            let family = (*ifa.ifa_addr).sa_family as i32;
-            if family != libc::AF_INET {
-                continue;
+            match iface.addr {
+                if_addrs::IfAddr::V4(v4) => Some(NetworkInterface {
+                    ip: v4.ip,
+                    netmask: v4.netmask,
+                }),
+                _ => None,
             }
-
-            let addr = ifa.ifa_addr as *const libc::sockaddr_in;
-            let ip_bytes = (*addr).sin_addr.s_addr.to_ne_bytes();
-            let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-
-            if ip.is_loopback() {
-                continue;
-            }
-
-            let mask_addr = ifa.ifa_netmask as *const libc::sockaddr_in;
-            let mask_bytes = (*mask_addr).sin_addr.s_addr.to_ne_bytes();
-            let netmask = Ipv4Addr::new(mask_bytes[0], mask_bytes[1], mask_bytes[2], mask_bytes[3]);
-
-            interfaces.push(NetworkInterface { ip, netmask });
-        }
-
-        libc::freeifaddrs(ifaddrs);
-    }
+        })
+        .collect();
 
     Ok(interfaces)
 }
 
-#[cfg(windows)]
-fn get_local_interfaces_impl() -> io::Result<Vec<NetworkInterface>> {
-    // On Windows, return empty vec to fall back to limited broadcast.
-    // A more complete implementation would use GetAdaptersAddresses.
-    Ok(vec![])
+/// Create a non-blocking UDP broadcast socket bound to a specific interface IP.
+pub fn broadcast_socket_bound_to(ip: Ipv4Addr) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_broadcast(true)?;
+    socket.bind(&SockAddr::from(SocketAddrV4::new(ip, 0)))?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 #[cfg(test)]

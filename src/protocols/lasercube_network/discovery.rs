@@ -46,8 +46,28 @@ impl Default for LaserCubeNetworkDiscoverer {
 
 pub struct DiscoverDacs {
     socket: UdpSocket,
+    /// Per-interface sockets used for limited broadcasts (255.255.255.255).
+    /// A limited broadcast from a socket bound to 0.0.0.0 only egresses on the
+    /// interface the routing table picks, which on multi-homed machines (VPNs,
+    /// virtual adapters) is often the wrong one. Binding to each interface IP
+    /// forces the broadcast out of every interface. Kept alive so replies
+    /// addressed to them can be drained.
+    interface_sockets: Vec<UdpSocket>,
+    /// Passive listener on the well-known alive port (45456). The active
+    /// sockets above bind ephemeral ports, so they only see replies addressed
+    /// to our requests' source endpoints. Firmware that announces itself
+    /// unsolicited sends to the well-known port instead; this socket catches
+    /// those. Bound with reuse flags so sharing the port is possible when the
+    /// other listener and platform allow it. `None` if binding failed.
+    passive_socket: Option<UdpSocket>,
     buffer: [u8; 1500],
     seen_ips: HashSet<IpAddr>,
+}
+
+#[derive(Clone, Copy)]
+enum ReceiveSocket {
+    Main,
+    Interface(usize),
 }
 
 pub fn discover_dacs() -> io::Result<DiscoverDacs> {
@@ -57,36 +77,145 @@ pub fn discover_dacs() -> io::Result<DiscoverDacs> {
     socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))?;
     socket.set_read_timeout(Some(DEFAULT_DISCOVERY_TIMEOUT))?;
     let udp_socket: UdpSocket = socket.into();
-    send_discovery_broadcasts(&udp_socket)?;
+    let interfaces = match crate::net_utils::get_local_interfaces() {
+        Ok(interfaces) => interfaces,
+        Err(e) => {
+            log::warn!("discovery: failed to enumerate interfaces: {e}");
+            Vec::new()
+        }
+    };
+    let interface_sockets = make_interface_sockets(&interfaces);
+    let passive_socket = match make_passive_alive_socket() {
+        Ok(socket) => Some(socket),
+        Err(e) => {
+            // Expected when another client holds the port without reuse flags.
+            log::debug!("discovery: could not bind passive listener on port {ALIVE_PORT}: {e}");
+            None
+        }
+    };
+    send_discovery_broadcasts(
+        &udp_socket,
+        passive_socket.as_ref(),
+        &interfaces,
+        &interface_sockets,
+    );
     Ok(DiscoverDacs {
         socket: udp_socket,
+        interface_sockets,
+        passive_socket,
         buffer: [0; 1500],
         seen_ips: HashSet::new(),
     })
 }
 
-fn send_discovery_broadcasts(socket: &UdpSocket) -> io::Result<()> {
-    if let Ok(interfaces) = crate::net_utils::get_local_interfaces() {
-        for iface in &interfaces {
-            let cmd_addr = SocketAddrV4::new(iface.broadcast_address(), CMD_PORT);
-            let alive_addr = SocketAddrV4::new(iface.broadcast_address(), ALIVE_PORT);
-            for _ in 0..2 {
-                let _ = socket.send_to(&command::get_full_info(), cmd_addr);
-                let _ = socket.send_to(&[CMD_ALIVE], alive_addr);
+/// Create the passive listener on the well-known alive port. See the
+/// `passive_socket` field on [`DiscoverDacs`].
+fn make_passive_alive_socket() -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_broadcast(true)?;
+    socket.set_reuse_address(true)?;
+    // On macOS/BSD, sharing a UDP port across processes requires SO_REUSEPORT.
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.bind(&SockAddr::from(SocketAddrV4::new(
+        Ipv4Addr::UNSPECIFIED,
+        ALIVE_PORT,
+    )))?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+/// Create one non-blocking broadcast socket per local interface, bound to the
+/// interface IP so limited broadcasts egress on that specific interface.
+fn make_interface_sockets(interfaces: &[crate::net_utils::NetworkInterface]) -> Vec<UdpSocket> {
+    interfaces
+        .iter()
+        .filter_map(
+            |iface| match crate::net_utils::broadcast_socket_bound_to(iface.ip) {
+                Ok(socket) => Some(socket),
+                Err(e) => {
+                    // Expected on some interfaces (e.g. VPN/virtual adapters).
+                    log::debug!(
+                        "discovery: failed to create broadcast socket on {}: {e}",
+                        iface.ip
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+fn send_discovery_broadcasts(
+    socket: &UdpSocket,
+    passive_socket: Option<&UdpSocket>,
+    interfaces: &[crate::net_utils::NetworkInterface],
+    interface_sockets: &[UdpSocket],
+) {
+    let alive_socket = passive_socket.unwrap_or(socket);
+    for iface in interfaces {
+        log::debug!(
+            "discovery: interface {} netmask {} -> directed broadcast {}",
+            iface.ip,
+            iface.netmask,
+            iface.broadcast_address()
+        );
+        let cmd_addr = SocketAddrV4::new(iface.broadcast_address(), CMD_PORT);
+        let alive_addr = SocketAddrV4::new(iface.broadcast_address(), ALIVE_PORT);
+        for _ in 0..2 {
+            // Send failures are expected on some interfaces (e.g. VPN/virtual
+            // adapters), so log at debug to avoid per-scan noise.
+            if let Err(e) = socket.send_to(&command::get_full_info(), cmd_addr) {
+                log::debug!("discovery: directed broadcast to {cmd_addr} failed: {e}");
+            }
+            if let Err(e) = alive_socket.send_to(&[CMD_ALIVE], alive_addr) {
+                log::debug!("discovery: directed broadcast to {alive_addr} failed: {e}");
             }
         }
     }
+    if interfaces.is_empty() {
+        log::warn!("discovery: no usable network interfaces found");
+    }
     for _ in 0..2 {
-        let _ = socket.send_to(
+        if let Err(e) = socket.send_to(
             &command::get_full_info(),
             SocketAddrV4::new(Ipv4Addr::BROADCAST, CMD_PORT),
-        );
-        let _ = socket.send_to(
+        ) {
+            log::warn!("discovery: limited broadcast (cmd) failed: {e}");
+        }
+        if let Err(e) = alive_socket.send_to(
             &[CMD_ALIVE],
             SocketAddrV4::new(Ipv4Addr::BROADCAST, ALIVE_PORT),
-        );
+        ) {
+            log::warn!("discovery: limited broadcast (alive) failed: {e}");
+        }
     }
-    Ok(())
+    // Limited broadcast per interface: covers devices reachable on an
+    // interface whose configured netmask doesn't match the device's subnet
+    // (e.g. a LaserCube in AP mode). Replies arrive on the per-interface
+    // socket and are drained in `next_device`.
+    for iface_socket in interface_sockets {
+        for _ in 0..2 {
+            if let Err(e) = iface_socket.send_to(
+                &command::get_full_info(),
+                SocketAddrV4::new(Ipv4Addr::BROADCAST, CMD_PORT),
+            ) {
+                log::debug!(
+                    "discovery: per-interface limited full-info broadcast from {:?} failed: {e}",
+                    iface_socket.local_addr()
+                );
+            }
+            if let Err(e) = iface_socket.send_to(
+                &[CMD_ALIVE],
+                SocketAddrV4::new(Ipv4Addr::BROADCAST, ALIVE_PORT),
+            ) {
+                log::debug!(
+                    "discovery: per-interface limited broadcast from {:?} failed: {e}",
+                    iface_socket.local_addr()
+                );
+            }
+        }
+    }
 }
 
 impl DiscoverDacs {
@@ -94,15 +223,135 @@ impl DiscoverDacs {
         self.socket.set_read_timeout(timeout)
     }
 
+    fn recv_interface(&mut self) -> Option<(usize, SocketAddr, ReceiveSocket)> {
+        for (index, iface_socket) in self.interface_sockets.iter().enumerate() {
+            match iface_socket.recv_from(&mut self.buffer) {
+                Ok((len, source_addr)) => {
+                    log::trace!(
+                        "discovery: {len} bytes from {source_addr} on interface socket {:?}",
+                        iface_socket.local_addr()
+                    );
+                    return Some((len, source_addr, ReceiveSocket::Interface(index)));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    // Expected noise on some platforms, e.g. Windows reports
+                    // ICMP port-unreachable from earlier broadcasts as recv
+                    // errors (ECONNRESET).
+                    log::debug!(
+                        "discovery: failed to receive from interface socket {:?}: {e}",
+                        iface_socket.local_addr()
+                    );
+                }
+            }
+        }
+        self.recv_passive()
+    }
+
+    /// Drain the passive alive-port listener. Packets here include our own
+    /// looped-back broadcast requests (a bare `[CMD_ALIVE]`, which fails the
+    /// `is_alive_response` check) and unsolicited device announcements.
+    /// Follow-up requests are sent from the main socket, so replies are tagged
+    /// `ReceiveSocket::Main`.
+    fn recv_passive(&mut self) -> Option<(usize, SocketAddr, ReceiveSocket)> {
+        let passive_socket = self.passive_socket.as_ref()?;
+        loop {
+            match passive_socket.recv_from(&mut self.buffer) {
+                Ok((len, source_addr)) => {
+                    if self.is_local_ip(source_addr.ip()) {
+                        continue;
+                    }
+                    log::trace!("discovery: {len} bytes from {source_addr} on passive socket");
+                    return Some((len, source_addr, ReceiveSocket::Main));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
+                Err(e) => {
+                    log::debug!("discovery: failed to receive from passive socket: {e}");
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Whether `ip` is one of this host's own addresses (our broadcasts are
+    /// looped back to the passive socket).
+    fn is_local_ip(&self, ip: IpAddr) -> bool {
+        self.interface_sockets.iter().any(|socket| {
+            socket
+                .local_addr()
+                .is_ok_and(|local_addr| local_addr.ip() == ip)
+        })
+    }
+
+    fn recv_any(&mut self) -> io::Result<(usize, SocketAddr, ReceiveSocket)> {
+        if let Some(received) = self.recv_interface() {
+            return Ok(received);
+        }
+
+        let received = self.socket.recv_from(&mut self.buffer)?;
+        log::trace!(
+            "discovery: {} bytes from {} on main socket",
+            received.0,
+            received.1
+        );
+        Ok((received.0, received.1, ReceiveSocket::Main))
+    }
+
+    fn send_full_info(&self, receive_socket: ReceiveSocket, ip: IpAddr) {
+        let addr = SocketAddr::new(ip, CMD_PORT);
+        let result = match receive_socket {
+            ReceiveSocket::Main => self.socket.send_to(&command::get_full_info(), addr),
+            ReceiveSocket::Interface(index) => {
+                self.interface_sockets[index].send_to(&command::get_full_info(), addr)
+            }
+        };
+        if let Err(e) = result {
+            log::warn!("discovery: unicast full-info request to {addr} failed: {e}");
+        }
+    }
+
     pub fn next_device(&mut self) -> io::Result<AddressedDevice> {
         loop {
-            let (len, source_addr) = self.socket.recv_from(&mut self.buffer)?;
+            let (len, source_addr, receive_socket) = match self.recv_any() {
+                Ok(received) => received,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if let Some(received) = self.recv_interface() {
+                        received
+                    } else {
+                        return Err(e);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {
+                    // Windows reports ICMP port-unreachable from earlier
+                    // broadcasts as recv errors. Ignore and keep draining.
+                    log::debug!("discovery: ignoring connection reset from main socket: {e}");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if is_alive_response(&self.buffer[..len]) {
                 if !self.seen_ips.contains(&source_addr.ip()) {
-                    let _ = self.socket.send_to(
-                        &command::get_full_info(),
-                        SocketAddr::new(source_addr.ip(), CMD_PORT),
+                    log::debug!(
+                        "discovery: alive response from {}, sending unicast full-info request",
+                        source_addr.ip()
                     );
+                    self.send_full_info(receive_socket, source_addr.ip());
                 }
                 continue;
             }
@@ -112,8 +361,17 @@ impl DiscoverDacs {
             let status = match LaserCubeNetworkStatus::parse(&self.buffer[..len], source_addr.ip())
             {
                 Ok(status) => status,
-                Err(_) => continue,
+                Err(e) => {
+                    log::debug!(
+                        "discovery: discarding {len}-byte packet from {source_addr}: {e:?}"
+                    );
+                    continue;
+                }
             };
+            log::debug!(
+                "discovery: found device at {source_addr} (model: {:?})",
+                status.model_name
+            );
             self.seen_ips.insert(source_addr.ip());
             let buffer_total = status.buffer_max as usize;
             let profile = ConnectionProfile::for_connection(status.connection_type, buffer_total);

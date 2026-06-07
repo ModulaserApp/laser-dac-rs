@@ -29,8 +29,8 @@ audio-dacs = ["avb", "oscilloscope"]
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
 ether-dream = []
-idn = ["dep:socket2", "dep:libc"]
-lasercube-network = ["dep:socket2", "dep:libc"]
+idn = ["dep:socket2", "dep:if-addrs"]
+lasercube-network = ["dep:socket2", "dep:if-addrs"]
 avb = ["dep:cpal", "dep:crossbeam-queue"]
 
 # Oscilloscope XY mode via audio output
@@ -63,13 +63,10 @@ rusb = { version = "0.9", optional = true }
 
 # Network DACs (optional for lasercube-network)
 socket2 = { version = "0.5", features = ["all"], optional = true }
+if-addrs = { version = "0.15", optional = true }
 
 # Optional serialization
 serde = { version = "1.0", features = ["derive"], optional = true }
-
-# Unix-only for lasercube-network
-[target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
 
 # Force vendored libusb on macOS and Windows. On macOS, Homebrew libusb 1.0.29
 # can trigger an `IOUSBHostFamily` kernel panic on Apple Silicon / macOS 26.x
