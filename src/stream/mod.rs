@@ -1391,24 +1391,20 @@ impl Dac {
     /// for custom backends registered via [`DacDiscovery::register`] — without it,
     /// reconnection uses the default discovery which only finds built-in DAC types.
     ///
-    /// For most cases, prefer [`open_device_with`](crate::open_device_with) which
-    /// handles both initial discovery and reconnection in one call. Use this method
-    /// when you build `Dac` instances yourself via `scan()` + `connect()` + `Dac::new()`.
+    /// For ID-based opens, prefer [`open_device_with`](crate::open_device_with).
+    /// For worker-owned scan results, compose
+    /// [`DacDiscovery::open_discovered`](crate::DacDiscovery::open_discovered)
+    /// with this method. Use this method directly when you construct a `Dac`
+    /// yourself around an application-owned backend.
     ///
     /// # Example
     ///
     /// ```ignore
     /// use laser_dac::{Dac, DacDiscovery, EnabledDacTypes, FrameSessionConfig, ReconnectConfig};
     ///
-    /// // Device opened through custom discovery path
-    /// let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    /// discovery.register(Box::new(MyCustomDiscoverer::new()));
-    /// let devices = discovery.scan();
-    /// let backend = discovery.connect(devices.into_iter().next().unwrap())?;
-    /// let dac = Dac::new(info, backend);
-    ///
-    /// // Attach factory so reconnection can also find custom backends
-    /// let dac = dac.with_discovery_factory(|| {
+    /// // `info` and `backend` come from application-owned construction, not
+    /// // from DacDiscovery::open_discovered*.
+    /// let dac = Dac::new(info, backend).with_discovery_factory(|| {
     ///     let mut d = DacDiscovery::new(EnabledDacTypes::all());
     ///     d.register(Box::new(MyCustomDiscoverer::new()));
     ///     d
