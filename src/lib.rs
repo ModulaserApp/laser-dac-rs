@@ -211,12 +211,7 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
     let devices = discovery
         .scan()
         .into_iter()
-        .map(|device| DacInfo {
-            id: device.info().stable_id().to_string(),
-            name: device.info().name().to_string(),
-            kind: device.dac_type().clone(),
-            caps: device.caps().clone(),
-        })
+        .map(|device| device.dac_info())
         .collect();
 
     Ok(devices)
@@ -229,12 +224,7 @@ pub fn list_devices_filtered(enabled_types: &EnabledDacTypes) -> BackendResult<V
 /// `idn:hostname.local`, `helios:serial`, `avb:device-slug:n`).
 pub fn open_device(id: &str) -> BackendResult<Dac> {
     let mut discovery = DacDiscovery::new(EnabledDacTypes::all());
-    let mut dac = discovery.open_by_id(id)?;
-    dac.reconnect_target = Some(reconnect::ReconnectTarget {
-        device_id: id.to_string(),
-        discovery_factory: None,
-    });
-    Ok(dac)
+    discovery.open_by_id(id)
 }
 
 /// Open a DAC by ID using a custom discovery factory.
@@ -247,6 +237,10 @@ pub fn open_device(id: &str) -> BackendResult<Dac> {
 /// The factory is called once now for the initial open, and stored for
 /// future reconnection attempts. It must be `Fn` (not `FnOnce`) because
 /// reconnection may call it multiple times.
+///
+/// If you already have a [`DiscoveredDevice`] from a worker-owned scan, use
+/// [`DacDiscovery::open_discovered`] and then [`Dac::with_discovery_factory`]
+/// to avoid scanning again for the initial connection.
 ///
 /// # Example
 ///
@@ -269,10 +263,6 @@ where
     F: Fn() -> DacDiscovery + Send + 'static,
 {
     let mut discovery = factory();
-    let mut dac = discovery.open_by_id(id)?;
-    dac.reconnect_target = Some(reconnect::ReconnectTarget {
-        device_id: id.to_string(),
-        discovery_factory: Some(Box::new(factory)),
-    });
-    Ok(dac)
+    let dac = discovery.open_by_id(id)?;
+    Ok(dac.with_discovery_factory(factory))
 }

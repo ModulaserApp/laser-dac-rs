@@ -10,7 +10,8 @@ use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
 
 use crate::backend::{BackendKind, Error, Result};
-use crate::device::{caps_for_dac_type, DacCapabilities, DacType, EnabledDacTypes};
+use crate::device::{caps_for_dac_type, DacCapabilities, DacInfo, DacType, EnabledDacTypes};
+use crate::reconnect::ReconnectTarget;
 
 // =============================================================================
 // Discoverer trait
@@ -82,6 +83,15 @@ pub trait Discoverer: Send {
 /// A discovered but not-yet-connected DAC device.
 ///
 /// Use [`DacDiscovery::connect`] to establish a connection and get a backend.
+///
+/// # Ownership
+///
+/// This is connection-bearing scan state. Some protocols attach handles or
+/// other resources needed for connect-time handoff. Pass cloneable
+/// [`DiscoveredDeviceInfo`] or [`DacInfo`] values to UI/control code, but keep
+/// the `DiscoveredDevice` itself owned by the worker that may connect it.
+/// [`DacDiscovery::connect`] and [`DacDiscovery::open_discovered`] consume the
+/// device to make that ownership transfer explicit.
 pub struct DiscoveredDevice {
     info: DiscoveredDeviceInfo,
     caps: DacCapabilities,
@@ -123,6 +133,19 @@ impl DiscoveredDevice {
 
     pub fn info(&self) -> &DiscoveredDeviceInfo {
         &self.info
+    }
+
+    /// Clone this scan result into lightweight DAC metadata.
+    ///
+    /// Unlike [`DiscoveredDevice`], the returned [`DacInfo`] is safe to clone,
+    /// store, and send to UI/control code. It does not carry connect-time state.
+    pub fn dac_info(&self) -> DacInfo {
+        DacInfo {
+            id: self.info.stable_id.clone(),
+            name: self.info.name.clone(),
+            kind: self.info.dac_type.clone(),
+            caps: self.caps.clone(),
+        }
     }
 }
 
@@ -412,6 +435,9 @@ impl DacDiscovery {
     }
 
     /// Connect to a previously discovered device.
+    ///
+    /// Consumes the [`DiscoveredDevice`] so protocol-owned connect data has a
+    /// single handoff path from scan to backend construction.
     pub fn connect(&mut self, device: DiscoveredDevice) -> Result<BackendKind> {
         let idx = device.discoverer_index.ok_or_else(|| {
             Error::invalid_config(
@@ -426,6 +452,27 @@ impl DacDiscovery {
             ))
         })?;
         discoverer.connect(device.connect_data)
+    }
+
+    /// Open a previously discovered device and return a high-level
+    /// [`crate::stream::Dac`].
+    ///
+    /// This preserves scan locality: no additional discovery scan is performed.
+    /// The returned `Dac` carries a reconnect target based on the device's
+    /// stable id. Reconnection still re-discovers by id because a fresh backend
+    /// needs fresh protocol-owned connect data after a disconnect.
+    pub fn open_discovered(&mut self, device: DiscoveredDevice) -> Result<crate::stream::Dac> {
+        let mut dac_info = device.dac_info();
+        let backend = self.connect(device)?;
+        dac_info.caps = backend.caps().clone();
+
+        let device_id = dac_info.id.clone();
+        let mut dac = crate::stream::Dac::new(dac_info, backend);
+        dac.reconnect_target = Some(ReconnectTarget {
+            device_id,
+            discovery_factory: None,
+        });
+        Ok(dac)
     }
 
     /// Scan for a device by stable ID, connect, and return a `Dac`.
@@ -459,18 +506,7 @@ impl DacDiscovery {
             .find(|d| d.info.stable_id == id)
             .ok_or_else(|| Error::disconnected(format!("DAC not found: {}", id)))?;
 
-        let name = device.info.name.clone();
-        let dac_type = device.info.dac_type.clone();
-        let stream_backend = self.connect(device)?;
-
-        let dac_info = crate::device::DacInfo {
-            id: id.to_string(),
-            name,
-            kind: dac_type,
-            caps: stream_backend.caps().clone(),
-        };
-
-        Ok(crate::stream::Dac::new(dac_info, stream_backend))
+        self.open_discovered(device)
     }
 }
 
@@ -672,6 +708,76 @@ mod tests {
 
         let backend = backend.unwrap();
         assert_eq!(backend.dac_type(), DacType::Custom("MockDAC".into()));
+    }
+
+    #[test]
+    fn discovered_device_clones_to_dac_info_without_consuming_connect_state() {
+        let discoverer = MockDiscoverer::new(vec![(7, None)]);
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let device = discovery.scan().into_iter().next().unwrap();
+        let info = device.dac_info();
+
+        assert_eq!(info.id, "mockdac:7");
+        assert_eq!(info.name, "Mock Device 7");
+        assert_eq!(info.kind, DacType::Custom("MockDAC".into()));
+        assert_eq!(
+            info.caps.max_points_per_chunk,
+            device.caps().max_points_per_chunk
+        );
+
+        let backend = discovery.connect(device);
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    fn open_discovered_consumes_scan_result_without_rescanning() {
+        let discoverer = MockDiscoverer::new(vec![(11, None)]);
+        let scan_count = discoverer.scan_count.clone();
+        let connect_called = discoverer.connect_called.clone();
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let device = discovery.scan().into_iter().next().unwrap();
+        assert_eq!(scan_count.load(Ordering::SeqCst), 1);
+
+        let dac = discovery.open_discovered(device).unwrap();
+
+        assert_eq!(scan_count.load(Ordering::SeqCst), 1);
+        assert!(connect_called.load(Ordering::SeqCst));
+        assert_eq!(dac.id(), "mockdac:11");
+        assert!(dac.has_backend());
+
+        let reconnect_target = dac.reconnect_target.as_ref().unwrap();
+        assert_eq!(reconnect_target.device_id, "mockdac:11");
+        assert!(reconnect_target.discovery_factory.is_none());
+    }
+
+    #[test]
+    fn open_discovered_can_compose_factory_for_reconnect_without_calling_it() {
+        let discoverer = MockDiscoverer::new(vec![(12, None)]);
+        let factory_count = Arc::new(AtomicUsize::new(0));
+        let factory_count_for_closure = factory_count.clone();
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let device = discovery.scan().into_iter().next().unwrap();
+        let dac = discovery
+            .open_discovered(device)
+            .unwrap()
+            .with_discovery_factory(move || {
+                factory_count_for_closure.fetch_add(1, Ordering::SeqCst);
+                DacDiscovery::new(EnabledDacTypes::none())
+            });
+
+        assert_eq!(factory_count.load(Ordering::SeqCst), 0);
+        let reconnect_target = dac.reconnect_target.as_ref().unwrap();
+        assert_eq!(reconnect_target.device_id, "mockdac:12");
+        assert!(reconnect_target.discovery_factory.is_some());
     }
 
     #[test]

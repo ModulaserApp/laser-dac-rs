@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::backend::{BackendKind, Error, Result};
 use crate::config::ReconnectConfig;
-use crate::device::DacInfo;
+use crate::device::{DacInfo, EnabledDacTypes};
 use crate::discovery::DacDiscovery;
 use crate::stream::{Dac, RunExit};
 
@@ -25,7 +25,8 @@ pub(crate) type DiscoveryFactory = Box<dyn Fn() -> DacDiscovery + Send + 'static
 // ReconnectTarget
 // =============================================================================
 
-/// How to reopen a device. Populated by `open_device()`, carried by `Dac`.
+/// How to reopen a device. Populated by [`DacDiscovery::open_discovered`]
+/// (and [`Dac::with_discovery_factory`]), carried by `Dac`.
 pub(crate) struct ReconnectTarget {
     pub device_id: String,
     pub discovery_factory: Option<DiscoveryFactory>,
@@ -34,12 +35,12 @@ pub(crate) struct ReconnectTarget {
 impl ReconnectTarget {
     /// Open a device using the configured discovery method.
     pub fn open_device(&self) -> Result<Dac> {
-        if let Some(factory) = &self.discovery_factory {
-            let mut discovery = factory();
-            discovery.open_by_id(&self.device_id)
+        let mut discovery = if let Some(factory) = &self.discovery_factory {
+            factory()
         } else {
-            crate::open_device(&self.device_id)
-        }
+            DacDiscovery::new(EnabledDacTypes::all())
+        };
+        discovery.open_by_id(&self.device_id)
     }
 }
 
