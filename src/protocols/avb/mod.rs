@@ -4,6 +4,16 @@
 //! ASIO on Windows by default (disable the `asio` default feature to use
 //! WASAPI instead), and ALSA on Linux.
 //! Supports 5-channel (XYRGB) and 6-channel (XYRGBI) mapping with auto-detected sample rate.
+//!
+//! Windows enumeration caveats:
+//! - ASIO exposes one device per interface that aggregates every AVB stream
+//!   into a single channel bank, so a multi-stream interface (e.g. RME
+//!   Digiface AVB) appears as a single candidate. Output always starts at
+//!   channel 1; addressing a laser on a higher channel bank is not yet
+//!   supported.
+//! - WASAPI (shared mode) only exposes each endpoint at the channel count
+//!   configured in Windows sound settings, so an endpoint must be configured
+//!   for 5.1/7.1 output to pass the >= 5 channel filter.
 
 pub mod backend;
 mod discovery;
