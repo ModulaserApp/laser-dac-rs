@@ -15,8 +15,20 @@ const STATUS_ERROR_LIMIT: u32 = 50;
 pub struct HeliosBackend {
     dac: Option<HeliosDac>,
     device_index: usize,
+    /// Physical USB location of this backend's device, recorded so a fallback
+    /// re-enumeration in `connect()` can re-match the same unit rather than
+    /// blindly picking device index 0.
+    usb_location: Option<String>,
     caps: DacCapabilities,
     status_error_count: u32,
+    /// Set once a fatal (physical-disconnect) USB error is observed. Gates the
+    /// handle leak in `Drop`: a physically-gone device is leaked (macOS
+    /// anti-segfault); a still-present device is closed normally.
+    fatal_disconnect: bool,
+    /// Rate-limit counter for oversized-frame truncation warnings.
+    oversize_clamp_count: u32,
+    /// Rate-limit counter for out-of-range pps clamp logs.
+    pps_clamp_count: u32,
     /// Pre-allocated buffer for LaserPoint → HeliosPoint conversion.
     point_buffer: Vec<HeliosPoint>,
     /// Pre-allocated buffer for wire-format frame encoding.
@@ -29,8 +41,12 @@ impl HeliosBackend {
         Self {
             dac: None,
             device_index,
+            usb_location: None,
             caps: super::default_capabilities(),
             status_error_count: 0,
+            fatal_disconnect: false,
+            oversize_clamp_count: 0,
+            pps_clamp_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -38,11 +54,16 @@ impl HeliosBackend {
 
     /// Create a backend from an already-discovered DAC.
     pub fn from_dac(dac: HeliosDac) -> Self {
+        let usb_location = Some(dac.usb_location());
         Self {
             dac: Some(dac),
             device_index: 0,
+            usb_location,
             caps: super::default_capabilities(),
             status_error_count: 0,
+            fatal_disconnect: false,
+            oversize_clamp_count: 0,
+            pps_clamp_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -130,6 +151,53 @@ impl HeliosBackend {
             );
         }
     }
+
+    /// Map a Helios error with context, recording a fatal (physical-disconnect)
+    /// error so `Drop` leaks rather than closes the handle.
+    fn map_err_ctx(&mut self, context: impl Into<String>, e: HeliosDacError) -> Error {
+        if Self::is_fatal_usb_error(&e) {
+            self.fatal_disconnect = true;
+        }
+        Self::map_err_with_context(context, e)
+    }
+
+    /// Rate-limited warning when an oversized frame is truncated to the device
+    /// maximum. Keeps output alive rather than erroring into a disconnect loop.
+    fn note_oversize_frame(&mut self, requested: usize, max: usize) {
+        self.oversize_clamp_count += 1;
+        if self.oversize_clamp_count == 1 || self.oversize_clamp_count.is_multiple_of(256) {
+            log::warn!(
+                "helios: frame of {requested} points exceeds device maximum {max}; truncating (occurrence {})",
+                self.oversize_clamp_count
+            );
+        }
+    }
+
+    /// Clamp `pps` into the device's advertised range. The wire encoder packs
+    /// pps into a u16, so an out-of-range rate would otherwise wrap to garbage.
+    /// Logs (rate-limited) when a clamp actually changes the value.
+    fn clamp_pps(&mut self, pps: u32) -> u32 {
+        let clamped = pps.clamp(self.caps.pps_min, self.caps.pps_max);
+        if clamped != pps {
+            self.pps_clamp_count += 1;
+            if self.pps_clamp_count == 1 || self.pps_clamp_count.is_multiple_of(256) {
+                log::debug!(
+                    "helios: pps {pps} out of range [{}, {}]; clamping to {clamped} (occurrence {})",
+                    self.caps.pps_min,
+                    self.caps.pps_max,
+                    self.pps_clamp_count
+                );
+            }
+        }
+        clamped
+    }
+
+    /// The firmware version probed at open time, if connected. For diagnostics.
+    pub fn firmware_version(&self) -> Option<u32> {
+        self.dac
+            .as_ref()
+            .and_then(HeliosDac::probed_firmware_version)
+    }
 }
 
 impl DacBackend for HeliosBackend {
@@ -142,27 +210,46 @@ impl DacBackend for HeliosBackend {
     }
 
     fn connect(&mut self) -> Result<()> {
+        // A fresh connect attempt: clear stale disconnect/error state.
+        self.status_error_count = 0;
+        self.fatal_disconnect = false;
+
         if let Some(dac) = self.dac.take() {
-            self.dac = Some(dac.open().map_err(Self::map_err)?);
+            let opened = dac.open().map_err(Self::map_err)?;
+            self.usb_location = Some(opened.usb_location());
+            self.dac = Some(opened);
             return Ok(());
         }
 
         let controller = HeliosDacController::new().map_err(Self::map_err)?;
-        let mut dacs = controller.list_devices().map_err(Self::map_err)?;
+        let dacs = controller.list_devices().map_err(Self::map_err)?;
 
-        if self.device_index >= dacs.len() {
-            return Err(Error::disconnected(format!(
-                "Device index {} out of range (found {} devices)",
-                self.device_index,
-                dacs.len()
-            )));
-        }
+        // Prefer re-matching the previously connected physical USB location so a
+        // fallback re-enumeration re-binds the same unit instead of hardcoding
+        // device index 0 (which could grab a different projector in a multi-DAC
+        // rig). Fall back to the configured device index when no location is
+        // stored yet (fresh `new(index)` backend).
+        let dac = if let Some(target) = self.usb_location.clone() {
+            dacs.into_iter()
+                .find(|d| d.usb_location() == target)
+                .ok_or_else(|| {
+                    Error::disconnected(format!("Helios device at USB location {target} not found"))
+                })?
+        } else {
+            let mut dacs = dacs;
+            if self.device_index >= dacs.len() {
+                return Err(Error::disconnected(format!(
+                    "Device index {} out of range (found {} devices)",
+                    self.device_index,
+                    dacs.len()
+                )));
+            }
+            dacs.remove(self.device_index)
+        };
 
-        let dac = dacs
-            .remove(self.device_index)
-            .open()
-            .map_err(Self::map_err)?;
-        self.dac = Some(dac);
+        let opened = dac.open().map_err(Self::map_err)?;
+        self.usb_location = Some(opened.usb_location());
+        self.dac = Some(opened);
         Ok(())
     }
 
@@ -181,23 +268,44 @@ impl DacBackend for HeliosBackend {
     }
 
     fn stop(&mut self) -> Result<()> {
-        if let Some(dac) = &self.dac {
-            dac.stop().map_err(Self::map_err)?;
+        let result = match &self.dac {
+            Some(dac) => dac.stop(),
+            None => return Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.map_err_ctx("helios stop", e)),
         }
-        Ok(())
     }
 
     fn set_shutter(&mut self, open: bool) -> Result<()> {
-        if let Some(dac) = &self.dac {
-            dac.set_shutter(open).map_err(Self::map_err)?;
+        let result = match &self.dac {
+            Some(dac) => dac.set_shutter(open),
+            None => return Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.map_err_ctx("helios set_shutter", e)),
         }
-        Ok(())
     }
 }
 
 impl Drop for HeliosBackend {
     fn drop(&mut self) {
-        self.leak_handle();
+        if self.fatal_disconnect {
+            // The device was physically disconnected: `libusb_close()` can
+            // segfault on macOS for a handle whose device is no longer present,
+            // so leak the claimed handle instead (a bounded ~200-byte leak).
+            self.leak_handle();
+        } else {
+            // Graceful teardown of a still-present device: close normally so the
+            // claimed interface is released and the DAC can be reopened in the
+            // same process (avoids LIBUSB_ERROR_BUSY). The macOS close segfault
+            // only affects handles whose device has been unplugged — that case
+            // is handled by the branch above — so closing a present device here
+            // is safe on all platforms.
+            self.close_handle();
+        }
     }
 }
 
@@ -223,6 +331,7 @@ impl FrameSwapBackend for HeliosBackend {
             Err(e) => {
                 if Self::is_fatal_usb_error(&e) {
                     log::warn!("helios: fatal status poll failure at {location}: {e}");
+                    self.fatal_disconnect = true;
                     self.leak_handle();
                 } else {
                     self.mark_status_error(&location, &e);
@@ -240,29 +349,41 @@ impl FrameSwapBackend for HeliosBackend {
     }
 
     fn write_frame(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        let dac = self
-            .dac
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("Not connected"))?;
+        let status = {
+            let dac = self
+                .dac
+                .as_ref()
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
+            dac.status()
+        };
 
-        match dac
-            .status()
-            .map_err(|e| Self::map_err_with_context("helios write_frame status poll", e))?
-        {
-            DeviceStatus::Ready => {}
-            DeviceStatus::NotReady => {
-                return Ok(WriteOutcome::WouldBlock);
-            }
+        match status {
+            Ok(DeviceStatus::Ready) => {}
+            Ok(DeviceStatus::NotReady) => return Ok(WriteOutcome::WouldBlock),
+            Err(e) => return Err(self.map_err_ctx("helios write_frame status poll", e)),
         }
 
         self.write_frame_ready(pps, points)
     }
 
     fn write_frame_ready(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
-        let dac = self
-            .dac
-            .as_mut()
-            .ok_or_else(|| Error::disconnected("Not connected"))?;
+        // Truncate oversized frames to the device maximum. The SDK refuses
+        // larger frames and firmware behavior is undefined; keep output alive
+        // with a rate-limited warning rather than erroring into reconnect.
+        let max_points = self.caps.max_points_per_chunk;
+        let points = if points.len() > max_points {
+            self.note_oversize_frame(points.len(), max_points);
+            &points[..max_points]
+        } else {
+            points
+        };
+
+        // Clamp pps into the device range so the u16 wire field never wraps.
+        let pps = self.clamp_pps(pps);
+
+        if self.dac.is_none() {
+            return Err(Error::disconnected("Not connected"));
+        }
 
         self.point_buffer.clear();
         self.point_buffer
@@ -275,19 +396,26 @@ impl FrameSwapBackend for HeliosBackend {
             &mut self.frame_buffer,
         );
 
-        dac.write_frame_buffer(&self.frame_buffer).map_err(|e| {
-            Self::map_err_with_context(
-                format!(
-                    "helios write_frame bulk transfer (pps={pps}, points={}, bytes={}, timeout_ms={})",
-                    points.len(),
-                    self.frame_buffer.len(),
-                    bulk_transfer_timeout(self.frame_buffer.len()).as_millis()
-                ),
-                e,
-            )
-        })?;
+        let byte_len = self.frame_buffer.len();
+        let write_result = {
+            let dac = self
+                .dac
+                .as_mut()
+                .ok_or_else(|| Error::disconnected("Not connected"))?;
+            dac.write_frame_buffer(&self.frame_buffer)
+        };
 
-        Ok(WriteOutcome::Written)
+        match write_result {
+            Ok(()) => Ok(WriteOutcome::Written),
+            Err(e) => {
+                let context = format!(
+                    "helios write_frame bulk transfer (pps={pps}, points={}, bytes={byte_len}, timeout_ms={})",
+                    points.len(),
+                    bulk_transfer_timeout(byte_len).as_millis()
+                );
+                Err(self.map_err_ctx(context, e))
+            }
+        }
     }
 }
 
@@ -302,8 +430,12 @@ mod tests {
         HeliosBackend {
             dac: Some(HeliosDac::MockOpen(state)),
             device_index: 0,
+            usb_location: Some("mock".into()),
             caps: super::super::default_capabilities(),
             status_error_count: 0,
+            fatal_disconnect: false,
+            oversize_clamp_count: 0,
+            pps_clamp_count: 0,
             point_buffer: Vec::new(),
             frame_buffer: Vec::new(),
         }
@@ -467,6 +599,57 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_is_truncated_to_device_maximum() {
+        let state = Arc::new(Mutex::new(MockUsbState::new()));
+        let mut backend = mock_backend(state);
+        let max = backend.caps.max_points_per_chunk;
+
+        // A frame larger than the device maximum must not be sent unclamped.
+        let points = vec![LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535); max + 500];
+        let result = backend.write_frame(30_000, &points);
+        assert!(matches!(result, Ok(WriteOutcome::Written)));
+
+        // Encoded to exactly `max` points (no transfer-size workaround at 4095).
+        assert_eq!(backend.point_buffer.len(), max);
+        assert_eq!(backend.frame_buffer.len(), max * 7 + 5);
+        let footer = &backend.frame_buffer[backend.frame_buffer.len() - 5..];
+        assert_eq!(u16::from_le_bytes([footer[2], footer[3]]) as usize, max);
+        assert_eq!(backend.oversize_clamp_count, 1);
+    }
+
+    #[test]
+    fn pps_above_caps_is_clamped_before_encoding() {
+        let state = Arc::new(Mutex::new(MockUsbState::new()));
+        let mut backend = mock_backend(state);
+        let pps_max = backend.caps.pps_max;
+
+        // A single point avoids the transfer-size workaround, so the encoded
+        // pps equals the clamped value exactly.
+        let points = vec![LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535)];
+        let result = backend.write_frame(10_000_000, &points);
+        assert!(matches!(result, Ok(WriteOutcome::Written)));
+
+        let footer = &backend.frame_buffer[backend.frame_buffer.len() - 5..];
+        assert_eq!(u16::from_le_bytes([footer[0], footer[1]]) as u32, pps_max);
+        assert_eq!(backend.pps_clamp_count, 1);
+    }
+
+    #[test]
+    fn pps_below_caps_is_clamped_up() {
+        let state = Arc::new(Mutex::new(MockUsbState::new()));
+        let mut backend = mock_backend(state);
+        let pps_min = backend.caps.pps_min;
+
+        let points = vec![LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535)];
+        let result = backend.write_frame(1, &points);
+        assert!(matches!(result, Ok(WriteOutcome::Written)));
+
+        let footer = &backend.frame_buffer[backend.frame_buffer.len() - 5..];
+        assert_eq!(u16::from_le_bytes([footer[0], footer[1]]) as u32, pps_min);
+        assert_eq!(backend.pps_clamp_count, 1);
+    }
+
+    #[test]
     fn write_frame_returns_disconnected_on_fatal_usb_error() {
         let state = Arc::new(Mutex::new(MockUsbState::new()));
         let mut backend = mock_backend(state.clone());
@@ -476,5 +659,36 @@ mod tests {
 
         let err = backend.write_frame(30_000, &points).unwrap_err();
         assert!(err.is_disconnected());
+        // The fatal error must flag Drop to leak (not close) the dead handle.
+        assert!(backend.fatal_disconnect);
+    }
+
+    #[test]
+    fn fatal_status_error_sets_fatal_disconnect_flag() {
+        let state = Arc::new(Mutex::new(MockUsbState::new()));
+        let mut backend = mock_backend(state.clone());
+
+        assert!(!backend.fatal_disconnect);
+        state.lock().unwrap().connected = false;
+        assert!(!backend.is_ready_for_frame());
+        assert!(
+            backend.fatal_disconnect,
+            "a fatal (NoDevice) status poll must set fatal_disconnect"
+        );
+    }
+
+    #[test]
+    fn nonfatal_status_error_leaves_fatal_disconnect_clear() {
+        let state = Arc::new(Mutex::new(
+            MockUsbState::new().with_disconnect_error(|| rusb::Error::Timeout),
+        ));
+        let mut backend = mock_backend(state.clone());
+
+        state.lock().unwrap().connected = false;
+        assert!(!backend.is_ready_for_frame());
+        assert!(
+            !backend.fatal_disconnect,
+            "a non-fatal timeout must not flag a fatal disconnect"
+        );
     }
 }

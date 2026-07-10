@@ -13,6 +13,11 @@ const SDK_VERSION: u8 = 6;
 const HELIOS_VID: u16 = 0x1209;
 const HELIOS_PID: u16 = 0xE500;
 
+/// Maximum points per frame accepted by the Helios firmware/SDK. Frames larger
+/// than this are refused by the official SDK and have undefined firmware
+/// behavior, so the encoder hard-caps to this length.
+pub const HELIOS_MAX_POINTS: usize = 4095;
+
 // USB endpoints
 const ENDPOINT_BULK_OUT: u8 = 0x02;
 const ENDPOINT_INT_OUT: u8 = 0x06;
@@ -99,6 +104,8 @@ pub enum HeliosDac {
     Open {
         device: rusb::Device<rusb::Context>,
         handle: rusb::DeviceHandle<rusb::Context>,
+        /// Firmware version probed during [`HeliosDac::open`], for diagnostics.
+        firmware_version: Option<u32>,
     },
     /// Test-only variant that simulates USB communication.
     #[cfg(test)]
@@ -131,8 +138,18 @@ impl HeliosDac {
                     .is_ok()
                 {}
 
-                let device = HeliosDac::Open { device, handle };
+                let mut device = HeliosDac::Open {
+                    device,
+                    handle,
+                    firmware_version: None,
+                };
                 let fw = device.probe_firmware_version()?;
+                if let HeliosDac::Open {
+                    firmware_version, ..
+                } = &mut device
+                {
+                    *firmware_version = Some(fw);
+                }
                 log::debug!("helios: connected, firmware version {fw}");
                 device.send_sdk_version()?;
 
@@ -209,6 +226,74 @@ impl HeliosDac {
         }
     }
 
+    /// Best-effort read of the device name for a stable identity, without
+    /// disturbing the `Idle`/`Open` state used for a later [`open`](Self::open).
+    ///
+    /// Opens a temporary handle, claims the interface, reads the name via
+    /// `CONTROL_GET_NAME`, then closes. The temporary handle is a plain
+    /// [`HeliosDac`] (not routed through the backend's `Drop`), so it closes
+    /// normally — safe because the device is physically present during a scan.
+    ///
+    /// Returns an error (leaving the caller to fall back to a port-path id)
+    /// when the device is busy — e.g. already claimed by a live session in
+    /// this process, where `claim_interface` fails before any transfer runs.
+    pub(crate) fn read_name(&self) -> Result<String> {
+        let device = match self {
+            HeliosDac::Idle(device) | HeliosDac::Open { device, .. } => device.clone(),
+            #[cfg(test)]
+            HeliosDac::MockOpen(_) => return Err(HeliosDacError::DeviceNotOpened),
+        };
+
+        let handle = device.open()?;
+        handle.claim_interface(0)?;
+        handle.set_alternate_setting(0, 1)?;
+        std::thread::sleep(INIT_SETTLE);
+
+        // Drain any lingering IN packets before issuing the name request.
+        let mut drain_buf = [0u8; 32];
+        while handle
+            .read_interrupt(ENDPOINT_INT_IN, &mut drain_buf, INIT_DRAIN_TIMEOUT)
+            .is_ok()
+        {}
+
+        // Route through a temporary Open so the existing `name()` control flow
+        // is reused. Dropped at end of scope, closing the handle normally.
+        let temp = HeliosDac::Open {
+            device,
+            handle,
+            firmware_version: None,
+        };
+        temp.name()
+    }
+
+    /// The firmware version probed during [`HeliosDac::open`], if the device is
+    /// open. Returns `None` for idle or mock devices. Exposed for diagnostics.
+    pub fn probed_firmware_version(&self) -> Option<u32> {
+        match self {
+            HeliosDac::Open {
+                firmware_version, ..
+            } => *firmware_version,
+            _ => None,
+        }
+    }
+
+    /// Drain any stale interrupt-IN responses so the next request/response pair
+    /// resyncs. Mirrors the drain step in [`HeliosDac::open`]; called after an
+    /// unexpected reply so a lingering response does not corrupt later reads.
+    fn drain_stale_responses(&self) {
+        #[cfg(test)]
+        if matches!(self, HeliosDac::MockOpen(_)) {
+            return;
+        }
+        if let Ok(handle) = self.handle() {
+            let mut drain_buf = [0u8; 32];
+            while handle
+                .read_interrupt(ENDPOINT_INT_IN, &mut drain_buf, INIT_DRAIN_TIMEOUT)
+                .is_ok()
+            {}
+        }
+    }
+
     /// Returns a reference to the open USB handle, or an error if the device is not opened.
     fn handle(&self) -> Result<&rusb::DeviceHandle<rusb::Context>> {
         match self {
@@ -237,12 +322,8 @@ impl HeliosDac {
             return Self::mock_check(state);
         }
 
-        let handle = self.handle()?;
         let frame_buffer = encode_frame(frame);
-        let timeout = bulk_transfer_timeout(frame_buffer.len());
-
-        handle.write_bulk(ENDPOINT_BULK_OUT, &frame_buffer, timeout)?;
-        Ok(())
+        self.write_bulk_all(&frame_buffer)
     }
 
     /// Write a pre-encoded frame buffer to the DAC.
@@ -255,10 +336,43 @@ impl HeliosDac {
             return Self::mock_check(state);
         }
 
+        self.write_bulk_all(buf)
+    }
+
+    /// Send a full frame buffer over the bulk-OUT endpoint.
+    ///
+    /// A partial transfer (fewer bytes accepted than submitted) yields a
+    /// truncated, corrupted frame on the device, so it is reported as an I/O
+    /// error rather than `Ok(())`. On a `Pipe` (endpoint STALL) the halt is
+    /// cleared once and the write retried before the error escalates.
+    fn write_bulk_all(&mut self, buf: &[u8]) -> Result<()> {
         let handle = self.handle()?;
         let timeout = bulk_transfer_timeout(buf.len());
-        handle.write_bulk(ENDPOINT_BULK_OUT, buf, timeout)?;
-        Ok(())
+
+        match handle.write_bulk(ENDPOINT_BULK_OUT, buf, timeout) {
+            Ok(n) if n == buf.len() => Ok(()),
+            Ok(n) => {
+                log::debug!("helios: bulk-OUT short-write ({n}/{} bytes)", buf.len());
+                Err(HeliosDacError::UsbError(rusb::Error::Io))
+            }
+            Err(rusb::Error::Pipe) => {
+                // STALL: try clearing the halt condition once before treating
+                // the endpoint as dead.
+                log::debug!("helios: bulk-OUT stalled (Pipe); clearing halt and retrying once");
+                handle.clear_halt(ENDPOINT_BULK_OUT)?;
+                match handle.write_bulk(ENDPOINT_BULK_OUT, buf, timeout)? {
+                    n if n == buf.len() => Ok(()),
+                    n => {
+                        log::debug!(
+                            "helios: bulk-OUT short-write after clear_halt ({n}/{} bytes)",
+                            buf.len()
+                        );
+                        Err(HeliosDacError::UsbError(rusb::Error::Io))
+                    }
+                }
+            }
+            Err(e) => Err(HeliosDacError::UsbError(e)),
+        }
     }
 
     /// Gets name of DAC.
@@ -274,7 +388,10 @@ impl HeliosDac {
 
                 Ok(name)
             }
-            _ => Err(HeliosDacError::InvalidDeviceResult),
+            _ => {
+                self.drain_stale_responses();
+                Err(HeliosDacError::InvalidDeviceResult)
+            }
         }
     }
 
@@ -285,7 +402,10 @@ impl HeliosDac {
 
         match &buffer[0..size] {
             [0x84, b0, b1, b2, b3, ..] => Ok(u32::from_le_bytes([*b0, *b1, *b2, *b3])),
-            _ => Err(HeliosDacError::InvalidDeviceResult),
+            _ => {
+                self.drain_stale_responses();
+                Err(HeliosDacError::InvalidDeviceResult)
+            }
         }
     }
 
@@ -302,7 +422,10 @@ impl HeliosDac {
         match &buffer[0..size] {
             [0x83, 0] => Ok(DeviceStatus::NotReady),
             [0x83, 1] => Ok(DeviceStatus::Ready),
-            _ => Err(HeliosDacError::InvalidDeviceResult),
+            _ => {
+                self.drain_stale_responses();
+                Err(HeliosDacError::InvalidDeviceResult)
+            }
         }
     }
 
@@ -332,7 +455,15 @@ impl HeliosDac {
         let handle = self.handle()?;
         let written_length =
             handle.write_interrupt(ENDPOINT_INT_OUT, buffer, Duration::from_millis(16))?;
-        assert_eq!(written_length, buffer.len());
+        if written_length != buffer.len() {
+            // A short interrupt-OUT write must not panic the output thread;
+            // surface it as an I/O error like the firmware-probe path does.
+            log::debug!(
+                "helios: control OUT short-write ({written_length}/{} bytes)",
+                buffer.len()
+            );
+            return Err(HeliosDacError::UsbError(rusb::Error::Io));
+        }
         Ok(())
     }
 
@@ -393,7 +524,10 @@ pub fn encode_frame_into(
     flags: super::WriteFrameFlags,
     buf: &mut Vec<u8>,
 ) {
-    let requested_points = points.len();
+    // Hard-cap to the firmware/SDK maximum; frames larger than this are
+    // refused by the SDK and undefined on the device. Callers should truncate
+    // earlier (with a warning) — this is a defensive backstop.
+    let requested_points = points.len().min(HELIOS_MAX_POINTS);
     let (pps_actual, num_of_points_actual) = adjusted_frame_params(pps, requested_points);
 
     buf.clear();
