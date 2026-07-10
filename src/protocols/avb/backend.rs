@@ -354,14 +354,28 @@ impl DacBackend for AvbBackend {
                 let _ = handle.join();
                 Err(err)
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Disconnected) => {
+                // The worker died (most likely panicked inside the audio
+                // engine) before reporting stream startup; it has already
+                // finished, so joining is safe and immediate.
+                log::error!("AVB: audio worker exited before reporting stream startup");
+                let _ = handle.join();
+                Err(Error::backend(super::error::Error::StreamStartFailed))
+            }
+            Err(RecvTimeoutError::Timeout) => {
                 // The worker is most likely blocked inside a driver call
                 // (opening an audio stream can hang in misbehaving drivers).
                 // Joining it here would block indefinitely, so detach
                 // instead: dropping `stop_tx` disconnects the worker's stop
                 // channel, making it shut down on its own if it ever
-                // unblocks.
+                // unblocks. Until then the thread (and its queue) stays
+                // alive, so repeated connect attempts against a permanently
+                // hung driver accumulate detached threads.
                 log::error!("AVB: audio worker init timed out ({:?})", self.init_timeout);
+                log::warn!(
+                    "AVB: detaching audio worker for {:?}; it will clean itself up if the driver call ever returns",
+                    self.selector.name
+                );
                 drop(handle);
                 Err(Error::backend(super::error::Error::StreamStartFailed))
             }
@@ -484,7 +498,11 @@ fn run_audio_worker(
         }
     };
 
-    let _ = init_tx.send(Ok(()));
+    if init_tx.send(Ok(())).is_err() {
+        // `connect` gave up waiting (init timeout) and detached this worker;
+        // the disconnected stop channel makes the loop below exit right away.
+        log::debug!("AVB: stream opened after connect gave up; shutting down");
+    }
 
     loop {
         match stop_rx.recv_timeout(Duration::from_millis(100)) {
@@ -1081,12 +1099,10 @@ mod tests {
         );
     }
 
-    struct NoopRunningStream;
-
-    impl RunningAudioStream for NoopRunningStream {}
-
     /// Engine whose `open_stream` blocks until the test releases it,
-    /// simulating a driver call that hangs during stream startup.
+    /// simulating a driver call that hangs during stream startup. Once
+    /// released it fails, so the worker thread exits promptly regardless of
+    /// whether anyone is listening for its stop signal.
     struct BlockingOpenEngine {
         release_rx: Mutex<Option<mpsc::Receiver<()>>>,
     }
@@ -1108,7 +1124,9 @@ mod tests {
             if let Some(rx) = self.release_rx.lock().unwrap().take() {
                 let _ = rx.recv();
             }
-            Ok(Box::new(NoopRunningStream))
+            Err(Error::backend(
+                crate::protocols::avb::error::Error::StreamStartFailed,
+            ))
         }
     }
 
@@ -1132,6 +1150,17 @@ mod tests {
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
         backend.init_timeout = Duration::from_millis(50);
 
+        // Watchdog: if connect regresses to joining the blocked worker it
+        // would deadlock (the release send below is sequenced after connect
+        // returns). Releasing the engine after a few seconds makes
+        // open_stream fail and the worker exit, so connect returns and the
+        // elapsed-time assertion fails instead of hanging the test suite.
+        let watchdog_tx = release_tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            let _ = watchdog_tx.send(());
+        });
+
         let t0 = std::time::Instant::now();
         let err = backend.connect().unwrap_err();
         // Must return promptly instead of joining the blocked worker thread.
@@ -1141,8 +1170,8 @@ mod tests {
             .contains("failed to start AVB output stream"));
         assert!(!backend.is_connected());
 
-        // Unblock the detached worker; it observes the dropped stop channel
-        // and shuts down on its own.
+        // Unblock the detached worker so it exits instead of lingering for
+        // the rest of the test run.
         let _ = release_tx.send(());
     }
 
