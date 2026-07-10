@@ -3014,8 +3014,19 @@ fn test_status_reports_connected_stats_and_scheduled_ahead() {
 
     let status = stream.status().unwrap();
     assert!(status.connected, "backend was connected");
-    assert_eq!(status.scheduled_ahead_points, 500);
-    assert_eq!(status.device_queued_points, Some(500));
+    // The software-decay estimator was seeded to 500 at wall-clock time, and
+    // `status()` reads it a few microseconds later; at 30k pps it sheds ~1
+    // point per 33us, so assert a tolerance band rather than exact equality to
+    // avoid a timing-flaky off-by-one on loaded CI runners.
+    assert!(
+        (490..=500).contains(&status.scheduled_ahead_points),
+        "scheduled_ahead_points ~500 (seeded depth, minus slight decay), got {}",
+        status.scheduled_ahead_points
+    );
+    assert_eq!(
+        status.device_queued_points,
+        Some(status.scheduled_ahead_points)
+    );
     assert!(status.stats.is_some());
     assert_eq!(status.stats.unwrap().underrun_count, 0);
 
