@@ -22,7 +22,7 @@
 //! machine-readable "I am a laser DAC" marker, so erring toward offering a
 //! device (which the user can ignore) is preferable to hiding a real DAC.
 //! The trade-off is that unrelated ≥5-channel outputs (7.1 onboard audio,
-//! some HDMI sinks) may also appear. Tighten via [`is_blacklisted_device`]
+//! some HDMI sinks) may also appear. Tighten via `is_blacklisted_device`
 //! rather than by changing the channel-count floor.
 
 pub mod backend;
