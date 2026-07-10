@@ -85,6 +85,8 @@ pub enum ProtocolError {
     BufferTooSmall,
     /// Invalid point format
     InvalidPointFormat,
+    /// Scan speed (pps) was zero, so chunk timing cannot be computed
+    InvalidScanSpeed,
     /// Response sequence number does not match request
     SequenceMismatch { expected: u16, actual: u16 },
 }
@@ -100,6 +102,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::InvalidServiceMapResponse => write!(f, "invalid service map response"),
             ProtocolError::BufferTooSmall => write!(f, "buffer too small for operation"),
             ProtocolError::InvalidPointFormat => write!(f, "invalid point format"),
+            ProtocolError::InvalidScanSpeed => write!(f, "scan speed must be greater than zero"),
             ProtocolError::SequenceMismatch { expected, actual } => {
                 write!(
                     f,
@@ -159,25 +162,27 @@ impl Error for ResponseError {}
 
 impl ResponseError {
     /// Create a ResponseError from an IDN acknowledgment result code.
+    ///
+    /// The numeric codes live in [`crate::protocols::idn::protocol`] and are the
+    /// single source of truth; per `idn-hello.h`, 0xEB is NOT_CONNECTED.
     pub fn from_ack_code(code: i8) -> Option<Self> {
+        use crate::protocols::idn::protocol::{
+            IDNVAL_RTACK_ERR_EXCLUDED, IDNVAL_RTACK_ERR_INVALID_PAYLOAD,
+            IDNVAL_RTACK_ERR_NOT_CONNECTED, IDNVAL_RTACK_ERR_OCCUPIED,
+            IDNVAL_RTACK_ERR_PROCESSING_ERROR,
+        };
+
         // Negative codes indicate errors
         if code >= 0 {
             return None; // Success
         }
 
-        // IDN acknowledgment error codes (from idn-hello.h)
-        const IDNVAL_RTACK_ERR_NOT_CONNECTED: i8 = -21; // 0xEB as i8
-        const IDNVAL_RTACK_ERR_OCCUPIED: i8 = -20; // 0xEC as i8
-        const IDNVAL_RTACK_ERR_EXCLUDED: i8 = -19; // 0xED as i8
-        const IDNVAL_RTACK_ERR_PAYLOAD: i8 = -18; // 0xEE as i8
-        const IDNVAL_RTACK_ERR_GENERIC: i8 = -17; // 0xEF as i8
-
-        Some(match code {
+        Some(match code as u8 {
             IDNVAL_RTACK_ERR_NOT_CONNECTED => ResponseError::NotConnected,
             IDNVAL_RTACK_ERR_OCCUPIED => ResponseError::Occupied,
             IDNVAL_RTACK_ERR_EXCLUDED => ResponseError::Excluded,
-            IDNVAL_RTACK_ERR_PAYLOAD => ResponseError::InvalidPayload,
-            IDNVAL_RTACK_ERR_GENERIC => ResponseError::GenericError,
+            IDNVAL_RTACK_ERR_INVALID_PAYLOAD => ResponseError::InvalidPayload,
+            IDNVAL_RTACK_ERR_PROCESSING_ERROR => ResponseError::GenericError,
             _ => ResponseError::UnknownAckCode(code),
         })
     }

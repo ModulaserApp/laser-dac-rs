@@ -481,24 +481,27 @@ fn test_connection_loss_detection() {
     // Let it stream for a bit
     thread::sleep(Duration::from_millis(200));
 
-    // Simulate server disconnect
+    // Simulate server disconnect. IDN now performs ACK/ping-based liveness
+    // checks, so a dead device is detected (instead of streaming into the void
+    // forever) and the stream exits Disconnected, letting the driver's
+    // reconnect path engage.
     handle.simulate_disconnect();
-    thread::sleep(Duration::from_millis(800));
-
-    // IDN uses fire-and-forget UDP, so the stream should still be running.
-    // Stop it via control.
-    control.stop().unwrap();
 
     let result = stream_thread
         .join()
         .expect("Stream thread should not panic");
 
-    // Stream should have stopped cleanly (not disconnected, since UDP is fire-and-forget)
+    // The stream ran without a producer error, and liveness detection surfaced
+    // the dead device as a disconnect.
     assert!(result.is_ok(), "Stream should complete without error");
     assert!(
-        matches!(result.unwrap(), RunExit::Stopped),
-        "UDP stream should stop cleanly via control (fire-and-forget)"
+        matches!(result.unwrap(), RunExit::Disconnected),
+        "IDN liveness should detect the dead device and disconnect"
     );
+
+    // `control` and `error_count` are kept alive for the duration of the run.
+    drop(control);
+    let _ = error_count;
 }
 
 #[test]
