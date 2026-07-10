@@ -63,7 +63,9 @@ impl LaserCubeNetworkStatus {
     }
 
     pub fn parse(buffer: &[u8], source_ip: IpAddr) -> io::Result<Self> {
-        if buffer.len() != 64 {
+        // Accept payloads of at least 64 bytes; future firmware may append
+        // fields after the known layout. We only read the first 64 bytes.
+        if buffer.len() < 64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unexpected full-info response length: {}", buffer.len()),
@@ -222,6 +224,15 @@ mod tests {
         assert!(
             LaserCubeNetworkStatus::parse(&data[..63], IpAddr::V4(Ipv4Addr::LOCALHOST)).is_err()
         );
+    }
+
+    #[test]
+    fn accepts_payloads_longer_than_64_bytes() {
+        let mut data = full_info().to_vec();
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let status = LaserCubeNetworkStatus::parse(&data, IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        assert_eq!(status.serial_number, "010203040506");
+        assert_eq!(status.model_name, "Ultra Mk2");
     }
 
     #[test]
