@@ -140,6 +140,16 @@ impl SlicePipeline {
             return &[];
         }
 
+        // No logical frame yet: the engine blanks at the origin. Honor
+        // `IdlePolicy::Park` so armed-but-idle output holds the configured park
+        // position instead of snapping to (0,0). (When disarmed, `apply_blanking`
+        // below parks regardless; this covers the armed/no-content case.)
+        if !self.engine.has_logical_frame() {
+            if let IdlePolicy::Park { x, y } = self.idle_policy {
+                self.buf[..n].fill(LaserPoint::blanked(x, y));
+            }
+        }
+
         apply_blanking(
             is_armed,
             &mut self.startup_blank_remaining,
@@ -394,6 +404,27 @@ mod tests {
 
     fn make_pipeline(initial_cap: usize) -> SlicePipeline {
         SlicePipeline::new(make_engine(), 0, None, IdlePolicy::Blank, initial_cap)
+    }
+
+    #[test]
+    fn armed_no_frame_honors_idle_policy_park() {
+        // Armed but no frame submitted yet: output should hold the configured
+        // park position, not blank at the origin.
+        let mut pipeline = SlicePipeline::new(
+            make_engine(),
+            0,
+            None,
+            IdlePolicy::Park { x: 0.25, y: -0.5 },
+            0,
+        );
+        let chunk: Vec<LaserPoint> = pipeline.produce_fifo_chunk(4, 30_000, true).to_vec();
+        assert_eq!(chunk.len(), 4);
+        let park = LaserPoint::blanked(0.25, -0.5);
+        for p in &chunk {
+            assert_eq!(p.x, park.x);
+            assert_eq!(p.y, park.y);
+            assert_eq!((p.r, p.g, p.b, p.intensity), (0, 0, 0, 0));
+        }
     }
 
     #[test]
