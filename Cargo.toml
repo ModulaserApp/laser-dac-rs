@@ -28,7 +28,7 @@ audio-dacs = ["avb", "oscilloscope"]
 # Individual DAC protocols
 helios = ["dep:rusb"]
 lasercube-usb = ["dep:rusb"]
-ether-dream = []
+ether-dream = ["dep:socket2"]
 idn = ["dep:socket2", "dep:if-addrs"]
 lasercube-network = ["dep:socket2", "dep:if-addrs"]
 avb = ["dep:cpal", "dep:crossbeam-queue"]
