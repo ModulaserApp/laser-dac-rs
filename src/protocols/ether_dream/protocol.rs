@@ -689,4 +689,255 @@ mod tests {
         assert_eq!(dac_point.x, -32767);
         assert_eq!(dac_point.y, 32767);
     }
+
+    // ==========================================================================
+    // Wire-format round-trip tests
+    //
+    // These exercise the WriteToBytes / ReadFromBytes impls end to end and lock
+    // in the little-endian layout and byte sizes of every protocol type.
+    // ==========================================================================
+
+    fn encode<P: WriteToBytes>(value: P) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_bytes(value).expect("encode");
+        buf
+    }
+
+    fn decode<P: ReadFromBytes>(bytes: &[u8]) -> P {
+        let mut slice = bytes;
+        slice.read_bytes::<P>().expect("decode")
+    }
+
+    fn sample_status() -> DacStatus {
+        DacStatus {
+            protocol: 1,
+            light_engine_state: DacStatus::LIGHT_ENGINE_WARMUP,
+            playback_state: DacStatus::PLAYBACK_PLAYING,
+            source: DacStatus::SOURCE_ILDA_PLAYBACK_SD,
+            light_engine_flags: 0x1234,
+            playback_flags: 0x5678,
+            source_flags: 0x9abc,
+            buffer_fullness: 1799,
+            point_rate: 30_000,
+            point_count: 123_456,
+        }
+    }
+
+    #[test]
+    fn test_dac_status_roundtrip() {
+        let status = sample_status();
+        let bytes = encode(status);
+        assert_eq!(bytes.len(), DacStatus::SIZE_BYTES);
+        assert_eq!(bytes.len(), 20);
+        // Verify little-endian ordering of the first multi-byte field.
+        assert_eq!(&bytes[4..6], &0x1234u16.to_le_bytes());
+        assert_eq!(decode::<DacStatus>(&bytes), status);
+    }
+
+    #[test]
+    fn test_dac_response_roundtrip() {
+        let response = DacResponse {
+            response: DacResponse::ACK,
+            command: command::Begin::START_BYTE,
+            dac_status: sample_status(),
+        };
+        let bytes = encode(response);
+        assert_eq!(bytes.len(), DacResponse::SIZE_BYTES);
+        assert_eq!(bytes.len(), 22);
+        assert_eq!(bytes[0], DacResponse::ACK);
+        assert_eq!(bytes[1], command::Begin::START_BYTE);
+        assert_eq!(decode::<DacResponse>(&bytes), response);
+    }
+
+    #[test]
+    fn test_dac_broadcast_roundtrip() {
+        let broadcast = DacBroadcast {
+            mac_address: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            hw_revision: 3,
+            sw_revision: 4,
+            buffer_capacity: 1800,
+            max_point_rate: 100_000,
+            dac_status: sample_status(),
+        };
+        let bytes = encode(broadcast);
+        assert_eq!(bytes.len(), DacBroadcast::SIZE_BYTES);
+        assert_eq!(bytes.len(), 36);
+        assert_eq!(&bytes[0..6], &broadcast.mac_address);
+        assert_eq!(decode::<DacBroadcast>(&bytes), broadcast);
+    }
+
+    #[test]
+    fn test_dac_point_roundtrip() {
+        let point = DacPoint {
+            control: 0x8000,
+            x: -12345,
+            y: 12345,
+            r: 65535,
+            g: 32768,
+            b: 1,
+            i: 4321,
+            u1: 7,
+            u2: 9,
+        };
+        let bytes = encode(point);
+        assert_eq!(bytes.len(), DacPoint::SIZE_BYTES);
+        assert_eq!(bytes.len(), 18);
+        assert_eq!(decode::<DacPoint>(&bytes), point);
+    }
+
+    #[test]
+    fn test_unit_command_roundtrips() {
+        use command::{ClearEmergencyStop, Ping, PrepareStream, Stop};
+
+        let prepare = encode(PrepareStream);
+        assert_eq!(prepare, vec![PrepareStream::START_BYTE]);
+        assert_eq!(decode::<PrepareStream>(&prepare), PrepareStream);
+
+        let stop = encode(Stop);
+        assert_eq!(stop, vec![Stop::START_BYTE]);
+        assert_eq!(decode::<Stop>(&stop), Stop);
+
+        let ping = encode(Ping);
+        assert_eq!(ping, vec![Ping::START_BYTE]);
+        assert_eq!(decode::<Ping>(&ping), Ping);
+
+        let clear = encode(ClearEmergencyStop);
+        assert_eq!(clear, vec![ClearEmergencyStop::START_BYTE]);
+        assert_eq!(decode::<ClearEmergencyStop>(&clear), ClearEmergencyStop);
+    }
+
+    #[test]
+    fn test_unit_command_rejects_wrong_byte() {
+        use command::PrepareStream;
+        // A byte that is not the PrepareStream start byte must fail to parse.
+        let err = PrepareStream::read_from_bytes(&[0x00u8][..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_begin_and_update_roundtrip() {
+        let begin = command::Begin {
+            low_water_mark: 1000,
+            point_rate: 30_000,
+        };
+        let bytes = encode(begin);
+        assert_eq!(bytes.len(), command::Begin::SIZE_BYTES);
+        assert_eq!(bytes[0], command::Begin::START_BYTE);
+        assert_eq!(decode::<command::Begin>(&bytes), begin);
+
+        let update = command::Update {
+            low_water_mark: 2000,
+            point_rate: 40_000,
+        };
+        let bytes = encode(update);
+        assert_eq!(bytes.len(), command::Update::SIZE_BYTES);
+        assert_eq!(bytes[0], command::Update::START_BYTE);
+        assert_eq!(decode::<command::Update>(&bytes), update);
+    }
+
+    #[test]
+    fn test_point_rate_roundtrip() {
+        let point_rate = command::PointRate(50_000);
+        let bytes = encode(point_rate);
+        assert_eq!(bytes.len(), command::PointRate::SIZE_BYTES);
+        assert_eq!(bytes[0], command::PointRate::START_BYTE);
+        assert_eq!(decode::<command::PointRate>(&bytes), point_rate);
+    }
+
+    #[test]
+    fn test_data_command_roundtrip() {
+        use std::borrow::Cow;
+        let points = vec![
+            DacPoint {
+                control: 0,
+                x: 1,
+                y: 2,
+                r: 3,
+                g: 4,
+                b: 5,
+                i: 6,
+                u1: 0,
+                u2: 0,
+            },
+            DacPoint {
+                control: 0,
+                x: -1,
+                y: -2,
+                r: 7,
+                g: 8,
+                b: 9,
+                i: 10,
+                u1: 0,
+                u2: 0,
+            },
+        ];
+        let data = command::Data {
+            points: Cow::Owned(points.clone()),
+        };
+        let bytes = encode(&data);
+        // start byte (1) + count (2) + 2 points * 18 bytes.
+        assert_eq!(bytes.len(), 1 + 2 + 2 * DacPoint::SIZE_BYTES);
+        assert_eq!(bytes[0], command::Data::START_BYTE);
+        assert_eq!(&bytes[1..3], &2u16.to_le_bytes());
+
+        let decoded = decode::<command::Data<'static>>(&bytes);
+        assert_eq!(decoded.points.as_ref(), points.as_slice());
+    }
+
+    #[test]
+    fn test_emergency_stop_accepts_both_start_bytes() {
+        use command::{EmergencyStop, EmergencyStopAlt};
+
+        let primary = encode(EmergencyStop);
+        assert_eq!(primary, vec![EmergencyStop::START_BYTE]);
+        assert_eq!(EmergencyStop::START_BYTE, 0x00);
+
+        let alt = encode(EmergencyStopAlt);
+        assert_eq!(alt, vec![EmergencyStopAlt::START_BYTE]);
+        assert_eq!(EmergencyStopAlt::START_BYTE, 0xff);
+
+        // Both the primary (0x00) and alternate (0xff) bytes decode to EmergencyStop.
+        assert_eq!(decode::<EmergencyStop>(&primary), EmergencyStop);
+        assert_eq!(decode::<EmergencyStop>(&alt), EmergencyStop);
+
+        // Any other byte is rejected.
+        assert!(EmergencyStop::read_from_bytes(&[0x42u8][..]).is_err());
+    }
+
+    #[test]
+    fn test_command_start_bytes_match_spec() {
+        assert_eq!(command::PrepareStream::START_BYTE, b'p');
+        assert_eq!(command::Begin::START_BYTE, b'b');
+        assert_eq!(command::Update::START_BYTE, b'u');
+        assert_eq!(command::PointRate::START_BYTE, 0x74);
+        assert_eq!(command::Data::START_BYTE, b'd');
+        assert_eq!(command::Stop::START_BYTE, b's');
+        assert_eq!(command::ClearEmergencyStop::START_BYTE, b'c');
+        assert_eq!(command::Ping::START_BYTE, b'?');
+    }
+
+    #[test]
+    fn test_data_command_rejects_too_many_points() {
+        use std::borrow::Cow;
+        // More than u16::MAX points cannot be encoded.
+        let points = vec![
+            DacPoint {
+                control: 0,
+                x: 0,
+                y: 0,
+                r: 0,
+                g: 0,
+                b: 0,
+                i: 0,
+                u1: 0,
+                u2: 0,
+            };
+            u16::MAX as usize + 1
+        ];
+        let data = command::Data {
+            points: Cow::Owned(points),
+        };
+        let mut buf = Vec::new();
+        assert!(buf.write_bytes(&data).is_err());
+    }
 }
