@@ -63,13 +63,21 @@ impl Drop for HostQueueReservation {
     }
 }
 
+/// Device buffer capacity from the reported `buffer_max`, falling back to the
+/// default only when the device reports 0 (unknown). Reporting a smaller real
+/// capacity must not be inflated to the default, or the pacer would over-fill.
+pub(super) fn buffer_total_from_max(buffer_max: u16) -> usize {
+    if buffer_max > 0 {
+        buffer_max as usize
+    } else {
+        super::super::protocol::DEFAULT_BUFFER_CAPACITY as usize
+    }
+}
+
 impl SharedTransportState {
     pub(super) fn new(status: &LaserCubeNetworkStatus, profile: ConnectionProfile) -> Self {
         let now = Instant::now();
-        let buffer_total = status
-            .buffer_max
-            .max(super::super::protocol::DEFAULT_BUFFER_CAPACITY)
-            as usize;
+        let buffer_total = buffer_total_from_max(status.buffer_max);
         let host_queue_capacity = (buffer_total * 2).max(profile.max_udp_samples_per_packet * 8);
         let point_rate = if status.point_rate > 0 {
             super::super::clamp_point_rate(status, status.point_rate)
