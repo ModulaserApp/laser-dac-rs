@@ -22,6 +22,8 @@ const CHANNELS_XYRGBI: usize = 6;
 /// Duration of the queue buffer in milliseconds.
 /// Chosen as a conservative jitter cushion while keeping queueing latency bounded.
 const QUEUE_DURATION_MS: u32 = 200;
+/// How long `connect` waits for the audio worker to report stream startup.
+const INIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn queue_capacity_for_rate(sample_rate: u32) -> usize {
     (sample_rate as usize * QUEUE_DURATION_MS as usize) / 1000
@@ -228,6 +230,7 @@ pub struct AvbBackend {
     engine: Arc<dyn AudioEngine>,
     caps: DacCapabilities,
     desired_shutter_open: bool,
+    init_timeout: Duration,
     /// Runtime-authoritative buffer estimator. Source is set on connect and
     /// cleared on disconnect; reports zero in between.
     estimator: RuntimeAuthorityEstimator,
@@ -247,6 +250,7 @@ impl AvbBackend {
             engine,
             caps: super::default_capabilities(),
             desired_shutter_open: false,
+            init_timeout: INIT_TIMEOUT,
             estimator: RuntimeAuthorityEstimator::new(),
             resample_scratch: Vec::new(),
         }
@@ -330,7 +334,7 @@ impl DacBackend for AvbBackend {
             );
         });
 
-        match init_rx.recv_timeout(Duration::from_secs(5)) {
+        match init_rx.recv_timeout(self.init_timeout) {
             Ok(Ok(())) => {
                 log::info!(
                     "AVB: connected to {:?} (duplicate_index={}) at {}Hz",
@@ -351,8 +355,14 @@ impl DacBackend for AvbBackend {
                 Err(err)
             }
             Err(_) => {
-                log::error!("AVB: audio worker init timed out (5s)");
-                let _ = handle.join();
+                // The worker is most likely blocked inside a driver call
+                // (opening an audio stream can hang in misbehaving drivers).
+                // Joining it here would block indefinitely, so detach
+                // instead: dropping `stop_tx` disconnects the worker's stop
+                // channel, making it shut down on its own if it ever
+                // unblocks.
+                log::error!("AVB: audio worker init timed out ({:?})", self.init_timeout);
+                drop(handle);
                 Err(Error::backend(super::error::Error::StreamStartFailed))
             }
         }
@@ -680,16 +690,16 @@ fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<Sel
 }
 
 fn build_cpal_stream_config(stream_config: SelectedStreamConfig) -> cpal::StreamConfig {
-    let buffer_size = if cfg!(target_os = "windows") {
-        cpal::BufferSize::Fixed(256)
-    } else {
-        cpal::BufferSize::Default
-    };
-
+    // Always let the host/driver pick the buffer size. Requesting a fixed
+    // size fails on drivers that don't support it: ASIO drivers (e.g. RME)
+    // only accept the buffer size configured in their own control panel, and
+    // WASAPI shared mode can reject buffer durations that don't match the
+    // engine period. The queue provides the jitter cushion, so the device
+    // buffer size only affects callback granularity, not correctness.
     cpal::StreamConfig {
         channels: stream_config.channels,
         sample_rate: cpal::SampleRate(stream_config.sample_rate),
-        buffer_size,
+        buffer_size: cpal::BufferSize::Default,
     }
 }
 
@@ -1069,6 +1079,71 @@ mod tests {
             target,
             engine.frame_count()
         );
+    }
+
+    struct NoopRunningStream;
+
+    impl RunningAudioStream for NoopRunningStream {}
+
+    /// Engine whose `open_stream` blocks until the test releases it,
+    /// simulating a driver call that hangs during stream startup.
+    struct BlockingOpenEngine {
+        release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl AudioEngine for BlockingOpenEngine {
+        fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<SelectedStreamConfig> {
+            Ok(SelectedStreamConfig {
+                channels: CHANNELS_XYRGBI as u16,
+                sample_rate: 48_000,
+            })
+        }
+
+        fn open_stream(
+            &self,
+            _selector: &AvbSelector,
+            _stream_config: SelectedStreamConfig,
+            _runtime: Arc<RuntimeState>,
+        ) -> Result<Box<dyn RunningAudioStream>> {
+            if let Some(rx) = self.release_rx.lock().unwrap().take() {
+                let _ = rx.recv();
+            }
+            Ok(Box::new(NoopRunningStream))
+        }
+    }
+
+    #[test]
+    fn build_cpal_stream_config_uses_default_buffer_size() {
+        let config = build_cpal_stream_config(SelectedStreamConfig {
+            channels: 6,
+            sample_rate: 48_000,
+        });
+        assert_eq!(config.buffer_size, cpal::BufferSize::Default);
+        assert_eq!(config.channels, 6);
+        assert_eq!(config.sample_rate, cpal::SampleRate(48_000));
+    }
+
+    #[test]
+    fn connect_times_out_without_hanging_when_open_stream_blocks() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let engine: Arc<dyn AudioEngine> = Arc::new(BlockingOpenEngine {
+            release_rx: Mutex::new(Some(release_rx)),
+        });
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.init_timeout = Duration::from_millis(50);
+
+        let t0 = std::time::Instant::now();
+        let err = backend.connect().unwrap_err();
+        // Must return promptly instead of joining the blocked worker thread.
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(err
+            .to_string()
+            .contains("failed to start AVB output stream"));
+        assert!(!backend.is_connected());
+
+        // Unblock the detached worker; it observes the dropped stop channel
+        // and shuts down on its own.
+        let _ = release_tx.send(());
     }
 
     #[test]
