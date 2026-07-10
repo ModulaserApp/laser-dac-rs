@@ -286,8 +286,13 @@ impl PresentationEngine {
         self.clamp_to_capacity();
     }
 
-    /// Truncate the transition prefix so the drawable fits within frame_capacity.
-    /// Never removes authored frame points — only the leading transition.
+    /// Clamp the composed drawable to `frame_capacity`.
+    ///
+    /// Trims the leading transition prefix first (it is generated filler, safe
+    /// to shorten). If the *authored* frame points alone still exceed capacity,
+    /// truncate the tail as a last resort — an oversized frame is rejected by
+    /// some encoders (the Helios SDK refuses > 4095 points) and undefined on
+    /// others, so a clamped frame is strictly safer than an oversized one.
     fn clamp_to_capacity(&mut self) {
         if let Some(cap) = self.frame_capacity {
             if self.drawable.len() > cap {
@@ -295,6 +300,11 @@ impl PresentationEngine {
                 let trim = excess.min(self.frame_swap_transition_len);
                 self.drawable.drain(..trim);
                 self.frame_swap_transition_len -= trim;
+
+                if self.drawable.len() > cap {
+                    warn_oversized_frame(self.drawable.len(), cap);
+                    self.drawable.truncate(cap);
+                }
             }
         }
     }
@@ -348,6 +358,30 @@ impl PresentationEngine {
 
         self.drawable.extend_from_slice(current.points());
     }
+}
+
+/// Rate-limited (≤ once/sec) warning that an authored frame exceeded the
+/// hardware frame capacity and was truncated. Runs on the single scheduler
+/// thread, so a `thread_local` last-warn timestamp is sufficient.
+fn warn_oversized_frame(len: usize, cap: usize) {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+    thread_local! {
+        static LAST_WARN: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+    LAST_WARN.with(|last| {
+        let now = Instant::now();
+        let emit = match last.get() {
+            Some(t) => now.duration_since(t) >= Duration::from_secs(1),
+            None => true,
+        };
+        if emit {
+            last.set(Some(now));
+            log::warn!(
+                "authored frame has {len} points, exceeding hardware frame_capacity {cap}; truncating tail"
+            );
+        }
+    });
 }
 
 /// Build a seam-adjusted drawable for a self-loop, applying the transition
@@ -487,5 +521,59 @@ impl ColorDelayLine {
             self.carry.extend_from_slice(&self.scratch);
             debug_assert_eq!(self.carry.len(), self.delay);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::presentation::TransitionPlan;
+
+    fn frame_of(n: usize) -> Frame {
+        let pts: Vec<LaserPoint> = (0..n)
+            .map(|i| LaserPoint::new(i as f32 * 0.0001, 0.0, 1000, 1000, 1000, 1000))
+            .collect();
+        Frame::new(pts)
+    }
+
+    /// An authored frame whose points alone exceed `frame_capacity` must be
+    /// truncated (not sent oversized) once the transition prefix is exhausted.
+    #[test]
+    fn oversized_authored_frame_is_truncated_to_capacity() {
+        const CAP: usize = 4_095;
+        // Transition function returns a 10-point prefix.
+        let mut engine = PresentationEngine::new(Box::new(|_, _| {
+            TransitionPlan::Transition(vec![LaserPoint::blanked(0.0, 0.0); 10])
+        }));
+        engine.set_frame_capacity(Some(CAP));
+
+        // Prime a current frame so the swap computes an A->B transition.
+        engine.set_pending(frame_of(4));
+        let _ = engine.compose_hardware_frame();
+
+        // Now swap in an over-capacity authored frame.
+        engine.set_pending(frame_of(5_000));
+        let composed = engine.compose_hardware_frame();
+        assert_eq!(
+            composed.len(),
+            CAP,
+            "authored frame must be clamped to capacity"
+        );
+    }
+
+    /// The self-loop (no pending) refresh path must also clamp an over-capacity
+    /// authored frame.
+    #[test]
+    fn oversized_self_loop_frame_is_truncated_to_capacity() {
+        const CAP: usize = 4_095;
+        let mut engine = PresentationEngine::new(Box::new(|_, _| {
+            TransitionPlan::Transition(vec![LaserPoint::blanked(0.0, 0.0); 10])
+        }));
+        engine.set_frame_capacity(Some(CAP));
+
+        engine.set_pending(frame_of(5_000));
+        let _ = engine.compose_hardware_frame(); // frame-change path
+        let composed = engine.compose_hardware_frame(); // self-loop refresh
+        assert_eq!(composed.len(), CAP);
     }
 }
