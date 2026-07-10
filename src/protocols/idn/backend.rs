@@ -5,8 +5,9 @@ use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
+use crate::protocols::idn::dac::stream::PointFormat;
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
-use crate::protocols::idn::protocol::PointXyrgbi;
+use crate::protocols::idn::protocol::{PointExtended, PointXyrgbHighRes, PointXyrgbi};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -38,9 +39,26 @@ struct WorkerRuntime {
     handle: Option<JoinHandle<()>>,
 }
 
+/// A chunk of converted points in the backend's selected wire format.
+enum ChunkPoints {
+    Xyrgbi(Vec<PointXyrgbi>),
+    HighRes(Vec<PointXyrgbHighRes>),
+    Extended(Vec<PointExtended>),
+}
+
+impl ChunkPoints {
+    fn len(&self) -> usize {
+        match self {
+            ChunkPoints::Xyrgbi(v) => v.len(),
+            ChunkPoints::HighRes(v) => v.len(),
+            ChunkPoints::Extended(v) => v.len(),
+        }
+    }
+}
+
 struct QueuedChunk {
     pps: u32,
-    points: Vec<PointXyrgbi>,
+    points: ChunkPoints,
 }
 
 enum WorkerCommand {
@@ -54,10 +72,10 @@ trait WorkerStream {
     fn set_scan_speed(&mut self, pps: u32);
     fn needs_keepalive(&self) -> bool;
     fn send_keepalive(&mut self) -> bool;
-    fn write_frame(&mut self, points: &[PointXyrgbi]) -> bool;
+    fn write_frame(&mut self, points: &ChunkPoints) -> bool;
     /// Send the frame requesting an acknowledgment; returns whether the ACK
     /// was received within `timeout` (used for liveness detection).
-    fn write_frame_with_ack(&mut self, points: &[PointXyrgbi], timeout: Duration) -> bool;
+    fn write_frame_with_ack(&mut self, points: &ChunkPoints, timeout: Duration) -> bool;
     /// Send a ping and report whether a response arrived within `timeout`.
     fn ping(&mut self, timeout: Duration) -> bool;
     fn close(&mut self);
@@ -80,12 +98,26 @@ impl WorkerStream for stream::Stream {
         stream::Stream::send_keepalive(self).is_ok()
     }
 
-    fn write_frame(&mut self, points: &[PointXyrgbi]) -> bool {
-        stream::Stream::write_frame(self, points).is_ok()
+    fn write_frame(&mut self, points: &ChunkPoints) -> bool {
+        match points {
+            ChunkPoints::Xyrgbi(v) => stream::Stream::write_frame(self, v).is_ok(),
+            ChunkPoints::HighRes(v) => stream::Stream::write_frame(self, v).is_ok(),
+            ChunkPoints::Extended(v) => stream::Stream::write_frame(self, v).is_ok(),
+        }
     }
 
-    fn write_frame_with_ack(&mut self, points: &[PointXyrgbi], timeout: Duration) -> bool {
-        stream::Stream::write_frame_with_ack(self, points, timeout).is_ok()
+    fn write_frame_with_ack(&mut self, points: &ChunkPoints, timeout: Duration) -> bool {
+        match points {
+            ChunkPoints::Xyrgbi(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+            ChunkPoints::HighRes(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+            ChunkPoints::Extended(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+        }
     }
 
     fn ping(&mut self, timeout: Duration) -> bool {
@@ -111,6 +143,10 @@ pub struct IdnBackend {
     /// Software-only buffer estimator. Driven by `record_send` from inside
     /// `try_write_points`; not yet consulted by the adapter (Phase 1).
     estimator: SoftwareDecayEstimator,
+    /// Wire point format. Defaults to [`PointFormat::Xyrgbi`] (8-bit colour);
+    /// callers can opt into a 16-bit format via [`IdnBackend::set_point_format`]
+    /// before connecting.
+    point_format: PointFormat,
 }
 
 impl IdnBackend {
@@ -122,8 +158,43 @@ impl IdnBackend {
             caps: super::default_capabilities(),
             point_buffer: Vec::new(),
             estimator: SoftwareDecayEstimator::new(),
+            point_format: PointFormat::Xyrgbi,
         }
     }
+
+    /// Select the wire point format for streaming.
+    ///
+    /// Defaults to [`PointFormat::Xyrgbi`] (8-bit RGBI). Selecting
+    /// [`PointFormat::XyrgbHighRes`] or [`PointFormat::Extended`] streams the
+    /// crate's full 16-bit colour depth end-to-end, at the cost of larger
+    /// samples (10 or 20 bytes vs 8) and therefore more packets per frame.
+    ///
+    /// Only receivers that advertise support for the chosen descriptors will
+    /// render hi-res formats correctly, so the default is left at the
+    /// universally understood XYRGBI format. Must be called **before**
+    /// [`connect`](crate::backend::DacBackend::connect); changing it on a live
+    /// connection has no effect until the next connect.
+    pub fn set_point_format(&mut self, format: PointFormat) {
+        self.point_format = format;
+        self.caps.max_points_per_chunk = max_points_per_chunk_for(format);
+    }
+
+    /// The currently selected wire point format.
+    pub fn point_format(&self) -> PointFormat {
+        self.point_format
+    }
+}
+
+/// Points that fit in one MTU-sized datagram (without a config header) for a
+/// given format, used to keep the scheduler's chunk sizing aligned with the
+/// sample size.
+fn max_points_per_chunk_for(format: PointFormat) -> usize {
+    use crate::protocols::idn::protocol::{
+        ChannelMessageHeader, PacketHeader, SampleChunkHeader, SizeBytes, MAX_UDP_PAYLOAD,
+    };
+    let header =
+        PacketHeader::SIZE_BYTES + ChannelMessageHeader::SIZE_BYTES + SampleChunkHeader::SIZE_BYTES;
+    (MAX_UDP_PAYLOAD - header) / format.size_bytes()
 }
 
 impl DacBackend for IdnBackend {
@@ -143,6 +214,7 @@ impl DacBackend for IdnBackend {
         let mut stream =
             stream::connect(&self.server, self.service.service_id).map_err(Error::backend)?;
         stream.set_frame_mode(stream::FrameMode::Wave);
+        stream.set_point_format(self.point_format);
 
         // Validate reachability before committing: a plain UDP connect always
         // "succeeds", so without this a dead address would appear connected and
@@ -171,7 +243,8 @@ impl DacBackend for IdnBackend {
         let (tx, rx) = mpsc::sync_channel(IDN_WORKER_QUEUE_CAPACITY);
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
-        let handle = thread::spawn(move || worker_loop(stream, rx, worker_connected));
+        let point_format = self.point_format;
+        let handle = thread::spawn(move || worker_loop(stream, rx, worker_connected, point_format));
 
         self.runtime = Some(WorkerRuntime {
             tx,
@@ -223,14 +296,24 @@ impl FifoBackend for IdnBackend {
             return Err(Error::disconnected("IDN sender thread disconnected"));
         }
 
-        self.point_buffer.clear();
-        self.point_buffer
-            .extend(points.iter().map(PointXyrgbi::from));
-
-        let n = self.point_buffer.len();
+        let n = points.len();
+        let chunk_points = match self.point_format {
+            PointFormat::Xyrgbi => {
+                self.point_buffer.clear();
+                self.point_buffer
+                    .extend(points.iter().map(PointXyrgbi::from));
+                ChunkPoints::Xyrgbi(std::mem::take(&mut self.point_buffer))
+            }
+            PointFormat::XyrgbHighRes => {
+                ChunkPoints::HighRes(points.iter().map(PointXyrgbHighRes::from).collect())
+            }
+            PointFormat::Extended => {
+                ChunkPoints::Extended(points.iter().map(PointExtended::from).collect())
+            }
+        };
         let chunk = QueuedChunk {
             pps,
-            points: std::mem::take(&mut self.point_buffer),
+            points: chunk_points,
         };
 
         match runtime.tx.try_send(WorkerCommand::Chunk(chunk)) {
@@ -253,8 +336,12 @@ impl FifoBackend for IdnBackend {
     }
 }
 
-fn blank_chunk(pps: u32) -> QueuedChunk {
-    let points = vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); 10];
+fn blank_chunk(pps: u32, format: PointFormat) -> QueuedChunk {
+    let points = match format {
+        PointFormat::Xyrgbi => ChunkPoints::Xyrgbi(vec![PointXyrgbi::default(); 10]),
+        PointFormat::XyrgbHighRes => ChunkPoints::HighRes(vec![PointXyrgbHighRes::default(); 10]),
+        PointFormat::Extended => ChunkPoints::Extended(vec![PointExtended::default(); 10]),
+    };
     QueuedChunk { pps, points }
 }
 
@@ -262,6 +349,7 @@ fn worker_loop<S: WorkerStream>(
     mut stream: S,
     rx: mpsc::Receiver<WorkerCommand>,
     connected: Arc<AtomicBool>,
+    point_format: PointFormat,
 ) {
     let mut queue = VecDeque::new();
     let mut last_pps = stream.scan_speed();
@@ -277,7 +365,7 @@ fn worker_loop<S: WorkerStream>(
         loop {
             match rx.try_recv() {
                 Ok(cmd) => {
-                    if !handle_worker_command(cmd, &mut queue, last_pps) {
+                    if !handle_worker_command(cmd, &mut queue, last_pps, point_format) {
                         break 'worker;
                     }
                 }
@@ -324,7 +412,7 @@ fn worker_loop<S: WorkerStream>(
 
         match rx.recv_timeout(stream::KEEPALIVE_INTERVAL) {
             Ok(cmd) => {
-                if !handle_worker_command(cmd, &mut queue, last_pps) {
+                if !handle_worker_command(cmd, &mut queue, last_pps, point_format) {
                     break;
                 }
             }
@@ -374,6 +462,7 @@ fn handle_worker_command(
     cmd: WorkerCommand,
     queue: &mut VecDeque<QueuedChunk>,
     last_pps: u32,
+    point_format: PointFormat,
 ) -> bool {
     match cmd {
         WorkerCommand::Chunk(chunk) => {
@@ -382,7 +471,7 @@ fn handle_worker_command(
         }
         WorkerCommand::Stop => {
             queue.clear();
-            queue.push_back(blank_chunk(last_pps));
+            queue.push_back(blank_chunk(last_pps, point_format));
             true
         }
         WorkerCommand::Shutdown => false,
@@ -392,9 +481,10 @@ fn handle_worker_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_worker_command, worker_loop, QueuedChunk, WorkerCommand, WorkerStream,
+        handle_worker_command, worker_loop, ChunkPoints, QueuedChunk, WorkerCommand, WorkerStream,
         MAX_CONSECUTIVE_ACK_MISSES,
     };
+    use crate::protocols::idn::dac::stream::PointFormat;
     use crate::protocols::idn::protocol::PointXyrgbi;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -444,12 +534,12 @@ mod tests {
             true
         }
 
-        fn write_frame(&mut self, _points: &[PointXyrgbi]) -> bool {
+        fn write_frame(&mut self, _points: &ChunkPoints) -> bool {
             self.writes.fetch_add(1, Ordering::Acquire);
             true
         }
 
-        fn write_frame_with_ack(&mut self, _points: &[PointXyrgbi], _timeout: Duration) -> bool {
+        fn write_frame_with_ack(&mut self, _points: &ChunkPoints, _timeout: Duration) -> bool {
             self.writes.fetch_add(1, Ordering::Acquire);
             self.ack_ok.load(Ordering::Acquire)
         }
@@ -464,7 +554,7 @@ mod tests {
     fn test_chunk(pps: u32, point_count: usize) -> QueuedChunk {
         QueuedChunk {
             pps,
-            points: vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); point_count],
+            points: ChunkPoints::Xyrgbi(vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); point_count]),
         }
     }
 
@@ -487,17 +577,20 @@ mod tests {
             WorkerCommand::Chunk(test_chunk(30_000, 179)),
             &mut queue,
             30_000,
+            PointFormat::Xyrgbi,
         ));
         assert!(handle_worker_command(
             WorkerCommand::Chunk(test_chunk(30_000, 179)),
             &mut queue,
             30_000,
+            PointFormat::Xyrgbi,
         ));
 
         assert!(handle_worker_command(
             WorkerCommand::Stop,
             &mut queue,
-            30_000
+            30_000,
+            PointFormat::Xyrgbi,
         ));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.front().unwrap().points.len(), 10);
@@ -511,7 +604,9 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
 
-        let handle = thread::spawn(move || worker_loop(fake_stream, rx, worker_connected));
+        let handle = thread::spawn(move || {
+            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+        });
 
         tx.send(WorkerCommand::Chunk(test_chunk(1_000, 179)))
             .unwrap();
@@ -540,7 +635,9 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
 
-        let handle = thread::spawn(move || worker_loop(fake_stream, rx, worker_connected));
+        let handle = thread::spawn(move || {
+            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+        });
 
         // Feed more chunks than the miss threshold; the first send is always an
         // ACK request (last_ack_check == None), and once misses start every

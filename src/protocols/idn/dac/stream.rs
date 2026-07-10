@@ -722,7 +722,7 @@ impl Stream {
         if self.scan_speed == 0 {
             warn!("IDN stream: scan_speed is 0, cannot send frame");
             return Err(CommunicationError::Protocol(
-                ProtocolError::InvalidPointFormat,
+                ProtocolError::InvalidScanSpeed,
             ));
         }
 
@@ -1964,6 +1964,42 @@ mod tests {
             0,
             "config must be resent after the refresh interval"
         );
+    }
+
+    #[test]
+    fn highres_format_writes_16bit_config_and_samples() {
+        use crate::protocols::idn::protocol::PointXyrgbHighRes;
+
+        let (mut stream, receiver) = connected_stream();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        stream.set_point_format(PointFormat::XyrgbHighRes);
+        stream.set_scan_speed(30_000);
+
+        // 40 hi-res points → single datagram (config on the first frame).
+        let pts: Vec<PointXyrgbHighRes> = (0..40)
+            .map(|i| PointXyrgbHighRes::new(i, 0, 0x1234, 0x5678, 0x9abc))
+            .collect();
+        stream.write_frame(&pts).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = receiver.recv_from(&mut buf).unwrap();
+
+        // Config header follows the 8-byte channel message header.
+        let cfg_off = PacketHeader::SIZE_BYTES + ChannelMessageHeader::SIZE_BYTES;
+        let word_count = buf[cfg_off] as usize;
+        assert_eq!(word_count, 5, "hi-res XYRGB descriptor has 5 words");
+
+        // config header (4) + descriptors (word_count*4) + sample chunk header (4).
+        let samples_off = cfg_off + 4 + word_count * 4 + SampleChunkHeader::SIZE_BYTES;
+        let sample_bytes = n - samples_off;
+        assert_eq!(
+            sample_bytes % PointXyrgbHighRes::SIZE_BYTES,
+            0,
+            "sample region must be a whole number of 10-byte hi-res samples"
+        );
+        assert_eq!(sample_bytes / PointXyrgbHighRes::SIZE_BYTES, 40);
     }
 
     #[test]
