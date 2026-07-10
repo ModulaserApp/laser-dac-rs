@@ -249,18 +249,25 @@ impl FrameSession {
         let slot_clone = frame_slot.clone();
         let metrics_clone = metrics.clone();
 
-        let thread = std::thread::spawn(move || {
-            let _disconnect_guard = MetricsDisconnectGuard(metrics_clone.clone());
-            Self::run_loop(
-                backend,
-                config,
-                control_clone,
-                control_rx,
-                slot_clone,
-                metrics_clone,
-                reconnect_policy,
-            )
-        });
+        // Named for diagnosability in profilers / thread dumps. Future work:
+        // request elevated (real-time / time-critical) scheduling priority here
+        // so pacing sleeps aren't preempted under load — deferred to avoid
+        // pulling in a platform thread-priority dependency.
+        let thread = std::thread::Builder::new()
+            .name("laser-frame-scheduler".to_string())
+            .spawn(move || {
+                let _disconnect_guard = MetricsDisconnectGuard(metrics_clone.clone());
+                Self::run_loop(
+                    backend,
+                    config,
+                    control_clone,
+                    control_rx,
+                    slot_clone,
+                    metrics_clone,
+                    reconnect_policy,
+                )
+            })
+            .map_err(Error::backend)?;
 
         Ok(Self {
             control,
