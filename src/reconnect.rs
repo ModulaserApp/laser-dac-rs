@@ -9,7 +9,7 @@
 //! [`ReconnectConfig`]: crate::config::ReconnectConfig
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, Error, Result};
 use crate::config::ReconnectConfig;
@@ -90,14 +90,18 @@ impl ReconnectPolicy {
         FProgress: FnMut(),
     {
         const SLICE: Duration = Duration::from_millis(50);
-        let mut remaining = duration;
-        while remaining > Duration::ZERO {
+        // Absolute deadline rather than decrementing by the nominal slice, so a
+        // coarse OS timer can't stretch the total backoff far beyond `duration`.
+        let deadline = Instant::now() + duration;
+        loop {
             if is_stopped() {
                 return true;
             }
-            let slice = remaining.min(SLICE);
-            std::thread::sleep(slice);
-            remaining = remaining.saturating_sub(slice);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(SLICE));
             on_progress();
         }
         is_stopped()
@@ -136,7 +140,12 @@ where
             }
         }
 
-        if ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress) {
+        // Attempt immediately on the first try; back off only *between* attempts
+        // so an instantly-recoverable disconnect doesn't blank output for a full
+        // backoff period before we even try to reopen.
+        if retries > 0
+            && ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress)
+        {
             return Err(RunExit::Stopped);
         }
 
