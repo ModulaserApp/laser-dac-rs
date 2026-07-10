@@ -12,9 +12,16 @@ use super::{
 
 const CHUNK_SECS: f64 = 0.010;
 
+/// After a stall, allow `next_send` to lag `now` by up to this many chunk
+/// durations so lost time is made up gradually instead of discarded.
+const CATCH_UP_CHUNKS: u32 = 3;
+
 pub(crate) struct UdpTimedAdapter {
     next_send: Instant,
     chunk_points: usize,
+    /// pps used to compute the current `chunk_duration`; a change here (even
+    /// with the chunk size pinned at the clamp) requires a duration recompute.
+    chunk_pps: u32,
     chunk_duration: Duration,
     /// True while a previously-filtered slice is held in `pipeline.cached_slice()`.
     has_retain: bool,
@@ -27,6 +34,7 @@ impl UdpTimedAdapter {
         Self {
             next_send: Instant::now(),
             chunk_points: 0,
+            chunk_pps: 0,
             chunk_duration: Duration::from_secs_f64(CHUNK_SECS),
             has_retain: false,
             max_points_per_chunk: max,
@@ -36,8 +44,14 @@ impl UdpTimedAdapter {
     fn recompute_chunk(&mut self, pps: u32) {
         let pps_f64 = pps as f64;
         let new_chunk = ((pps_f64 * CHUNK_SECS).ceil() as usize).min(self.max_points_per_chunk);
-        if new_chunk != self.chunk_points {
+        // Recompute the send period whenever the chunk size OR pps changes. In
+        // the clamped regime (chunk pinned at `max_points_per_chunk`, e.g. IDN's
+        // 179 points at pps ≥ 17.9k) a pps change leaves the chunk size the same
+        // but still shifts the per-chunk duration; guarding on chunk size alone
+        // would keep a stale, too-slow send period and cause continuous underrun.
+        if new_chunk != self.chunk_points || pps != self.chunk_pps {
             self.chunk_points = new_chunk;
+            self.chunk_pps = pps;
             self.chunk_duration = Duration::from_secs_f64(new_chunk as f64 / pps_f64.max(1.0));
         }
     }
@@ -50,8 +64,16 @@ impl OutputModelAdapter for UdpTimedAdapter {
         }
         self.next_send += self.chunk_duration;
         let now = Instant::now();
-        if self.next_send < now {
-            self.next_send = now;
+        // Bounded catch-up: after a stall (long sleep, backpressure) `next_send`
+        // may be far behind `now`. Rather than hard-clamping to `now` — which
+        // discards the lost time and permanently drains the device buffer — let
+        // `next_send` lag `now` by up to `CATCH_UP_CHUNKS` chunk durations so the
+        // backlog is worked off over the next few sends. Clamp only beyond that
+        // window to avoid an unbounded send burst.
+        let max_lag = self.chunk_duration.saturating_mul(CATCH_UP_CHUNKS);
+        let min_next = now.checked_sub(max_lag).unwrap_or(now);
+        if self.next_send < min_next {
+            self.next_send = min_next;
         }
 
         // pps may have changed during the sleep — re-read from control.
@@ -286,6 +308,106 @@ mod tests {
         let writes_v = writes.lock().unwrap();
         assert_eq!(writes_v.len(), 1);
         assert_eq!(writes_v[0].len(), expected_initial_chunk);
+    }
+
+    /// Regression for the clamped-regime pps change: when the chunk size stays
+    /// pinned at `max_points_per_chunk` (IDN's 179 points at pps ≥ 17.9k), a pps
+    /// change must still recompute `chunk_duration` — otherwise the send period
+    /// is stale and the device is fed at the wrong rate.
+    #[test]
+    fn pps_change_in_clamped_band_changes_chunk_duration() {
+        const MAX: usize = 179; // IDN clamp
+        let caps = DacCapabilities {
+            pps_min: 1_000,
+            pps_max: 100_000,
+            max_points_per_chunk: MAX,
+            output_model: OutputModel::UdpTimed,
+        };
+        let backend = FakeFifo {
+            caps,
+            next_outcomes: Arc::new(Mutex::new(Vec::new())),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
+        };
+        let backend = BackendKind::Fifo(Box::new(backend));
+        let mut adapter = UdpTimedAdapter::new(&backend);
+
+        // Both pps values are in the clamped band (ceil(pps*0.01) ≥ 179).
+        adapter.recompute_chunk(18_000);
+        let d1 = adapter.chunk_duration;
+        assert_eq!(adapter.chunk_points, MAX);
+
+        adapter.recompute_chunk(30_000);
+        let d2 = adapter.chunk_duration;
+        assert_eq!(adapter.chunk_points, MAX, "still clamped");
+
+        assert_ne!(
+            d1, d2,
+            "chunk_duration must change with pps even while chunk size is clamped"
+        );
+        // 179 / 30000 < 179 / 18000
+        assert!(d2 < d1);
+    }
+
+    /// After a long stall, `next_send` must be allowed to lag `now` (bounded
+    /// catch-up) rather than being hard-clamped to `now`, so lost time is made
+    /// up over the next few sends instead of permanently draining the buffer.
+    #[test]
+    fn stall_allows_bounded_catchup() {
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        engine.set_pending(frame_with_points(4_000));
+        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+        let backend = FakeFifo {
+            caps: DacCapabilities {
+                pps_min: 1_000,
+                pps_max: 100_000,
+                max_points_per_chunk: 4_096,
+                output_model: OutputModel::UdpTimed,
+            },
+            next_outcomes: Arc::new(Mutex::new(Vec::new())),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
+        };
+        let mut backend = BackendKind::Fifo(Box::new(backend));
+        let mut adapter = UdpTimedAdapter::new(&backend);
+        // chunk_duration is 10ms by default; catch-up window is 30ms.
+        // Simulate a 1s stall: next_send far in the past.
+        adapter.next_send = std::time::Instant::now() - std::time::Duration::from_secs(1);
+
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, std::time::Duration::ZERO, 30_000);
+        let metrics = FrameSessionMetrics::new(true);
+        let mut shutter = false;
+        {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+            let mut ctx = LoopCtx {
+                backend: &mut backend,
+                source,
+                control: &control,
+                control_rx: &rx,
+                metrics: &metrics,
+                shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: std::time::Duration::from_millis(20),
+                pps: 30_000,
+                is_armed: true,
+            };
+            assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
+        }
+
+        // Hard-clamp (old behavior) would leave next_send ≈ now (gap ~0). Bounded
+        // catch-up keeps it ~30ms (3 × 10ms chunks) behind, so the lag survives.
+        let lag = std::time::Instant::now().saturating_duration_since(adapter.next_send);
+        assert!(
+            lag >= std::time::Duration::from_millis(20),
+            "expected retained catch-up lag, got {lag:?}"
+        );
+        assert!(
+            lag <= std::time::Duration::from_millis(45),
+            "catch-up lag must stay bounded, got {lag:?}"
+        );
     }
 
     /// Phase 4 lock-in: UdpTimed produces fixed 10ms slices sized
