@@ -251,7 +251,7 @@ impl From<&LaserPoint> for DacPoint {
     /// # Coordinate convention
     ///
     /// **Both** the X and Y axes are inverted here (via
-    /// [`LaserPoint::coord_to_i16_inverted`]). This is a deliberate
+    /// `LaserPoint::coord_to_i16_inverted`). This is a deliberate
     /// crate-wide orientation choice: relative to stock Ether Dream tooling
     /// (which maps the crate's `+1.0` to `+32767` on both axes), output is
     /// rotated 180°. Content authored against this crate's convention will
