@@ -6,8 +6,9 @@ use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
 use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
-use crate::resample::{catmull_rom, resampled_len};
+use crate::resample::{CatmullInterp, StreamingResampler};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Sample, SampleFormat};
 use crossbeam_queue::ArrayQueue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -60,12 +61,14 @@ struct OutputConfigRange {
     channels: u16,
     min_sample_rate: u32,
     max_sample_rate: u32,
+    sample_format: SampleFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SelectedStreamConfig {
     channels: u16,
     sample_rate: u32,
+    sample_format: SampleFormat,
 }
 
 struct DeviceRecord<D> {
@@ -83,7 +86,7 @@ struct DeviceCandidate<D> {
     default_output_sample_rate: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct StreamPoint {
     x: f32,
     y: f32,
@@ -93,12 +96,30 @@ struct StreamPoint {
     i: f32,
 }
 
+impl CatmullInterp for StreamPoint {
+    fn catmull(s0: Self, s1: Self, s2: Self, s3: Self, t: f32) -> Self {
+        use crate::resample::catmull_rom;
+        StreamPoint {
+            x: catmull_rom(s0.x, s1.x, s2.x, s3.x, t),
+            y: catmull_rom(s0.y, s1.y, s2.y, s3.y, t),
+            r: catmull_rom(s0.r, s1.r, s2.r, s3.r, t),
+            g: catmull_rom(s0.g, s1.g, s2.g, s3.g, t),
+            b: catmull_rom(s0.b, s1.b, s2.b, s3.b, t),
+            i: catmull_rom(s0.i, s1.i, s2.i, s3.i, t),
+        }
+    }
+}
+
 struct RuntimeState {
     queue: ArrayQueue<StreamPoint>,
     sample_rate: u32,
     shutter_open: AtomicBool,
     last_x_bits: AtomicU32,
     last_y_bits: AtomicU32,
+    /// Set by the cpal error callback when the stream dies (e.g. the device
+    /// was unplugged). Producer-side calls observe it and surface a
+    /// disconnected-class error so the driver's reconnect path engages.
+    stream_failed: AtomicBool,
 }
 
 impl RuntimeState {
@@ -109,6 +130,7 @@ impl RuntimeState {
             shutter_open: AtomicBool::new(shutter_open),
             last_x_bits: AtomicU32::new(0.0f32.to_bits()),
             last_y_bits: AtomicU32::new(0.0f32.to_bits()),
+            stream_failed: AtomicBool::new(false),
         }
     }
 
@@ -119,11 +141,22 @@ impl RuntimeState {
     fn queued_points(&self) -> u64 {
         self.queue.len() as u64
     }
+
+    fn mark_stream_failed(&self) {
+        self.stream_failed.store(true, Ordering::Release);
+    }
+
+    fn stream_failed(&self) -> bool {
+        self.stream_failed.load(Ordering::Acquire)
+    }
 }
 
 impl QueueDepthSource for RuntimeState {
     fn queued_points(&self) -> u64 {
         RuntimeState::queued_points(self)
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 
@@ -164,8 +197,17 @@ impl RuntimeState {
 
 trait RunningAudioStream {}
 
+/// Result of resolving a selector to a concrete stream config, plus the count
+/// of same-named devices visible at resolve time (for the reconnect identity
+/// guard). `same_name_count` is `None` when the engine can't enumerate a stable
+/// device set (test fakes), in which case the guard is skipped.
+struct ResolvedConfig {
+    config: SelectedStreamConfig,
+    same_name_count: Option<usize>,
+}
+
 trait AudioEngine: Send + Sync {
-    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<SelectedStreamConfig>;
+    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig>;
     fn open_stream(
         &self,
         selector: &AvbSelector,
@@ -183,9 +225,35 @@ impl RunningAudioStream for CpalRunningStream {}
 struct CpalAudioEngine;
 
 impl AudioEngine for CpalAudioEngine {
-    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<SelectedStreamConfig> {
-        let candidate = select_device(selector)?;
-        select_stream_config(&candidate)
+    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig> {
+        // Enumerate once: derive both the stream config and the same-named
+        // device count from a single candidate list (the worker thread does a
+        // second, unavoidable enumeration to build the !Send stream).
+        let candidates = collect_candidates()?;
+        let key = normalize_device_name(&selector.name);
+        let same_name_count = candidates
+            .iter()
+            .filter(|c| normalize_device_name(&c.selector.name) == key)
+            .count();
+        let candidate = candidates
+            .into_iter()
+            .find(|candidate| {
+                candidate.selector.name == selector.name
+                    && candidate.selector.duplicate_index == selector.duplicate_index
+            })
+            .ok_or_else(|| {
+                Error::disconnected(
+                    super::error::Error::DeviceNotFound(format!(
+                        "{} (index {})",
+                        selector.name, selector.duplicate_index
+                    ))
+                    .to_string(),
+                )
+            })?;
+        Ok(ResolvedConfig {
+            config: select_stream_config(&candidate)?,
+            same_name_count: Some(same_name_count),
+        })
     }
 
     fn open_stream(
@@ -195,28 +263,107 @@ impl AudioEngine for CpalAudioEngine {
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>> {
         let selected = select_device(selector)?;
-        let stream_config = build_cpal_stream_config(stream_config);
         let output_channels = stream_config.channels as usize;
-        let callback_state = Arc::clone(&runtime);
+        let sample_format = stream_config.sample_format;
 
-        let stream = selected
-            .device
-            .build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| {
-                    fill_output_buffer(data, output_channels, &callback_state);
-                },
-                move |err| {
-                    log::error!("AVB output stream error: {}", err);
-                },
-                None,
-            )
-            .map_err(Error::backend)?;
+        // Try the preferred fixed buffer size (Windows/ASIO) and fall back to
+        // the driver default if the build fails (some ASIO drivers reject
+        // arbitrary sizes).
+        let stream = build_stream_with_buffer_fallback(
+            &selected.device,
+            stream_config,
+            output_channels,
+            sample_format,
+            &runtime,
+        )?;
 
         stream.play().map_err(Error::backend)?;
 
         Ok(Box::new(CpalRunningStream { _stream: stream }))
     }
+}
+
+/// Build the output stream, first attempting the preferred fixed buffer size
+/// and falling back to `BufferSize::Default` on failure.
+fn build_stream_with_buffer_fallback(
+    device: &cpal::Device,
+    stream_config: SelectedStreamConfig,
+    output_channels: usize,
+    sample_format: SampleFormat,
+    runtime: &Arc<RuntimeState>,
+) -> Result<cpal::Stream> {
+    let preferred = build_cpal_stream_config(stream_config, preferred_buffer_size());
+    match build_output_stream_for_format(
+        device,
+        &preferred,
+        output_channels,
+        sample_format,
+        runtime,
+    ) {
+        Ok(stream) => Ok(stream),
+        Err(err) if !matches!(preferred.buffer_size, cpal::BufferSize::Default) => {
+            log::warn!(
+                "AVB: fixed buffer size rejected ({}); retrying with device default",
+                err
+            );
+            let fallback = build_cpal_stream_config(stream_config, cpal::BufferSize::Default);
+            build_output_stream_for_format(
+                device,
+                &fallback,
+                output_channels,
+                sample_format,
+                runtime,
+            )
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Build an output stream for the given sample format, converting f32 samples
+/// to the device's native format inside the callback.
+fn build_output_stream_for_format(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    output_channels: usize,
+    sample_format: SampleFormat,
+    runtime: &Arc<RuntimeState>,
+) -> Result<cpal::Stream> {
+    let callback_state = Arc::clone(runtime);
+    let err_state = Arc::clone(runtime);
+    let err_fn = move |err: cpal::StreamError| {
+        log::error!("AVB output stream error: {}", err);
+        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+            err_state.mark_stream_failed();
+        }
+    };
+
+    let built = match sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            config,
+            move |data: &mut [f32], _| fill_output_buffer(data, output_channels, &callback_state),
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_output_stream(
+            config,
+            move |data: &mut [i16], _| {
+                fill_output_buffer_converted(data, output_channels, &callback_state)
+            },
+            err_fn,
+            None,
+        ),
+        SampleFormat::I32 => device.build_output_stream(
+            config,
+            move |data: &mut [i32], _| {
+                fill_output_buffer_converted(data, output_channels, &callback_state)
+            },
+            err_fn,
+            None,
+        ),
+        _ => return Err(Error::backend(super::error::Error::UnsupportedOutputConfig)),
+    };
+
+    built.map_err(Error::backend)
 }
 
 /// AVB DAC backend using system audio output.
@@ -231,10 +378,21 @@ pub struct AvbBackend {
     /// Runtime-authoritative buffer estimator. Source is set on connect and
     /// cleared on disconnect; reports zero in between.
     estimator: RuntimeAuthorityEstimator,
-    /// Reusable scratch buffer for resampled `StreamPoint` conversion. Lives
-    /// on the backend so the realtime `try_write_points` path doesn't allocate
-    /// a fresh `Vec` per call.
+    /// Stateful PPS→sample-rate resampler. Carries fractional phase and
+    /// trailing input across `try_write_points` calls so interpolation spans
+    /// chunk boundaries. Reset on connect/stop/disconnect; re-phased on PPS
+    /// change. Rates are (from=pps, to=sample_rate); `1` is a placeholder until
+    /// the first write establishes the real rates.
+    resampler: StreamingResampler<StreamPoint>,
+    /// Reusable scratch buffer for `StreamPoint` conversion of the input chunk,
+    /// so the realtime `try_write_points` path doesn't allocate per call.
     resample_scratch: Vec<StreamPoint>,
+    /// Number of same-named devices seen at scan time, used to detect device
+    /// set changes that would make `duplicate_index` bind a different unit.
+    scan_duplicate_count: Option<usize>,
+    /// Whether we've already warned that the requested PPS exceeds the device
+    /// sample rate (decimation). Reset on connect so each session warns once.
+    warned_pps_exceeds_rate: bool,
 }
 
 impl AvbBackend {
@@ -248,8 +406,19 @@ impl AvbBackend {
             caps: super::default_capabilities(),
             desired_shutter_open: false,
             estimator: RuntimeAuthorityEstimator::new(),
+            resampler: StreamingResampler::new(1, 1),
             resample_scratch: Vec::new(),
+            scan_duplicate_count: None,
+            warned_pps_exceeds_rate: false,
         }
+    }
+
+    /// After a successful connect, pin `pps_max` to the detected device sample
+    /// rate: PPS above it can only be delivered by decimation. The driver
+    /// re-reads caps on reconnect, so this propagates to later sessions.
+    fn update_caps_for_sample_rate(&mut self, sample_rate: u32) {
+        self.caps.pps_max = sample_rate;
+        self.warned_pps_exceeds_rate = false;
     }
 
     pub fn new(name: String, duplicate_index: u16) -> Self {
@@ -262,8 +431,15 @@ impl AvbBackend {
         )
     }
 
-    pub(crate) fn from_selector(selector: AvbSelector) -> Self {
-        Self::build(selector, Arc::new(CpalAudioEngine))
+    /// Build from a discovered selector, recording how many same-named devices
+    /// were visible at scan time for the reconnect identity guard.
+    pub(crate) fn from_selector_with_scan_count(
+        selector: AvbSelector,
+        scan_duplicate_count: usize,
+    ) -> Self {
+        let mut backend = Self::build(selector, Arc::new(CpalAudioEngine));
+        backend.scan_duplicate_count = Some(scan_duplicate_count);
+        backend
     }
 
     #[cfg(test)]
@@ -302,12 +478,45 @@ impl DacBackend for AvbBackend {
             self.selector.name,
             self.selector.duplicate_index
         );
-        let stream_config = self.engine.resolve_stream_config(&self.selector)?;
+
+        let resolved = self.engine.resolve_stream_config(&self.selector)?;
+
+        // Reconnect identity guard: `duplicate_index` is a positional index
+        // among same-named devices, so if the number of devices sharing this
+        // name changed since scan time the index may now bind a *different*
+        // physical unit. Refuse rather than silently drive the wrong laser.
+        if let (Some(recorded), Some(current)) =
+            (self.scan_duplicate_count, resolved.same_name_count)
+        {
+            if recorded != current {
+                log::error!(
+                    "AVB: device set for {:?} changed since scan ({} → {} same-named devices); \
+                     refusing to bind by positional index",
+                    self.selector.name,
+                    recorded,
+                    current
+                );
+                return Err(Error::disconnected(
+                    super::error::Error::DeviceNotFound(format!(
+                        "{}: same-named device count changed ({} → {}); rescan required",
+                        self.selector.name, recorded, current
+                    ))
+                    .to_string(),
+                ));
+            }
+        }
+
+        let stream_config = resolved.config;
         log::info!(
-            "AVB: selected {} channels at {}Hz",
+            "AVB: selected {} channels at {}Hz ({:?})",
             stream_config.channels,
-            stream_config.sample_rate
+            stream_config.sample_rate,
+            stream_config.sample_format,
         );
+
+        // A fresh stream starts a fresh resample phase.
+        self.resampler.reset();
+
         let runtime = Arc::new(RuntimeState::new(
             self.desired_shutter_open,
             stream_config.sample_rate,
@@ -338,6 +547,7 @@ impl DacBackend for AvbBackend {
                     self.selector.duplicate_index,
                     stream_config.sample_rate
                 );
+                self.update_caps_for_sample_rate(stream_config.sample_rate);
                 self.estimator
                     .set_source(Arc::clone(&runtime) as Arc<dyn QueueDepthSource>);
                 self.runtime = Some(runtime);
@@ -352,6 +562,13 @@ impl DacBackend for AvbBackend {
             }
             Err(_) => {
                 log::error!("AVB: audio worker init timed out (5s)");
+                // Signal the worker to stop *before* joining: if `open_stream`
+                // is slow-but-successful the worker would otherwise loop
+                // forever on the still-alive `stop_tx` and this join would
+                // deadlock. Dropping/sending closes the channel so the worker
+                // tears down any stream it managed to open and exits.
+                let _ = stop_tx.send(());
+                drop(stop_tx);
                 let _ = handle.join();
                 Err(Error::backend(super::error::Error::StreamStartFailed))
             }
@@ -376,13 +593,16 @@ impl DacBackend for AvbBackend {
             runtime.clear_queue();
         }
         self.estimator.clear_source();
+        self.resampler.reset();
 
         log::info!("AVB: disconnected from {:?}", self.selector.name);
         Ok(())
     }
 
     fn is_connected(&self) -> bool {
-        self.runtime.is_some() && self.worker_handle.is_some()
+        self.runtime.is_some()
+            && self.worker_handle.is_some()
+            && self.runtime.as_ref().is_some_and(|rt| !rt.stream_failed())
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -391,6 +611,9 @@ impl DacBackend for AvbBackend {
             runtime.shutter_open.store(false, Ordering::Release);
             runtime.clear_queue();
         }
+        // The queue was just cleared; drop the carried resample phase too so
+        // output resumes cleanly rather than continuing a stale trajectory.
+        self.resampler.reset();
         Ok(())
     }
 
@@ -410,21 +633,43 @@ impl FifoBackend for AvbBackend {
             .as_ref()
             .ok_or_else(|| Error::disconnected("Not connected"))?;
 
+        // Surface a dead cpal stream (e.g. device unplugged) as a
+        // disconnected-class error so the driver's reconnect path engages.
+        if runtime.stream_failed() {
+            return Err(Error::disconnected("AVB output stream failed"));
+        }
+
         if points.is_empty() {
             return Ok(WriteOutcome::Written);
         }
 
-        // Fast path: no resampling needed when PPS matches the audio sample rate.
-        if pps == runtime.sample_rate {
-            Ok(enqueue_points(runtime, points))
-        } else {
-            Ok(enqueue_resampled(
-                runtime,
-                points,
+        if pps > runtime.sample_rate && !self.warned_pps_exceeds_rate {
+            log::warn!(
+                "AVB: requested PPS {} exceeds device sample rate {}Hz — output will be decimated",
                 pps,
-                &mut self.resample_scratch,
-            ))
+                runtime.sample_rate
+            );
+            self.warned_pps_exceeds_rate = true;
         }
+
+        // Keep the resampler phased to the current PPS (a PPS change re-phases).
+        self.resampler.set_rates(pps.max(1), runtime.sample_rate);
+
+        // Reserve queue capacity for exactly what the resampler will emit for
+        // this chunk, given its carried phase; bail out cleanly if it won't fit.
+        let output_len = self.resampler.pending_output_count(points.len());
+        if !runtime.has_capacity_for(output_len) {
+            return Ok(WriteOutcome::WouldBlock);
+        }
+
+        self.resample_scratch.clear();
+        self.resample_scratch
+            .extend(points.iter().map(StreamPoint::from));
+        let scratch = std::mem::take(&mut self.resample_scratch);
+        self.resampler.process(&scratch, |p| runtime.push_point(p));
+        self.resample_scratch = scratch;
+
+        Ok(WriteOutcome::Written)
     }
 
     fn estimator(&self) -> &dyn BufferEstimator {
@@ -548,6 +793,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
                         channels: cfg.channels(),
                         min_sample_rate: cfg.min_sample_rate().0,
                         max_sample_rate: cfg.max_sample_rate().0,
+                        sample_format: cfg.sample_format(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -673,19 +919,58 @@ fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<Sel
         }
     };
 
+    let sample_format =
+        choose_sample_format(&candidate.output_config_ranges, channels, sample_rate);
+
     Ok(SelectedStreamConfig {
         channels,
         sample_rate,
+        sample_format,
     })
 }
 
-fn build_cpal_stream_config(stream_config: SelectedStreamConfig) -> cpal::StreamConfig {
-    let buffer_size = if cfg!(target_os = "windows") {
+/// Pick a sample format for the chosen (channels, rate), preferring f32 (native
+/// output type) and falling back to i16/i32 for devices — many ALSA/ASIO
+/// interfaces — that only expose integer formats. Defaults to f32 when no
+/// range matches (the build will surface any real mismatch).
+fn choose_sample_format(
+    config_ranges: &[OutputConfigRange],
+    channels: u16,
+    sample_rate: u32,
+) -> SampleFormat {
+    let matching = || {
+        config_ranges.iter().filter(move |r| {
+            r.channels == channels && (r.min_sample_rate..=r.max_sample_rate).contains(&sample_rate)
+        })
+    };
+    for preferred in [SampleFormat::F32, SampleFormat::I16, SampleFormat::I32] {
+        if matching().any(|r| r.sample_format == preferred) {
+            return preferred;
+        }
+    }
+    // No preferred format matched exactly; take whatever the first matching
+    // range offers, else fall back to f32.
+    matching()
+        .map(|r| r.sample_format)
+        .next()
+        .unwrap_or(SampleFormat::F32)
+}
+
+/// The buffer size to try first. Windows/ASIO drivers generally want a small
+/// fixed size for low latency; everywhere else the device default is best.
+/// [`build_stream_with_buffer_fallback`] retries with `Default` if this fails.
+fn preferred_buffer_size() -> cpal::BufferSize {
+    if cfg!(target_os = "windows") {
         cpal::BufferSize::Fixed(256)
     } else {
         cpal::BufferSize::Default
-    };
+    }
+}
 
+fn build_cpal_stream_config(
+    stream_config: SelectedStreamConfig,
+    buffer_size: cpal::BufferSize,
+) -> cpal::StreamConfig {
     cpal::StreamConfig {
         channels: stream_config.channels,
         sample_rate: cpal::SampleRate(stream_config.sample_rate),
@@ -729,6 +1014,9 @@ fn choose_stream_config(
         .map(|r| (r.channels, r.max_sample_rate))
 }
 
+/// Directly enqueue points without resampling. Test helper for exercising the
+/// queue and `fill_output_buffer` in isolation.
+#[cfg(test)]
 fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome {
     if !runtime.has_capacity_for(points.len()) {
         return WriteOutcome::WouldBlock;
@@ -737,66 +1025,6 @@ fn enqueue_points(runtime: &RuntimeState, points: &[LaserPoint]) -> WriteOutcome
     for point in points {
         runtime.push_point(StreamPoint::from(point));
     }
-    WriteOutcome::Written
-}
-
-/// Interpolate all fields of four `StreamPoint`s using 4-point Catmull-Rom.
-fn catmull_rom_stream_point(
-    s0: &StreamPoint,
-    s1: &StreamPoint,
-    s2: &StreamPoint,
-    s3: &StreamPoint,
-    t: f32,
-) -> StreamPoint {
-    StreamPoint {
-        x: catmull_rom(s0.x, s1.x, s2.x, s3.x, t),
-        y: catmull_rom(s0.y, s1.y, s2.y, s3.y, t),
-        r: catmull_rom(s0.r, s1.r, s2.r, s3.r, t),
-        g: catmull_rom(s0.g, s1.g, s2.g, s3.g, t),
-        b: catmull_rom(s0.b, s1.b, s2.b, s3.b, t),
-        i: catmull_rom(s0.i, s1.i, s2.i, s3.i, t),
-    }
-}
-
-/// Resample `points` from `pps` to `sample_rate` and enqueue directly.
-///
-/// Caller must ensure `points` is non-empty (the `try_write_points` fast path handles this).
-/// `scratch` is a reusable buffer for the `StreamPoint` conversion of `points`; it's cleared
-/// on entry and refilled, allowing the realtime caller to amortize the allocation across calls.
-fn enqueue_resampled(
-    runtime: &RuntimeState,
-    points: &[LaserPoint],
-    pps: u32,
-    scratch: &mut Vec<StreamPoint>,
-) -> WriteOutcome {
-    debug_assert!(!points.is_empty());
-    let output_len = resampled_len(points.len(), pps, runtime.sample_rate);
-    if !runtime.has_capacity_for(output_len) {
-        return WriteOutcome::WouldBlock;
-    }
-
-    scratch.clear();
-    scratch.extend(points.iter().map(StreamPoint::from));
-    let src = scratch.as_slice();
-    let last_src_idx = (src.len() - 1) as f32;
-    let step = if output_len > 1 {
-        last_src_idx / (output_len - 1) as f32
-    } else {
-        0.0
-    };
-
-    let last = src.len() - 1;
-    for i in 0..output_len {
-        let src_pos = i as f32 * step;
-        let idx = (src_pos as usize).min(last);
-        let t = src_pos - idx as f32;
-        let s0 = &src[idx.saturating_sub(1)];
-        let s1 = &src[idx];
-        let s2 = &src[(idx + 1).min(last)];
-        let s3 = &src[(idx + 2).min(last)];
-        runtime.push_point(catmull_rom_stream_point(s0, s1, s2, s3, t));
-    }
-
     WriteOutcome::Written
 }
 
@@ -817,14 +1045,28 @@ fn scale_u16_to_f32(value: u16) -> f32 {
     value as f32 / u16::MAX as f32
 }
 
+/// Fill an f32 output buffer. Kept as a concrete entry point for tests and the
+/// fake engine; delegates to the format-generic implementation.
 fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &RuntimeState) {
+    fill_output_buffer_converted(data, output_channels, runtime);
+}
+
+/// Fill an output buffer of any cpal sample format from the runtime queue.
+///
+/// XY are sign-flipped to match the galvo convention. On a 5-channel (XYRGB)
+/// config there is no dedicated intensity channel, so RGB is premultiplied by
+/// the point intensity; on a 6-channel (XYRGBI) config intensity is written to
+/// its own channel. On underrun the last XY position is held and RGB blanked
+/// (laser-safe); on shutter-closed RGB is blanked but XY still tracks.
+fn fill_output_buffer_converted<S: Sample + cpal::FromSample<f32>>(
+    data: &mut [S],
+    output_channels: usize,
+    runtime: &RuntimeState,
+) {
     let shutter_open = runtime.shutter_open.load(Ordering::Acquire);
 
     for frame in data.chunks_mut(output_channels) {
-        frame.fill(0.0);
-        let maybe_point = runtime.pop_point();
-
-        let point = match maybe_point {
+        let point = match runtime.pop_point() {
             Some(point) => {
                 runtime.set_last_xy(point.x, point.y);
                 point
@@ -842,19 +1084,26 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
             }
         };
 
-        if !frame.is_empty() {
-            frame[0] = -point.x;
-        }
-        if frame.len() > 1 {
-            frame[1] = -point.y;
-        }
+        let mut vals = [0.0f32; CHANNELS_XYRGBI];
+        vals[0] = -point.x;
+        vals[1] = -point.y;
         if shutter_open && frame.len() >= CHANNELS_XYRGB {
-            frame[2] = point.r;
-            frame[3] = point.g;
-            frame[4] = point.b;
             if frame.len() >= CHANNELS_XYRGBI {
-                frame[5] = point.i;
+                vals[2] = point.r;
+                vals[3] = point.g;
+                vals[4] = point.b;
+                vals[5] = point.i;
+            } else {
+                // No dedicated intensity channel: fold intensity into RGB.
+                vals[2] = point.r * point.i;
+                vals[3] = point.g * point.i;
+                vals[4] = point.b * point.i;
             }
+        }
+
+        for (i, slot) in frame.iter_mut().enumerate() {
+            let v = if i < CHANNELS_XYRGBI { vals[i] } else { 0.0 };
+            *slot = S::from_sample(v);
         }
     }
 }
@@ -879,6 +1128,7 @@ mod tests {
                 channels,
                 min_sample_rate,
                 max_sample_rate,
+                sample_format: SampleFormat::F32,
             }],
             default_output_channels: Some(channels),
             default_output_sample_rate: Some(max_sample_rate),
@@ -913,6 +1163,7 @@ mod tests {
         channels: usize,
         sample_rate: AtomicU32,
         sample_rate_after_resolve: Option<u32>,
+        same_name_count: Option<usize>,
     }
 
     impl FakeAudioEngine {
@@ -931,6 +1182,7 @@ mod tests {
                 channels,
                 sample_rate: AtomicU32::new(sample_rate),
                 sample_rate_after_resolve: None,
+                same_name_count: None,
             }
         }
 
@@ -943,6 +1195,11 @@ mod tests {
                 sample_rate_after_resolve: Some(next_sample_rate),
                 ..Self::with_sample_rate(channels, sample_rate)
             }
+        }
+
+        fn with_same_name_count(mut self, count: usize) -> Self {
+            self.same_name_count = Some(count);
+            self
         }
 
         fn snapshot(&self) -> Vec<Vec<f32>> {
@@ -968,7 +1225,7 @@ mod tests {
     }
 
     impl AudioEngine for FakeAudioEngine {
-        fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<SelectedStreamConfig> {
+        fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<ResolvedConfig> {
             if self.fail_open.load(Ordering::Acquire) {
                 return Err(Error::backend(
                     crate::protocols::avb::error::Error::StreamStartFailed,
@@ -978,9 +1235,13 @@ mod tests {
             if let Some(next_sample_rate) = self.sample_rate_after_resolve {
                 self.sample_rate.store(next_sample_rate, Ordering::Release);
             }
-            Ok(SelectedStreamConfig {
-                channels: self.channels as u16,
-                sample_rate,
+            Ok(ResolvedConfig {
+                config: SelectedStreamConfig {
+                    channels: self.channels as u16,
+                    sample_rate,
+                    sample_format: SampleFormat::F32,
+                },
+                same_name_count: self.same_name_count,
             })
         }
 
@@ -1210,11 +1471,13 @@ mod tests {
                 channels: 8,
                 min_sample_rate: 44_100,
                 max_sample_rate: 96_000,
+                sample_format: SampleFormat::F32,
             },
             OutputConfigRange {
                 channels: 6,
                 min_sample_rate: 48_000,
                 max_sample_rate: 48_000,
+                sample_format: SampleFormat::F32,
             },
         ];
         assert_eq!(
@@ -1229,6 +1492,7 @@ mod tests {
             channels: 8,
             min_sample_rate: 44_100,
             max_sample_rate: 96_000,
+            sample_format: SampleFormat::F32,
         }];
         assert_eq!(
             choose_stream_config(&ranges, Some(96_000)),
@@ -1242,6 +1506,7 @@ mod tests {
             channels: 6,
             min_sample_rate: 48_000,
             max_sample_rate: 96_000,
+            sample_format: SampleFormat::F32,
         }];
         assert_eq!(
             choose_stream_config(&ranges, Some(96_000)),
@@ -1255,6 +1520,7 @@ mod tests {
             channels: 8,
             min_sample_rate: 44_100,
             max_sample_rate: 44_100,
+            sample_format: SampleFormat::F32,
         }];
         // Default rate 48kHz is not in range, so falls back to max_sample_rate.
         assert_eq!(
@@ -1270,11 +1536,13 @@ mod tests {
                 channels: 2,
                 min_sample_rate: 48_000,
                 max_sample_rate: 96_000,
+                sample_format: SampleFormat::F32,
             },
             OutputConfigRange {
                 channels: 6,
                 min_sample_rate: 48_000,
                 max_sample_rate: 48_000,
+                sample_format: SampleFormat::F32,
             },
         ];
         assert_eq!(
@@ -1289,6 +1557,7 @@ mod tests {
             channels: 2,
             min_sample_rate: 44_100,
             max_sample_rate: 96_000,
+            sample_format: SampleFormat::F32,
         }];
         assert_eq!(choose_stream_config(&ranges, Some(48_000)), None);
     }
@@ -1300,11 +1569,13 @@ mod tests {
                 channels: 8,
                 min_sample_rate: 96_000,
                 max_sample_rate: 96_000,
+                sample_format: SampleFormat::F32,
             },
             OutputConfigRange {
                 channels: 6,
                 min_sample_rate: 48_000,
                 max_sample_rate: 48_000,
+                sample_format: SampleFormat::F32,
             },
         ];
         assert_eq!(
@@ -1334,6 +1605,69 @@ mod tests {
 
         backend.disconnect().unwrap();
         assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn stream_failure_flag_surfaces_as_disconnected() {
+        let fake = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI));
+        let engine: Arc<dyn AudioEngine> = fake.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.connect().unwrap();
+        assert!(backend.is_connected());
+
+        // Simulate the cpal error callback marking the stream dead.
+        backend.runtime.as_ref().unwrap().mark_stream_failed();
+
+        // Writes now report disconnected so the driver's reconnect path runs.
+        let err = backend
+            .try_write_points(48_000, &[LaserPoint::blanked(0.0, 0.0)])
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("stream failed"));
+        assert!(!backend.is_connected());
+
+        backend.disconnect().unwrap();
+    }
+
+    #[test]
+    fn fill_output_buffer_converts_to_i16() {
+        let runtime = RuntimeState::new(true, 48_000);
+        let point = LaserPoint::new(0.5, -0.5, 65535, 0, 0, 65535);
+        assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
+
+        let mut data = vec![0i16; CHANNELS_XYRGBI];
+        fill_output_buffer_converted(&mut data, CHANNELS_XYRGBI, &runtime);
+
+        // frame[0] = -x = -0.5 → strongly negative i16; frame[1] = -y = 0.5.
+        assert!(data[0] < -10_000);
+        assert!(data[1] > 10_000);
+        // R at full scale → near i16::MAX.
+        assert!(data[2] > 30_000);
+    }
+
+    #[test]
+    fn connect_refuses_when_same_name_device_count_changed() {
+        // Scanned with 2 same-named devices; engine now reports 1 → the
+        // positional index may bind a different unit, so connect must refuse.
+        let fake = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI).with_same_name_count(1));
+        let engine: Arc<dyn AudioEngine> = fake.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.scan_duplicate_count = Some(2);
+
+        let err = backend.connect().unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("count changed"));
+        assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn connect_allows_when_same_name_device_count_matches() {
+        let fake = Arc::new(FakeAudioEngine::new(CHANNELS_XYRGBI).with_same_name_count(2));
+        let engine: Arc<dyn AudioEngine> = fake.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.scan_duplicate_count = Some(2);
+
+        backend.connect().unwrap();
+        assert!(backend.is_connected());
+        backend.disconnect().unwrap();
     }
 
     #[test]
@@ -1397,6 +1731,7 @@ mod tests {
                 SelectedStreamConfig {
                     channels: CHANNELS_XYRGBI as u16,
                     sample_rate: runtime.sample_rate,
+                    sample_format: SampleFormat::F32,
                 },
                 Arc::clone(&runtime),
             )
@@ -1439,6 +1774,7 @@ mod tests {
                 SelectedStreamConfig {
                     channels: CHANNELS_XYRGBI as u16,
                     sample_rate: runtime.sample_rate,
+                    sample_format: SampleFormat::F32,
                 },
                 Arc::clone(&runtime),
             )
@@ -1484,61 +1820,78 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_resampled_interpolates_xy() {
-        let runtime = RuntimeState::new(true, 48_000);
+    fn resampler_write_interpolates_xy() {
+        let fake = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 48_000));
+        fake.paused.store(true, Ordering::Release);
+        let engine: Arc<dyn AudioEngine> = fake.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.connect().unwrap();
+        backend.set_shutter(true).unwrap();
+
         let points = vec![
             LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
         ];
-        // 2 points at 24k → ceil(2 * 48000 / 24000) = 4 output samples
-        let mut scratch = Vec::new();
-        let outcome = enqueue_resampled(&runtime, &points, 24_000, &mut scratch);
-        assert_eq!(outcome, WriteOutcome::Written);
-        assert_eq!(runtime.queued_points(), 4);
+        // 24k → 48k, fresh phase: total_emittable(2) = floor(1*2)+1 = 3.
+        assert_eq!(
+            backend.try_write_points(24_000, &points).unwrap(),
+            WriteOutcome::Written
+        );
+        let runtime = backend.runtime.as_ref().unwrap().clone();
+        assert_eq!(runtime.queued_points(), 3);
 
-        // First sample should be at input start
+        // First sample sits at the input start.
         let p0 = runtime.pop_point().unwrap();
         assert!((p0.x - (-1.0)).abs() < 0.01);
         assert!((p0.y - (-1.0)).abs() < 0.01);
         assert!(p0.r < 0.01);
 
-        // Middle samples should be interpolated (position and color)
+        // Middle sample is interpolated in both position and color.
         let p1 = runtime.pop_point().unwrap();
         assert!(p1.x > -1.0 && p1.x < 1.0);
         assert!(p1.y > -1.0 && p1.y < 1.0);
         assert!(p1.r > 0.0 && p1.r < 1.0);
-        assert!(p1.g > 0.0 && p1.g < 1.0);
 
-        let _p2 = runtime.pop_point().unwrap();
+        // Last sample sits at the input end.
+        let p2 = runtime.pop_point().unwrap();
+        assert!((p2.x - 1.0).abs() < 0.01);
+        assert!((p2.y - 1.0).abs() < 0.01);
+        assert!(p2.r > 0.99);
 
-        // Last sample should be at input end
-        let p3 = runtime.pop_point().unwrap();
-        assert!((p3.x - 1.0).abs() < 0.01);
-        assert!((p3.y - 1.0).abs() < 0.01);
-        assert!(p3.r > 0.99);
+        backend.disconnect().unwrap();
     }
 
     #[test]
-    fn enqueue_resampled_checks_capacity() {
+    fn resampler_write_checks_capacity() {
         let cap = queue_capacity_for_rate(48_000);
-        let runtime = RuntimeState::new(true, 48_000);
-        // Fill the queue to near capacity
+        let fake = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 48_000));
+        fake.paused.store(true, Ordering::Release);
+        let engine: Arc<dyn AudioEngine> = fake.clone();
+        let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
+        backend.connect().unwrap();
+
+        // Fill the queue to one below capacity directly.
+        let runtime = backend.runtime.as_ref().unwrap().clone();
         let fill = vec![LaserPoint::blanked(0.0, 0.0); cap - 1];
         assert_eq!(enqueue_points(&runtime, &fill), WriteOutcome::Written);
 
-        // 2 points at 24k → 4 output samples, but only 1 slot remains
+        // 2 points at 24k → 3 output samples, but only 1 slot remains.
         let points = vec![
             LaserPoint::new(0.0, 0.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 0, 0, 0, 0),
         ];
-        let mut scratch = Vec::new();
-        let outcome = enqueue_resampled(&runtime, &points, 24_000, &mut scratch);
-        assert_eq!(outcome, WriteOutcome::WouldBlock);
+        assert_eq!(
+            backend.try_write_points(24_000, &points).unwrap(),
+            WriteOutcome::WouldBlock
+        );
+
+        backend.disconnect().unwrap();
     }
 
     #[test]
     fn engine_at_96khz_uses_correct_queue_capacity_and_resampling() {
         let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
+        fake_engine.paused.store(true, Ordering::Release);
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
 
@@ -1548,7 +1901,8 @@ mod tests {
         assert_eq!(runtime.sample_rate, 96_000);
         assert_eq!(runtime.queue.capacity(), queue_capacity_for_rate(96_000));
 
-        // Resampling: 2 points at 48kHz → ceil(2 * 96000 / 48000) = 4 output samples
+        // Resampling 2 points at 48kHz to 96kHz with a fresh phase yields
+        // total_emittable(2) = floor(1 * 96000/48000) + 1 = 3 output samples.
         let points = vec![
             LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
@@ -1556,7 +1910,7 @@ mod tests {
         backend.set_shutter(true).unwrap();
         let outcome = backend.try_write_points(48_000, &points).unwrap();
         assert_eq!(outcome, WriteOutcome::Written);
-        assert_eq!(runtime.queued_points(), 4);
+        assert_eq!(runtime.queued_points(), 3);
 
         backend.disconnect().unwrap();
     }
@@ -1601,13 +1955,14 @@ mod tests {
     fn try_write_points_resamples_up_to_selected_audio_rate() {
         let fake_engine = Arc::new(FakeAudioEngine::with_sample_rate(CHANNELS_XYRGBI, 96_000));
         fake_engine.paused.store(true, Ordering::Release);
-        fake_engine.set_frame_budget(4);
+        fake_engine.set_frame_budget(3);
         let engine: Arc<dyn AudioEngine> = fake_engine.clone();
         let mut backend = AvbBackend::with_engine_for_test("MOTU AVB Main".to_string(), 0, engine);
 
         backend.connect().unwrap();
         backend.set_shutter(true).unwrap();
 
+        // 2 points at 48kHz → 96kHz, fresh phase → 3 output samples.
         let points = vec![
             LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 65535, 65535, 65535, 65535),
@@ -1619,16 +1974,16 @@ mod tests {
 
         let start_frames = fake_engine.frame_count();
         fake_engine.paused.store(false, Ordering::Release);
-        wait_for_frame_count(fake_engine.as_ref(), start_frames + 4);
+        wait_for_frame_count(fake_engine.as_ref(), start_frames + 3);
         fake_engine.paused.store(true, Ordering::Release);
 
         let frames = fake_engine.snapshot();
-        let captured = &frames[frames.len() - 4..];
-        assert_eq!(captured.len(), 4);
+        let captured = &frames[frames.len() - 3..];
+        assert_eq!(captured.len(), 3);
+        // frame[0] = -x: start (-1) → 1.0, interpolated mid, end (1) → -1.0.
         assert!((captured[0][0] - 1.0).abs() < 0.01);
         assert!(captured[1][0] > -1.0 && captured[1][0] < 1.0);
-        assert!(captured[2][0] > -1.0 && captured[2][0] < 1.0);
-        assert!((captured[3][0] - (-1.0)).abs() < 0.01);
+        assert!((captured[2][0] - (-1.0)).abs() < 0.01);
 
         backend.disconnect().unwrap();
     }
@@ -1724,8 +2079,10 @@ mod tests {
     }
 
     #[test]
-    fn fill_output_buffer_5ch_open_shutter_writes_xyrgb_no_intensity() {
+    fn fill_output_buffer_5ch_premultiplies_rgb_by_intensity() {
         let runtime = RuntimeState::new(true, 48_000);
+        // Intensity 32768 ≈ 0.5: with no dedicated intensity channel, RGB is
+        // folded by intensity so brightness is still honored on 5ch configs.
         let point = LaserPoint::new(0.1, 0.2, 65535, 0, 65535, 32768);
         assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
 
@@ -1734,9 +2091,26 @@ mod tests {
 
         assert!((data[0] + 0.1).abs() < 0.0001);
         assert!((data[1] + 0.2).abs() < 0.0001);
-        assert_eq!(data[2], 1.0); // R
+        assert!((data[2] - 0.5).abs() < 0.001); // R * intensity
+        assert_eq!(data[3], 0.0); // G * intensity
+        assert!((data[4] - 0.5).abs() < 0.001); // B * intensity
+    }
+
+    #[test]
+    fn fill_output_buffer_6ch_keeps_dedicated_intensity_channel() {
+        // On a 6ch config RGB stays full and intensity gets its own channel —
+        // contrast with the 5ch premultiply above.
+        let runtime = RuntimeState::new(true, 48_000);
+        let point = LaserPoint::new(0.1, 0.2, 65535, 0, 65535, 32768);
+        assert_eq!(enqueue_points(&runtime, &[point]), WriteOutcome::Written);
+
+        let mut data = vec![0.0; CHANNELS_XYRGBI];
+        fill_output_buffer(&mut data, CHANNELS_XYRGBI, &runtime);
+
+        assert_eq!(data[2], 1.0); // R at full scale
         assert_eq!(data[3], 0.0); // G
-        assert_eq!(data[4], 1.0); // B
+        assert_eq!(data[4], 1.0); // B at full scale
+        assert!((data[5] - 0.5).abs() < 0.001); // intensity on its own channel
     }
 
     #[test]
@@ -1808,11 +2182,13 @@ mod tests {
                 channels: 8,
                 min_sample_rate: 44_100,
                 max_sample_rate: 96_000,
+                sample_format: SampleFormat::F32,
             },
             OutputConfigRange {
                 channels: 5,
                 min_sample_rate: 48_000,
                 max_sample_rate: 48_000,
+                sample_format: SampleFormat::F32,
             },
         ];
         assert_eq!(
@@ -1843,6 +2219,7 @@ mod tests {
             vec![SelectedStreamConfig {
                 channels: CHANNELS_XYRGBI as u16,
                 sample_rate: 48_000,
+                sample_format: SampleFormat::F32,
             }]
         );
 

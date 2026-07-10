@@ -7,12 +7,18 @@ use crate::device::DacType;
 use crate::discovery::{
     downcast_connect_data, slugify_device_id, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer,
 };
-use crate::protocols::avb::{discover_device_selectors, AvbSelector};
+use crate::protocols::avb::{discover_device_selectors, normalize_device_name, AvbSelector};
+use std::collections::HashMap;
 
 const PREFIX: &str = "avb";
 
 struct ConnectData {
     selector: AvbSelector,
+    /// Number of devices sharing this device's (normalized) name at scan time.
+    /// The backend compares this against the live count on connect to detect a
+    /// device-set change that would make the positional `duplicate_index` bind
+    /// a different physical unit.
+    scan_duplicate_count: usize,
 }
 
 pub struct AvbDiscoverer;
@@ -43,27 +49,50 @@ impl Discoverer for AvbDiscoverer {
     }
 
     fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let Ok(selectors) = discover_device_selectors() else {
-            return Vec::new();
+        let selectors = match discover_device_selectors() {
+            Ok(selectors) => selectors,
+            Err(e) => {
+                log::warn!("AVB: device discovery failed: {}", e);
+                return Vec::new();
+            }
         };
+
+        // Count devices per normalized name so the backend can later detect a
+        // device-set change that would shift the positional `duplicate_index`.
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for selector in &selectors {
+            *counts
+                .entry(normalize_device_name(&selector.name))
+                .or_insert(0) += 1;
+        }
+
         selectors
             .into_iter()
             .map(|selector| {
                 let device_index = selector.duplicate_index;
+                let scan_duplicate_count = *counts
+                    .get(&normalize_device_name(&selector.name))
+                    .unwrap_or(&1);
                 let stable_id = format_stable_id(&selector.name, device_index);
                 let info = DiscoveredDeviceInfo::new(DacType::Avb, stable_id, &selector.name)
                     .with_hardware_name(&selector.name)
                     .with_device_index(device_index);
-                DiscoveredDevice::new(info, Box::new(ConnectData { selector }))
+                DiscoveredDevice::new(
+                    info,
+                    Box::new(ConnectData {
+                        selector,
+                        scan_duplicate_count,
+                    }),
+                )
             })
             .collect()
     }
 
     fn connect(&mut self, opaque: Box<dyn Any + Send>) -> Result<BackendKind> {
         let data = downcast_connect_data::<ConnectData>(opaque, "AVB")?;
-        Ok(BackendKind::Fifo(Box::new(AvbBackend::from_selector(
-            data.selector,
-        ))))
+        Ok(BackendKind::Fifo(Box::new(
+            AvbBackend::from_selector_with_scan_count(data.selector, data.scan_duplicate_count),
+        )))
     }
 }
 
