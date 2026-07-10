@@ -247,7 +247,17 @@ impl From<&LaserPoint> for DacPoint {
     ///
     /// LaserPoint uses f32 coordinates (-1.0 to 1.0) and u16 colors (0-65535).
     /// Ether Dream uses i16 signed coordinates and u16 colors (direct mapping).
-    /// Coordinates are inverted to match hardware orientation.
+    ///
+    /// # Coordinate convention
+    ///
+    /// **Both** the X and Y axes are inverted here (via
+    /// `LaserPoint::coord_to_i16_inverted`). This is a deliberate
+    /// crate-wide orientation choice: relative to stock Ether Dream tooling
+    /// (which maps the crate's `+1.0` to `+32767` on both axes), output is
+    /// rotated 180°. Content authored against this crate's convention will
+    /// therefore appear upside-down/mirrored on tools that assume the stock
+    /// mapping, and vice-versa. Changing this would silently flip every
+    /// existing show, so it is intentionally fixed rather than configurable.
     fn from(p: &LaserPoint) -> Self {
         DacPoint {
             control: 0,
