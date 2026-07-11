@@ -67,34 +67,70 @@ impl Default for IdnDiscoverer {
     }
 }
 
-fn format_stable_id(hostname: &str) -> String {
-    format!("{}:{}", PREFIX, hostname)
+/// Format the unit ID as a lowercase hex string.
+fn unit_id_hex(unit_id: &[u8; 16]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(32);
+    for b in unit_id {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Build the stable id for a service.
+///
+/// The id is derived from the hardware unit ID (stable across IP/port
+/// changes) rather than the hostname — factory-default hostnames collide on
+/// identical fixtures. The service ID is suffixed so a multi-output server
+/// yields a distinct, stable id per laser-projector service.
+fn format_stable_id(unit_id: &[u8; 16], service_id: u8) -> String {
+    format!("{}:{}:{}", PREFIX, unit_id_hex(unit_id), service_id)
 }
 
 fn servers_to_devices(servers: Vec<ServerInfo>) -> Vec<DiscoveredDevice> {
-    servers
-        .into_iter()
-        .filter_map(|server| {
-            let service = server.find_laser_projector().cloned()?;
-            let ip_address = server.addresses.first().map(|addr| addr.ip());
-            let hostname = server.hostname.clone();
+    let mut devices = Vec::new();
+    for server in servers {
+        let ip_address = server.addresses.first().map(|addr| addr.ip());
+        let hostname = server.hostname.clone();
 
-            let stable_id = format_stable_id(&hostname);
-            let name = ip_address
+        // Emit one device per laser-projector service (a multi-output IDN
+        // server surfaces as several devices, not just the first).
+        let laser_services: Vec<ServiceInfo> = server
+            .services
+            .iter()
+            .filter(|s| s.is_laser_projector())
+            .cloned()
+            .collect();
+        let multi_service = laser_services.len() > 1;
+
+        for service in laser_services {
+            let stable_id = format_stable_id(&server.unit_id, service.service_id);
+            let base_name = ip_address
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| hostname.clone());
+            // Disambiguate the display name only when a server exposes more
+            // than one laser service.
+            let name = if multi_service {
+                format!("{} ({})", base_name, service.name)
+            } else {
+                base_name
+            };
 
-            let mut info =
-                DiscoveredDeviceInfo::new(DacType::Idn, stable_id, name).with_hostname(hostname);
+            let mut info = DiscoveredDeviceInfo::new(DacType::Idn, stable_id, name)
+                .with_hostname(hostname.clone());
             if let Some(ip) = ip_address {
                 info = info.with_ip(ip);
             }
-            Some(DiscoveredDevice::new(
+            devices.push(DiscoveredDevice::new(
                 info,
-                Box::new(ConnectData { server, service }),
-            ))
-        })
-        .collect()
+                Box::new(ConnectData {
+                    server: server.clone(),
+                    service,
+                }),
+            ));
+        }
+    }
+    devices
 }
 
 impl Discoverer for IdnDiscoverer {
@@ -142,11 +178,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_stable_id_uses_hostname() {
+    fn format_stable_id_uses_unit_id_hex_and_service() {
+        let unit_id: [u8; 16] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ];
         assert_eq!(
-            format_stable_id("laser-projector.local"),
-            "idn:laser-projector.local"
+            format_stable_id(&unit_id, 1),
+            "idn:0102030405060708090a0b0c0d0e0f10:1"
         );
-        assert_eq!(format_stable_id("idn-server-7"), "idn:idn-server-7");
+        // Same unit, different service → distinct id.
+        assert_eq!(
+            format_stable_id(&unit_id, 2),
+            "idn:0102030405060708090a0b0c0d0e0f10:2"
+        );
+    }
+
+    #[test]
+    fn stable_id_distinguishes_identical_hostnames() {
+        // Two servers with the same factory-default hostname but different
+        // unit IDs must not collide.
+        let a = format_stable_id(&[0xaa; 16], 1);
+        let b = format_stable_id(&[0xbb; 16], 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn servers_to_devices_emits_one_per_laser_service() {
+        use crate::protocols::idn::dac::{ServiceInfo, ServiceType};
+
+        let mut server = ServerInfo::new([0x11; 16], "dual".to_string(), (1, 0), 0);
+        server
+            .addresses
+            .push("10.0.0.5:7255".parse::<std::net::SocketAddr>().unwrap());
+        server.services.push(ServiceInfo {
+            service_id: 1,
+            service_type: ServiceType::LaserProjector,
+            name: "Left".to_string(),
+            flags: 0,
+            relay_number: 0,
+        });
+        server.services.push(ServiceInfo {
+            service_id: 2,
+            service_type: ServiceType::LaserProjector,
+            name: "Right".to_string(),
+            flags: 0,
+            relay_number: 0,
+        });
+        // A non-laser service is ignored.
+        server.services.push(ServiceInfo {
+            service_id: 3,
+            service_type: ServiceType::Dmx512,
+            name: "DMX".to_string(),
+            flags: 0,
+            relay_number: 0,
+        });
+
+        let devices = servers_to_devices(vec![server]);
+        assert_eq!(devices.len(), 2, "one device per laser-projector service");
+        let ids: Vec<String> = devices
+            .iter()
+            .map(|d| d.info().stable_id().to_string())
+            .collect();
+        assert!(ids.contains(&"idn:11111111111111111111111111111111:1".to_string()));
+        assert!(ids.contains(&"idn:11111111111111111111111111111111:2".to_string()));
     }
 }

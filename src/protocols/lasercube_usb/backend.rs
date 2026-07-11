@@ -166,4 +166,20 @@ impl FifoBackend for LaserCubeUsbBackend {
     fn estimator(&self) -> &dyn BufferEstimator {
         &self.estimator
     }
+
+    fn reset_device_buffer(&mut self) -> Result<()> {
+        let Some(stream) = &mut self.stream else {
+            return Ok(());
+        };
+        match stream.clear_ringbuffer() {
+            Ok(()) => {
+                // The hardware ring is now empty; drop the software estimate so
+                // it agrees with the device rather than replaying pre-disarm
+                // fullness.
+                self.estimator.reset(Instant::now());
+                Ok(())
+            }
+            Err(e) => self.handle_stream_error(e),
+        }
+    }
 }

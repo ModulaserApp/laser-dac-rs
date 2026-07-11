@@ -38,7 +38,9 @@ pub(super) const MAX_CONTROL_DRAIN_PER_LOOP: usize = 32;
 pub(super) const MAX_IDLE_SLEEP: Duration = Duration::from_millis(1);
 pub(super) const FULL_INFO_POLL_INACTIVE: Duration = Duration::from_millis(250);
 pub(super) const FULL_INFO_POLL_ACTIVE: Duration = Duration::from_millis(2500);
-pub(super) const COMMS_STALE_TIMEOUT: Duration = Duration::from_millis(4000);
+// Must exceed 2x FULL_INFO_POLL_ACTIVE (2 x 2500 ms) plus margin, so a single
+// lost poll reply while armed-but-idle does not trip a spurious disconnect.
+pub(super) const COMMS_STALE_TIMEOUT: Duration = Duration::from_millis(6000);
 pub(super) const DIAGNOSTIC_LOG_PERIOD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -82,6 +84,11 @@ pub(super) fn startup_commands(
     status: &LaserCubeNetworkStatus,
     profile: ConnectionProfile,
 ) -> Vec<Vec<u8>> {
+    // We deliberately do NOT send a ring-buffer clear (0x8D) on connect or
+    // re-arm. Output is forced off first, which halts playback, and the device
+    // drains its ring naturally; issuing a clear would only risk a visible
+    // glitch on a device another client may still be feeding. 0x8D is retained
+    // as a test-only encoder (see `command::clear_ringbuffer`).
     let mut commands = vec![
         command::set_output(false).to_vec(),
         command::enable_buffer_size_response(true).to_vec(),

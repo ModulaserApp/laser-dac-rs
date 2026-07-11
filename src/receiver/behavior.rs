@@ -177,3 +177,112 @@ impl ServerBehavior for SimpleBehavior {
         0x00
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A behavior that only implements the required methods, so the trait's
+    /// default method bodies are exercised as-authored.
+    #[derive(Default)]
+    struct MinimalBehavior {
+        forwarded_points: usize,
+    }
+
+    impl ServerBehavior for MinimalBehavior {
+        fn should_respond(&self, _command: u8) -> bool {
+            true
+        }
+        fn get_status_byte(&self) -> u8 {
+            0
+        }
+        fn get_ack_result_code(&self) -> u8 {
+            0
+        }
+        // Override only the leaf callback so we can observe that the default
+        // `on_chunk_received` forwards to it.
+        fn on_points_received(&mut self, points: &[ReceivedPoint]) {
+            self.forwarded_points += points.len();
+        }
+    }
+
+    fn sample_chunk() -> ParsedChunk {
+        ParsedChunk {
+            sequence: 9,
+            content_id: 0xC003,
+            channel_id: 2,
+            chunk_type: ChunkType::Frame,
+            config_or_last_fragment: true,
+            has_config: true,
+            is_last_fragment: true,
+            timestamp_us_u32: 1234,
+            duration_us: 1000,
+            format: SampleFormat::Xyrgbi,
+            points: vec![
+                ReceivedPoint {
+                    x: 0.0,
+                    y: 0.0,
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                },
+                ReceivedPoint {
+                    x: 0.5,
+                    y: -0.5,
+                    r: 0.0,
+                    g: 1.0,
+                    b: 0.0,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn simple_behavior_defaults() {
+        let mut b = SimpleBehavior;
+        assert!(b.should_respond(0x10));
+        assert_eq!(b.get_status_byte(), IDNFLG_STATUS_REALTIME);
+        assert_eq!(b.get_ack_result_code(), 0x00);
+        assert_eq!(b.get_simulated_latency(), Duration::ZERO);
+        assert!(!b.should_force_disconnect());
+        assert!(!b.is_occupied());
+        assert!(!b.is_excluded());
+    }
+
+    #[test]
+    fn default_on_chunk_received_forwards_to_on_points_received() {
+        let chunk = sample_chunk();
+        let addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let received = ReceivedChunk::new(addr, &chunk);
+
+        let mut b = MinimalBehavior::default();
+        b.on_chunk_received(received);
+        assert_eq!(
+            b.forwarded_points, 2,
+            "default on_chunk_received should forward the chunk's points to on_points_received"
+        );
+    }
+
+    #[test]
+    fn received_chunk_mirrors_parsed_chunk_metadata() {
+        let chunk = sample_chunk();
+        let addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let received = ReceivedChunk::new(addr, &chunk);
+
+        assert_eq!(received.source_addr, addr);
+        assert_eq!(received.sequence, chunk.sequence);
+        assert_eq!(received.content_id, chunk.content_id);
+        assert_eq!(received.channel_id, chunk.channel_id);
+        assert_eq!(received.chunk_type, chunk.chunk_type);
+        assert_eq!(
+            received.config_or_last_fragment,
+            chunk.config_or_last_fragment
+        );
+        assert_eq!(received.has_config, chunk.has_config);
+        assert_eq!(received.is_last_fragment, chunk.is_last_fragment);
+        assert_eq!(received.timestamp_us_u32, chunk.timestamp_us_u32);
+        assert_eq!(received.duration_us, chunk.duration_us);
+        assert_eq!(received.format, chunk.format);
+        assert_eq!(received.points.len(), chunk.points.len());
+    }
+}

@@ -73,8 +73,10 @@ impl<T: UsbContext> Stream<T> {
             handle,
             info: DeviceInfo::default(),
             status: DeviceStatus::Unknown,
+            // Match the reference laserdocklib defaults: flip X, do not flip Y.
+            // Flipping both vertically mirrors output relative to the reference.
             flip_x: true,
-            flip_y: true,
+            flip_y: false,
             send_buffer: Vec::new(),
         };
 

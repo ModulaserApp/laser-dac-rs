@@ -4,6 +4,37 @@
 //! ASIO on Windows by default (disable the `asio` default feature to use
 //! WASAPI instead), and ALSA on Linux.
 //! Supports 5-channel (XYRGB) and 6-channel (XYRGBI) mapping with auto-detected sample rate.
+//!
+//! # Hardware requirement: DC-coupled output
+//!
+//! The X/Y galvo channels carry a position signal whose DC component is
+//! meaningful (a static beam sits at a constant voltage). The output interface
+//! **must be DC-coupled** — an AC-coupled interface high-pass-filters the
+//! signal, so static or slow-moving geometry drifts back toward centre. This is
+//! the same constraint as the oscilloscope backend.
+//!
+//! # Discovery heuristic
+//!
+//! Any output device exposing at least five channels ([`backend`]'s
+//! `MIN_CHANNELS`) is offered as a candidate laser DAC, minus an explicit
+//! name blacklist. This is deliberately permissive: AVB laser interfaces
+//! present as generic multichannel audio devices with no reliable
+//! machine-readable "I am a laser DAC" marker, so erring toward offering a
+//! device (which the user can ignore) is preferable to hiding a real DAC.
+//! The trade-off is that unrelated ≥5-channel outputs (7.1 onboard audio,
+//! some HDMI sinks) may also appear. Tighten via `is_blacklisted_device`
+//! rather than by changing the channel-count floor.
+//!
+//! # Windows enumeration caveats
+//!
+//! - ASIO exposes one device per interface that aggregates every AVB stream
+//!   into a single channel bank, so a multi-stream interface (e.g. RME
+//!   Digiface AVB) appears as a single candidate. Output always starts at
+//!   channel 1; addressing a laser on a higher channel bank is not yet
+//!   supported.
+//! - WASAPI (shared mode) only exposes each endpoint at the channel count
+//!   configured in Windows sound settings, so an endpoint must be configured
+//!   for 5.1/7.1 output to pass the >= 5 channel filter.
 
 pub mod backend;
 mod discovery;

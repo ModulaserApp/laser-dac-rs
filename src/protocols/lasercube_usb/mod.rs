@@ -59,7 +59,7 @@ pub fn default_capabilities() -> DacCapabilities {
         pps_min: 1,
         pps_max: 35_000,
         max_points_per_chunk: 4096,
-        output_model: OutputModel::NetworkFifo,
+        output_model: OutputModel::BlockingFifo,
     }
 }
 

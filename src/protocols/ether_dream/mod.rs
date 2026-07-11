@@ -68,9 +68,22 @@ impl RecvDacBroadcasts {
 
 /// Produces a `RecvDacBroadcasts` instance that listens and waits for broadcast messages from DACs
 /// on the network and yields them as they are received on the inner UDP socket.
+///
+/// The socket is bound with `SO_REUSEADDR` (and `SO_REUSEPORT` on unix) so that
+/// other Ether Dream software sharing port 7654 on the same host does not make
+/// the DAC invisible to this discoverer.
 pub fn recv_dac_broadcasts() -> io::Result<RecvDacBroadcasts> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
     let broadcast_addr = net::SocketAddrV4::new([0, 0, 0, 0].into(), protocol::BROADCAST_PORT);
-    let udp_socket = net::UdpSocket::bind(broadcast_addr)?;
+    socket.bind(&socket2::SockAddr::from(broadcast_addr))?;
+
+    let udp_socket = net::UdpSocket::from(socket);
     Ok(RecvDacBroadcasts {
         udp_socket,
         buffer: [0; RecvDacBroadcasts::BUFFER_LEN],

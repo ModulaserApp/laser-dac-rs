@@ -17,6 +17,7 @@ use crate::stream::{ControlMsg, StreamControl};
 use super::content_source::ContentSourceKind;
 use super::session::FrameSessionMetrics;
 
+mod blocking_fifo;
 mod network_fifo;
 mod udp_timed;
 mod usb_frame_swap;
@@ -225,5 +226,6 @@ pub(crate) fn for_backend(backend: &BackendKind) -> Box<dyn OutputModelAdapter> 
         OutputModel::UsbFrameSwap => Box::new(usb_frame_swap::UsbFrameSwapAdapter::new(backend)),
         OutputModel::NetworkFifo => Box::new(network_fifo::NetworkFifoAdapter::new(backend)),
         OutputModel::UdpTimed => Box::new(udp_timed::UdpTimedAdapter::new(backend)),
+        OutputModel::BlockingFifo => Box::new(blocking_fifo::BlockingFifoAdapter::new(backend)),
     }
 }

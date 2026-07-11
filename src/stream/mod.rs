@@ -1543,14 +1543,8 @@ impl Dac {
 
     fn apply_backend_buffer_defaults(info: &DacInfo, mut cfg: StreamConfig) -> StreamConfig {
         if cfg.target_buffer == StreamConfig::DEFAULT_TARGET_BUFFER {
-            if matches!(info.kind, DacType::LaserCubeNetwork) {
-                cfg.target_buffer = StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER;
-            } else if matches!(
-                info.caps.output_model,
-                OutputModel::NetworkFifo | OutputModel::UdpTimed
-            ) {
-                cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
-            }
+            cfg.target_buffer =
+                StreamConfig::default_target_buffer_for(&info.kind, &info.caps.output_model);
         }
 
         cfg

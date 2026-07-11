@@ -117,6 +117,29 @@ impl Stream {
         self.set_read_timeout(duration)?;
         self.set_write_timeout(duration)
     }
+
+    /// Build a `Stream` around an already-connected TCP stream and a known DAC
+    /// state, bypassing the discovery handshake. Test-only: lets the backend
+    /// tests drive a mock DAC over a loopback socket.
+    #[cfg(test)]
+    pub(crate) fn from_tcp_stream_for_test(
+        dac: Addressed,
+        tcp: net::TcpStream,
+    ) -> io::Result<Self> {
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(READ_TIMEOUT))?;
+        tcp.set_write_timeout(Some(WRITE_TIMEOUT))?;
+        let tcp_writer = tcp.try_clone()?;
+        let tcp_reader = BufReader::new(tcp);
+        Ok(Stream {
+            dac,
+            tcp_reader,
+            tcp_writer,
+            command_buffer: vec![],
+            point_buffer: vec![],
+            bytes: vec![],
+        })
+    }
 }
 
 impl<'a> CommandQueue<'a> {
@@ -161,8 +184,19 @@ impl<'a> CommandQueue<'a> {
     {
         let start = self.stream.point_buffer.len();
         self.stream.point_buffer.extend(points);
-        let end = self.stream.point_buffer.len();
-        assert!(end - start < u16::MAX as usize, "too many points");
+        let mut end = self.stream.point_buffer.len();
+        // A single Data command addresses at most u16::MAX points. Drop any
+        // excess rather than panicking on the output thread; the write path
+        // enforces the same bound. In practice chunks are capped far below this.
+        if end - start > u16::MAX as usize {
+            log::warn!(
+                "Ether Dream: data chunk of {} points exceeds {}, truncating",
+                end - start,
+                u16::MAX
+            );
+            end = start + u16::MAX as usize;
+            self.stream.point_buffer.truncate(end);
+        }
         self.stream
             .command_buffer
             .push(QueuedCommand::Data(start..end));
@@ -347,6 +381,18 @@ impl From<ResponseError> for CommunicationError {
     }
 }
 
+/// Per-`read` timeout. A single response may span several of these if the DAC
+/// is briefly slow; see [`READ_BUDGET`].
+const READ_TIMEOUT: time::Duration = time::Duration::from_millis(500);
+
+/// Total time budget for reading one complete response before giving up. A
+/// Wi-Fi latency spike should be ridden out (retrying the in-progress read)
+/// rather than restarting the whole stream.
+const READ_BUDGET: time::Duration = time::Duration::from_secs(2);
+
+/// Write timeout — bounds how long a hung DAC can wedge `write_all`.
+const WRITE_TIMEOUT: time::Duration = time::Duration::from_secs(2);
+
 /// Establishes a TCP stream connection with the DAC at the given address.
 pub fn connect(
     broadcast: &protocol::DacBroadcast,
@@ -377,8 +423,13 @@ fn connect_inner(
 
     tcp_stream.set_nodelay(true)?;
 
-    // Read timeout prevents blocking forever on a dead DAC.
-    tcp_stream.set_read_timeout(Some(time::Duration::from_millis(500)))?;
+    // Read timeout prevents blocking forever on a dead DAC. On a timeout the
+    // in-progress read is retried (preserving bytes already consumed) up to
+    // `READ_BUDGET` before failing — see `read_exact_with_budget`.
+    tcp_stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    // Write timeout prevents a hung DAC from wedging the session thread forever
+    // inside `write_all`.
+    tcp_stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
     let tcp_writer = tcp_stream.try_clone()?;
     let mut tcp_reader = BufReader::new(tcp_stream);
@@ -426,7 +477,7 @@ fn recv_response_buffered(
 
     for _ in 0..=MAX_RETRIES {
         bytes.resize(protocol::DacResponse::SIZE_BYTES, 0);
-        tcp_reader.read_exact(bytes)?;
+        read_exact_with_budget(tcp_reader, bytes, READ_BUDGET)?;
         let response = (&bytes[..]).read_bytes::<protocol::DacResponse>()?;
 
         // Always update status from every response, even mismatched ones.
@@ -462,4 +513,42 @@ fn recv_response_buffered(
     Err(CommunicationError::Io(io::Error::other(
         "too many unsolicited responses",
     )))
+}
+
+/// Fill `buf` completely, retrying reads that time out (or are interrupted)
+/// while tracking bytes already consumed, so a per-read timeout never desyncs
+/// the stream by dropping a partial response. Fails once `budget` elapses.
+fn read_exact_with_budget<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    budget: time::Duration,
+) -> io::Result<()> {
+    let start = time::Instant::now();
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed mid-response",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(ref e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                // Partial data (if any) is retained in `buf[..filled]`; keep
+                // waiting for the rest until the overall budget is exhausted.
+                if start.elapsed() >= budget {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out reading response",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }

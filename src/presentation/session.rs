@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
 use crate::config::StreamConfig;
-use crate::device::{DacInfo, DacType, OutputModel};
+use crate::device::{DacInfo, OutputModel};
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
 use crate::stream::{ControlMsg, RunExit, StreamControl};
@@ -340,7 +340,9 @@ impl FrameSession {
         // frame-swap bounds by frame_capacity (max_points_per_chunk is meaningless there).
         let initial_buf_capacity = match backend.caps().output_model {
             OutputModel::UsbFrameSwap => backend.frame_capacity().unwrap_or(0),
-            OutputModel::NetworkFifo | OutputModel::UdpTimed => backend.caps().max_points_per_chunk,
+            OutputModel::NetworkFifo | OutputModel::UdpTimed | OutputModel::BlockingFifo => {
+                backend.caps().max_points_per_chunk
+            }
         };
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,
@@ -411,9 +413,7 @@ impl Drop for FrameSession {
 }
 
 pub(super) fn target_buffer_for_backend(backend: &BackendKind) -> Duration {
-    if matches!(backend.dac_type(), DacType::LaserCubeNetwork) {
-        StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
-    } else {
-        Duration::from_millis(20)
-    }
+    // Delegate to the shared policy so the frame path and the stream path's
+    // `apply_backend_buffer_defaults` can never disagree on the cushion.
+    StreamConfig::default_target_buffer_for(&backend.dac_type(), &backend.caps().output_model)
 }

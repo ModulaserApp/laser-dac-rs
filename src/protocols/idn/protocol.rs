@@ -69,9 +69,17 @@ pub const IDNVAL_STYPE_UART: u8 = 0x04;
 pub const IDNVAL_STYPE_DMX512: u8 = 0x05;
 pub const IDNVAL_STYPE_LAPRO: u8 = 0x80; // Standard laser projector
 
-// RT-ACK result codes (spec section 6.3.3)
-/// RT-ACK result code: empty close.
-pub const IDNVAL_RTACK_ERR_EMPTY_CLOSE: u8 = 0xEB;
+// RT-ACK result codes (spec section 6.3.3 / idn-hello.h). These are the single
+// source of truth; `error.rs` maps them to `ResponseError`.
+/// RT-ACK result code 0xEB: not connected (no active channel/session).
+///
+/// Per `idn-hello.h` code 0xEB is NOT_CONNECTED.
+pub const IDNVAL_RTACK_ERR_NOT_CONNECTED: u8 = 0xEB;
+/// Deprecated misnomer for 0xEB, retained only for backward compatibility.
+///
+/// Per `idn-hello.h`, 0xEB is NOT_CONNECTED — prefer
+/// [`IDNVAL_RTACK_ERR_NOT_CONNECTED`].
+pub const IDNVAL_RTACK_ERR_EMPTY_CLOSE: u8 = IDNVAL_RTACK_ERR_NOT_CONNECTED;
 /// RT-ACK result code: sessions occupied (another client is already connected).
 pub const IDNVAL_RTACK_ERR_OCCUPIED: u8 = 0xEC;
 /// RT-ACK result code: group excluded (server is excluded from this group).
@@ -1010,6 +1018,23 @@ impl SizeBytes for PointXyrgbHighRes {
     const SIZE_BYTES: usize = XYRGB_HIGHRES_SAMPLE_SIZE;
 }
 
+impl From<&LaserPoint> for PointXyrgbHighRes {
+    /// Convert a LaserPoint to a high-resolution XYRGB point.
+    ///
+    /// Unlike [`PointXyrgbi`], the 16-bit colours are carried through without
+    /// downscaling, so this format preserves the crate's full colour depth on
+    /// the wire. Coordinates are inverted to match hardware orientation.
+    fn from(p: &LaserPoint) -> Self {
+        PointXyrgbHighRes::new(
+            LaserPoint::coord_to_i16_inverted(p.x),
+            LaserPoint::coord_to_i16_inverted(p.y),
+            p.r,
+            p.g,
+            p.b,
+        )
+    }
+}
+
 /// Extended point format (20 bytes).
 /// Includes user-defined channels for additional colors or effects.
 #[repr(C)]
@@ -1111,6 +1136,28 @@ impl ReadFromBytes for PointExtended {
 
 impl SizeBytes for PointExtended {
     const SIZE_BYTES: usize = EXTENDED_SAMPLE_SIZE;
+}
+
+impl From<&LaserPoint> for PointExtended {
+    /// Convert a LaserPoint to an extended point.
+    ///
+    /// Carries the 16-bit R/G/B/intensity channels through without loss; the
+    /// four user channels are left at zero. Coordinates are inverted to match
+    /// hardware orientation.
+    fn from(p: &LaserPoint) -> Self {
+        PointExtended::new(
+            LaserPoint::coord_to_i16_inverted(p.x),
+            LaserPoint::coord_to_i16_inverted(p.y),
+            p.r,
+            p.g,
+            p.b,
+            p.intensity,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1499,5 +1546,59 @@ mod tests {
             group_mask: 0b1000_0000_0000_0011, // Groups 0, 1, and 15 enabled
         };
         assert_eq!(resp.enabled_groups(), vec![0, 1, 15]);
+    }
+
+    // ==========================================================================
+    // High-resolution (16-bit colour) point conversion + wire tests
+    // ==========================================================================
+
+    #[test]
+    fn highres_conversion_preserves_16bit_color() {
+        // 16-bit colours pass through without the >>8 downscale that XYRGBI does.
+        let lp = LaserPoint::new(0.0, 0.0, 0x1234, 0xABCD, 0x00FF, 0xFFFF);
+        let hr: PointXyrgbHighRes = (&lp).into();
+        assert_eq!(hr.x, 0);
+        assert_eq!(hr.y, 0);
+        assert_eq!(hr.r, 0x1234);
+        assert_eq!(hr.g, 0xABCD);
+        assert_eq!(hr.b, 0x00FF);
+    }
+
+    #[test]
+    fn highres_wire_layout_is_big_endian_10_bytes() {
+        let hr = PointXyrgbHighRes::new(0x0102, -1, 0x1122, 0x3344, 0x5566);
+        let mut buf = Vec::new();
+        hr.write_to_bytes(&mut buf).unwrap();
+        assert_eq!(buf.len(), XYRGB_HIGHRES_SAMPLE_SIZE);
+        assert_eq!(
+            buf,
+            vec![0x01, 0x02, 0xFF, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+    }
+
+    #[test]
+    fn extended_conversion_preserves_channels_and_zeroes_user() {
+        let lp = LaserPoint::new(0.0, 0.0, 0x1111, 0x2222, 0x3333, 0x4444);
+        let ext: PointExtended = (&lp).into();
+        assert_eq!(ext.r, 0x1111);
+        assert_eq!(ext.g, 0x2222);
+        assert_eq!(ext.b, 0x3333);
+        assert_eq!(ext.i, 0x4444);
+        assert_eq!((ext.u1, ext.u2, ext.u3, ext.u4), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn extended_wire_layout_is_big_endian_20_bytes() {
+        let ext = PointExtended::new(0, 0, 0x1111, 0x2222, 0x3333, 0x4444, 0, 0, 0, 0);
+        let mut buf = Vec::new();
+        ext.write_to_bytes(&mut buf).unwrap();
+        assert_eq!(buf.len(), EXTENDED_SAMPLE_SIZE);
+        // x, y, then r,g,b,i big-endian, then 4 user channels of zero.
+        assert_eq!(&buf[0..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &buf[4..12],
+            &[0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44]
+        );
+        assert_eq!(&buf[12..20], &[0u8; 8]);
     }
 }

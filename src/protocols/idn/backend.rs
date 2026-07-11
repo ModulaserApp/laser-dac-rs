@@ -5,15 +5,33 @@ use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
+use crate::protocols::idn::dac::stream::PointFormat;
 use crate::protocols::idn::dac::{stream, ServerInfo, ServiceInfo};
-use crate::protocols::idn::protocol::PointXyrgbi;
+use crate::protocols::idn::protocol::{PointExtended, PointXyrgbHighRes, PointXyrgbi};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const IDN_WORKER_QUEUE_CAPACITY: usize = 8;
+
+/// How often the worker upgrades a data send to an ACK request (or, while
+/// idle, sends a ping) to prove the device is still alive.
+const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long to wait for an ACK/ping response before counting it as a miss.
+const ACK_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Consecutive ACK/ping misses after which the device is considered dead and
+/// the backend is marked disconnected so the driver's reconnect path engages.
+const MAX_CONSECUTIVE_ACK_MISSES: u32 = 4;
+
+/// Reachability check timeout used at `connect()`.
+const CONNECT_PING_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Number of extra ping retries at `connect()` before giving up.
+const CONNECT_PING_RETRIES: u32 = 2;
 
 struct WorkerRuntime {
     tx: mpsc::SyncSender<WorkerCommand>,
@@ -21,9 +39,26 @@ struct WorkerRuntime {
     handle: Option<JoinHandle<()>>,
 }
 
+/// A chunk of converted points in the backend's selected wire format.
+enum ChunkPoints {
+    Xyrgbi(Vec<PointXyrgbi>),
+    HighRes(Vec<PointXyrgbHighRes>),
+    Extended(Vec<PointExtended>),
+}
+
+impl ChunkPoints {
+    fn len(&self) -> usize {
+        match self {
+            ChunkPoints::Xyrgbi(v) => v.len(),
+            ChunkPoints::HighRes(v) => v.len(),
+            ChunkPoints::Extended(v) => v.len(),
+        }
+    }
+}
+
 struct QueuedChunk {
     pps: u32,
-    points: Vec<PointXyrgbi>,
+    points: ChunkPoints,
 }
 
 enum WorkerCommand {
@@ -37,7 +72,12 @@ trait WorkerStream {
     fn set_scan_speed(&mut self, pps: u32);
     fn needs_keepalive(&self) -> bool;
     fn send_keepalive(&mut self) -> bool;
-    fn write_frame(&mut self, points: &[PointXyrgbi]) -> bool;
+    fn write_frame(&mut self, points: &ChunkPoints) -> bool;
+    /// Send the frame requesting an acknowledgment; returns whether the ACK
+    /// was received within `timeout` (used for liveness detection).
+    fn write_frame_with_ack(&mut self, points: &ChunkPoints, timeout: Duration) -> bool;
+    /// Send a ping and report whether a response arrived within `timeout`.
+    fn ping(&mut self, timeout: Duration) -> bool;
     fn close(&mut self);
 }
 
@@ -58,8 +98,30 @@ impl WorkerStream for stream::Stream {
         stream::Stream::send_keepalive(self).is_ok()
     }
 
-    fn write_frame(&mut self, points: &[PointXyrgbi]) -> bool {
-        stream::Stream::write_frame(self, points).is_ok()
+    fn write_frame(&mut self, points: &ChunkPoints) -> bool {
+        match points {
+            ChunkPoints::Xyrgbi(v) => stream::Stream::write_frame(self, v).is_ok(),
+            ChunkPoints::HighRes(v) => stream::Stream::write_frame(self, v).is_ok(),
+            ChunkPoints::Extended(v) => stream::Stream::write_frame(self, v).is_ok(),
+        }
+    }
+
+    fn write_frame_with_ack(&mut self, points: &ChunkPoints, timeout: Duration) -> bool {
+        match points {
+            ChunkPoints::Xyrgbi(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+            ChunkPoints::HighRes(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+            ChunkPoints::Extended(v) => {
+                stream::Stream::write_frame_with_ack(self, v, timeout).is_ok()
+            }
+        }
+    }
+
+    fn ping(&mut self, timeout: Duration) -> bool {
+        stream::Stream::ping(self, timeout).is_ok()
     }
 
     fn close(&mut self) {
@@ -73,11 +135,18 @@ pub struct IdnBackend {
     service: ServiceInfo,
     runtime: Option<WorkerRuntime>,
     caps: DacCapabilities,
-    /// Conversion buffer moved into each chunk (capacity reused across writes).
+    /// Scratch conversion buffer. Its backing allocation is handed off to each
+    /// queued chunk via `mem::take`, so a fresh allocation is grown on the next
+    /// write; the field mainly keeps the conversion code allocation-free within
+    /// a single write.
     point_buffer: Vec<PointXyrgbi>,
     /// Software-only buffer estimator. Driven by `record_send` from inside
     /// `try_write_points`; not yet consulted by the adapter (Phase 1).
     estimator: SoftwareDecayEstimator,
+    /// Wire point format. Defaults to [`PointFormat::Xyrgbi`] (8-bit colour);
+    /// callers can opt into a 16-bit format via [`IdnBackend::set_point_format`]
+    /// before connecting.
+    point_format: PointFormat,
 }
 
 impl IdnBackend {
@@ -89,8 +158,43 @@ impl IdnBackend {
             caps: super::default_capabilities(),
             point_buffer: Vec::new(),
             estimator: SoftwareDecayEstimator::new(),
+            point_format: PointFormat::Xyrgbi,
         }
     }
+
+    /// Select the wire point format for streaming.
+    ///
+    /// Defaults to [`PointFormat::Xyrgbi`] (8-bit RGBI). Selecting
+    /// [`PointFormat::XyrgbHighRes`] or [`PointFormat::Extended`] streams the
+    /// crate's full 16-bit colour depth end-to-end, at the cost of larger
+    /// samples (10 or 20 bytes vs 8) and therefore more packets per frame.
+    ///
+    /// Only receivers that advertise support for the chosen descriptors will
+    /// render hi-res formats correctly, so the default is left at the
+    /// universally understood XYRGBI format. Must be called **before**
+    /// [`connect`](crate::backend::DacBackend::connect); changing it on a live
+    /// connection has no effect until the next connect.
+    pub fn set_point_format(&mut self, format: PointFormat) {
+        self.point_format = format;
+        self.caps.max_points_per_chunk = max_points_per_chunk_for(format);
+    }
+
+    /// The currently selected wire point format.
+    pub fn point_format(&self) -> PointFormat {
+        self.point_format
+    }
+}
+
+/// Points that fit in one MTU-sized datagram (without a config header) for a
+/// given format, used to keep the scheduler's chunk sizing aligned with the
+/// sample size.
+fn max_points_per_chunk_for(format: PointFormat) -> usize {
+    use crate::protocols::idn::protocol::{
+        ChannelMessageHeader, PacketHeader, SampleChunkHeader, SizeBytes, MAX_UDP_PAYLOAD,
+    };
+    let header =
+        PacketHeader::SIZE_BYTES + ChannelMessageHeader::SIZE_BYTES + SampleChunkHeader::SIZE_BYTES;
+    (MAX_UDP_PAYLOAD - header) / format.size_bytes()
 }
 
 impl DacBackend for IdnBackend {
@@ -110,10 +214,37 @@ impl DacBackend for IdnBackend {
         let mut stream =
             stream::connect(&self.server, self.service.service_id).map_err(Error::backend)?;
         stream.set_frame_mode(stream::FrameMode::Wave);
+        stream.set_point_format(self.point_format);
+
+        // Validate reachability before committing: a plain UDP connect always
+        // "succeeds", so without this a dead address would appear connected and
+        // stream into the void. A ping (short timeout, a couple of retries)
+        // confirms the server is actually answering.
+        let mut reachable = false;
+        for attempt in 0..=CONNECT_PING_RETRIES {
+            match stream.ping(CONNECT_PING_TIMEOUT) {
+                Ok(_) => {
+                    reachable = true;
+                    break;
+                }
+                Err(e) => log::debug!("idn connect: ping attempt {} failed: {}", attempt, e),
+            }
+        }
+        if !reachable {
+            return Err(Error::disconnected(
+                "IDN server did not respond to ping at connect",
+            ));
+        }
+
+        // Fresh session: reset the estimator so stale decay state from a prior
+        // connection does not bias admission.
+        self.estimator.reset(Instant::now());
+
         let (tx, rx) = mpsc::sync_channel(IDN_WORKER_QUEUE_CAPACITY);
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
-        let handle = thread::spawn(move || worker_loop(stream, rx, worker_connected));
+        let point_format = self.point_format;
+        let handle = thread::spawn(move || worker_loop(stream, rx, worker_connected, point_format));
 
         self.runtime = Some(WorkerRuntime {
             tx,
@@ -130,6 +261,7 @@ impl DacBackend for IdnBackend {
                 let _ = handle.join();
             }
         }
+        self.estimator.reset(Instant::now());
         Ok(())
     }
 
@@ -144,6 +276,7 @@ impl DacBackend for IdnBackend {
         if let Some(runtime) = &self.runtime {
             let _ = runtime.tx.send(WorkerCommand::Stop);
         }
+        self.estimator.reset(Instant::now());
         Ok(())
     }
 
@@ -163,14 +296,24 @@ impl FifoBackend for IdnBackend {
             return Err(Error::disconnected("IDN sender thread disconnected"));
         }
 
-        self.point_buffer.clear();
-        self.point_buffer
-            .extend(points.iter().map(PointXyrgbi::from));
-
-        let n = self.point_buffer.len();
+        let n = points.len();
+        let chunk_points = match self.point_format {
+            PointFormat::Xyrgbi => {
+                self.point_buffer.clear();
+                self.point_buffer
+                    .extend(points.iter().map(PointXyrgbi::from));
+                ChunkPoints::Xyrgbi(std::mem::take(&mut self.point_buffer))
+            }
+            PointFormat::XyrgbHighRes => {
+                ChunkPoints::HighRes(points.iter().map(PointXyrgbHighRes::from).collect())
+            }
+            PointFormat::Extended => {
+                ChunkPoints::Extended(points.iter().map(PointExtended::from).collect())
+            }
+        };
         let chunk = QueuedChunk {
             pps,
-            points: std::mem::take(&mut self.point_buffer),
+            points: chunk_points,
         };
 
         match runtime.tx.try_send(WorkerCommand::Chunk(chunk)) {
@@ -193,8 +336,12 @@ impl FifoBackend for IdnBackend {
     }
 }
 
-fn blank_chunk(pps: u32) -> QueuedChunk {
-    let points = vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); 10];
+fn blank_chunk(pps: u32, format: PointFormat) -> QueuedChunk {
+    let points = match format {
+        PointFormat::Xyrgbi => ChunkPoints::Xyrgbi(vec![PointXyrgbi::default(); 10]),
+        PointFormat::XyrgbHighRes => ChunkPoints::HighRes(vec![PointXyrgbHighRes::default(); 10]),
+        PointFormat::Extended => ChunkPoints::Extended(vec![PointExtended::default(); 10]),
+    };
     QueuedChunk { pps, points }
 }
 
@@ -202,15 +349,23 @@ fn worker_loop<S: WorkerStream>(
     mut stream: S,
     rx: mpsc::Receiver<WorkerCommand>,
     connected: Arc<AtomicBool>,
+    point_format: PointFormat,
 ) {
     let mut queue = VecDeque::new();
     let mut last_pps = stream.scan_speed();
+
+    // Liveness tracking. Data sends are periodically upgraded to ACK requests
+    // (and idle intervals send a ping); after `MAX_CONSECUTIVE_ACK_MISSES`
+    // consecutive misses the device is treated as dead so the worker exits and
+    // the backend is marked disconnected (triggering the driver's reconnect).
+    let mut last_ack_check: Option<Instant> = None;
+    let mut misses: u32 = 0;
 
     'worker: loop {
         loop {
             match rx.try_recv() {
                 Ok(cmd) => {
-                    if !handle_worker_command(cmd, &mut queue, last_pps) {
+                    if !handle_worker_command(cmd, &mut queue, last_pps, point_format) {
                         break 'worker;
                     }
                 }
@@ -228,7 +383,28 @@ fn worker_loop<S: WorkerStream>(
             );
             last_pps = chunk.pps;
             stream.set_scan_speed(chunk.pps);
-            if !stream.write_frame(&chunk.points) {
+
+            let now = Instant::now();
+            if liveness_check_due(last_ack_check, misses, now) {
+                last_ack_check = Some(now);
+                if stream.write_frame_with_ack(&chunk.points, ACK_TIMEOUT) {
+                    misses = 0;
+                } else {
+                    misses += 1;
+                    log::debug!(
+                        "idn worker: liveness ACK miss {}/{}",
+                        misses,
+                        MAX_CONSECUTIVE_ACK_MISSES
+                    );
+                    if misses >= MAX_CONSECUTIVE_ACK_MISSES {
+                        log::warn!(
+                            "idn worker: {} consecutive ACK misses; marking disconnected",
+                            misses
+                        );
+                        break;
+                    }
+                }
+            } else if !stream.write_frame(&chunk.points) {
                 break;
             }
             continue;
@@ -236,13 +412,31 @@ fn worker_loop<S: WorkerStream>(
 
         match rx.recv_timeout(stream::KEEPALIVE_INTERVAL) {
             Ok(cmd) => {
-                if !handle_worker_command(cmd, &mut queue, last_pps) {
+                if !handle_worker_command(cmd, &mut queue, last_pps, point_format) {
                     break;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if stream.needs_keepalive() && !stream.send_keepalive() {
                     break;
+                }
+                // Detect a device that dies while idle: ping periodically.
+                let now = Instant::now();
+                if liveness_check_due(last_ack_check, misses, now) {
+                    last_ack_check = Some(now);
+                    if stream.ping(ACK_TIMEOUT) {
+                        misses = 0;
+                    } else {
+                        misses += 1;
+                        if misses >= MAX_CONSECUTIVE_ACK_MISSES {
+                            log::warn!(
+                                "idn worker: {} consecutive ping misses while idle; \
+                                 marking disconnected",
+                                misses
+                            );
+                            break;
+                        }
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -253,10 +447,22 @@ fn worker_loop<S: WorkerStream>(
     stream.close();
 }
 
+/// Whether a liveness (ACK/ping) check is due: once we start missing we probe
+/// on every opportunity so a dead device is detected quickly; otherwise we
+/// probe at most once per `ACK_CHECK_INTERVAL`.
+fn liveness_check_due(last_ack_check: Option<Instant>, misses: u32, now: Instant) -> bool {
+    misses > 0
+        || match last_ack_check {
+            None => true,
+            Some(t) => now.duration_since(t) >= ACK_CHECK_INTERVAL,
+        }
+}
+
 fn handle_worker_command(
     cmd: WorkerCommand,
     queue: &mut VecDeque<QueuedChunk>,
     last_pps: u32,
+    point_format: PointFormat,
 ) -> bool {
     match cmd {
         WorkerCommand::Chunk(chunk) => {
@@ -265,7 +471,7 @@ fn handle_worker_command(
         }
         WorkerCommand::Stop => {
             queue.clear();
-            queue.push_back(blank_chunk(last_pps));
+            queue.push_back(blank_chunk(last_pps, point_format));
             true
         }
         WorkerCommand::Shutdown => false,
@@ -274,7 +480,11 @@ fn handle_worker_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_worker_command, worker_loop, QueuedChunk, WorkerCommand, WorkerStream};
+    use super::{
+        handle_worker_command, worker_loop, ChunkPoints, QueuedChunk, WorkerCommand, WorkerStream,
+        MAX_CONSECUTIVE_ACK_MISSES,
+    };
+    use crate::protocols::idn::dac::stream::PointFormat;
     use crate::protocols::idn::protocol::PointXyrgbi;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -285,6 +495,8 @@ mod tests {
     struct FakeStream {
         scan_speed: u32,
         writes: Arc<AtomicUsize>,
+        /// Whether ACK/ping probes succeed (false simulates a dead device).
+        ack_ok: Arc<AtomicBool>,
     }
 
     impl FakeStream {
@@ -292,6 +504,15 @@ mod tests {
             Self {
                 scan_speed: 30_000,
                 writes,
+                ack_ok: Arc::new(AtomicBool::new(true)),
+            }
+        }
+
+        fn with_ack(writes: Arc<AtomicUsize>, ack_ok: Arc<AtomicBool>) -> Self {
+            Self {
+                scan_speed: 30_000,
+                writes,
+                ack_ok,
             }
         }
     }
@@ -313,9 +534,18 @@ mod tests {
             true
         }
 
-        fn write_frame(&mut self, _points: &[PointXyrgbi]) -> bool {
+        fn write_frame(&mut self, _points: &ChunkPoints) -> bool {
             self.writes.fetch_add(1, Ordering::Acquire);
             true
+        }
+
+        fn write_frame_with_ack(&mut self, _points: &ChunkPoints, _timeout: Duration) -> bool {
+            self.writes.fetch_add(1, Ordering::Acquire);
+            self.ack_ok.load(Ordering::Acquire)
+        }
+
+        fn ping(&mut self, _timeout: Duration) -> bool {
+            self.ack_ok.load(Ordering::Acquire)
         }
 
         fn close(&mut self) {}
@@ -324,7 +554,7 @@ mod tests {
     fn test_chunk(pps: u32, point_count: usize) -> QueuedChunk {
         QueuedChunk {
             pps,
-            points: vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); point_count],
+            points: ChunkPoints::Xyrgbi(vec![PointXyrgbi::new(0, 0, 0, 0, 0, 0); point_count]),
         }
     }
 
@@ -347,17 +577,20 @@ mod tests {
             WorkerCommand::Chunk(test_chunk(30_000, 179)),
             &mut queue,
             30_000,
+            PointFormat::Xyrgbi,
         ));
         assert!(handle_worker_command(
             WorkerCommand::Chunk(test_chunk(30_000, 179)),
             &mut queue,
             30_000,
+            PointFormat::Xyrgbi,
         ));
 
         assert!(handle_worker_command(
             WorkerCommand::Stop,
             &mut queue,
-            30_000
+            30_000,
+            PointFormat::Xyrgbi,
         ));
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.front().unwrap().points.len(), 10);
@@ -371,7 +604,9 @@ mod tests {
         let connected = Arc::new(AtomicBool::new(true));
         let worker_connected = Arc::clone(&connected);
 
-        let handle = thread::spawn(move || worker_loop(fake_stream, rx, worker_connected));
+        let handle = thread::spawn(move || {
+            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+        });
 
         tx.send(WorkerCommand::Chunk(test_chunk(1_000, 179)))
             .unwrap();
@@ -388,5 +623,38 @@ mod tests {
             "worker should drain backlog immediately to build timestamp lead"
         );
         assert!(!connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn worker_disconnects_after_consecutive_ack_misses() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        // A dead device: ACK/ping probes never succeed.
+        let ack_ok = Arc::new(AtomicBool::new(false));
+        let fake_stream = FakeStream::with_ack(Arc::clone(&writes), Arc::clone(&ack_ok));
+        let (tx, rx) = mpsc::sync_channel(8);
+        let connected = Arc::new(AtomicBool::new(true));
+        let worker_connected = Arc::clone(&connected);
+
+        let handle = thread::spawn(move || {
+            worker_loop(fake_stream, rx, worker_connected, PointFormat::Xyrgbi)
+        });
+
+        // Feed more chunks than the miss threshold; the first send is always an
+        // ACK request (last_ack_check == None), and once misses start every
+        // subsequent send is probed, so the worker gives up quickly.
+        for _ in 0..10 {
+            let _ = tx.send(WorkerCommand::Chunk(test_chunk(30_000, 20)));
+        }
+
+        handle.join().unwrap();
+
+        assert!(
+            !connected.load(Ordering::Acquire),
+            "worker should mark disconnected after consecutive ACK misses"
+        );
+        assert!(
+            writes.load(Ordering::Acquire) >= MAX_CONSECUTIVE_ACK_MISSES as usize,
+            "worker should have attempted the frames before giving up"
+        );
     }
 }

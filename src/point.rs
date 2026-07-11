@@ -90,10 +90,12 @@ impl LaserPoint {
         (v.clamp(-1.0, 1.0) * -32767.0).round() as i16
     }
 
-    /// Downscale a u16 color channel (0-65535) to u8 (0-255).
+    /// Downscale a u16 color channel (0-65535) to u8 (0-255), rounding to the
+    /// nearest 8-bit value rather than truncating. Truncation (`v >> 8`) biases
+    /// every channel slightly dark; exact rescaling maps 0→0 and 65535→255.
     #[inline]
     pub(crate) fn color_to_u8(v: u16) -> u8 {
-        (v >> 8) as u8
+        ((v as u32 * 255 + 32767) / 65535) as u8
     }
 
     /// Downscale a u16 color channel (0-65535) to 12-bit (0-4095).

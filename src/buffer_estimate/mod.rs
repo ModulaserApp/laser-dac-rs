@@ -13,7 +13,10 @@
 //! - [`StatusDecayEstimator`] — periodic authoritative status reports decay
 //!   between updates (Ether Dream).
 //! - [`DualTrackAckEstimator`] — UDP send-track + ACK-track, conservative
-//!   maximum (LaserCube Network).
+//!   maximum. Available for UDP-acked transports but not currently wired to a
+//!   backend: the LaserCube Network transport tracks device fullness inside its
+//!   own worker (ACK-sequence correlation plus rate-based decay, exposed via the
+//!   transport's `BufferEstimator` impl) rather than owning this strategy.
 //! - [`RuntimeAuthorityEstimator`] — delegated to an external runtime that
 //!   already tracks queue depth (AVB, Oscilloscope).
 
@@ -36,8 +39,10 @@ pub use status_decay::StatusDecayEstimator;
 /// adapter and downstream policy code) never mutate.
 pub trait BufferEstimator: Send {
     /// Best estimate of the device's queued points at `now`, given the current
-    /// playback rate. Strategies that don't need `pps` (e.g.
-    /// [`RuntimeAuthorityEstimator`]) ignore it.
+    /// playback rate. Strategies that already track depth in pps-points (e.g.
+    /// [`SoftwareDecayEstimator`]) ignore `pps`; strategies that hold depth in
+    /// another unit (e.g. [`RuntimeAuthorityEstimator`], which tracks device
+    /// output samples) use it to convert into comparable pps-points.
     fn estimated_fullness(&self, now: Instant, pps: u32) -> u64;
 
     /// Whether [`estimated_fullness`](Self::estimated_fullness) actually

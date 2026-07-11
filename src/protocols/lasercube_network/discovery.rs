@@ -219,6 +219,20 @@ fn send_discovery_broadcasts(
 }
 
 impl DiscoverDacs {
+    /// Construct a discovery driver around a single, caller-controlled main
+    /// socket, with no interface/passive sockets. Used by tests to drive
+    /// [`Self::next_device`] deterministically over loopback.
+    #[cfg(test)]
+    fn for_test(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            interface_sockets: Vec::new(),
+            passive_socket: None,
+            buffer: [0; 1500],
+            seen_ips: HashSet::new(),
+        }
+    }
+
     pub fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.socket.set_read_timeout(timeout)
     }
@@ -396,8 +410,31 @@ fn is_alive_response(buffer: &[u8]) -> bool {
     buffer == [CMD_ALIVE, 0x00]
 }
 
-fn format_stable_id(ip: IpAddr) -> String {
+/// Stable id from the hardware serial number, which survives DHCP lease
+/// changes. Falls back to the IP form when the serial is unavailable (empty or
+/// all-zero). The IP is retained separately as an identifier hint on the
+/// discovered device info.
+fn stable_id_for(status: &LaserCubeNetworkStatus) -> String {
+    let serial = status.serial_number.trim();
+    if !serial.is_empty() && serial.bytes().any(|b| b != b'0') {
+        format!("{}:{}", PREFIX, serial)
+    } else {
+        format_stable_id_ip(status.ip)
+    }
+}
+
+fn format_stable_id_ip(ip: IpAddr) -> String {
     format!("{}:{}", PREFIX, ip)
+}
+
+/// Human-readable device name, preferring the advertised model name and always
+/// disambiguating by IP.
+fn device_name(status: &LaserCubeNetworkStatus, ip: IpAddr) -> String {
+    if status.model_name.is_empty() {
+        format!("LaserCube {}", ip)
+    } else {
+        format!("{} {}", status.model_name, ip)
+    }
 }
 
 impl Discoverer for LaserCubeNetworkDiscoverer {
@@ -426,12 +463,8 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
                 Err(_) => continue,
             };
             let ip = addressed.source_addr.ip();
-            let stable_id = format_stable_id(ip);
-            let name = if addressed.status.model_name.is_empty() {
-                format!("LaserCube {}", ip)
-            } else {
-                format!("{} {}", addressed.status.model_name, ip)
-            };
+            let stable_id = stable_id_for(&addressed.status);
+            let name = device_name(&addressed.status, ip);
             let caps = super::capabilities_for_status(addressed.profile, &addressed.status);
             let info = DiscoveredDeviceInfo::new(DacType::LaserCubeNetwork, stable_id, name)
                 .with_ip(ip)
@@ -453,12 +486,57 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::profiles::ConnectionType;
+    use super::super::protocol::CMD_GET_FULL_INFO;
     use super::*;
 
+    /// Build a valid 64-byte full-info response advertising `model` and the
+    /// given raw connection-type byte.
+    fn full_info_packet(model: &str, connection_type: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 64];
+        d[0] = CMD_GET_FULL_INFO; // 0x77
+        d[3] = 1; // firmware major
+        d[4] = 24; // firmware minor
+        d[10..14].copy_from_slice(&30_000u32.to_le_bytes()); // point_rate
+        d[14..18].copy_from_slice(&30_000u32.to_le_bytes()); // point_rate_max
+        d[19..21].copy_from_slice(&3000u16.to_le_bytes()); // buffer_free
+        d[21..23].copy_from_slice(&6000u16.to_le_bytes()); // buffer_max
+        d[25] = connection_type;
+        d[37] = 10; // model number
+        d[38..38 + model.len()].copy_from_slice(model.as_bytes());
+        d
+    }
+
+    fn loopback_pair() -> (UdpSocket, UdpSocket, SocketAddr) {
+        let main = UdpSocket::bind("127.0.0.1:0").unwrap();
+        main.set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let main_addr = main.local_addr().unwrap();
+        let device = UdpSocket::bind("127.0.0.1:0").unwrap();
+        (main, device, main_addr)
+    }
+
     #[test]
-    fn stable_id_keeps_existing_lasercube_network_prefix() {
+    fn stable_id_uses_serial_when_available() {
+        let mut status = LaserCubeNetworkStatus::minimal("192.168.1.50".parse().unwrap());
+        status.serial_number = "010203040506".to_string();
+        assert_eq!(stable_id_for(&status), "lasercube-network:010203040506");
+    }
+
+    #[test]
+    fn stable_id_falls_back_to_ip_without_serial() {
+        let mut status = LaserCubeNetworkStatus::minimal("192.168.1.50".parse().unwrap());
+        status.serial_number = String::new();
+        assert_eq!(stable_id_for(&status), "lasercube-network:192.168.1.50");
+        // An all-zero serial is not a usable identity; fall back to IP.
+        status.serial_number = "000000000000".to_string();
+        assert_eq!(stable_id_for(&status), "lasercube-network:192.168.1.50");
+    }
+
+    #[test]
+    fn stable_id_ip_form_keeps_existing_prefix() {
         let ip: IpAddr = "192.168.1.50".parse().unwrap();
-        assert_eq!(format_stable_id(ip), "lasercube-network:192.168.1.50");
+        assert_eq!(format_stable_id_ip(ip), "lasercube-network:192.168.1.50");
     }
 
     #[test]
@@ -466,5 +544,100 @@ mod tests {
         assert!(is_alive_response(&[0x27, 0x00]));
         assert!(!is_alive_response(&[0x27]));
         assert!(!is_alive_response(&[0x27, 0x01]));
+    }
+
+    #[test]
+    fn device_name_prefers_model_and_disambiguates_by_ip() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let mut status = LaserCubeNetworkStatus::minimal(ip);
+        status.model_name = "Ultra Mk2".to_string();
+        assert_eq!(device_name(&status, ip), "Ultra Mk2 10.0.0.5");
+        status.model_name.clear();
+        assert_eq!(device_name(&status, ip), "LaserCube 10.0.0.5");
+    }
+
+    #[test]
+    fn next_device_parses_valid_full_info_response() {
+        let (main, device, main_addr) = loopback_pair();
+        let device_ip = device.local_addr().unwrap().ip();
+        device
+            .send_to(&full_info_packet("Ultra Mk2", 1), main_addr)
+            .unwrap();
+
+        let mut discovery = DiscoverDacs::for_test(main);
+        let addressed = discovery.next_device().unwrap();
+
+        assert_eq!(addressed.ip(), device_ip);
+        assert_eq!(addressed.status.model_name, "Ultra Mk2");
+        assert_eq!(addressed.status.connection_type, ConnectionType::WifiServer);
+        assert_eq!(addressed.status.buffer_max, 6000);
+        // Profile is derived from the advertised connection type + buffer.
+        assert_eq!(
+            addressed.profile.connection_type,
+            ConnectionType::WifiServer
+        );
+    }
+
+    #[test]
+    fn next_device_dedups_by_source_ip() {
+        let (main, device, main_addr) = loopback_pair();
+        device
+            .send_to(&full_info_packet("A", 0), main_addr)
+            .unwrap();
+        device
+            .send_to(&full_info_packet("A", 0), main_addr)
+            .unwrap();
+
+        let mut discovery = DiscoverDacs::for_test(main);
+        assert!(discovery.next_device().is_ok());
+        // Second announcement from the same IP is suppressed, so the driver
+        // drains until the read timeout fires.
+        let err = discovery.next_device().unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn next_device_discards_truncated_and_wrong_magic_packets() {
+        let (main, device, main_addr) = loopback_pair();
+        // Truncated full-info (wrong length).
+        device.send_to(&[0x77, 0x00, 0x00], main_addr).unwrap();
+        // Correct length but wrong leading command byte.
+        let mut wrong_magic = full_info_packet("X", 0);
+        wrong_magic[0] = 0x99;
+        device.send_to(&wrong_magic, main_addr).unwrap();
+
+        let mut discovery = DiscoverDacs::for_test(main);
+        let err = discovery.next_device().unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn next_device_handles_alive_response_without_yielding_device() {
+        let (main, device, main_addr) = loopback_pair();
+        device.send_to(&[CMD_ALIVE, 0x00], main_addr).unwrap();
+
+        let mut discovery = DiscoverDacs::for_test(main);
+        // An alive response triggers a unicast full-info request and continues;
+        // with no follow-up it drains to a timeout.
+        let err = discovery.next_device().unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn scan_runs_and_returns_without_devices() {
+        // Exercises the live discovery setup (socket binding, broadcasts, and
+        // the timeout-terminated scan loop). No LaserCube is expected in the
+        // test environment, so this must complete quickly and not panic.
+        let mut discoverer = LaserCubeNetworkDiscoverer::new();
+        let _devices = discoverer.scan();
     }
 }

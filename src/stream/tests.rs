@@ -268,10 +268,48 @@ fn test_device_start_stream_connects_backend() {
 fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::NetworkFifo;
+    // Use a non-`Custom` network dac_type: `Custom` backends are intentionally
+    // excluded from promotion (they set their own policy), so promotion must be
+    // observed on a real network DAC.
+    let mut info = test_info(backend.caps());
+    info.kind = DacType::EtherDream;
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+
+    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+    assert_eq!(
+        stream.config.target_buffer,
+        StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn test_device_start_stream_does_not_promote_custom_backends() {
+    // `Custom` backends keep the raw 20ms default even with a network output
+    // model — the frame path and the stream path agree on this exclusion.
+    let mut backend = TestBackend::new();
+    backend.caps.output_model = OutputModel::NetworkFifo;
     let device = Dac::new(
-        test_info(backend.caps()),
+        test_info(backend.caps()), // test_info sets kind = Custom
         BackendKind::Fifo(Box::new(backend)),
     );
+
+    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+    assert_eq!(
+        stream.config.target_buffer,
+        StreamConfig::DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn test_device_start_stream_promotes_blocking_fifo_backends() {
+    // BlockingFifo (e.g. LaserCube USB) is promoted just like NetworkFifo.
+    let mut backend = TestBackend::new();
+    backend.caps.output_model = OutputModel::BlockingFifo;
+    let mut info = test_info(backend.caps());
+    info.kind = DacType::LaserCubeUsb;
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 
@@ -2945,4 +2983,514 @@ fn reconnect_rediscovers_custom_backend_via_factory() {
     );
 
     drop(session);
+}
+
+// =========================================================================
+// StreamInstant helpers and operators
+// =========================================================================
+
+#[test]
+fn test_stream_instant_conversions() {
+    let a = StreamInstant::new(100);
+    assert_eq!(a.points(), 100);
+    // 100 points at 1000 pps = 0.1s
+    assert_eq!(a.as_seconds(1000), 0.1);
+    assert_eq!(a.as_secs_f64(1000), 0.1);
+    // round-trip through seconds
+    assert_eq!(
+        StreamInstant::from_seconds(0.1, 1000),
+        StreamInstant::new(100)
+    );
+    // default is zero
+    assert_eq!(StreamInstant::default(), StreamInstant::new(0));
+}
+
+#[test]
+fn test_stream_instant_add_sub_points_saturate() {
+    let a = StreamInstant::new(100);
+    assert_eq!(a.add_points(50), StreamInstant::new(150));
+    assert_eq!(a.sub_points(30), StreamInstant::new(70));
+    // sub saturates at zero
+    assert_eq!(a.sub_points(1000), StreamInstant::new(0));
+    // add saturates at u64::MAX
+    assert_eq!(
+        StreamInstant::new(u64::MAX).add_points(5),
+        StreamInstant::new(u64::MAX)
+    );
+}
+
+#[test]
+fn test_stream_instant_operators() {
+    let mut a = StreamInstant::new(100);
+    assert_eq!(a + 25u64, StreamInstant::new(125));
+    assert_eq!(a - 40u64, StreamInstant::new(60));
+    // Sub saturates at zero
+    assert_eq!(a - 500u64, StreamInstant::new(0));
+
+    a += 10;
+    assert_eq!(a, StreamInstant::new(110));
+    a -= 5;
+    assert_eq!(a, StreamInstant::new(105));
+    // SubAssign saturates at zero
+    a -= 1000;
+    assert_eq!(a, StreamInstant::new(0));
+
+    // AddAssign saturates at u64::MAX
+    let mut b = StreamInstant::new(u64::MAX);
+    b += 10;
+    assert_eq!(b, StreamInstant::new(u64::MAX));
+}
+
+// =========================================================================
+// status() tests
+// =========================================================================
+
+#[test]
+fn test_status_reports_connected_stats_and_scheduled_ahead() {
+    let backend = TestBackend::new().with_initial_queue(500);
+    let mut stream = make_test_stream(backend); // make_test_stream connects the backend
+
+    let status = stream.status().unwrap();
+    assert!(status.connected, "backend was connected");
+    // The software-decay estimator was seeded to 500 at wall-clock time, and
+    // `status()` reads it a few microseconds later; at 30k pps it sheds ~1
+    // point per 33us, so assert a tolerance band rather than exact equality to
+    // avoid a timing-flaky off-by-one on loaded CI runners.
+    assert!(
+        (490..=500).contains(&status.scheduled_ahead_points),
+        "scheduled_ahead_points ~500 (seeded depth, minus slight decay), got {}",
+        status.scheduled_ahead_points
+    );
+    assert_eq!(
+        status.device_queued_points,
+        Some(status.scheduled_ahead_points)
+    );
+    assert!(status.stats.is_some());
+    assert_eq!(status.stats.unwrap().underrun_count, 0);
+
+    // Stats are snapshotted from live state.
+    stream.state.stats.underrun_count = 7;
+    stream.state.stats.reconnect_count = 2;
+    let status = stream.status().unwrap();
+    let stats = status.stats.unwrap();
+    assert_eq!(stats.underrun_count, 7);
+    assert_eq!(stats.reconnect_count, 2);
+}
+
+#[test]
+fn test_status_reports_disconnected() {
+    // Build a stream without connecting the backend.
+    let backend = TestBackend::new();
+    let info = test_info(backend.caps());
+    let stream = Stream::with_backend(
+        info,
+        BackendKind::Fifo(Box::new(backend)),
+        StreamConfig::new(30_000),
+    );
+
+    let status = stream.status().unwrap();
+    assert!(!status.connected, "backend was never connected");
+    assert_eq!(status.scheduled_ahead_points, 0);
+}
+
+// =========================================================================
+// handle_shutter_transition tests
+// =========================================================================
+
+#[test]
+fn test_handle_shutter_transition_arm_prefills_and_opens() {
+    // 10000 PPS, color delay 300µs → 3 points, startup blank 500µs → 5 points.
+    let cfg = StreamConfig::new(10_000)
+        .with_color_delay(Duration::from_micros(300))
+        .with_startup_blank(Duration::from_micros(500));
+    let backend = TestBackend::new();
+    let shutter = backend.shutter_open.clone();
+    let mut stream = make_test_stream_with_cfg(backend, cfg);
+
+    assert!(!stream.state.shutter_open);
+    assert!(!stream.state.last_armed);
+
+    stream.handle_shutter_transition(true);
+
+    assert!(stream.state.last_armed);
+    assert!(stream.state.shutter_open);
+    assert!(shutter.load(Ordering::SeqCst), "hardware shutter opened");
+    // Color delay line pre-filled with blanked entries.
+    assert_eq!(stream.state.color_delay_line.len(), 3);
+    assert!(stream
+        .state
+        .color_delay_line
+        .iter()
+        .all(|&c| c == (0, 0, 0, 0)));
+    // Startup blank window reset.
+    assert_eq!(stream.state.startup_blank_points, 5);
+    assert_eq!(stream.state.startup_blank_remaining, 5);
+}
+
+#[test]
+fn test_handle_shutter_transition_disarm_clears_and_closes() {
+    let backend = TestBackend::new();
+    let shutter = backend.shutter_open.clone();
+    let mut stream = make_test_stream(backend);
+
+    // Arm first so the disarm transition fires.
+    stream.handle_shutter_transition(true);
+    assert!(stream.state.shutter_open);
+    // Seed the color delay line with content that disarm must flush.
+    stream.state.color_delay_line.push_back((1, 2, 3, 4));
+
+    stream.handle_shutter_transition(false);
+
+    assert!(!stream.state.last_armed);
+    assert!(!stream.state.shutter_open);
+    assert!(!shutter.load(Ordering::SeqCst), "hardware shutter closed");
+    assert!(stream.state.color_delay_line.is_empty());
+}
+
+#[test]
+fn test_handle_shutter_transition_noop_when_state_unchanged() {
+    let backend = TestBackend::new();
+    let shutter = backend.shutter_open.clone();
+    let mut stream = make_test_stream(backend);
+
+    // disarmed -> disarmed: nothing happens.
+    stream.handle_shutter_transition(false);
+    assert!(!stream.state.shutter_open);
+    assert!(!shutter.load(Ordering::SeqCst));
+
+    // Arm once.
+    stream.handle_shutter_transition(true);
+    assert!(stream.state.shutter_open);
+
+    // armed -> armed: no re-prefill, no shutter toggling. Seed a marker and
+    // verify the armed->armed branch leaves the delay line untouched.
+    stream.state.color_delay_line.push_back((9, 9, 9, 9));
+    stream.handle_shutter_transition(true);
+    assert!(stream.state.shutter_open);
+    assert!(shutter.load(Ordering::SeqCst));
+    assert_eq!(stream.state.color_delay_line.back(), Some(&(9, 9, 9, 9)));
+}
+
+// =========================================================================
+// Streaming-side reconnect tests
+//
+// Two flavours:
+//   1. `handle_reconnect` exercised directly as an isolated helper (covers
+//      the backend swap, frame-swap rejection, PPS revalidation, and
+//      stop-during-reconnect branches deterministically).
+//   2. An end-to-end reconnect through the REAL `Stream::run` unified driver
+//      path (not the legacy helpers): a FIFO backend that disconnects after N
+//      writes plus a registered mock Discoverer that supplies the replacement.
+// =========================================================================
+
+/// Stable id shared by the streaming reconnect mock discoverer and the Dac.
+const STREAM_RECON_ID: &str = "streamrecon:swap";
+
+/// What kind of replacement backend the mock discoverer hands back on connect.
+#[derive(Clone, Copy)]
+enum ReplacementKind {
+    /// A compatible FIFO backend (accepts the swap).
+    Fifo,
+    /// A frame-swap backend — incompatible with streaming, must be rejected.
+    FrameSwap,
+    /// A FIFO backend whose PPS range excludes the stream config PPS.
+    NarrowPps,
+}
+
+/// FIFO backend with a PPS range [1, 1000] that excludes the 30 kpps test config.
+struct NarrowPpsBackend {
+    connected: bool,
+    estimator: SoftwareDecayEstimator,
+}
+
+impl NarrowPpsBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            estimator: SoftwareDecayEstimator::new(),
+        }
+    }
+}
+
+impl DacBackend for NarrowPpsBackend {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("StreamRecon".into())
+    }
+    fn caps(&self) -> &DacCapabilities {
+        static CAPS: DacCapabilities = DacCapabilities {
+            pps_min: 1,
+            pps_max: 1000,
+            max_points_per_chunk: 1000,
+            output_model: crate::device::OutputModel::NetworkFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> Result<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _open: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for NarrowPpsBackend {
+    fn try_write_points(&mut self, _pps: u32, _points: &[LaserPoint]) -> Result<WriteOutcome> {
+        Ok(WriteOutcome::Written)
+    }
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+}
+
+/// Mock discoverer that supplies a replacement backend of a chosen kind when
+/// `open_by_id(STREAM_RECON_ID)` is called during reconnect.
+struct StreamReconDiscoverer {
+    kind: ReplacementKind,
+    connect_count: Arc<AtomicUsize>,
+}
+
+impl crate::discovery::Discoverer for StreamReconDiscoverer {
+    fn dac_type(&self) -> DacType {
+        DacType::Custom("StreamRecon".into())
+    }
+    fn prefix(&self) -> &str {
+        "streamrecon"
+    }
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            DacType::Custom("StreamRecon".into()),
+            STREAM_RECON_ID,
+            "Stream Recon Device",
+        );
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
+    }
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
+        self.connect_count.fetch_add(1, Ordering::SeqCst);
+        Ok(match self.kind {
+            ReplacementKind::Fifo => BackendKind::Fifo(Box::new(ReconnectFifoBackend::new())),
+            ReplacementKind::FrameSwap => {
+                BackendKind::FrameSwap(Box::new(FrameSwapTestBackend::new()))
+            }
+            ReplacementKind::NarrowPps => BackendKind::Fifo(Box::new(NarrowPpsBackend::new())),
+        })
+    }
+}
+
+/// Build a Stream whose reconnect policy re-opens `STREAM_RECON_ID` via a
+/// freshly-registered `StreamReconDiscoverer` of the given kind.
+fn make_reconnecting_stream(
+    kind: ReplacementKind,
+    connect_count: Arc<AtomicUsize>,
+    reconnected: Arc<AtomicBool>,
+) -> Stream {
+    let initial = ReconnectFifoBackend::new();
+    let info = DacInfo {
+        id: STREAM_RECON_ID.to_string(),
+        name: "Stream Recon Device".to_string(),
+        kind: DacType::Custom("StreamRecon".to_string()),
+        caps: initial.caps().clone(),
+    };
+    let reconnected_cb = reconnected.clone();
+    let device =
+        Dac::new(info, BackendKind::Fifo(Box::new(initial))).with_discovery_factory(move || {
+            let mut d = crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
+            d.register(Box::new(StreamReconDiscoverer {
+                kind,
+                connect_count: connect_count.clone(),
+            }));
+            d
+        });
+
+    let cfg = StreamConfig::new(30_000).with_reconnect(
+        crate::config::ReconnectConfig::new()
+            .max_retries(3)
+            .backoff(Duration::from_millis(1))
+            .on_reconnect(move |_info| {
+                reconnected_cb.store(true, Ordering::SeqCst);
+            }),
+    );
+    let (stream, _info) = device.start_stream(cfg).unwrap();
+    stream
+}
+
+#[test]
+fn handle_reconnect_swaps_backend_and_fires_callback() {
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+    let mut stream = make_reconnecting_stream(
+        ReplacementKind::Fifo,
+        connect_count.clone(),
+        reconnected.clone(),
+    );
+
+    // Dirty some state so we can prove the reset happened.
+    stream.state.shutter_open = true;
+    stream.state.last_armed = true;
+    stream.state.startup_blank_remaining = 42;
+
+    let result = stream.handle_reconnect();
+    assert!(
+        result.is_ok(),
+        "reconnect to compatible FIFO should succeed"
+    );
+
+    // New backend is swapped in and connected.
+    assert!(stream.backend.as_ref().unwrap().is_connected());
+    assert_eq!(stream.info.id, STREAM_RECON_ID);
+    // State was reset for the new connection.
+    assert!(!stream.state.shutter_open);
+    assert!(!stream.state.last_armed);
+    assert_eq!(stream.state.startup_blank_remaining, 0);
+    assert_eq!(stream.state.stats.reconnect_count, 1);
+    // Callback fired and the discoverer actually connected.
+    assert!(reconnected.load(Ordering::SeqCst));
+    assert!(connect_count.load(Ordering::SeqCst) >= 1);
+}
+
+#[test]
+fn handle_reconnect_rejects_frame_swap_device() {
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+    let mut stream = make_reconnecting_stream(
+        ReplacementKind::FrameSwap,
+        connect_count.clone(),
+        reconnected.clone(),
+    );
+
+    let result = stream.handle_reconnect();
+    assert_eq!(
+        result,
+        Err(RunExit::Disconnected),
+        "a frame-swap device is incompatible with streaming"
+    );
+    assert!(
+        !reconnected.load(Ordering::SeqCst),
+        "on_reconnect must not fire on a rejected swap"
+    );
+}
+
+#[test]
+fn handle_reconnect_rejects_incompatible_pps() {
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+    let mut stream = make_reconnecting_stream(
+        ReplacementKind::NarrowPps,
+        connect_count.clone(),
+        reconnected.clone(),
+    );
+
+    let result = stream.handle_reconnect();
+    assert_eq!(
+        result,
+        Err(RunExit::Disconnected),
+        "reconnected device PPS range must contain the stream config PPS"
+    );
+    assert!(!reconnected.load(Ordering::SeqCst));
+}
+
+#[test]
+fn handle_reconnect_stops_when_stop_requested() {
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+    let mut stream = make_reconnecting_stream(
+        ReplacementKind::Fifo,
+        connect_count.clone(),
+        reconnected.clone(),
+    );
+
+    // Request stop before reconnecting — the retry loop should bail out.
+    stream.control.stop().unwrap();
+
+    let result = stream.handle_reconnect();
+    assert_eq!(result, Err(RunExit::Stopped));
+    assert_eq!(
+        connect_count.load(Ordering::SeqCst),
+        0,
+        "no connect attempt should occur once stop is requested"
+    );
+}
+
+#[test]
+fn stream_reconnects_through_run_driver_path() {
+    // End-to-end: drive the REAL `Stream::run` unified driver. The initial
+    // FIFO backend disconnects (Error::Disconnected) after 2 writes; the
+    // registered mock Discoverer supplies a fresh FIFO backend on reopen.
+    let scan_count = Arc::new(AtomicUsize::new(0));
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let reconnected = Arc::new(AtomicBool::new(false));
+
+    let scan_factory = scan_count.clone();
+    let connect_factory = connect_count.clone();
+    let reconnected_cb = reconnected.clone();
+
+    let initial_backend = DisconnectAfterNBackend::new(2);
+    let caps = initial_backend.caps().clone();
+    let device_id = "trackingtest:10.0.0.99";
+    let info = DacInfo {
+        id: device_id.to_string(),
+        name: "Tracking Test Device".to_string(),
+        kind: DacType::Custom("TrackingTest".to_string()),
+        caps,
+    };
+
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut d = crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
+            d.register(Box::new(TrackingDiscoverer {
+                scan_count: scan_factory.clone(),
+                connect_count: connect_factory.clone(),
+            }));
+            d
+        });
+
+    let cfg = StreamConfig::new(30_000).with_reconnect(
+        crate::config::ReconnectConfig::new()
+            .max_retries(5)
+            .backoff(Duration::from_millis(5))
+            .on_reconnect(move |_info| {
+                reconnected_cb.store(true, Ordering::SeqCst);
+            }),
+    );
+
+    let (stream, _info) = device.start_stream(cfg).unwrap();
+    let control = stream.control();
+    control.arm().unwrap();
+
+    let handle = std::thread::spawn(move || stream.run(blank_producer, |_e| {}));
+
+    // Wait for the disconnect -> reconnect cycle to complete.
+    let start = Instant::now();
+    while !reconnected.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        reconnected.load(Ordering::SeqCst),
+        "on_reconnect should fire via the run() driver path"
+    );
+
+    // Stop the (now healthy) stream and verify a clean exit.
+    control.stop().unwrap();
+    let result = handle.join().expect("stream thread panicked");
+    assert_eq!(result.unwrap(), RunExit::Stopped);
+
+    assert!(
+        scan_count.load(Ordering::SeqCst) > 0,
+        "discoverer scan() should run during reconnect"
+    );
+    assert!(
+        connect_count.load(Ordering::SeqCst) > 0,
+        "discoverer connect() should run to reopen the device"
+    );
 }
