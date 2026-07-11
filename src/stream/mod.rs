@@ -1542,7 +1542,7 @@ impl Dac {
                 cfg.target_buffer = StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER;
             } else if matches!(
                 info.caps.output_model,
-                OutputModel::NetworkFifo | OutputModel::UdpTimed
+                OutputModel::NetworkFifo | OutputModel::UdpTimed | OutputModel::BlockingFifo
             ) {
                 cfg.target_buffer = StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER;
             }

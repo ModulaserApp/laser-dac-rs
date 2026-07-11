@@ -324,6 +324,15 @@ pub enum OutputModel {
     NetworkFifo,
     /// Timed UDP chunks where OS send may not reflect hardware pacing.
     UdpTimed,
+    /// Small hardware ring fed by a *blocking* write endpoint that provides its
+    /// own backpressure (e.g., LaserCube USB / LaserDock).
+    ///
+    /// Unlike [`NetworkFifo`](Self::NetworkFifo), the scheduler must not meter
+    /// writes off a software buffer estimator: the device ring is tiny and only
+    /// drains while output is enabled, so estimator-driven deficit trickle
+    /// degenerates into starving sub-packet writes. Instead the adapter writes
+    /// large fixed-size chunks and lets the blocking endpoint set the pace.
+    BlockingFifo,
 }
 
 /// Information about a discovered DAC before connection.
