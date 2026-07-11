@@ -1,6 +1,6 @@
 //! Oscilloscope streaming backend implementation.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -9,7 +9,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig as CpalStreamConfig};
 use crossbeam_queue::ArrayQueue;
 
-use crate::resample::{catmull_rom, resampled_len};
+use crate::resample::StreamingResampler;
 
 use super::OscilloscopeConfig;
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
@@ -17,6 +17,9 @@ use crate::buffer_estimate::{BufferEstimator, QueueDepthSource, RuntimeAuthority
 use crate::device::{DacCapabilities, DacType};
 use crate::error::{Error, Result};
 use crate::point::LaserPoint;
+
+/// Approximate time constant for the mute ramp toward screen centre.
+const MUTE_RAMP_MS: f32 = 3.0;
 
 /// Shared state between the producer (backend) and consumer (audio callback).
 struct RuntimeState {
@@ -26,14 +29,25 @@ struct RuntimeState {
     muted: AtomicBool,
     /// Whether the audio stream is alive.
     connected: AtomicBool,
+    /// Device output sample rate in Hz (used to convert queue depth to
+    /// pps-points and to size the mute ramp).
+    sample_rate: u32,
+    /// Last emitted output sample, as f32 bits. Held on underrun so the beam
+    /// stays put instead of snapping to the screen centre, and ramped toward
+    /// centre while muted. Written only by the audio callback.
+    last_l_bits: AtomicU32,
+    last_r_bits: AtomicU32,
 }
 
 impl RuntimeState {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, sample_rate: u32) -> Self {
         Self {
             queue: ArrayQueue::new(capacity),
             muted: AtomicBool::new(true),
             connected: AtomicBool::new(false),
+            sample_rate,
+            last_l_bits: AtomicU32::new(0.0f32.to_bits()),
+            last_r_bits: AtomicU32::new(0.0f32.to_bits()),
         }
     }
 
@@ -52,11 +66,52 @@ impl RuntimeState {
     fn clear_queue(&self) {
         while self.queue.pop().is_some() {}
     }
+
+    fn last_output(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.last_l_bits.load(Ordering::Relaxed)),
+            f32::from_bits(self.last_r_bits.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn set_last_output(&self, l: f32, r: f32) {
+        self.last_l_bits.store(l.to_bits(), Ordering::Relaxed);
+        self.last_r_bits.store(r.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Compute the next output sample, advancing the held/ramped state.
+    ///
+    /// - Unmuted with a queued sample: pass it through.
+    /// - Unmuted underrun (empty queue): hold the last output — no centre spike.
+    /// - Muted: ramp the held value toward screen centre (0,0) over a few ms,
+    ///   so muting glides rather than stepping. The queue is still drained so
+    ///   the producer never stalls on `WouldBlock`.
+    fn next_output(&self) -> (f32, f32) {
+        let muted = self.muted.load(Ordering::Relaxed);
+        let queued = self.queue.pop();
+        let (last_l, last_r) = self.last_output();
+
+        let (l, r) = if muted {
+            let k = (1000.0 / (MUTE_RAMP_MS * self.sample_rate as f32)).clamp(0.0, 1.0);
+            (last_l + (0.0 - last_l) * k, last_r + (0.0 - last_r) * k)
+        } else {
+            match queued {
+                Some((l, r)) => (l, r),
+                None => (last_l, last_r),
+            }
+        };
+
+        self.set_last_output(l, r);
+        (l, r)
+    }
 }
 
 impl QueueDepthSource for RuntimeState {
     fn queued_points(&self) -> u64 {
         RuntimeState::queued_points(self)
+    }
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 }
 
@@ -87,6 +142,9 @@ pub struct OscilloscopeBackend {
     /// Runtime-authoritative buffer estimator. Source is set on connect and
     /// cleared on disconnect; reports zero in between.
     estimator: RuntimeAuthorityEstimator,
+    /// Stateful PPS→sample-rate resampler carrying phase across write chunks.
+    /// Reset on connect/stop/disconnect; re-phased on PPS change.
+    resampler: StreamingResampler<(f32, f32)>,
     /// Audio engine seam. Abstracts cpal so the backend can be tested with a
     /// mock engine that has no real audio device.
     engine: Arc<dyn AudioEngine>,
@@ -108,6 +166,7 @@ impl OscilloscopeBackend {
             audio_thread: None,
             sample_buffer: Vec::new(),
             estimator: RuntimeAuthorityEstimator::new(),
+            resampler: StreamingResampler::new(1, 1),
             engine,
         }
     }
@@ -330,43 +389,22 @@ impl AudioEngine for CpalAudioEngine {
 /// Fill an F32 output buffer from the runtime queue.
 ///
 /// Always consumes from the queue even when muted, to prevent the producer
-/// from stalling on `WouldBlock`.
+/// from stalling on `WouldBlock`. Underrun holds the last position and mute
+/// ramps toward centre (see [`RuntimeState::next_output`]).
 fn fill_f32_output(data: &mut [f32], runtime: &RuntimeState) {
-    let muted = runtime.muted.load(Ordering::Relaxed);
-
     for chunk in data.chunks_mut(2) {
-        if let Some((l, r)) = runtime.queue.pop() {
-            if muted {
-                chunk[0] = 0.0;
-                chunk[1] = 0.0;
-            } else {
-                chunk[0] = l;
-                chunk[1] = r;
-            }
-        } else {
-            chunk[0] = 0.0;
-            chunk[1] = 0.0;
-        }
+        let (l, r) = runtime.next_output();
+        chunk[0] = l;
+        chunk[1] = r;
     }
 }
 
 /// Fill an I16 output buffer from the runtime queue.
 fn fill_i16_output(data: &mut [i16], runtime: &RuntimeState) {
-    let muted = runtime.muted.load(Ordering::Relaxed);
-
     for chunk in data.chunks_mut(2) {
-        if let Some((l, r)) = runtime.queue.pop() {
-            if muted {
-                chunk[0] = 0;
-                chunk[1] = 0;
-            } else {
-                chunk[0] = (l * i16::MAX as f32) as i16;
-                chunk[1] = (r * i16::MAX as f32) as i16;
-            }
-        } else {
-            chunk[0] = 0;
-            chunk[1] = 0;
-        }
+        let (l, r) = runtime.next_output();
+        chunk[0] = (l * i16::MAX as f32) as i16;
+        chunk[1] = (r * i16::MAX as f32) as i16;
     }
 }
 
@@ -417,7 +455,10 @@ impl DacBackend for OscilloscopeBackend {
         }
 
         // Create fresh runtime state for this connection (no stale data)
-        let runtime = Arc::new(RuntimeState::new(self.buffer_capacity()));
+        let runtime = Arc::new(RuntimeState::new(self.buffer_capacity(), self.sample_rate));
+
+        // A fresh stream starts a fresh resample phase.
+        self.resampler.reset();
 
         let audio_thread = self.start_audio_thread(&runtime)?;
 
@@ -459,6 +500,7 @@ impl DacBackend for OscilloscopeBackend {
             runtime.clear_queue();
         }
         self.estimator.clear_source();
+        self.resampler.reset();
 
         Ok(())
     }
@@ -473,6 +515,8 @@ impl DacBackend for OscilloscopeBackend {
         if let Some(runtime) = &self.runtime {
             runtime.muted.store(true, Ordering::Release);
         }
+        // Drop the carried resample phase so output resumes cleanly on re-arm.
+        self.resampler.reset();
         Ok(())
     }
 
@@ -482,20 +526,6 @@ impl DacBackend for OscilloscopeBackend {
         }
         Ok(())
     }
-}
-
-/// Interpolate two stereo sample pairs using 4-point Catmull-Rom.
-fn catmull_rom_samples(
-    s0: (f32, f32),
-    s1: (f32, f32),
-    s2: (f32, f32),
-    s3: (f32, f32),
-    t: f32,
-) -> (f32, f32) {
-    (
-        catmull_rom(s0.0, s1.0, s2.0, s3.0, t),
-        catmull_rom(s0.1, s1.1, s2.1, s3.1, t),
-    )
 }
 
 impl FifoBackend for OscilloscopeBackend {
@@ -513,50 +543,28 @@ impl FifoBackend for OscilloscopeBackend {
             return Ok(WriteOutcome::Written);
         }
 
-        // Check capacity before doing any conversion work.
-        let resampling = pps != self.sample_rate;
-        if resampling {
-            let output_len = resampled_len(points.len(), pps, self.sample_rate);
-            if !runtime.has_capacity_for(output_len) {
-                return Ok(WriteOutcome::WouldBlock);
-            }
-        } else if !runtime.has_capacity_for(points.len()) {
+        // Keep the resampler phased to the current PPS (a PPS change re-phases).
+        self.resampler.set_rates(pps.max(1), self.sample_rate);
+
+        // Reserve queue capacity for exactly what the resampler will emit for
+        // this chunk, given its carried phase.
+        let output_len = self.resampler.pending_output_count(points.len());
+        if !runtime.has_capacity_for(output_len) {
             return Ok(WriteOutcome::WouldBlock);
         }
 
-        // Convert points to stereo samples.
+        // Convert points to stereo samples, then resample with carried phase.
         self.sample_buffer.clear();
         self.sample_buffer.extend(
             points
                 .iter()
                 .map(|p| Self::point_to_samples(p, &self.config)),
         );
-
-        if resampling {
-            let output_len = resampled_len(self.sample_buffer.len(), pps, self.sample_rate);
-            let last_src_idx = (self.sample_buffer.len() - 1) as f32;
-            let step = if output_len > 1 {
-                last_src_idx / (output_len - 1) as f32
-            } else {
-                0.0
-            };
-
-            let last = self.sample_buffer.len() - 1;
-            for i in 0..output_len {
-                let src_pos = i as f32 * step;
-                let idx = (src_pos as usize).min(last);
-                let t = src_pos - idx as f32;
-                let s0 = self.sample_buffer[idx.saturating_sub(1)];
-                let s1 = self.sample_buffer[idx];
-                let s2 = self.sample_buffer[(idx + 1).min(last)];
-                let s3 = self.sample_buffer[(idx + 2).min(last)];
-                let _ = runtime.queue.push(catmull_rom_samples(s0, s1, s2, s3, t));
-            }
-        } else {
-            for &sample in &self.sample_buffer {
-                let _ = runtime.queue.push(sample);
-            }
-        }
+        let samples = std::mem::take(&mut self.sample_buffer);
+        self.resampler.process(&samples, |s| {
+            let _ = runtime.queue.push(s);
+        });
+        self.sample_buffer = samples;
 
         Ok(WriteOutcome::Written)
     }
@@ -643,7 +651,7 @@ mod tests {
 
     #[test]
     fn fill_f32_output_unmuted_emits_samples_and_drains() {
-        let rt = RuntimeState::new(8);
+        let rt = RuntimeState::new(8, RATE);
         rt.muted.store(false, Ordering::Release);
         rt.queue.push((0.5, -0.5)).unwrap();
         rt.queue.push((0.25, 0.75)).unwrap();
@@ -656,7 +664,7 @@ mod tests {
 
     #[test]
     fn fill_f32_output_muted_emits_zero_but_still_drains() {
-        let rt = RuntimeState::new(8); // muted defaults to true
+        let rt = RuntimeState::new(8, RATE); // muted defaults to true
         rt.queue.push((0.5, -0.5)).unwrap();
 
         let mut data = [9.0f32; 2];
@@ -668,7 +676,7 @@ mod tests {
 
     #[test]
     fn fill_f32_output_underrun_emits_zero() {
-        let rt = RuntimeState::new(8);
+        let rt = RuntimeState::new(8, RATE);
         rt.muted.store(false, Ordering::Release);
         let mut data = [9.0f32; 4];
         fill_f32_output(&mut data, &rt);
@@ -677,7 +685,7 @@ mod tests {
 
     #[test]
     fn fill_i16_output_scales_unmuted() {
-        let rt = RuntimeState::new(8);
+        let rt = RuntimeState::new(8, RATE);
         rt.muted.store(false, Ordering::Release);
         rt.queue.push((1.0, -1.0)).unwrap();
 
@@ -690,7 +698,7 @@ mod tests {
 
     #[test]
     fn fill_i16_output_muted_and_underrun_emit_zero() {
-        let rt = RuntimeState::new(8); // muted
+        let rt = RuntimeState::new(8, RATE); // muted
         rt.queue.push((1.0, -1.0)).unwrap();
         let mut data = [123i16; 4];
         fill_i16_output(&mut data, &rt);
@@ -703,7 +711,7 @@ mod tests {
 
     #[test]
     fn runtime_state_capacity_accounting() {
-        let rt = RuntimeState::new(4);
+        let rt = RuntimeState::new(4, RATE);
         assert!(rt.has_capacity_for(0));
         assert!(rt.has_capacity_for(4));
         assert!(!rt.has_capacity_for(5));
@@ -878,7 +886,7 @@ mod tests {
         let fake = Arc::new(FakeAudioEngine::new());
         fake.fail_open.store(true, Ordering::Release);
         let engine: Arc<dyn AudioEngine> = fake;
-        let runtime = Arc::new(RuntimeState::new(16));
+        let runtime = Arc::new(RuntimeState::new(16, RATE));
         let stop = AtomicBool::new(false);
 
         let err = run_audio_thread(&engine, "scope", RATE, &runtime, &stop).unwrap_err();
@@ -1029,7 +1037,8 @@ mod tests {
         backend.connect().unwrap();
         let rt = backend.runtime.as_ref().unwrap().clone();
 
-        // 2 points at 24kHz → ceil(2 * 48000 / 24000) = 4 output samples.
+        // 2 points at 24kHz through the streaming resampler → (2-1)*48000/24000
+        // + 1 = 3 output samples (one input interval spans two output steps).
         let points = vec![
             LaserPoint::new(-1.0, -1.0, 0, 0, 0, 0),
             LaserPoint::new(1.0, 1.0, 0, 0, 0, 0),
@@ -1038,12 +1047,11 @@ mod tests {
             backend.try_write_points(24_000, &points).unwrap(),
             WriteOutcome::Written
         );
-        assert_eq!(rt.queued_points(), 4);
+        assert_eq!(rt.queued_points(), 3);
 
         // Endpoints preserved, interior interpolated.
         let first = rt.queue.pop().unwrap();
         assert!((first.0 - (-1.0)).abs() < 0.01);
-        let _ = rt.queue.pop();
         let _ = rt.queue.pop();
         let last = rt.queue.pop().unwrap();
         assert!((last.0 - 1.0).abs() < 0.01);
