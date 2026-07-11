@@ -60,12 +60,54 @@ impl Point {
 
 impl From<&LaserPoint> for Point {
     fn from(p: &LaserPoint) -> Self {
+        // Premultiply the intensity dimmer into each color channel before the
+        // u12 downscale. The LaserCube wire format carries no separate intensity
+        // channel, so an intensity-as-dimmer source would otherwise render
+        // full-bright. This matches the receiver-side convention in
+        // `receiver::parser` (intensity folded into RGB).
+        let dim = |c: u16| -> u16 { ((c as u32 * p.intensity as u32) / 65535) as u16 };
         Self {
             x: LaserPoint::coord_to_u12(p.x),
             y: LaserPoint::coord_to_u12_inverted(p.y),
-            r: LaserPoint::color_to_u12(p.r),
-            g: LaserPoint::color_to_u12(p.g),
-            b: LaserPoint::color_to_u12(p.b),
+            r: LaserPoint::color_to_u12(dim(p.r)),
+            g: LaserPoint::color_to_u12(dim(p.g)),
+            b: LaserPoint::color_to_u12(dim(p.b)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_intensity_passes_color_through() {
+        let p = LaserPoint::new(0.0, 0.0, 65535, 32768, 4096, 65535);
+        let point = Point::from(&p);
+        assert_eq!(point.r, LaserPoint::color_to_u12(65535));
+        assert_eq!(point.g, LaserPoint::color_to_u12(32768));
+        assert_eq!(point.b, LaserPoint::color_to_u12(4096));
+    }
+
+    #[test]
+    fn zero_intensity_blanks_color() {
+        let p = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 0);
+        let point = Point::from(&p);
+        assert_eq!(point.r, 0);
+        assert_eq!(point.g, 0);
+        assert_eq!(point.b, 0);
+    }
+
+    #[test]
+    fn half_intensity_dims_color() {
+        // intensity ~50% should roughly halve each channel before downscale.
+        let p = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 32768);
+        let point = Point::from(&p);
+        let expected = LaserPoint::color_to_u12((65535u32 * 32768 / 65535) as u16);
+        assert_eq!(point.r, expected);
+        assert_eq!(point.g, expected);
+        assert_eq!(point.b, expected);
+        // ~half of full-scale u12 (4095).
+        assert!(point.r >= 2000 && point.r <= 2100);
     }
 }

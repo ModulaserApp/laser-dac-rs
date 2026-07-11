@@ -40,7 +40,9 @@ pub fn set_dac_buffer_threshold(threshold: u32) -> [u8; 5] {
 }
 
 pub fn threshold_supported(status: &LaserCubeNetworkStatus) -> bool {
-    status.model_number >= 10 || status.firmware_major > 1 || status.firmware_minor > 23
+    status.firmware_major > 1
+        || (status.firmware_major == 1 && status.firmware_minor > 23)
+        || status.model_number >= 10
 }
 
 #[cfg(test)]
@@ -70,8 +72,15 @@ mod tests {
         status.model_number = 0;
         status.firmware_major = 2;
         assert!(threshold_supported(&status));
-        status.firmware_major = 0;
+        // firmware 1.24 supports the threshold, but a high minor with major 0 must not.
+        status.firmware_major = 1;
         status.firmware_minor = 24;
         assert!(threshold_supported(&status));
+        status.firmware_major = 1;
+        status.firmware_minor = 23;
+        assert!(!threshold_supported(&status));
+        status.firmware_major = 0;
+        status.firmware_minor = 24;
+        assert!(!threshold_supported(&status));
     }
 }

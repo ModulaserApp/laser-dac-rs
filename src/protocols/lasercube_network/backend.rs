@@ -46,8 +46,15 @@ impl DacBackend for LaserCubeNetworkBackend {
     }
 
     fn connect(&mut self) -> Result<()> {
-        if self.transport.is_some() {
-            return Ok(());
+        // Reuse the existing transport only if it is still usable; otherwise tear
+        // it down and rebuild so a stale/dead transport is not silently kept.
+        if let Some(existing) = &self.transport {
+            if existing.is_usable() {
+                return Ok(());
+            }
+        }
+        if let Some(mut stale) = self.transport.take() {
+            stale.shutdown();
         }
         let transport = TransportHandle::connect(self.addressed.clone()).map_err(Error::backend)?;
         self.transport = Some(transport);
@@ -95,7 +102,8 @@ impl FifoBackend for LaserCubeNetworkBackend {
         self.point_buffer.clear();
         self.point_buffer.extend(points.iter().map(Point::from));
 
-        match transport.enqueue(pps, self.point_buffer.clone()) {
+        // Hand the buffer to the transport by move instead of cloning it.
+        match transport.enqueue(pps, std::mem::take(&mut self.point_buffer)) {
             Ok(()) => Ok(WriteOutcome::Written),
             Err(super::error::CommunicationError::QueueFull) => Ok(WriteOutcome::WouldBlock),
             Err(err) => Err(Error::backend(err)),

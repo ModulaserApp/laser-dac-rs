@@ -410,7 +410,20 @@ fn is_alive_response(buffer: &[u8]) -> bool {
     buffer == [CMD_ALIVE, 0x00]
 }
 
-fn format_stable_id(ip: IpAddr) -> String {
+/// Stable id from the hardware serial number, which survives DHCP lease
+/// changes. Falls back to the IP form when the serial is unavailable (empty or
+/// all-zero). The IP is retained separately as an identifier hint on the
+/// discovered device info.
+fn stable_id_for(status: &LaserCubeNetworkStatus) -> String {
+    let serial = status.serial_number.trim();
+    if !serial.is_empty() && serial.bytes().any(|b| b != b'0') {
+        format!("{}:{}", PREFIX, serial)
+    } else {
+        format_stable_id_ip(status.ip)
+    }
+}
+
+fn format_stable_id_ip(ip: IpAddr) -> String {
     format!("{}:{}", PREFIX, ip)
 }
 
@@ -450,7 +463,7 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
                 Err(_) => continue,
             };
             let ip = addressed.source_addr.ip();
-            let stable_id = format_stable_id(ip);
+            let stable_id = stable_id_for(&addressed.status);
             let name = device_name(&addressed.status, ip);
             let caps = super::capabilities_for_status(addressed.profile, &addressed.status);
             let info = DiscoveredDeviceInfo::new(DacType::LaserCubeNetwork, stable_id, name)
@@ -504,9 +517,26 @@ mod tests {
     }
 
     #[test]
-    fn stable_id_keeps_existing_lasercube_network_prefix() {
+    fn stable_id_uses_serial_when_available() {
+        let mut status = LaserCubeNetworkStatus::minimal("192.168.1.50".parse().unwrap());
+        status.serial_number = "010203040506".to_string();
+        assert_eq!(stable_id_for(&status), "lasercube-network:010203040506");
+    }
+
+    #[test]
+    fn stable_id_falls_back_to_ip_without_serial() {
+        let mut status = LaserCubeNetworkStatus::minimal("192.168.1.50".parse().unwrap());
+        status.serial_number = String::new();
+        assert_eq!(stable_id_for(&status), "lasercube-network:192.168.1.50");
+        // An all-zero serial is not a usable identity; fall back to IP.
+        status.serial_number = "000000000000".to_string();
+        assert_eq!(stable_id_for(&status), "lasercube-network:192.168.1.50");
+    }
+
+    #[test]
+    fn stable_id_ip_form_keeps_existing_prefix() {
         let ip: IpAddr = "192.168.1.50".parse().unwrap();
-        assert_eq!(format_stable_id(ip), "lasercube-network:192.168.1.50");
+        assert_eq!(format_stable_id_ip(ip), "lasercube-network:192.168.1.50");
     }
 
     #[test]
