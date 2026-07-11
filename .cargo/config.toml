@@ -1,0 +1,13 @@
+# Convenience aliases so local runs match CI, which always uses `--all-features`.
+#
+# A plain `cargo test` uses the default feature set, which compiles OUT the
+# feature-gated integration tests (e.g. `receiver_server.rs` needs `receiver`,
+# which is not a default feature). That silently runs only a fraction of the
+# e2e suite locally while CI runs all of it. Prefer these aliases (or the
+# `--all-features` flag) so what passes locally is what CI checks.
+[alias]
+# Full test suite exactly as CI runs it.
+test-ci = "test --all-features"
+# Full check/clippy as CI runs them.
+check-ci = "check --all-features --all-targets"
+clippy-ci = "clippy --all-features --all-targets -- -D warnings"

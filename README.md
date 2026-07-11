@@ -403,6 +403,23 @@ On **Linux** the crate links against the distro-packaged `libusb-1.0` (install v
 
 ## Development Tools
 
+### Running the tests
+
+CI always builds and tests with **all features enabled**. A plain `cargo test`
+uses only the default feature set, which silently compiles out feature-gated
+integration tests (for example `tests/receiver_server.rs` needs the `receiver`
+feature). To run the same suite CI does — and avoid "passes locally, fails on
+CI" surprises — use `--all-features` or the provided aliases:
+
+```bash
+cargo test-ci     # = cargo test --all-features
+cargo check-ci    # = cargo check --all-features --all-targets
+cargo clippy-ci   # = cargo clippy --all-features --all-targets -- -D warnings
+```
+
+The `.githooks/pre-commit` hook also runs `check`/`clippy` with `--all-features`
+(enable it with `git config core.hooksPath .githooks`).
+
 ### IDN Simulator
 
 The repository includes a debug simulator (in `tools/idn-simulator/`) that acts as a virtual IDN laser DAC. This is useful for testing and development without physical hardware.
