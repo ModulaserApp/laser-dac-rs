@@ -29,6 +29,73 @@ pub(crate) enum StepOutcome {
     Disconnected,
 }
 
+/// Injectable time source for the driver loop's pacing sleeps.
+///
+/// Production uses [`SystemClock`], a zero-overhead pass-through to `std`, so
+/// behavior is unchanged. Tests can inject a fake clock whose `sleep` advances a
+/// virtual `now` instantly, making the [`LoopCtx`] pacing waits deterministic
+/// and free of real wall-clock delay.
+///
+/// This is the seam the audit's "injectable clock at the `driver::run` seam"
+/// recommendation asks for. It currently covers the `LoopCtx` sleep helpers and
+/// the estimator drain-poll; virtualizing the adapters' internal deadline state
+/// and converting the remaining wall-clock test sleeps is a deliberate,
+/// separately-scoped follow-up (the "large" option in the audit).
+pub(crate) trait Clock: Send {
+    fn now(&self) -> Instant;
+    fn sleep(&self, dur: Duration);
+}
+
+/// Real wall clock: `Instant::now()` + `thread::sleep`. The production clock.
+pub(crate) struct SystemClock;
+
+impl Clock for SystemClock {
+    #[inline]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    #[inline]
+    fn sleep(&self, dur: Duration) {
+        std::thread::sleep(dur);
+    }
+}
+
+/// Test clock: `sleep` advances a virtual `now` instantly instead of blocking,
+/// so pacing loops run to completion with zero wall-clock delay while their
+/// time-based logic still sees time pass. Records total virtual sleep for
+/// assertions.
+#[cfg(test)]
+pub(crate) struct FakeClock {
+    now: std::sync::Mutex<Instant>,
+    slept: std::sync::Mutex<Duration>,
+}
+
+#[cfg(test)]
+impl FakeClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            now: std::sync::Mutex::new(Instant::now()),
+            slept: std::sync::Mutex::new(Duration::ZERO),
+        }
+    }
+
+    /// Total virtual time advanced via `sleep`.
+    pub(crate) fn total_slept(&self) -> Duration {
+        *self.slept.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+impl Clock for FakeClock {
+    fn now(&self) -> Instant {
+        *self.now.lock().unwrap()
+    }
+    fn sleep(&self, dur: Duration) {
+        *self.now.lock().unwrap() += dur;
+        *self.slept.lock().unwrap() += dur;
+    }
+}
+
 /// Shared context borrowed by the adapter for one `step`.
 pub(crate) struct LoopCtx<'a> {
     pub backend: &'a mut BackendKind,
@@ -41,6 +108,9 @@ pub(crate) struct LoopCtx<'a> {
     pub target_buffer: Duration,
     pub pps: u32,
     pub is_armed: bool,
+    /// Time source for all pacing waits in this step. `SystemClock` in
+    /// production; a virtual clock in tests.
+    pub clock: &'a dyn Clock,
 }
 
 impl<'a> LoopCtx<'a> {
@@ -53,13 +123,13 @@ impl<'a> LoopCtx<'a> {
         // over-sleeps badly on coarse timers (a 2ms sleep can take 15.6ms on
         // Windows' default resolution), so the total wait can run many times
         // long. Loop on the real remaining time to `deadline` instead.
-        let deadline = Instant::now() + duration;
+        let deadline = self.clock.now() + duration;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(self.clock.now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            std::thread::sleep(remaining.min(SLICE));
+            self.clock.sleep(remaining.min(SLICE));
             self.metrics.mark_loop_activity();
             if self.control.is_stop_requested() {
                 return Err(StepOutcome::Stopped);
@@ -76,7 +146,7 @@ impl<'a> LoopCtx<'a> {
         const SLEEP_SLICE: Duration = Duration::from_millis(1);
 
         loop {
-            let now = Instant::now();
+            let now = self.clock.now();
             if now >= deadline {
                 return Ok(());
             }
@@ -86,7 +156,7 @@ impl<'a> LoopCtx<'a> {
                 let slice = remaining
                     .saturating_sub(BUSY_WAIT_THRESHOLD)
                     .min(SLEEP_SLICE);
-                std::thread::sleep(slice);
+                self.clock.sleep(slice);
             } else {
                 std::thread::yield_now();
             }
@@ -102,7 +172,7 @@ impl<'a> LoopCtx<'a> {
     }
 
     pub fn sleep_and_mark_activity(&self, duration: Duration) {
-        std::thread::sleep(duration);
+        self.clock.sleep(duration);
         self.metrics.mark_loop_activity();
     }
 }
@@ -198,7 +268,7 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
     if timeout.is_zero() {
         return;
     }
-    let start = Instant::now();
+    let start = ctx.clock.now();
     let deadline = start + timeout;
     const POLL: Duration = Duration::from_millis(5);
     let mut now = start;
@@ -213,9 +283,9 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
         if process_control_messages(ctx.control_rx, ctx.shutter_open, ctx.backend) {
             break;
         }
-        std::thread::sleep(POLL);
+        ctx.clock.sleep(POLL);
         ctx.metrics.mark_loop_activity();
-        now = Instant::now();
+        now = ctx.clock.now();
     }
 }
 

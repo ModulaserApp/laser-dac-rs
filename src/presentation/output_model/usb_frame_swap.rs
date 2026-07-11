@@ -143,7 +143,9 @@ mod tests {
     use crate::point::LaserPoint;
     use crate::presentation::content_source::{ContentSourceKind, FrameContentSource};
     use crate::presentation::engine::PresentationEngine;
-    use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
+    use crate::presentation::output_model::{
+        LoopCtx, OutputModelAdapter, StepOutcome, SystemClock,
+    };
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
@@ -256,6 +258,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -277,6 +280,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -340,6 +344,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -359,6 +364,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -378,6 +384,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -451,6 +458,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -475,6 +483,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -523,6 +532,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             last = adapter.step(&mut ctx);
             if matches!(last, StepOutcome::Disconnected) {

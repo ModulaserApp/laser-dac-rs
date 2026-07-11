@@ -380,6 +380,7 @@ impl FrameSession {
             target_buffer,
             drain_timeout: Duration::ZERO,
             pending_frame: Some(frame_slot),
+            clock: DriverInputs::system_clock(),
         })
     }
 

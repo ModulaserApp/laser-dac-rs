@@ -628,6 +628,7 @@ impl Stream {
             target_buffer: self.config.target_buffer,
             drain_timeout: self.config.drain_timeout,
             pending_frame: None,
+            clock: DriverInputs::system_clock(),
         })
     }
 

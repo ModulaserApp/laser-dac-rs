@@ -21,7 +21,7 @@ use crate::stream::{ControlMsg, RunExit, StreamControl};
 
 use super::content_source::{ContentSourceKind, FifoContentSource, FrameContentSource};
 use super::output_model::{
-    self, process_control_messages, LoopCtx, OutputModelAdapter, StepOutcome,
+    self, process_control_messages, Clock, LoopCtx, OutputModelAdapter, StepOutcome, SystemClock,
 };
 use super::session::FrameSessionMetrics;
 use super::OutputResetReason;
@@ -134,6 +134,18 @@ pub(crate) struct DriverInputs {
     /// `FrameSession::send_frame` can write into it; stream-mode passes
     /// `None` (no frame intake).
     pub pending_frame: Option<PendingFrame>,
+    /// Time source for the loop's pacing sleeps. Production passes
+    /// [`SystemClock`]; tests can inject a virtual clock for deterministic
+    /// pacing. Defaulted via [`DriverInputs::system_clock`].
+    pub clock: Box<dyn Clock>,
+}
+
+impl DriverInputs {
+    /// The production clock (real wall-clock). Constructors that don't inject a
+    /// custom clock use this.
+    pub(crate) fn system_clock() -> Box<dyn Clock> {
+        Box::new(SystemClock)
+    }
 }
 
 /// The unified driver loop. Lifted from the old `FrameSession::run_loop`,
@@ -211,6 +223,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
+                clock: &*inputs.clock,
             };
             adapter.step(&mut ctx)
         };
@@ -253,6 +266,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 target_buffer: inputs.target_buffer,
                 pps,
                 is_armed,
+                clock: &*inputs.clock,
             };
             adapter.drain_and_blank(&mut ctx, inputs.drain_timeout);
             return Ok(RunExit::ProducerEnded);
