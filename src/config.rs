@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use crate::device::DacInfo;
+use crate::device::{DacInfo, DacType, OutputModel};
 
 /// Configuration for starting a stream.
 ///
@@ -146,6 +146,39 @@ impl StreamConfig {
     /// host-side cushion for the transport to top up the firmware ringbuffer.
     pub const LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
         std::time::Duration::from_millis(120);
+
+    /// Default target buffer for a backend, applied when the caller leaves
+    /// `target_buffer` at [`DEFAULT_TARGET_BUFFER`](Self::DEFAULT_TARGET_BUFFER).
+    ///
+    /// Single source of truth shared by the frame path
+    /// (`presentation::session::target_buffer_for_backend`) and the stream path
+    /// (`Dac::apply_backend_buffer_defaults`) so the two never drift.
+    ///
+    /// LaserCube network devices want a deep cushion. Other real network/FIFO
+    /// DACs (`NetworkFifo`/`UdpTimed`/`BlockingFifo` — AVB, oscilloscope,
+    /// Ether Dream, IDN, LaserCube USB, …) get the 50ms network default rather
+    /// than the blanket 20ms; combined with the runtime-authority estimator's
+    /// pps-point conversion this gives audio-clocked backends a genuine
+    /// multi-callback-quantum cushion. `Custom` backends are intentionally
+    /// excluded so they keep the raw 20ms default (test/embedding backends set
+    /// their own policy).
+    pub fn default_target_buffer_for(
+        dac_type: &DacType,
+        output_model: &OutputModel,
+    ) -> std::time::Duration {
+        if matches!(dac_type, DacType::LaserCubeNetwork) {
+            Self::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+        } else if !matches!(dac_type, DacType::Custom(_))
+            && matches!(
+                output_model,
+                OutputModel::NetworkFifo | OutputModel::UdpTimed | OutputModel::BlockingFifo
+            )
+        {
+            Self::NETWORK_DEFAULT_TARGET_BUFFER
+        } else {
+            Self::DEFAULT_TARGET_BUFFER
+        }
+    }
 
     /// Create a new stream configuration with the given PPS.
     pub fn new(pps: u32) -> Self {

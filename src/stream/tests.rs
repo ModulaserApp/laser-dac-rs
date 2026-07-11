@@ -268,10 +268,48 @@ fn test_device_start_stream_connects_backend() {
 fn test_device_start_stream_promotes_untouched_defaults_for_network_backends() {
     let mut backend = TestBackend::new();
     backend.caps.output_model = OutputModel::NetworkFifo;
+    // Use a non-`Custom` network dac_type: `Custom` backends are intentionally
+    // excluded from promotion (they set their own policy), so promotion must be
+    // observed on a real network DAC.
+    let mut info = test_info(backend.caps());
+    info.kind = DacType::EtherDream;
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
+
+    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+    assert_eq!(
+        stream.config.target_buffer,
+        StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn test_device_start_stream_does_not_promote_custom_backends() {
+    // `Custom` backends keep the raw 20ms default even with a network output
+    // model — the frame path and the stream path agree on this exclusion.
+    let mut backend = TestBackend::new();
+    backend.caps.output_model = OutputModel::NetworkFifo;
     let device = Dac::new(
-        test_info(backend.caps()),
+        test_info(backend.caps()), // test_info sets kind = Custom
         BackendKind::Fifo(Box::new(backend)),
     );
+
+    let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
+
+    assert_eq!(
+        stream.config.target_buffer,
+        StreamConfig::DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn test_device_start_stream_promotes_blocking_fifo_backends() {
+    // BlockingFifo (e.g. LaserCube USB) is promoted just like NetworkFifo.
+    let mut backend = TestBackend::new();
+    backend.caps.output_model = OutputModel::BlockingFifo;
+    let mut info = test_info(backend.caps());
+    info.kind = DacType::LaserCubeUsb;
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(backend)));
 
     let (stream, _info) = device.start_stream(StreamConfig::new(30_000)).unwrap();
 

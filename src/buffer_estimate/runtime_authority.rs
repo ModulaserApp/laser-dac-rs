@@ -19,7 +19,16 @@ pub trait QueueDepthSource: Send + Sync {
     /// Current queue depth in device output samples.
     fn queued_points(&self) -> u64;
     /// The device output sample rate in Hz.
-    fn sample_rate(&self) -> u32;
+    ///
+    /// Defaults to `0`, which makes [`estimated_fullness`] pass
+    /// [`queued_points`](Self::queued_points) through unscaled — the behavior
+    /// before this conversion existed. Real backends override it with the
+    /// detected device rate so the depth is converted into pps-points.
+    ///
+    /// [`estimated_fullness`]: RuntimeAuthorityEstimator::estimated_fullness
+    fn sample_rate(&self) -> u32 {
+        0
+    }
 }
 
 /// Estimator that delegates to a [`QueueDepthSource`].
@@ -125,6 +134,22 @@ mod tests {
         let counter = Arc::new(AtomicCounter::new(600, 96_000));
         let est = RuntimeAuthorityEstimator::with_source(counter);
         assert_eq!(est.estimated_fullness(Instant::now(), 30_000), 187);
+    }
+
+    #[test]
+    fn default_sample_rate_passes_depth_through_unscaled() {
+        // An implementor that does not override `sample_rate()` inherits the
+        // `0` default, which must make the estimator report the raw queue depth
+        // (the pre-conversion behavior) rather than dividing by zero.
+        struct DepthOnly(u64);
+        impl QueueDepthSource for DepthOnly {
+            fn queued_points(&self) -> u64 {
+                self.0
+            }
+        }
+
+        let est = RuntimeAuthorityEstimator::with_source(Arc::new(DepthOnly(600)));
+        assert_eq!(est.estimated_fullness(Instant::now(), 30_000), 600);
     }
 
     #[test]

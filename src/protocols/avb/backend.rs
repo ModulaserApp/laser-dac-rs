@@ -101,13 +101,20 @@ struct StreamPoint {
 impl CatmullInterp for StreamPoint {
     fn catmull(s0: Self, s1: Self, s2: Self, s3: Self, t: f32) -> Self {
         use crate::resample::catmull_rom;
+        // Catmull-Rom is non-monotone: it can overshoot the control points, so
+        // an interpolated value may leave the input range even though every
+        // source point is in range. Clamp the six fields to their valid domains
+        // (XY ∈ [-1, 1], colors/intensity ∈ [0, 1]) before they reach the
+        // galvo/premultiply path — an undershoot below 0 on both a color and
+        // `i` would otherwise multiply into a spurious positive in the 5-channel
+        // premultiply.
         StreamPoint {
-            x: catmull_rom(s0.x, s1.x, s2.x, s3.x, t),
-            y: catmull_rom(s0.y, s1.y, s2.y, s3.y, t),
-            r: catmull_rom(s0.r, s1.r, s2.r, s3.r, t),
-            g: catmull_rom(s0.g, s1.g, s2.g, s3.g, t),
-            b: catmull_rom(s0.b, s1.b, s2.b, s3.b, t),
-            i: catmull_rom(s0.i, s1.i, s2.i, s3.i, t),
+            x: catmull_rom(s0.x, s1.x, s2.x, s3.x, t).clamp(-1.0, 1.0),
+            y: catmull_rom(s0.y, s1.y, s2.y, s3.y, t).clamp(-1.0, 1.0),
+            r: catmull_rom(s0.r, s1.r, s2.r, s3.r, t).clamp(0.0, 1.0),
+            g: catmull_rom(s0.g, s1.g, s2.g, s3.g, t).clamp(0.0, 1.0),
+            b: catmull_rom(s0.b, s1.b, s2.b, s3.b, t).clamp(0.0, 1.0),
+            i: catmull_rom(s0.i, s1.i, s2.i, s3.i, t).clamp(0.0, 1.0),
         }
     }
 }
@@ -379,11 +386,15 @@ impl AvbBackend {
         }
     }
 
-    /// After a successful connect, pin `pps_max` to the detected device sample
-    /// rate: PPS above it can only be delivered by decimation. The driver
-    /// re-reads caps on reconnect, so this propagates to later sessions.
-    fn update_caps_for_sample_rate(&mut self, sample_rate: u32) {
-        self.caps.pps_max = sample_rate;
+    /// Reset the "PPS exceeds sample rate" warning latch after a (re)connect so
+    /// the next session logs the decimation notice once.
+    ///
+    /// We deliberately do *not* pin `caps.pps_max` to the device rate. PPS above
+    /// the rate is handled by decimation in the write path (see `write`), which
+    /// is the intended behavior; a hard cap would only be observable if it were
+    /// wired into reconnect validation, and there it would *reject* such a
+    /// session outright instead of decimating it — a regression, not a fix.
+    fn reset_pps_warning(&mut self) {
         self.warned_pps_exceeds_rate = false;
     }
 
@@ -513,7 +524,7 @@ impl DacBackend for AvbBackend {
                     self.selector.duplicate_index,
                     stream_config.sample_rate
                 );
-                self.update_caps_for_sample_rate(stream_config.sample_rate);
+                self.reset_pps_warning();
                 self.estimator
                     .set_source(Arc::clone(&runtime) as Arc<dyn QueueDepthSource>);
                 self.runtime = Some(runtime);
@@ -1089,6 +1100,47 @@ mod tests {
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::thread;
+
+    #[test]
+    fn catmull_output_is_clamped_to_valid_ranges() {
+        // The non-monotone Catmull-Rom spline overshoots its control points, so
+        // in-range inputs can produce out-of-range interpolants. Emitted points
+        // must still be clamped to XY ∈ [-1, 1] and colors/intensity ∈ [0, 1] so
+        // an undershoot below 0 can't turn into a spurious positive in the
+        // 5-channel `r * i` premultiply, and XY can't drive galvos past range.
+        let p = |v: f32| StreamPoint {
+            x: v,
+            y: v,
+            r: v,
+            g: v,
+            b: v,
+            i: v,
+        };
+
+        // First arrangement (0,1,1,0) bulges above the upper bound; the second
+        // (1,0,0,1) dips below the lower bound. Together they exercise both the
+        // color/intensity undershoot and the XY over/undershoot.
+        for &[a, b, c, d] in &[[0.0f32, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0]] {
+            let (s0, s1, s2, s3) = (p(a), p(b), p(c), p(d));
+            // Confirm the raw spline actually leaves range at the midpoint, so
+            // this test would fail without the clamp.
+            let raw = crate::resample::catmull_rom(a, b, c, d, 0.5);
+            assert!(
+                !(0.0..=1.0).contains(&raw),
+                "control points must overshoot to make the clamp observable"
+            );
+
+            for k in 0..=20 {
+                let t = k as f32 / 20.0;
+                let out = StreamPoint::catmull(s0, s1, s2, s3, t);
+                for v in [out.r, out.g, out.b, out.i] {
+                    assert!((0.0..=1.0).contains(&v), "color/intensity {v} out of [0,1]");
+                }
+                assert!((-1.0..=1.0).contains(&out.x), "x {} out of [-1,1]", out.x);
+                assert!((-1.0..=1.0).contains(&out.y), "y {} out of [-1,1]", out.y);
+            }
+        }
+    }
 
     fn make_record(
         name: &str,

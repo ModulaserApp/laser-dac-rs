@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
 use crate::config::StreamConfig;
-use crate::device::{DacInfo, DacType, OutputModel};
+use crate::device::{DacInfo, OutputModel};
 use crate::error::{Error, Result};
 use crate::reconnect::ReconnectPolicy;
 use crate::stream::{ControlMsg, RunExit, StreamControl};
@@ -407,26 +407,7 @@ impl Drop for FrameSession {
 }
 
 pub(super) fn target_buffer_for_backend(backend: &BackendKind) -> Duration {
-    // Mirror the stream path's `apply_backend_buffer_defaults`: LaserCube
-    // network devices want a deep cushion, and other real network DACs
-    // (NetworkFifo/UdpTimed — AVB, oscilloscope, Ether Dream, IDN, …) get the
-    // 50ms network default rather than the blanket 20ms. Combined with the
-    // runtime-authority estimator's pps-point conversion, this gives the
-    // audio-clocked backends a genuine multi-callback-quantum cushion.
-    //
-    // `Custom` backends are intentionally excluded so they keep the raw 20ms
-    // default (test/embedding backends set their own policy).
-    let dac_type = backend.dac_type();
-    if matches!(dac_type, DacType::LaserCubeNetwork) {
-        StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
-    } else if !matches!(dac_type, DacType::Custom(_))
-        && matches!(
-            backend.caps().output_model,
-            OutputModel::NetworkFifo | OutputModel::UdpTimed
-        )
-    {
-        StreamConfig::NETWORK_DEFAULT_TARGET_BUFFER
-    } else {
-        Duration::from_millis(20)
-    }
+    // Delegate to the shared policy so the frame path and the stream path's
+    // `apply_backend_buffer_defaults` can never disagree on the cushion.
+    StreamConfig::default_target_buffer_for(&backend.dac_type(), &backend.caps().output_model)
 }
