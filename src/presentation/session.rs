@@ -334,7 +334,9 @@ impl FrameSession {
         // frame-swap bounds by frame_capacity (max_points_per_chunk is meaningless there).
         let initial_buf_capacity = match backend.caps().output_model {
             OutputModel::UsbFrameSwap => backend.frame_capacity().unwrap_or(0),
-            OutputModel::NetworkFifo | OutputModel::UdpTimed => backend.caps().max_points_per_chunk,
+            OutputModel::NetworkFifo | OutputModel::UdpTimed | OutputModel::BlockingFifo => {
+                backend.caps().max_points_per_chunk
+            }
         };
         let mut pipeline = SlicePipeline::with_startup_blank(
             engine,

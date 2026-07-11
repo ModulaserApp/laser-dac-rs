@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, EtherDreamBackend, Result};
 use crate::device::DacType;
@@ -54,20 +54,43 @@ impl Discoverer for EtherDreamDiscoverer {
     }
 
     fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let Ok(mut rx) = recv_dac_broadcasts() else {
-            return Vec::new();
+        let mut rx = match recv_dac_broadcasts() {
+            Ok(rx) => rx,
+            Err(e) => {
+                log::warn!("Ether Dream discovery: failed to bind UDP broadcast socket: {e}");
+                return Vec::new();
+            }
         };
-        if rx.set_timeout(Some(self.timeout)).is_err() {
+        // Short per-recv timeout so the loop can poll until the overall deadline
+        // rather than blocking on a single broadcast.
+        if let Err(e) = rx.set_timeout(Some(Duration::from_millis(200))) {
+            log::warn!("Ether Dream discovery: failed to set socket timeout: {e}");
             return Vec::new();
         }
 
         let mut discovered = Vec::new();
         let mut seen_macs = std::collections::HashSet::new();
 
-        for _ in 0..3 {
+        // Keep reading datagrams until the scan window closes; each DAC
+        // broadcasts ~once per second, so a fixed small cap could miss devices.
+        let deadline = Instant::now() + self.timeout;
+        while Instant::now() < deadline {
             let (broadcast, source_addr) = match rx.next_broadcast() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // No datagram this interval; keep polling until the deadline.
+                    continue;
+                }
+                Err(e) => {
+                    // A malformed/short datagram shouldn't abort the whole scan.
+                    log::warn!("Ether Dream discovery: recv error: {e}");
+                    continue;
+                }
             };
 
             let ip = source_addr.ip();
