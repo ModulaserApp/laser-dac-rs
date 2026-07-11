@@ -89,6 +89,19 @@ pub trait FifoBackend: DacBackend {
     /// protocol-specific event hooks. Adapters (and any other observers) only
     /// query estimated fullness via this getter.
     fn estimator(&self) -> &dyn BufferEstimator;
+
+    /// Clear the device-side queue (drop all buffered-but-unplayed points) and
+    /// reset queue-depth bookkeeping.
+    ///
+    /// Called by the scheduler when re-arming an
+    /// [`OutputModel::BlockingFifo`](crate::device::OutputModel::BlockingFifo)
+    /// device whose hardware ring does not drain while output is disabled
+    /// (e.g. LaserCube USB), so stale points do not replay on re-arm. The
+    /// default is a no-op: FIFO devices that keep draining while disarmed empty
+    /// their queue on their own and have nothing to clear.
+    fn reset_device_buffer(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -239,6 +252,17 @@ impl BackendKind {
         match self {
             BackendKind::Fifo(b) => Some(b.estimator()),
             BackendKind::FrameSwap(_) => None,
+        }
+    }
+
+    /// Clear the device-side queue and reset queue-depth bookkeeping.
+    ///
+    /// Delegates to [`FifoBackend::reset_device_buffer`]; frame-swap backends
+    /// never queue points, so this is a no-op for them.
+    pub fn reset_device_buffer(&mut self) -> Result<()> {
+        match self {
+            BackendKind::Fifo(b) => b.reset_device_buffer(),
+            BackendKind::FrameSwap(_) => Ok(()),
         }
     }
 
