@@ -11,7 +11,7 @@
 
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::BackendKind;
 use crate::device::DacInfo;
@@ -145,6 +145,9 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
     let mut shutter_open = false;
     let mut last_armed = false;
     let mut error_sink = inputs.error_sink;
+    // Instant the last reconnect completed; gates the flapping-device backoff
+    // floor in `reconnect_backend_with_retry`.
+    let mut last_reconnect_at: Option<Instant> = None;
 
     loop {
         inputs.metrics.mark_loop_activity();
@@ -175,6 +178,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                 &mut last_armed,
                 &inputs.metrics,
                 &mut *adapter,
+                &mut last_reconnect_at,
             ) {
                 Ok(()) => continue,
                 Err(exit) => return Ok(exit),
@@ -226,6 +230,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
                     &mut last_armed,
                     &inputs.metrics,
                     &mut *adapter,
+                    &mut last_reconnect_at,
                 ) {
                     Ok(()) => continue,
                     Err(exit) => return Ok(exit),
@@ -267,6 +272,7 @@ fn reconnect(
     last_armed: &mut bool,
     metrics: &FrameSessionMetrics,
     adapter: &mut dyn OutputModelAdapter,
+    last_reconnect_at: &mut Option<Instant>,
 ) -> std::result::Result<(), RunExit> {
     let Some(policy) = policy else {
         return Err(RunExit::Disconnected);
@@ -274,6 +280,7 @@ fn reconnect(
     metrics.set_connected(false);
     let (info, new_backend) = reconnect_backend_with_retry(
         policy,
+        *last_reconnect_at,
         || control.is_stop_requested(),
         |info, new_backend| {
             if new_backend.is_frame_swap() != expected_frame_swap {
@@ -291,6 +298,7 @@ fn reconnect(
     *backend = new_backend;
     *shutter_open = false;
     *last_armed = false;
+    *last_reconnect_at = Some(Instant::now());
     metrics.set_connected(true);
 
     source.on_reconnect(&info);

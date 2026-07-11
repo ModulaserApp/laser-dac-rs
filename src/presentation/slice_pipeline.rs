@@ -55,13 +55,20 @@ impl SlicePipeline {
     }
 
     pub fn with_startup_blank(
-        engine: PresentationEngine,
+        mut engine: PresentationEngine,
         color_delay_points: usize,
         output_filter: Option<Box<dyn OutputFilter>>,
         idle_policy: IdlePolicy,
         initial_buf_capacity: usize,
         startup_blank: Duration,
     ) -> Self {
+        // Under `Park`, hold the configured position whenever the engine has no
+        // drawable content (no frame *or* an empty "clear the display" frame),
+        // including mid-chunk promotion of an empty pending frame — otherwise the
+        // engine would snap those to the origin.
+        if let IdlePolicy::Park { x, y } = idle_policy {
+            engine.set_idle_blank_point(LaserPoint::blanked(x, y));
+        }
         Self {
             engine,
             color_delay: ColorDelayLine::new(color_delay_points),
@@ -140,6 +147,10 @@ impl SlicePipeline {
             return &[];
         }
 
+        // When the engine has no drawable content it fills the configured
+        // idle-blank point (park position under `IdlePolicy::Park`, origin
+        // otherwise) — see `PresentationEngine::idle_blank`. No extra handling
+        // needed here.
         apply_blanking(
             is_armed,
             &mut self.startup_blank_remaining,
@@ -394,6 +405,50 @@ mod tests {
 
     fn make_pipeline(initial_cap: usize) -> SlicePipeline {
         SlicePipeline::new(make_engine(), 0, None, IdlePolicy::Blank, initial_cap)
+    }
+
+    #[test]
+    fn armed_no_frame_honors_idle_policy_park() {
+        // Armed but no frame submitted yet: output should hold the configured
+        // park position, not blank at the origin.
+        let mut pipeline = SlicePipeline::new(
+            make_engine(),
+            0,
+            None,
+            IdlePolicy::Park { x: 0.25, y: -0.5 },
+            0,
+        );
+        let chunk: Vec<LaserPoint> = pipeline.produce_fifo_chunk(4, 30_000, true).to_vec();
+        assert_eq!(chunk.len(), 4);
+        let park = LaserPoint::blanked(0.25, -0.5);
+        for p in &chunk {
+            assert_eq!(p.x, park.x);
+            assert_eq!(p.y, park.y);
+            assert_eq!((p.r, p.g, p.b, p.intensity), (0, 0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn armed_empty_frame_honors_idle_policy_park() {
+        // An empty ("clear the display") frame reports `has_logical_frame() ==
+        // true` but has no drawable content, so the engine fills the idle-blank
+        // point. Under `Park` that must be the configured position, not (0,0).
+        let mut pipeline = SlicePipeline::new(
+            make_engine(),
+            0,
+            None,
+            IdlePolicy::Park { x: 0.25, y: -0.5 },
+            0,
+        );
+        pipeline.set_pending(Frame::new(Vec::new()));
+        let chunk: Vec<LaserPoint> = pipeline.produce_fifo_chunk(4, 30_000, true).to_vec();
+        assert_eq!(chunk.len(), 4);
+        let park = LaserPoint::blanked(0.25, -0.5);
+        for p in &chunk {
+            assert_eq!(p.x, park.x);
+            assert_eq!(p.y, park.y);
+            assert_eq!((p.r, p.g, p.b, p.intensity), (0, 0, 0, 0));
+        }
     }
 
     #[test]

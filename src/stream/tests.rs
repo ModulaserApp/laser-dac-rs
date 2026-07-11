@@ -776,10 +776,22 @@ fn test_estimate_buffer_reads_backend_estimator() {
     let estimator = backend.estimator.clone();
     let stream = make_test_stream(backend);
 
-    assert_eq!(stream.estimate_buffer_points(), 300);
+    // The software-decay estimator is seeded at wall-clock time and read a few
+    // microseconds later; at 30k pps it sheds ~1 point per 33µs, so assert a
+    // tolerance band rather than exact equality to avoid a timing-flaky
+    // off-by-one on loaded CI runners (matches `test_status_reports_*`).
+    let first = stream.estimate_buffer_points();
+    assert!(
+        (290..=300).contains(&first),
+        "estimate ~300 (seeded depth, minus slight decay), got {first}"
+    );
 
     estimator.seed(800, stream.config.pps);
-    assert_eq!(stream.estimate_buffer_points(), 800);
+    let second = stream.estimate_buffer_points();
+    assert!(
+        (790..=800).contains(&second),
+        "estimate ~800 (seeded depth, minus slight decay), got {second}"
+    );
 }
 
 #[test]

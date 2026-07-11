@@ -4,7 +4,7 @@
 //! Reads compute `fullness_at_anchor − elapsed × pps` from a fixed anchor —
 //! truncation does not accumulate across calls.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::BufferEstimator;
 
@@ -28,12 +28,35 @@ impl SoftwareDecayEstimator {
         self.anchor_time = now;
     }
 
-    /// Record that `n` points were just sent at `pps`. Rebases the anchor:
-    /// the new fullness is `current(now, pps) + n`.
+    /// Record that `n` points were just sent at `pps`. Rebases the anchor while
+    /// carrying the fractional consumption forward.
+    ///
+    /// Naively setting `anchor_time = now` and `fullness = floor(current) + n`
+    /// discards the sub-point remainder of `elapsed × pps` on every call
+    /// (~0.5 points of upward bias per rebase — hundreds of phantom points/sec
+    /// at ~1 kHz write rates). Instead we subtract only the *integer* points
+    /// consumed and advance the anchor by the exact time those points represent,
+    /// leaving the fractional remainder in the residual `now − anchor_time` gap
+    /// so it is accounted for on the next read/rebase.
     pub fn record_send(&mut self, now: Instant, n: u64, pps: u32) {
-        let current = self.read_at(now, pps);
-        self.fullness_at_anchor = current.saturating_add(n);
-        self.anchor_time = now;
+        if pps == 0 {
+            // No decay clock: accumulate without moving the anchor.
+            self.fullness_at_anchor = self.fullness_at_anchor.saturating_add(n);
+            return;
+        }
+        let elapsed_secs = now
+            .saturating_duration_since(self.anchor_time)
+            .as_secs_f64();
+        let consumed_int = (elapsed_secs * pps as f64) as u64; // floor
+        self.fullness_at_anchor = self
+            .fullness_at_anchor
+            .saturating_sub(consumed_int)
+            .saturating_add(n);
+        // Advance the anchor by exactly the time the integer points consumed
+        // represent, not all the way to `now` — the leftover fraction stays in
+        // the (now − anchor) residual and is carried into future reads.
+        let consumed_secs = consumed_int as f64 / pps as f64;
+        self.anchor_time += Duration::from_secs_f64(consumed_secs);
     }
 
     fn read_at(&self, now: Instant, pps: u32) -> u64 {
@@ -125,6 +148,39 @@ mod tests {
         let t2 = t0 + Duration::from_millis(100);
         // 0.1 × 10 = 1.0 → 1 consumed → 9.
         assert_eq!(est.estimated_fullness(t2, 10), 9);
+    }
+
+    #[test]
+    fn many_rebases_do_not_accumulate_fractional_bias() {
+        // 1000 rebases at ~1.0167ms spacing (30.5 points/step at 30k pps) exercises
+        // the fractional-carry path heavily. The floor-truncating rebase used to
+        // bake in ~0.5 points of upward bias per call → ~500 phantom points here;
+        // the exact-carry version must track a full-precision reference to ~1 pt.
+        let pps = 30_000u32;
+        let mut est = SoftwareDecayEstimator::new();
+        let t0 = Instant::now();
+        est.reset(t0);
+
+        est.record_send(t0, 5_000, pps);
+        let mut exact = 5_000.0f64;
+        let mut last_t = t0;
+
+        for i in 1..=1_000u64 {
+            let t = t0 + Duration::from_nanos(i * 1_016_667);
+            let dt = t.saturating_duration_since(last_t).as_secs_f64();
+            exact -= dt * pps as f64; // true consumption since last rebase
+            let send = 30u64; // slight net drain vs 30.5 consumed/step
+            est.record_send(t, send, pps);
+            exact += send as f64;
+            last_t = t;
+        }
+
+        let est_val = est.estimated_fullness(last_t, pps) as f64;
+        let drift = (est_val - exact).abs();
+        assert!(
+            drift <= 1.5,
+            "estimator drifted {drift} points from exact ({est_val} vs {exact})"
+        );
     }
 
     #[test]

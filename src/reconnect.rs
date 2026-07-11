@@ -9,7 +9,7 @@
 //! [`ReconnectConfig`]: crate::config::ReconnectConfig
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::{BackendKind, Error, Result};
 use crate::config::ReconnectConfig;
@@ -90,14 +90,18 @@ impl ReconnectPolicy {
         FProgress: FnMut(),
     {
         const SLICE: Duration = Duration::from_millis(50);
-        let mut remaining = duration;
-        while remaining > Duration::ZERO {
+        // Absolute deadline rather than decrementing by the nominal slice, so a
+        // coarse OS timer can't stretch the total backoff far beyond `duration`.
+        let deadline = Instant::now() + duration;
+        loop {
             if is_stopped() {
                 return true;
             }
-            let slice = remaining.min(SLICE);
-            std::thread::sleep(slice);
-            remaining = remaining.saturating_sub(slice);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(SLICE));
             on_progress();
         }
         is_stopped()
@@ -108,8 +112,17 @@ impl ReconnectPolicy {
 ///
 /// This is the shared reconnect scaffolding used by stream and frame schedulers.
 /// Scheduler-specific state reset and callback timing remain local to the caller.
+///
+/// `last_reconnect` is the instant the *previous* reconnect cycle completed
+/// successfully (or `None` on the first ever call). It gates the immediate
+/// first attempt: if the last reconnect was less than `backoff` ago the device
+/// is flapping (accepts the connection, then dies immediately), so we back off
+/// before even the first attempt instead of spinning disconnect→reopen→disconnect
+/// with zero delay. A genuine one-off disconnect (old or absent `last_reconnect`)
+/// still recovers instantly.
 pub(crate) fn reconnect_backend_with_retry<FStop, FValidate, FProgress>(
     policy: &ReconnectPolicy,
+    last_reconnect: Option<Instant>,
     is_stopped: FStop,
     validate: FValidate,
     mut on_progress: FProgress,
@@ -122,6 +135,10 @@ where
     if let Some(cb) = policy.on_disconnect.lock().unwrap().as_mut() {
         cb(&Error::disconnected("backend disconnected"));
     }
+
+    // Flapping guard: back off before the first attempt when the previous
+    // reconnect completed less than a full backoff ago.
+    let flapping = is_flapping(last_reconnect, policy.backoff);
 
     let mut retries = 0u32;
     loop {
@@ -136,7 +153,14 @@ where
             }
         }
 
-        if ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress) {
+        // Attempt immediately on the first try; back off only *between* attempts
+        // so an instantly-recoverable disconnect doesn't blank output for a full
+        // backoff period before we even try to reopen. The exception is a
+        // flapping device (see `flapping` above): there we back off even before
+        // the first attempt so rapid connect/die cycles can't busy-loop.
+        if (retries > 0 || flapping)
+            && ReconnectPolicy::sleep_with_stop(policy.backoff, &is_stopped, &mut on_progress)
+        {
             return Err(RunExit::Stopped);
         }
 
@@ -189,6 +213,16 @@ where
         log::info!("'{}' reconnected successfully", policy.target.device_id);
         return Ok((info, backend));
     }
+}
+
+/// Whether the first reconnect attempt should back off instead of firing
+/// immediately: true when the previous reconnect completed less than `backoff`
+/// ago (a flapping device that accepts the connection then dies immediately).
+/// `None` (first ever reconnect) never delays.
+fn is_flapping(last_reconnect: Option<Instant>, backoff: Duration) -> bool {
+    last_reconnect
+        .map(|t| t.elapsed() < backoff)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -401,7 +435,7 @@ mod tests {
         let connect_count = Arc::new(AtomicUsize::new(0));
         let policy = make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
 
-        let result = reconnect_backend_with_retry(&policy, || false, accept, || {});
+        let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
 
         let (info, backend) = result.expect("should reconnect");
         assert_eq!(info.id, MOCK_ID);
@@ -425,7 +459,7 @@ mod tests {
         let connect_count = Arc::new(AtomicUsize::new(0));
         let policy = make_policy(config, false, ConnectBehavior::Ok, connect_count.clone());
 
-        let result = reconnect_backend_with_retry(&policy, || false, accept, || {});
+        let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
         assert_eq!(result.err(), Some(RunExit::Disconnected));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
@@ -436,8 +470,11 @@ mod tests {
 
     #[test]
     fn retry_stops_during_backoff() {
-        // is_stopped: false on the first (top-of-loop) check, true afterwards —
-        // i.e. inside the backoff sleep.
+        // The first attempt is normally immediate, so drive the backoff via the
+        // flapping path: a recent `last_reconnect` forces a backoff *before* the
+        // first attempt. is_stopped is false on the first (top-of-loop) check and
+        // true afterwards — i.e. inside the backoff sleep — so we must bail with
+        // Stopped before opening.
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_stop = calls.clone();
         let is_stopped = move || calls_stop.fetch_add(1, Ordering::SeqCst) >= 1;
@@ -446,7 +483,8 @@ mod tests {
         let connect_count = Arc::new(AtomicUsize::new(0));
         let policy = make_policy(config, true, ConnectBehavior::Ok, connect_count.clone());
 
-        let result = reconnect_backend_with_retry(&policy, is_stopped, accept, || {});
+        let result =
+            reconnect_backend_with_retry(&policy, Some(Instant::now()), is_stopped, accept, || {});
         assert_eq!(result.err(), Some(RunExit::Stopped));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
@@ -467,7 +505,7 @@ mod tests {
             connect_count.clone(),
         );
 
-        let result = reconnect_backend_with_retry(&policy, || false, accept, || {});
+        let result = reconnect_backend_with_retry(&policy, None, || false, accept, || {});
         assert_eq!(result.err(), Some(RunExit::Disconnected));
         assert_eq!(
             connect_count.load(Ordering::SeqCst),
@@ -489,11 +527,37 @@ mod tests {
             Err(RunExit::Disconnected)
         };
 
-        let result = reconnect_backend_with_retry(&policy, || false, reject, || {});
+        let result = reconnect_backend_with_retry(&policy, None, || false, reject, || {});
         assert_eq!(result.err(), Some(RunExit::Disconnected));
         assert!(
             validated.load(Ordering::SeqCst),
             "validate closure should have run on the opened device"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // is_flapping (first-attempt backoff floor)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn first_ever_reconnect_does_not_delay() {
+        assert!(!is_flapping(None, Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn recent_reconnect_flaps_and_delays() {
+        // Previous reconnect just completed → within backoff → must back off.
+        assert!(is_flapping(
+            Some(Instant::now()),
+            Duration::from_millis(100)
+        ));
+    }
+
+    #[test]
+    fn old_reconnect_does_not_delay() {
+        // A genuine one-off disconnect long after the last reconnect recovers
+        // instantly.
+        let long_ago = Instant::now() - Duration::from_secs(5);
+        assert!(!is_flapping(Some(long_ago), Duration::from_millis(100)));
     }
 }

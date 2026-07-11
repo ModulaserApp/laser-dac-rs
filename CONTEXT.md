@@ -29,8 +29,8 @@ The runtime object that holds a connection to a single [DAC](#dac) and accepts w
 The scheduler-relevant pacing model of a [Backend](#backend). Determines how the presentation scheduler drives writes — pacing, slice sizing, backpressure, and reconnect-state reset. Three variants live in `src/device.rs`:
 
 - `UsbFrameSwap` — limited-depth double-buffered DACs (e.g. Helios). The scheduler waits for a "ready" signal and writes whole composed frames.
-- `NetworkFifo` — FIFO-buffered DACs with a queryable queue depth (e.g. Ether Dream, IDN). The scheduler estimates outstanding points and tops up to a target buffer.
-- `UdpTimed` — DACs paced by timed UDP chunks where OS send time, not hardware position, is the clock (e.g. LaserCube WiFi, AVB). The scheduler emits fixed-duration chunks against a precise deadline.
+- `NetworkFifo` — FIFO-buffered DACs with a queryable queue depth (e.g. Ether Dream, LaserCube WiFi, AVB). The scheduler estimates outstanding points and tops up to a target buffer.
+- `UdpTimed` — DACs paced by timed UDP chunks where OS send time, not hardware position, is the clock (e.g. IDN). The scheduler emits fixed-duration chunks against a precise deadline.
 
 `OutputModel` is the discriminant for the per-loop scheduler strategy inside `FrameSession`: each variant has its own adapter owning pacing, slice planning, backpressure, and reconnect-state reset, while the rest of the loop body (frame intake, arm/disarm, blanking, color delay, output filter, reconnect orchestration) is shared.
 

@@ -49,11 +49,17 @@ impl<'a> LoopCtx<'a> {
     /// (either via the atomic flag or a `ControlMsg::Stop` on the channel).
     pub fn sleep_with_control_check(&mut self, duration: Duration) -> Result<(), StepOutcome> {
         const SLICE: Duration = Duration::from_millis(2);
-        let mut remaining = duration;
-        while remaining > Duration::ZERO {
-            let slice = remaining.min(SLICE);
-            std::thread::sleep(slice);
-            remaining = remaining.saturating_sub(slice);
+        // Absolute deadline: decrementing `remaining` by the *nominal* slice
+        // over-sleeps badly on coarse timers (a 2ms sleep can take 15.6ms on
+        // Windows' default resolution), so the total wait can run many times
+        // long. Loop on the real remaining time to `deadline` instead.
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(remaining.min(SLICE));
             self.metrics.mark_loop_activity();
             if self.control.is_stop_requested() {
                 return Err(StepOutcome::Stopped);
@@ -62,7 +68,6 @@ impl<'a> LoopCtx<'a> {
                 return Err(StepOutcome::Stopped);
             }
         }
-        Ok(())
     }
 
     /// High-precision sleep until `deadline` (UDP-timed pacing).

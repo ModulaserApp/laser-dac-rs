@@ -476,6 +476,8 @@ pub struct Stream {
     pub(crate) reconnect_policy: Option<ReconnectPolicy>,
     /// Reopen identity, preserved for `into_dac()` even without reconnect enabled.
     pub(crate) reconnect_target: Option<ReconnectTarget>,
+    /// Instant the last reconnect completed; gates the flapping-device floor.
+    last_reconnect_at: Option<std::time::Instant>,
 }
 
 // Inherent helpers retained for the test surface (see `run_legacy`); the
@@ -524,6 +526,7 @@ impl Stream {
             state,
             reconnect_policy: None,
             reconnect_target: None,
+            last_reconnect_at: None,
         }
     }
 
@@ -684,6 +687,7 @@ impl Stream {
 
         let (info, new_backend) = reconnect_backend_with_retry(
             policy,
+            self.last_reconnect_at,
             || self.control.is_stop_requested(),
             |info, new_backend| {
                 if new_backend.is_frame_swap() {
@@ -710,6 +714,7 @@ impl Stream {
         // Swap the backend
         self.backend = Some(new_backend);
         self.info = info;
+        self.last_reconnect_at = Some(std::time::Instant::now());
 
         // Reset all runtime state for the new connection
         self.reset_state_for_reconnect();
