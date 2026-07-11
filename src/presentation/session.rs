@@ -249,10 +249,9 @@ impl FrameSession {
         let slot_clone = frame_slot.clone();
         let metrics_clone = metrics.clone();
 
-        // Named for diagnosability in profilers / thread dumps. Future work:
-        // request elevated (real-time / time-critical) scheduling priority here
-        // so pacing sleeps aren't preempted under load — deferred to avoid
-        // pulling in a platform thread-priority dependency.
+        // Named for diagnosability in profilers / thread dumps. Elevating this
+        // thread's scheduling priority so pacing sleeps aren't preempted under
+        // load is tracked separately (see issue #35).
         let thread = std::thread::Builder::new()
             .name("laser-frame-scheduler".to_string())
             .spawn(move || {

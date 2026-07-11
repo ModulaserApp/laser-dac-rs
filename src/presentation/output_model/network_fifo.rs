@@ -260,8 +260,12 @@ mod tests {
         const PPS: u32 = 30_000;
         // 20ms target = 600 points; quantum = ceil(5ms * 30k) = 150 points.
         // Pre-fill to 595 → deficit ~5 points, well below the quantum.
+        // Anchor the send one second in the future so the estimator does not
+        // decay during the (real-time) construction between here and the read
+        // inside `step` — otherwise a slow/loaded runner could drain enough
+        // points to push the deficit across the quantum and flake the test.
         let mut estimator = SoftwareDecayEstimator::new();
-        estimator.record_send(Instant::now(), 595, PPS);
+        estimator.record_send(Instant::now() + Duration::from_secs(1), 595, PPS);
 
         let mut engine =
             PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));

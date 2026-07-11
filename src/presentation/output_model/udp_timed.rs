@@ -399,13 +399,20 @@ mod tests {
 
         // Hard-clamp (old behavior) would leave next_send ≈ now (gap ~0). Bounded
         // catch-up keeps it ~30ms (3 × 10ms chunks) behind, so the lag survives.
+        //
+        // The lag is computed against a fresh `Instant::now()`, so any scheduling
+        // delay between the clamp inside `step` and this read only inflates it —
+        // the lower bound is what proves the catch-up window was retained. The
+        // upper bound only guards against the *unbounded* burst (a regression
+        // would leave the full ~1s stall), so it is generous to avoid flaking on
+        // a preemption-heavy runner.
         let lag = std::time::Instant::now().saturating_duration_since(adapter.next_send);
         assert!(
             lag >= std::time::Duration::from_millis(20),
             "expected retained catch-up lag, got {lag:?}"
         );
         assert!(
-            lag <= std::time::Duration::from_millis(45),
+            lag <= std::time::Duration::from_millis(250),
             "catch-up lag must stay bounded, got {lag:?}"
         );
     }

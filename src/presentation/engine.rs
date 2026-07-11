@@ -42,8 +42,15 @@ pub struct PresentationEngine {
     /// Length of the transition prefix in the last composed frame-swap drawable.
     frame_swap_transition_len: usize,
     /// Maximum hardware frame capacity (frame-swap only). When set, composed
-    /// frames are clamped by truncating the transition prefix.
+    /// frames are clamped by first trimming the generated transition prefix,
+    /// then—only if the authored points still exceed capacity—truncating the tail.
     frame_capacity: Option<usize>,
+    /// Point emitted while the engine has no drawable content — no frame yet, or
+    /// an empty ("clear the display") frame. Defaults to a blanked origin point;
+    /// the pipeline sets it to the configured park position under
+    /// [`IdlePolicy::Park`](crate::config::IdlePolicy) so armed-but-idle output
+    /// holds park instead of snapping to (0,0).
+    idle_blank: LaserPoint,
 }
 
 impl PresentationEngine {
@@ -61,12 +68,20 @@ impl PresentationEngine {
             transition_is_self_loop: false,
             frame_swap_transition_len: 0,
             frame_capacity: None,
+            idle_blank: LaserPoint::blanked(0.0, 0.0),
         }
     }
 
     /// Set the maximum hardware frame capacity for frame-swap clamping.
     pub fn set_frame_capacity(&mut self, cap: Option<usize>) {
         self.frame_capacity = cap;
+    }
+
+    /// Set the point held while the engine has no drawable content (see
+    /// [`idle_blank`](Self::idle_blank)). Preserved across [`reset`](Self::reset)
+    /// like `frame_capacity`, since it is configuration rather than runtime state.
+    pub fn set_idle_blank_point(&mut self, point: LaserPoint) {
+        self.idle_blank = point;
     }
 
     /// Reset all runtime state. Preserves the transition_fn and frame_capacity.
@@ -120,9 +135,10 @@ impl PresentationEngine {
             self.refresh_drawable();
         }
 
-        // No frame yet or empty frame: output blanked at origin
+        // No frame yet or empty frame: hold the idle-blank point (origin by
+        // default, or the configured park position).
         if self.current_base.is_none() || self.drawable.is_empty() {
-            buffer[..max_points].fill(LaserPoint::blanked(0.0, 0.0));
+            buffer[..max_points].fill(self.idle_blank);
             return max_points;
         }
 
@@ -146,7 +162,7 @@ impl PresentationEngine {
                     self.promote_pending();
 
                     if self.drawable.is_empty() {
-                        buffer[written..max_points].fill(LaserPoint::blanked(0.0, 0.0));
+                        buffer[written..max_points].fill(self.idle_blank);
                         return max_points;
                     }
                     continue;
@@ -174,7 +190,7 @@ impl PresentationEngine {
                     self.promote_pending();
 
                     if self.drawable.is_empty() {
-                        buffer[written..max_points].fill(LaserPoint::blanked(0.0, 0.0));
+                        buffer[written..max_points].fill(self.idle_blank);
                         return max_points;
                     }
                 } else {
@@ -238,9 +254,9 @@ impl PresentationEngine {
                 }
             }
 
-            // Empty frame submitted: send a blanked point to clear the display
+            // Empty frame submitted: send the idle-blank point to clear the display
             if self.drawable.is_empty() {
-                self.drawable.push(LaserPoint::blanked(0.0, 0.0));
+                self.drawable.push(self.idle_blank);
             }
 
             self.clamp_to_capacity();
@@ -276,7 +292,7 @@ impl PresentationEngine {
         };
 
         if current.is_empty() {
-            self.drawable.push(LaserPoint::blanked(0.0, 0.0));
+            self.drawable.push(self.idle_blank);
             return;
         }
 
@@ -293,6 +309,12 @@ impl PresentationEngine {
     /// truncate the tail as a last resort — an oversized frame is rejected by
     /// some encoders (the Helios SDK refuses > 4095 points) and undefined on
     /// others, so a clamped frame is strictly safer than an oversized one.
+    ///
+    /// Note: `current_base` retains the full authored frame, so the subsequent
+    /// self-loop seam is still computed from the authored last point even after
+    /// a tail truncation — the seam then launches from a point that isn't
+    /// displayed. This is cosmetic and only reachable in the already-pathological
+    /// oversized-frame case, so it is accepted rather than special-cased.
     fn clamp_to_capacity(&mut self) {
         if let Some(cap) = self.frame_capacity {
             if self.drawable.len() > cap {
@@ -559,6 +581,50 @@ mod tests {
             CAP,
             "authored frame must be clamped to capacity"
         );
+    }
+
+    /// The configured idle-blank point is used both before any frame and for an
+    /// empty ("clear the display") frame, including when an empty pending frame
+    /// is promoted at the seam mid-chunk.
+    #[test]
+    fn idle_blank_point_used_for_no_content_and_empty_frame() {
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        let park = LaserPoint::blanked(0.25, -0.5);
+        engine.set_idle_blank_point(park);
+
+        // No frame yet: fill holds the idle-blank point.
+        let mut buf = vec![LaserPoint::default(); 4];
+        assert_eq!(engine.fill_chunk(&mut buf, 4), 4);
+        assert!(buf.iter().all(|p| p.x == park.x && p.y == park.y));
+
+        // Empty frame ("clear the display") reports a logical frame but no
+        // drawable content, so it also holds the idle-blank point.
+        engine.set_pending(Frame::new(Vec::new()));
+        assert!(engine.has_logical_frame());
+        let mut buf = vec![LaserPoint::default(); 4];
+        assert_eq!(engine.fill_chunk(&mut buf, 4), 4);
+        assert!(buf.iter().all(|p| p.x == park.x && p.y == park.y));
+    }
+
+    /// A pending empty frame promoted at the seam mid-chunk fills the remainder
+    /// with the idle-blank point rather than the origin.
+    #[test]
+    fn idle_blank_point_used_for_midchunk_empty_promotion() {
+        let mut engine = PresentationEngine::new(Box::new(|_, _| TransitionPlan::Coalesce));
+        let park = LaserPoint::blanked(0.1, 0.2);
+        engine.set_idle_blank_point(park);
+
+        // Prime a 2-point frame, then queue an empty frame to promote at the seam.
+        engine.set_pending(frame_of(2));
+        engine.set_pending(Frame::new(Vec::new()));
+
+        // Ask for more points than the current frame holds so the seam is hit
+        // and the empty pending frame is promoted, blanking the tail to park.
+        let mut buf = vec![LaserPoint::default(); 8];
+        assert_eq!(engine.fill_chunk(&mut buf, 8), 8);
+        // The tail (after the current frame drains) must be the idle-blank point.
+        assert!(buf[2..].iter().all(|p| p.x == park.x && p.y == park.y));
     }
 
     /// The self-loop (no pending) refresh path must also clamp an over-capacity
