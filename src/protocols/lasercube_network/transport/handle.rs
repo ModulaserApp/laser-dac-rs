@@ -173,3 +173,124 @@ fn verify_reachable(cmd_socket: &UdpSocket) -> Result<(), CommunicationError> {
         "LaserCube network device did not respond to full-info handshake".to_string(),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::IpAddr;
+    use std::time::Duration;
+
+    use crate::protocols::lasercube_network::backend::mock::{self, MockDac};
+
+    use super::super::super::profiles::{ConnectionProfile, ConnectionType};
+    use super::super::super::protocol::Point;
+    use super::super::super::status::LaserCubeNetworkStatus;
+    use super::*;
+
+    fn device_for(ip: IpAddr) -> AddressedDevice {
+        let mut status = LaserCubeNetworkStatus::minimal(ip);
+        status.buffer_free = 6000;
+        status.buffer_max = 6000;
+        status.point_rate_max = 30_000;
+        let profile = ConnectionProfile::for_connection(ConnectionType::EthernetServer, 6000);
+        AddressedDevice {
+            source_addr: SocketAddr::new(ip, CMD_PORT),
+            status,
+            profile,
+        }
+    }
+
+    #[test]
+    fn connect_sends_startup_commands_and_is_usable() {
+        let dac = MockDac::start();
+        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+
+        assert!(handle.is_usable());
+        assert!(
+            mock::wait_until(Duration::from_millis(1000), || {
+                let cmds = dac.cmd_packets();
+                cmds.iter().any(|p| p.as_slice() == [0x80, 0x00]) // set_output(false)
+                    && cmds.iter().any(|p| p.as_slice() == [0x78, 0x01]) // enable buffer size resp
+                    && cmds.iter().any(|p| p.first() == Some(&0x82)) // set_rate
+            }),
+            "startup commands missing: {:?}",
+            dac.cmd_packets()
+        );
+    }
+
+    #[test]
+    fn set_output_emits_enable_command() {
+        let dac = MockDac::start();
+        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+
+        handle.set_output(true).unwrap();
+        assert!(
+            mock::wait_until(Duration::from_millis(1000), || dac
+                .cmd_packets()
+                .iter()
+                .any(|p| p.as_slice() == [0x80, 0x01])),
+            "expected set_output(true), got {:?}",
+            dac.cmd_packets()
+        );
+    }
+
+    #[test]
+    fn enqueue_rejects_writes_beyond_host_queue_capacity() {
+        let dac = MockDac::start();
+        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+
+        let err = handle
+            .enqueue(30_000, vec![Point::blank(); 20_000])
+            .unwrap_err();
+        assert!(matches!(err, CommunicationError::QueueFull));
+    }
+
+    #[test]
+    fn data_acks_flow_back_into_diagnostics() {
+        let dac = MockDac::start();
+        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+
+        // Feed points so the worker emits sample packets that the mock ACKs.
+        for _ in 0..8 {
+            let _ = handle.enqueue(30_000, vec![Point::blank(); 200]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            mock::wait_until(Duration::from_millis(1500), || handle
+                .state()
+                .diagnostics()
+                .acks_received
+                > 0),
+            "no ACKs applied: {:?}",
+            handle.state().diagnostics()
+        );
+
+        let diagnostics = handle.state().diagnostics();
+        assert!(diagnostics.packets_sent > 0);
+        assert!(diagnostics.last_data_ack_sequence.is_some());
+        assert!(diagnostics.last_ack_free_space.is_some());
+    }
+
+    #[test]
+    fn shutdown_joins_worker_and_marks_unusable() {
+        let dac = MockDac::start();
+        let mut handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        assert!(handle.is_usable());
+
+        handle.shutdown();
+        assert!(!handle.is_usable());
+
+        // Shutdown is idempotent (join already taken).
+        handle.shutdown();
+        assert!(!handle.is_usable());
+    }
+
+    #[test]
+    fn drop_shuts_down_worker_without_hanging() {
+        let dac = MockDac::start();
+        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        // Drop joins the worker thread; this must return promptly.
+        drop(handle);
+        drop(dac);
+    }
+}

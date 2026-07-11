@@ -71,6 +71,15 @@ pub fn default_capabilities() -> DacCapabilities {
 /// Default client group for IDN communication.
 pub const DEFAULT_CLIENT_GROUP: u8 = 0;
 
+/// Number of scan-request bursts spread across the scan window.
+const SCAN_BURSTS: u32 = 3;
+
+/// Number of attempts for a service-map query before giving up on a server.
+const SERVICEMAP_ATTEMPTS: u32 = 3;
+
+/// Per-attempt timeout for a service-map response.
+const SERVICEMAP_TIMEOUT: Duration = Duration::from_millis(400);
+
 /// Scan for IDN servers on the network.
 ///
 /// This function sends broadcast SCAN_REQUEST packets to all network interfaces
@@ -183,7 +192,10 @@ impl ServerScanner {
         let mut servers: HashMap<[u8; 16], ServerInfo> = HashMap::new();
         let mut addr_to_unit: HashMap<SocketAddr, [u8; 16]> = HashMap::new();
 
-        // Send broadcast scan requests on all interfaces
+        // Resend the scan request a few times spaced across the window so a
+        // single lost broadcast (common on Wi-Fi) does not hide a device.
+        let burst_interval = timeout / SCAN_BURSTS.max(1);
+        let mut next_burst: u32 = 1;
         self.send_broadcast_scan()?;
 
         // Set unicast socket to non-blocking for the polling loop
@@ -191,6 +203,11 @@ impl ServerScanner {
 
         // Non-blocking polling loop across all sockets
         while start.elapsed() < timeout {
+            if next_burst < SCAN_BURSTS && start.elapsed() >= burst_interval * next_burst {
+                let _ = self.send_broadcast_scan();
+                next_burst += 1;
+            }
+
             let mut received_any = false;
 
             // Poll each per-interface endpoint
@@ -350,67 +367,125 @@ impl ServerScanner {
         Ok(())
     }
 
-    /// Query the service map from a server.
+    /// Query the service map from a server, retrying a few times.
+    ///
+    /// Each attempt drains any stale datagrams first, sends a fresh request,
+    /// and tolerantly waits for the matching response (skipping late scan
+    /// replies or other datagrams that would otherwise drop the whole server).
     fn query_service_map(&mut self, server: &mut ServerInfo, addr: SocketAddr) -> io::Result<()> {
-        let seq = self.next_sequence();
-        let header = PacketHeader {
-            command: IDNCMD_SERVICEMAP_REQUEST,
-            flags: self.client_group,
-            sequence: seq,
-        };
+        let mut last_err =
+            io::Error::new(io::ErrorKind::TimedOut, "no service map response received");
 
-        let mut packet = Vec::with_capacity(PacketHeader::SIZE_BYTES);
-        packet.write_bytes(header)?;
+        for attempt in 0..SERVICEMAP_ATTEMPTS {
+            self.drain_unicast_socket();
 
-        self.unicast_socket.send_to(&packet, addr)?;
+            let seq = self.next_sequence();
+            let header = PacketHeader {
+                command: IDNCMD_SERVICEMAP_REQUEST,
+                flags: self.client_group,
+                sequence: seq,
+            };
+            let mut packet = Vec::with_capacity(PacketHeader::SIZE_BYTES);
+            packet.write_bytes(header)?;
+            self.unicast_socket.send_to(&packet, addr)?;
 
-        self.unicast_socket
-            .set_read_timeout(Some(Duration::from_millis(500)))?;
-
-        let (len, _) = self.unicast_socket.recv_from(&mut self.buffer)?;
-
-        if len < PacketHeader::SIZE_BYTES + ServiceMapResponseHeader::SIZE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "service map response too small",
-            ));
+            match self.recv_service_map(seq) {
+                Ok((relays, services)) => {
+                    server.relays = relays;
+                    server.services = services;
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!(
+                        "IDN: service map attempt {} for {} failed: {}",
+                        attempt, addr, e
+                    );
+                    last_err = e;
+                }
+            }
         }
 
-        let mut cursor = &self.buffer[..len];
+        Err(last_err)
+    }
 
-        let header: PacketHeader = cursor.read_bytes()?;
+    /// Receive the service-map response matching `expected_seq`, discarding
+    /// non-matching datagrams until the per-attempt deadline.
+    #[allow(clippy::type_complexity)]
+    fn recv_service_map(
+        &mut self,
+        expected_seq: u16,
+    ) -> io::Result<(Vec<RelayInfo>, Vec<ServiceInfo>)> {
+        let deadline = Instant::now() + SERVICEMAP_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "service map response timeout",
+                ));
+            }
+            self.unicast_socket.set_read_timeout(Some(remaining))?;
 
-        if header.command != IDNCMD_SERVICEMAP_RESPONSE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected command: 0x{:02x}", header.command),
-            ));
+            let len = match self.unicast_socket.recv_from(&mut self.buffer) {
+                Ok((len, _src)) => len,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "service map response timeout",
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+
+            if len < PacketHeader::SIZE_BYTES + ServiceMapResponseHeader::SIZE_BYTES {
+                continue;
+            }
+
+            let mut cursor = &self.buffer[..len];
+            let header: PacketHeader = match cursor.read_bytes() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if header.command != IDNCMD_SERVICEMAP_RESPONSE || header.sequence != expected_seq {
+                continue;
+            }
+
+            let map_header: ServiceMapResponseHeader = cursor.read_bytes()?;
+            let header_extra = (map_header.struct_size as usize)
+                .saturating_sub(ServiceMapResponseHeader::SIZE_BYTES);
+            if header_extra > 0 && cursor.len() >= header_extra {
+                cursor = &cursor[header_extra..];
+            }
+
+            let entry_size = map_header.entry_size as usize;
+            let relays = parse_service_map_entries(
+                &mut cursor,
+                map_header.relay_entry_count,
+                entry_size,
+                RelayInfo::from_entry,
+            )?;
+            let services = parse_service_map_entries(
+                &mut cursor,
+                map_header.service_entry_count,
+                entry_size,
+                ServiceInfo::from_entry,
+            )?;
+            return Ok((relays, services));
         }
+    }
 
-        let map_header: ServiceMapResponseHeader = cursor.read_bytes()?;
-
-        let header_extra =
-            (map_header.struct_size as usize).saturating_sub(ServiceMapResponseHeader::SIZE_BYTES);
-        if header_extra > 0 && cursor.len() >= header_extra {
-            cursor = &cursor[header_extra..];
+    /// Discard any datagrams sitting in the unicast socket's receive queue so
+    /// a stale reply cannot be mistaken for the next request's response.
+    fn drain_unicast_socket(&mut self) {
+        if self.unicast_socket.set_nonblocking(true).is_err() {
+            return;
         }
-
-        let entry_size = map_header.entry_size as usize;
-
-        server.relays = parse_service_map_entries(
-            &mut cursor,
-            map_header.relay_entry_count,
-            entry_size,
-            RelayInfo::from_entry,
-        )?;
-        server.services = parse_service_map_entries(
-            &mut cursor,
-            map_header.service_entry_count,
-            entry_size,
-            ServiceInfo::from_entry,
-        )?;
-
-        Ok(())
+        let mut scratch = [0u8; 64];
+        while self.unicast_socket.recv_from(&mut scratch).is_ok() {}
+        let _ = self.unicast_socket.set_nonblocking(false);
     }
 
     /// Get the next sequence number.
@@ -439,7 +514,9 @@ impl ServerScanner {
         let mut servers: HashMap<[u8; 16], ServerInfo> = HashMap::new();
         let mut addr_to_unit: HashMap<SocketAddr, [u8; 16]> = HashMap::new();
 
-        // Send scan request to specific address
+        // Send scan request to specific address, resending across the window.
+        let burst_interval = timeout / SCAN_BURSTS.max(1);
+        let mut next_burst: u32 = 1;
         self.send_scan_to(addr)?;
 
         // Set socket timeout for receiving
@@ -448,6 +525,11 @@ impl ServerScanner {
 
         // Collect scan responses
         while start.elapsed() < timeout {
+            if next_burst < SCAN_BURSTS && start.elapsed() >= burst_interval * next_burst {
+                let _ = self.send_scan_to(addr);
+                next_burst += 1;
+            }
+
             match self.recv_scan_response_with_port() {
                 Ok((response, src_addr)) => {
                     Self::record_server(&mut servers, &mut addr_to_unit, response, src_addr);

@@ -12,6 +12,9 @@ use super::BufferEstimator;
 pub struct StatusDecayEstimator {
     fullness_at_anchor: u64,
     anchor_time: Option<Instant>,
+    /// Whether the device is actively consuming points. When false (Idle /
+    /// Prepared) the ring is static, so the anchor is frozen rather than decayed.
+    playing: bool,
 }
 
 impl StatusDecayEstimator {
@@ -19,12 +22,21 @@ impl StatusDecayEstimator {
         Self {
             fullness_at_anchor: 0,
             anchor_time: None,
+            playing: false,
         }
     }
 
     pub fn reset(&mut self) {
         self.fullness_at_anchor = 0;
         self.anchor_time = None;
+        self.playing = false;
+    }
+
+    /// Set whether the device is actively playing. Only while playing does the
+    /// device drain the ring, so decay is gated on this flag; when the device
+    /// is Idle or Prepared the estimate is held at the last anchor.
+    pub fn set_playing(&mut self, playing: bool) {
+        self.playing = playing;
     }
 
     /// Authoritative status report from the device.
@@ -45,6 +57,11 @@ impl StatusDecayEstimator {
     fn read_at(&self, now: Instant, pps: u32) -> u64 {
         match self.anchor_time {
             Some(t) => {
+                // Frozen while the device isn't playing: nothing is drained, so
+                // the last anchor is still authoritative.
+                if !self.playing {
+                    return self.fullness_at_anchor;
+                }
                 let elapsed = now.saturating_duration_since(t).as_secs_f64();
                 let consumed = (elapsed * pps as f64) as u64;
                 self.fullness_at_anchor.saturating_sub(consumed)
@@ -86,8 +103,9 @@ mod tests {
     }
 
     #[test]
-    fn status_decays_over_time() {
+    fn status_decays_over_time_while_playing() {
         let mut est = StatusDecayEstimator::new();
+        est.set_playing(true);
         let t0 = Instant::now();
         est.record_status(t0, 3000);
 
@@ -97,8 +115,29 @@ mod tests {
     }
 
     #[test]
+    fn fullness_frozen_when_not_playing() {
+        let mut est = StatusDecayEstimator::new();
+        // Default (not playing): the ring is static, so no decay.
+        let t0 = Instant::now();
+        est.record_status(t0, 3000);
+
+        let t1 = t0 + Duration::from_millis(50);
+        assert_eq!(est.estimated_fullness(t1, 30_000), 3000);
+
+        // Once playing is set, decay resumes.
+        est.set_playing(true);
+        assert_eq!(est.estimated_fullness(t1, 30_000), 1500);
+
+        // Freezing again holds the current anchor.
+        est.set_playing(false);
+        let t2 = t0 + Duration::from_millis(500);
+        assert_eq!(est.estimated_fullness(t2, 30_000), 3000);
+    }
+
+    #[test]
     fn record_send_advances_anchor() {
         let mut est = StatusDecayEstimator::new();
+        est.set_playing(true);
         let t0 = Instant::now();
         est.record_status(t0, 1000);
 
