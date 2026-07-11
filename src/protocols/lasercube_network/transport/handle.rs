@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::super::command;
 use super::super::error::CommunicationError;
-use super::super::protocol::{CMD_GET_FULL_INFO, CMD_PORT, DATA_PORT};
+use super::super::protocol::CMD_GET_FULL_INFO;
 use super::state::SharedTransportState;
 use super::worker::TransportWorker;
 use super::{
@@ -31,10 +31,10 @@ pub struct TransportHandle {
 impl TransportHandle {
     pub fn connect(device: AddressedDevice) -> Result<Self, CommunicationError> {
         let cmd_socket = UdpSocket::bind("0.0.0.0:0")?;
-        cmd_socket.connect(SocketAddr::new(device.ip(), CMD_PORT))?;
+        cmd_socket.connect(device.cmd_addr())?;
 
         let data_socket = UdpSocket::bind("0.0.0.0:0")?;
-        data_socket.connect(SocketAddr::new(device.ip(), DATA_PORT))?;
+        data_socket.connect(device.data_addr())?;
         data_socket.set_nonblocking(true)?;
 
         for cmd in startup_commands(&device.status, device.profile) {
@@ -176,7 +176,7 @@ fn verify_reachable(cmd_socket: &UdpSocket) -> Result<(), CommunicationError> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::IpAddr;
+    use std::net::SocketAddr;
     use std::time::Duration;
 
     use crate::protocols::lasercube_network::backend::mock::{self, MockDac};
@@ -186,23 +186,26 @@ mod tests {
     use super::super::super::status::LaserCubeNetworkStatus;
     use super::*;
 
-    fn device_for(ip: IpAddr) -> AddressedDevice {
+    fn device_for(dac: &MockDac) -> AddressedDevice {
+        let ip = dac.ip();
         let mut status = LaserCubeNetworkStatus::minimal(ip);
         status.buffer_free = 6000;
         status.buffer_max = 6000;
         status.point_rate_max = 30_000;
         let profile = ConnectionProfile::for_connection(ConnectionType::EthernetServer, 6000);
         AddressedDevice {
-            source_addr: SocketAddr::new(ip, CMD_PORT),
+            source_addr: SocketAddr::new(ip, dac.cmd_port()),
             status,
             profile,
+            cmd_port: dac.cmd_port(),
+            data_port: dac.data_port(),
         }
     }
 
     #[test]
     fn connect_sends_startup_commands_and_is_usable() {
         let dac = MockDac::start();
-        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let handle = TransportHandle::connect(device_for(&dac)).unwrap();
 
         assert!(handle.is_usable());
         assert!(
@@ -220,7 +223,7 @@ mod tests {
     #[test]
     fn set_output_emits_enable_command() {
         let dac = MockDac::start();
-        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let handle = TransportHandle::connect(device_for(&dac)).unwrap();
 
         handle.set_output(true).unwrap();
         assert!(
@@ -236,7 +239,7 @@ mod tests {
     #[test]
     fn enqueue_rejects_writes_beyond_host_queue_capacity() {
         let dac = MockDac::start();
-        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let handle = TransportHandle::connect(device_for(&dac)).unwrap();
 
         let err = handle
             .enqueue(30_000, vec![Point::blank(); 20_000])
@@ -247,7 +250,7 @@ mod tests {
     #[test]
     fn data_acks_flow_back_into_diagnostics() {
         let dac = MockDac::start();
-        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let handle = TransportHandle::connect(device_for(&dac)).unwrap();
 
         // Feed points so the worker emits sample packets that the mock ACKs.
         for _ in 0..8 {
@@ -274,7 +277,7 @@ mod tests {
     #[test]
     fn shutdown_joins_worker_and_marks_unusable() {
         let dac = MockDac::start();
-        let mut handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let mut handle = TransportHandle::connect(device_for(&dac)).unwrap();
         assert!(handle.is_usable());
 
         handle.shutdown();
@@ -288,7 +291,7 @@ mod tests {
     #[test]
     fn drop_shuts_down_worker_without_hanging() {
         let dac = MockDac::start();
-        let handle = TransportHandle::connect(device_for(dac.ip())).unwrap();
+        let handle = TransportHandle::connect(device_for(&dac)).unwrap();
         // Drop joins the worker thread; this must return promptly.
         drop(handle);
         drop(dac);

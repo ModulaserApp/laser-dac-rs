@@ -14,7 +14,7 @@ use std::time::Instant;
 /// LaserCube USB DAC backend (LaserDock).
 pub struct LaserCubeUsbBackend {
     device: Option<rusb::Device<rusb::Context>>,
-    stream: Option<Stream<rusb::Context>>,
+    stream: Option<Stream<rusb::DeviceHandle<rusb::Context>>>,
     caps: DacCapabilities,
     /// Pre-allocated conversion buffer (avoids per-write heap allocation).
     point_buffer: Vec<LaserCubeUsbSample>,
@@ -34,7 +34,7 @@ impl LaserCubeUsbBackend {
         }
     }
 
-    pub fn from_stream(stream: Stream<rusb::Context>) -> Self {
+    pub fn from_stream(stream: Stream<rusb::DeviceHandle<rusb::Context>>) -> Self {
         Self {
             device: None,
             stream: Some(stream),
@@ -49,26 +49,38 @@ impl LaserCubeUsbBackend {
         controller.list_devices().map_err(Error::backend)
     }
 
-    /// Handle a stream error by classifying it as fatal (disconnected) or transient.
-    ///
-    /// Fatal USB errors (`NoDevice`, `Io`, `Pipe`) clear the stream and return
-    /// `Error::disconnected`. Transient errors (`Timeout`) return `Error::backend`.
+    /// Handle a stream error by classifying it as fatal (disconnected) or
+    /// transient. Fatal errors clear the stream and report `disconnected`;
+    /// transient errors are surfaced as a backend error with the stream intact.
     fn handle_stream_error<R>(&mut self, err: UsbError) -> Result<R> {
-        match &err {
-            UsbError::Usb(usb_err) => match usb_err {
-                rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe => {
-                    self.stream = None;
-                    Err(Error::disconnected(format!("USB device error: {err}")))
-                }
-                rusb::Error::Timeout => Err(Error::backend(err)),
-                _ => Err(Error::backend(err)),
-            },
-            UsbError::DeviceNotOpened => {
+        match classify_stream_error(&err) {
+            StreamErrorClass::Fatal => {
                 self.stream = None;
-                Err(Error::disconnected(format!("{err}")))
+                Err(Error::disconnected(format!("USB device error: {err}")))
             }
-            _ => Err(Error::backend(err)),
+            StreamErrorClass::Transient => Err(Error::backend(err)),
         }
+    }
+}
+
+/// Whether a USB stream error means the device is gone (fatal) or the operation
+/// can be retried against the same stream (transient).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamErrorClass {
+    Fatal,
+    Transient,
+}
+
+/// Classify a USB stream error. `NoDevice`/`Io`/`Pipe` and a not-opened stream
+/// are fatal (the device is unusable); everything else — notably `Timeout` — is
+/// transient. Pure and hardware-free so it can be unit-tested exhaustively.
+fn classify_stream_error(err: &UsbError) -> StreamErrorClass {
+    match err {
+        UsbError::Usb(rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::Pipe) => {
+            StreamErrorClass::Fatal
+        }
+        UsbError::DeviceNotOpened => StreamErrorClass::Fatal,
+        _ => StreamErrorClass::Transient,
     }
 }
 
@@ -155,8 +167,14 @@ impl FifoBackend for LaserCubeUsbBackend {
 
         let n = self.point_buffer.len();
         match stream.write_frame(&self.point_buffer, pps) {
-            Ok(()) => {
-                self.estimator.record_send(Instant::now(), n as u64, pps);
+            // `write_frame` clamps the requested pps to the device max and
+            // returns the rate it actually programmed. Feed the estimator that
+            // effective rate, not the caller's request — otherwise, whenever
+            // `pps > max_dac_rate`, the software buffer model drains faster than
+            // the hardware and can blank the tail of a frame early.
+            Ok(effective_pps) => {
+                self.estimator
+                    .record_send(Instant::now(), n as u64, effective_pps);
                 Ok(WriteOutcome::Written)
             }
             Err(e) => self.handle_stream_error(e),
@@ -180,6 +198,36 @@ impl FifoBackend for LaserCubeUsbBackend {
                 Ok(())
             }
             Err(e) => self.handle_stream_error(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_stream_error, StreamErrorClass};
+    use crate::protocols::lasercube_usb::error::Error as UsbError;
+    use crate::protocols::lasercube_usb::rusb;
+
+    #[test]
+    fn classify_stream_error_covers_every_variant() {
+        use StreamErrorClass::{Fatal, Transient};
+        let cases = [
+            (UsbError::Usb(rusb::Error::NoDevice), Fatal),
+            (UsbError::Usb(rusb::Error::Io), Fatal),
+            (UsbError::Usb(rusb::Error::Pipe), Fatal),
+            (UsbError::DeviceNotOpened, Fatal),
+            (UsbError::Usb(rusb::Error::Timeout), Transient),
+            (UsbError::Usb(rusb::Error::Busy), Transient),
+            (UsbError::Usb(rusb::Error::Access), Transient),
+            (UsbError::Usb(rusb::Error::Other), Transient),
+            (UsbError::InvalidResponse, Transient),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                classify_stream_error(&err),
+                expected,
+                "classification of {err:?}"
+            );
         }
     }
 }

@@ -711,6 +711,8 @@ mod tests {
             source_addr: "127.0.0.1:45457".parse().unwrap(),
             status: status.clone(),
             profile,
+            cmd_port: super::super::super::protocol::CMD_PORT,
+            data_port: super::super::super::protocol::DATA_PORT,
         };
         let state = SharedTransportState::new(&status, profile);
         let generation = Arc::new(AtomicU64::new(0));

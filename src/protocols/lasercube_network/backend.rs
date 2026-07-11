@@ -8,7 +8,7 @@ use crate::point::LaserPoint;
 
 use super::diagnostics::LaserCubeNetworkDiagnostics;
 use super::profiles::ConnectionProfile;
-use super::protocol::{Point, DEFAULT_BUFFER_CAPACITY};
+use super::protocol::{Point, CMD_PORT, DATA_PORT, DEFAULT_BUFFER_CAPACITY};
 use super::transport::{AddressedDevice, SharedTransportState, TransportHandle};
 
 pub struct LaserCubeNetworkBackend {
@@ -128,35 +128,27 @@ impl Default for LaserCubeNetworkBackend {
             source_addr: "0.0.0.0:0".parse().expect("valid default socket address"),
             status,
             profile,
+            cmd_port: CMD_PORT,
+            data_port: DATA_PORT,
         })
     }
 }
 
 /// Hermetic loopback mock LaserCube DAC, shared by the backend and transport
-/// handle tests. It binds the well-known LaserCube UDP ports on a unique
-/// `127.0.0.x` loopback address (so parallel tests do not collide on the fixed
-/// ports) and answers full-info requests and sample packets using the wire
-/// encodings under test.
+/// handle tests. It binds ephemeral UDP ports on `127.0.0.1` (so parallel tests
+/// never collide and it works on macOS, which only brings up `127.0.0.1`) and
+/// exposes them via [`MockDac::cmd_port`]/[`MockDac::data_port`] so the test
+/// `AddressedDevice` targets the mock. It answers full-info requests and sample
+/// packets using the wire encodings under test.
 #[cfg(test)]
 pub(crate) mod mock {
-    use std::net::{IpAddr, SocketAddr, UdpSocket};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use super::super::protocol::{
-        CMD_GET_FULL_INFO, CMD_GET_RINGBUFFER_EMPTY, CMD_PORT, CMD_SAMPLE_DATA, DATA_PORT,
-    };
-
-    static NEXT_HOST: AtomicU32 = AtomicU32::new(0);
-
-    /// Allocate a unique loopback IP so tests can share the fixed LaserCube
-    /// ports without conflicting binds.
-    pub(crate) fn unique_loopback_ip() -> IpAddr {
-        let n = NEXT_HOST.fetch_add(1, Ordering::Relaxed);
-        IpAddr::from([127, 0, 0, 101 + (n % 150) as u8])
-    }
+    use super::super::protocol::{CMD_GET_FULL_INFO, CMD_GET_RINGBUFFER_EMPTY, CMD_SAMPLE_DATA};
 
     /// A valid 64-byte full-info status advertising a 6000-sample buffer.
     pub(crate) fn full_info_status() -> [u8; 64] {
@@ -195,6 +187,8 @@ pub(crate) mod mock {
 
     pub(crate) struct MockDac {
         ip: IpAddr,
+        cmd_port: u16,
+        data_port: u16,
         shared: Arc<Shared>,
         stop: Arc<AtomicBool>,
         join: Option<JoinHandle<()>>,
@@ -202,11 +196,19 @@ pub(crate) mod mock {
 
     impl MockDac {
         pub(crate) fn start() -> Self {
-            let ip = unique_loopback_ip();
-            let cmd_socket =
-                UdpSocket::bind(SocketAddr::new(ip, CMD_PORT)).expect("bind mock cmd socket");
+            // Bind ephemeral ports on `127.0.0.1` rather than the fixed LaserCube
+            // ports on a per-test loopback alias. Only `127.0.0.1` is guaranteed
+            // to be up (macOS does not bring up `127.0.0.2+` by default), and the
+            // OS hands out a free port per socket so parallel tests never collide.
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            let cmd_socket = UdpSocket::bind(SocketAddr::new(ip, 0)).expect("bind mock cmd socket");
             let data_socket =
-                UdpSocket::bind(SocketAddr::new(ip, DATA_PORT)).expect("bind mock data socket");
+                UdpSocket::bind(SocketAddr::new(ip, 0)).expect("bind mock data socket");
+            let cmd_port = cmd_socket.local_addr().expect("mock cmd local addr").port();
+            let data_port = data_socket
+                .local_addr()
+                .expect("mock data local addr")
+                .port();
             cmd_socket
                 .set_read_timeout(Some(Duration::from_millis(5)))
                 .unwrap();
@@ -250,6 +252,8 @@ pub(crate) mod mock {
 
             Self {
                 ip,
+                cmd_port,
+                data_port,
                 shared,
                 stop,
                 join: Some(join),
@@ -258,6 +262,14 @@ pub(crate) mod mock {
 
         pub(crate) fn ip(&self) -> IpAddr {
             self.ip
+        }
+
+        pub(crate) fn cmd_port(&self) -> u16 {
+            self.cmd_port
+        }
+
+        pub(crate) fn data_port(&self) -> u16 {
+            self.data_port
         }
 
         pub(crate) fn cmd_packets(&self) -> Vec<Vec<u8>> {
@@ -281,33 +293,35 @@ pub(crate) mod mock {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
     use crate::device::OutputModel;
     use crate::point::LaserPoint;
 
     use super::super::profiles::{ConnectionProfile, ConnectionType};
-    use super::super::protocol::CMD_PORT;
     use super::super::status::LaserCubeNetworkStatus;
     use super::mock::{self, MockDac};
     use super::*;
 
-    fn addressed_for(ip: IpAddr) -> AddressedDevice {
+    fn addressed_for(dac: &MockDac) -> AddressedDevice {
+        let ip = dac.ip();
         let mut status = LaserCubeNetworkStatus::minimal(ip);
         status.buffer_free = 6000;
         status.buffer_max = 6000;
         status.point_rate_max = 30_000;
         let profile = ConnectionProfile::for_connection(ConnectionType::EthernetServer, 6000);
         AddressedDevice {
-            source_addr: SocketAddr::new(ip, CMD_PORT),
+            source_addr: SocketAddr::new(ip, dac.cmd_port()),
             status,
             profile,
+            cmd_port: dac.cmd_port(),
+            data_port: dac.data_port(),
         }
     }
 
     fn backend_for(dac: &MockDac) -> LaserCubeNetworkBackend {
-        LaserCubeNetworkBackend::new(addressed_for(dac.ip()))
+        LaserCubeNetworkBackend::new(addressed_for(dac))
     }
 
     #[test]
