@@ -343,6 +343,117 @@ mod tests {
         (cp, control)
     }
 
+    /// Build a producer with an explicit color-delay (seeded on the control's
+    /// atomic) and startup-blank window. Capacity is large enough for the
+    /// deterministic single-chunk tests below.
+    fn make_producer_cfg<F>(
+        producer: F,
+        color_delay: Duration,
+        startup_blank: Duration,
+        pps: u32,
+    ) -> (ChunkProducer, StreamControl)
+    where
+        F: FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static,
+    {
+        let (tx, _rx) = mpsc::channel();
+        let control = StreamControl::new(tx, color_delay, pps);
+        let cp = ChunkProducer::new(
+            producer,
+            control.clone(),
+            IdlePolicy::Blank,
+            startup_blank,
+            32,
+        );
+        (cp, control)
+    }
+
+    /// Fill `buf` with `n` distinct, lit points at a fixed non-zero position so
+    /// tests can prove x/y are preserved while colour is shifted or blanked.
+    fn fill_distinct_lit(buf: &mut [LaserPoint], n: usize) {
+        for (i, p) in buf.iter_mut().take(n).enumerate() {
+            let c = (i as u16 + 1) * 1000;
+            *p = LaserPoint::new(0.5, -0.25, c, c / 2, c / 4, 60000);
+        }
+    }
+
+    #[test]
+    fn color_delay_blanks_leading_points_and_shifts_color() {
+        // pps=10_000, color_delay=300µs → ceil(0.0003 * 10_000) = 3 points.
+        let n = 8;
+        let (mut cp, _ctrl) = make_producer_cfg(
+            move |_req, buf| {
+                fill_distinct_lit(buf, n);
+                ChunkResult::Filled(n)
+            },
+            Duration::from_micros(300),
+            Duration::ZERO,
+            10_000,
+        );
+
+        let slice = cp.produce_chunk(n, 10_000, true).to_vec();
+        assert_eq!(slice.len(), n);
+
+        // Leading 3 points: colour/intensity blanked, but x/y PRESERVED — the
+        // invariant the legacy deque-state tests never checked.
+        for (i, p) in slice.iter().take(3).enumerate() {
+            assert_eq!(
+                (p.r, p.g, p.b, p.intensity),
+                (0, 0, 0, 0),
+                "point {i} colour must be blanked by the delay line"
+            );
+            assert_eq!(
+                p.x, 0.5,
+                "point {i} x must be preserved through color delay"
+            );
+            assert_eq!(
+                p.y, -0.25,
+                "point {i} y must be preserved through color delay"
+            );
+        }
+
+        // Point 3 carries the colour shifted in from input point 0.
+        assert_eq!(
+            (slice[3].r, slice[3].g, slice[3].b, slice[3].intensity),
+            (1000, 500, 250, 60000),
+            "point 3 must carry input point 0's colour, delayed by 3"
+        );
+    }
+
+    #[test]
+    fn startup_blank_blanks_first_n_returned_points() {
+        // pps=10_000, startup_blank=500µs → ceil(0.0005 * 10_000) = 5 points.
+        let n = 10;
+        let (mut cp, _ctrl) = make_producer_cfg(
+            move |_req, buf| {
+                fill_distinct_lit(buf, n);
+                ChunkResult::Filled(n)
+            },
+            Duration::ZERO,
+            Duration::from_micros(500),
+            10_000,
+        );
+
+        // Arm the startup-blank window (the driver does this on the arm edge).
+        cp.arm_startup_blank(10_000);
+
+        let slice = cp.produce_chunk(n, 10_000, true).to_vec();
+        assert_eq!(slice.len(), n);
+
+        for (i, p) in slice.iter().take(5).enumerate() {
+            assert_eq!(
+                (p.r, p.g, p.b, p.intensity),
+                (0, 0, 0, 0),
+                "point {i} must be fully blanked during startup window"
+            );
+        }
+        for (i, p) in slice.iter().enumerate().skip(5) {
+            assert!(
+                p.intensity > 0,
+                "point {i} must be lit after startup window"
+            );
+        }
+    }
+
     #[test]
     fn filled_then_committed_advances_state() {
         let (mut cp, _ctrl) = make_producer(

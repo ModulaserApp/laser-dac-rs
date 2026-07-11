@@ -1,6 +1,8 @@
 use super::*;
 use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
 use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
+use crate::config::IdlePolicy;
+use crate::device::OutputModel;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -53,6 +55,10 @@ struct TestBackend {
     shutter_open: Arc<AtomicBool>,
     /// Decaying estimator the stream consults; tests can seed via `estimator.seed()`.
     estimator: SharedEstimator,
+    /// Every point value accepted by `try_write_points`, in write order. Lets
+    /// tests assert on the exact bytes reaching the backend (color delay,
+    /// startup blank, parking) instead of internal deque state.
+    received: Arc<Mutex<Vec<LaserPoint>>>,
 }
 
 impl TestBackend {
@@ -70,12 +76,13 @@ impl TestBackend {
             queued: Arc::new(AtomicU64::new(0)),
             shutter_open: Arc::new(AtomicBool::new(false)),
             estimator: SharedEstimator::new(),
+            received: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn with_max_points_per_chunk(mut self, max_points_per_chunk: usize) -> Self {
-        self.caps.max_points_per_chunk = max_points_per_chunk;
-        self
+    /// Handle to the captured point log (see [`Self::received`]).
+    fn received(&self) -> Arc<Mutex<Vec<LaserPoint>>> {
+        self.received.clone()
     }
 
     fn with_would_block_count(mut self, count: usize) -> Self {
@@ -145,6 +152,7 @@ impl FifoBackend for TestBackend {
         self.queued.fetch_add(points.len() as u64, Ordering::SeqCst);
         self.estimator
             .record_send(Instant::now(), points.len() as u64, pps);
+        self.received.lock().unwrap().extend_from_slice(points);
         Ok(WriteOutcome::Written)
     }
 
@@ -359,35 +367,6 @@ fn test_device_start_stream_keeps_explicit_network_buffer_settings() {
 // `test_device_start_stream_rejects_frame_swap_backend` below.
 
 #[test]
-fn test_handle_underrun_advances_state() {
-    let backend = TestBackend::new();
-    let queued = backend.queued.clone();
-    let mut stream = make_test_stream(backend);
-
-    // Record initial state
-    let initial_instant = stream.state.current_instant;
-    let initial_queued = queued.load(Ordering::SeqCst);
-    let initial_chunks = stream.state.stats.chunks_written;
-    let initial_points = stream.state.stats.points_written;
-
-    // Trigger underrun handling with ChunkRequest
-    let req = ChunkRequest {
-        start: StreamInstant::new(0),
-        pps: 30000,
-        target_points: 100,
-    };
-    stream.handle_underrun(&req).unwrap();
-
-    // State should have advanced
-    assert!(stream.state.current_instant > initial_instant);
-    // Backend queue (the new authority) reflects the underrun-fill write.
-    assert!(queued.load(Ordering::SeqCst) > initial_queued);
-    assert_eq!(stream.state.stats.chunks_written, initial_chunks + 1);
-    assert_eq!(stream.state.stats.points_written, initial_points + 100);
-    assert_eq!(stream.state.stats.underrun_count, 1);
-}
-
-#[test]
 fn test_run_retries_on_would_block() {
     // Create a backend that returns WouldBlock 3 times before accepting
     let backend = TestBackend::new().with_would_block_count(3);
@@ -413,113 +392,9 @@ fn test_run_retries_on_would_block() {
     );
 
     assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-    // With the new API, WouldBlock retries happen internally in write_fill_points
-    // The exact count depends on timing, but we should see multiple writes
+    // WouldBlock retries happen internally in the driver's write spin.
+    // The exact count depends on timing, but we should see multiple writes.
     assert!(write_count.load(Ordering::SeqCst) >= 1);
-}
-
-#[test]
-fn test_arm_opens_shutter_disarm_closes_shutter() {
-    let backend = TestBackend::new();
-    let shutter_open = backend.shutter_open.clone();
-    let mut stream = make_test_stream(backend);
-
-    // Initially shutter is closed
-    assert!(!shutter_open.load(Ordering::SeqCst));
-
-    // Arm via control (this sends ControlMsg::Arm)
-    let control = stream.control();
-    control.arm().unwrap();
-
-    // Process control messages - this should open the shutter
-    let stopped = stream.process_control_messages();
-    assert!(!stopped);
-    assert!(shutter_open.load(Ordering::SeqCst));
-
-    // Disarm (this sends ControlMsg::Disarm)
-    control.disarm().unwrap();
-
-    // Process control messages - this should close the shutter
-    let stopped = stream.process_control_messages();
-    assert!(!stopped);
-    assert!(!shutter_open.load(Ordering::SeqCst));
-}
-
-#[test]
-fn test_handle_underrun_blanks_when_disarmed() {
-    // Use RepeatLast policy - but when disarmed, should still blank
-    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    // Set some last_chunk with colored points using the pre-allocated buffer
-    let colored_point = LaserPoint::new(0.5, 0.5, 65535, 65535, 65535, 65535);
-    for i in 0..100 {
-        stream.state.last_chunk[i] = colored_point;
-    }
-    stream.state.last_chunk_len = 100;
-
-    // Ensure disarmed (default state)
-    assert!(!stream.control.is_armed());
-
-    let req = ChunkRequest {
-        start: StreamInstant::new(0),
-        pps: 30000,
-        target_points: 100,
-    };
-
-    // Handle underrun while disarmed
-    stream.handle_underrun(&req).unwrap();
-
-    // last_chunk should NOT be updated (we're disarmed)
-    // The actual write was blanked points, but we don't update last_chunk when disarmed
-    // because "last armed content" hasn't changed
-    assert_eq!(stream.state.last_chunk[0].r, 65535); // Still the old colored points
-}
-
-#[test]
-fn test_stop_closes_shutter() {
-    let backend = TestBackend::new();
-    let shutter_open = backend.shutter_open.clone();
-    let mut stream = make_test_stream(backend);
-
-    // Arm first to open shutter
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-    assert!(shutter_open.load(Ordering::SeqCst));
-
-    // Stop should close shutter
-    stream.stop().unwrap();
-    assert!(!shutter_open.load(Ordering::SeqCst));
-}
-
-#[test]
-fn test_arm_disarm_arm_cycle() {
-    let backend = TestBackend::new();
-    let shutter_open = backend.shutter_open.clone();
-    let mut stream = make_test_stream(backend);
-    let control = stream.control();
-
-    // Initial state: disarmed
-    assert!(!control.is_armed());
-    assert!(!shutter_open.load(Ordering::SeqCst));
-
-    // Arm
-    control.arm().unwrap();
-    stream.process_control_messages();
-    assert!(control.is_armed());
-    assert!(shutter_open.load(Ordering::SeqCst));
-
-    // Disarm
-    control.disarm().unwrap();
-    stream.process_control_messages();
-    assert!(!control.is_armed());
-    assert!(!shutter_open.load(Ordering::SeqCst));
-
-    // Arm again
-    control.arm().unwrap();
-    stream.process_control_messages();
-    assert!(control.is_armed());
-    assert!(shutter_open.load(Ordering::SeqCst));
 }
 
 // =========================================================================
@@ -766,6 +641,113 @@ fn test_run_filled_zero_with_target_treated_as_starved() {
 }
 
 // =========================================================================
+// End-to-end color-delay / startup-blank tests
+//
+// These drive the REAL `Stream::run` production path and assert on the exact
+// point VALUES reaching the backend (captured via `TestBackend::received`),
+// rather than poking internal deque state. They supersede the old
+// `write_fill_points`-driven color-delay/startup-blank tests.
+// =========================================================================
+
+#[test]
+fn test_run_color_delay_blanks_leading_points() {
+    // pps=10_000, color_delay=300µs → 3 points. The producer emits lit points
+    // at a fixed non-zero position; the first 3 written points must have their
+    // colour blanked (delay line shifts in blanks) while x/y are preserved.
+    let backend = TestBackend::new();
+    let received = backend.received();
+    // Disable startup blanking so the leading-blank assertion isolates the
+    // color-delay behaviour.
+    let cfg = StreamConfig::new(10_000)
+        .with_color_delay(Duration::from_micros(300))
+        .with_startup_blank(Duration::ZERO);
+    let stream = make_test_stream_with_cfg(backend, cfg);
+    stream.control().arm().unwrap();
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_c = call_count.clone();
+    let result = stream.run(
+        move |req, buffer| {
+            if call_count_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let n = req.target_points.min(buffer.len());
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::new(0.5, 0.5, 40000, 30000, 20000, 50000);
+                }
+                ChunkResult::Filled(n)
+            } else {
+                ChunkResult::End
+            }
+        },
+        |_e| {},
+    );
+    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+    let pts = received.lock().unwrap();
+    assert!(pts.len() > 3, "expected at least one written chunk");
+    // Leading 3 points: colour blanked, x/y preserved.
+    for (i, p) in pts.iter().take(3).enumerate() {
+        assert_eq!(
+            (p.r, p.g, p.b, p.intensity),
+            (0, 0, 0, 0),
+            "leading point {i} must be colour-blanked by the delay line"
+        );
+        assert_eq!(p.x, 0.5, "leading point {i} x must be preserved");
+        assert_eq!(p.y, 0.5, "leading point {i} y must be preserved");
+    }
+    // Point 3 carries the shifted-in lit colour.
+    assert_eq!(
+        (pts[3].r, pts[3].g, pts[3].b, pts[3].intensity),
+        (40000, 30000, 20000, 50000),
+        "point 3 must carry the lit colour delayed by 3 points"
+    );
+}
+
+#[test]
+fn test_run_startup_blank_blanks_first_n_points() {
+    // pps=10_000, startup_blank=500µs → 5 points. After arming, the first 5
+    // written points must be fully blanked; later ones stay lit.
+    let backend = TestBackend::new();
+    let received = backend.received();
+    let cfg = StreamConfig::new(10_000)
+        .with_startup_blank(Duration::from_micros(500))
+        .with_color_delay(Duration::ZERO);
+    let stream = make_test_stream_with_cfg(backend, cfg);
+    stream.control().arm().unwrap();
+
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_c = call_count.clone();
+    let result = stream.run(
+        move |req, buffer| {
+            if call_count_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let n = req.target_points.min(buffer.len());
+                for pt in buffer.iter_mut().take(n) {
+                    *pt = LaserPoint::new(0.1, 0.1, 65535, 32000, 16000, 65535);
+                }
+                ChunkResult::Filled(n)
+            } else {
+                ChunkResult::End
+            }
+        },
+        |_e| {},
+    );
+    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+
+    let pts = received.lock().unwrap();
+    assert!(pts.len() > 5, "expected at least one written chunk");
+    for (i, p) in pts.iter().take(5).enumerate() {
+        assert_eq!(
+            (p.r, p.g, p.b, p.intensity),
+            (0, 0, 0, 0),
+            "startup point {i} must be fully blanked"
+        );
+    }
+    assert!(
+        pts[5].intensity > 0,
+        "point 5 must be lit once the startup window closes"
+    );
+}
+
+// =========================================================================
 // Buffer estimation tests (Task 6.3)
 // =========================================================================
 
@@ -792,30 +774,6 @@ fn test_estimate_buffer_reads_backend_estimator() {
         (790..=800).contains(&second),
         "estimate ~800 (seeded depth, minus slight decay), got {second}"
     );
-}
-
-#[test]
-fn test_build_fill_request_calculates_target_points() {
-    // 30000 PPS, target_buffer = 40ms → 1200 points
-    let cfg = StreamConfig::new(30000).with_target_buffer(Duration::from_millis(40));
-    let backend = TestBackend::new();
-    let estimator = backend.estimator.clone();
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    // Empty buffer: need full target (clamped to max_points)
-    estimator.seed(0, 30_000);
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-    assert_eq!(req.target_points, 1000);
-
-    // Buffer at 500 points (16.67ms): below target (40ms)
-    estimator.seed(500, 30_000);
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-    assert_eq!(req.target_points, 700);
-
-    // Buffer full at 1200 points (40ms): at target
-    estimator.seed(1200, 30_000);
-    let req = stream.build_fill_request(1000, stream.estimate_buffer_points());
-    assert_eq!(req.target_points, 0);
 }
 
 // =========================================================================
@@ -1387,29 +1345,47 @@ fn test_stream_disarm_during_streaming() {
 // instead of continuing to trace the shape path with blanked colors.
 // See: https://github.com/ModulaserApp/Modulaser-v2/issues/117
 
+/// Drive `run()` on a DISARMED stream (starts disarmed by default). The
+/// producer emits lit shape points until it ends; the returned vector is the
+/// exact point log written to the backend. Assert on LEADING points — the
+/// graceful-End drain appends origin blanks at the tail.
+fn run_disarmed_and_capture(cfg: StreamConfig) -> Vec<LaserPoint> {
+    let backend = TestBackend::new();
+    let received = backend.received();
+    let stream = make_test_stream_with_cfg(backend, cfg);
+    // NB: no arm() — the stream stays disarmed.
+    let call_count = Arc::new(AtomicUsize::new(0));
+    let call_count_c = call_count.clone();
+    let result = stream.run(
+        move |req, buffer| {
+            if call_count_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                let n = req.target_points.min(buffer.len());
+                for (i, pt) in buffer.iter_mut().take(n).enumerate() {
+                    // A lit shape path with a non-zero position, so parking is
+                    // observable as a position/colour change.
+                    let angle = i as f32 * 0.05;
+                    *pt = LaserPoint::new(angle.cos(), angle.sin(), 65535, 40000, 20000, 65535);
+                }
+                ChunkResult::Filled(n)
+            } else {
+                ChunkResult::End
+            }
+        },
+        |_e| {},
+    );
+    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
+    let pts = received.lock().unwrap().clone();
+    assert!(pts.len() > 10, "expected at least one written chunk");
+    pts
+}
+
 #[test]
 fn test_disarm_parks_scanners_at_origin_default_policy() {
-    // Regression: disarming with the default Blank policy must park scanners
-    // at (0,0) — not keep tracing the shape path with blanked colors.
-    let mut stream = make_test_stream(TestBackend::new());
+    // Regression: a disarmed stream with the default Blank policy must park
+    // scanners at (0,0) — not keep tracing the shape path with blanked colors.
+    let pts = run_disarmed_and_capture(StreamConfig::new(30000));
 
-    // Fill buffer with shape points (simulating a circle being traced)
-    let n = 10;
-    for i in 0..n {
-        let angle = i as f32 * 0.628; // ~36° steps
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(angle.cos(), angle.sin(), 65535, 0, 0, 65535);
-    }
-
-    // Stream starts disarmed by default
-    assert!(!stream.control.is_armed());
-
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Every point must be parked at (0,0) with laser off
-    for i in 0..n {
-        let p = &stream.state.chunk_buffer[i];
+    for (i, p) in pts.iter().take(10).enumerate() {
         assert_eq!(p.x, 0.0, "point {i}: x must be 0.0 (parked), got {}", p.x);
         assert_eq!(p.y, 0.0, "point {i}: y must be 0.0 (parked), got {}", p.y);
         assert_eq!(p.r, 0, "point {i}: must be blanked");
@@ -1421,57 +1397,26 @@ fn test_disarm_parks_scanners_at_origin_default_policy() {
 
 #[test]
 fn test_disarm_parks_scanners_at_configured_park_position() {
-    // When IdlePolicy::Park is set, disarmed scanners must park at that position.
+    // When IdlePolicy::Park is set, a disarmed stream must park at that position.
     let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Park { x: 0.5, y: -0.3 });
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+    let pts = run_disarmed_and_capture(cfg);
 
-    // Fill buffer with shape points
-    let n = 10;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(i as f32 * 0.1, i as f32 * -0.1, 65535, 65535, 65535, 65535);
-    }
-
-    assert!(!stream.control.is_armed());
-
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    for i in 0..n {
-        let p = &stream.state.chunk_buffer[i];
+    for (i, p) in pts.iter().take(10).enumerate() {
         assert_eq!(p.x, 0.5, "point {i}: x must be park position 0.5");
         assert_eq!(p.y, -0.3, "point {i}: y must be park position -0.3");
         assert_eq!(p.r, 0, "point {i}: must be blanked");
+        assert_eq!(p.intensity, 0, "point {i}: must be blanked");
     }
 }
 
 #[test]
 fn test_disarm_repeat_last_falls_back_to_blank() {
-    // RepeatLast must NOT repeat lit content when disarmed — falls back to Blank.
+    // RepeatLast must NOT repeat lit content when disarmed — it falls back to
+    // parking at the origin (blank).
     let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+    let pts = run_disarmed_and_capture(cfg);
 
-    // Simulate having a stored "last chunk" with lit content
-    let lit = LaserPoint::new(0.8, 0.8, 65535, 65535, 65535, 65535);
-    for i in 0..100 {
-        stream.state.last_chunk[i] = lit;
-    }
-    stream.state.last_chunk_len = 100;
-
-    // Fill buffer with shape points
-    let n = 10;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = lit;
-    }
-
-    assert!(!stream.control.is_armed());
-
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Must be blanked at origin — not repeating the lit content
-    for i in 0..n {
-        let p = &stream.state.chunk_buffer[i];
+    for (i, p) in pts.iter().take(10).enumerate() {
         assert_eq!(
             p.x, 0.0,
             "point {i}: must be parked at origin, not shape position"
@@ -1484,30 +1429,7 @@ fn test_disarm_repeat_last_falls_back_to_blank() {
             p.r, 0,
             "point {i}: must be blanked, not repeating lit content"
         );
-    }
-}
-
-#[test]
-fn test_disarm_underrun_respects_park_policy() {
-    // handle_underrun when disarmed must also respect IdlePolicy::Park.
-    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::Park { x: -0.5, y: 0.5 });
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    assert!(!stream.control.is_armed());
-
-    let req = ChunkRequest {
-        start: StreamInstant::new(0),
-        pps: 30000,
-        target_points: 50,
-    };
-
-    stream.handle_underrun(&req).unwrap();
-
-    for i in 0..50 {
-        let p = &stream.state.chunk_buffer[i];
-        assert_eq!(p.x, -0.5, "point {i}: must park at configured x");
-        assert_eq!(p.y, 0.5, "point {i}: must park at configured y");
-        assert_eq!(p.r, 0, "point {i}: must be blanked");
+        assert_eq!(p.intensity, 0, "point {i}: must be blanked");
     }
 }
 
@@ -1602,8 +1524,8 @@ fn test_stream_with_mock_backend_disconnect() {
 // the backend to be disconnected, so the stream exits with
 // RunExit::Disconnected and the device can be reconnected.
 //
-// Without the fix (backend.disconnect() call in the Err(e) branch of
-// write_fill_points), the backend stays "connected" and the stream loops
+// Without the fix (backend.disconnect() on a non-disconnected write error in
+// the driver's write path), the backend stays "connected" and the stream loops
 // forever retrying writes that keep failing.
 // =========================================================================
 
@@ -1765,44 +1687,6 @@ fn test_start_stream_reconnect_with_target_succeeds() {
 
     let (stream, _) = result.unwrap();
     assert!(stream.reconnect_policy.is_some());
-}
-
-#[test]
-fn test_reset_state_for_reconnect_resizes_buffers() {
-    // When reconnecting to a device with different max_points_per_chunk,
-    // buffers should be resized.
-    let backend = TestBackend::new().with_max_points_per_chunk(1000);
-    let mut stream = make_test_stream(backend);
-
-    assert_eq!(stream.state.chunk_buffer.len(), 1000);
-    assert_eq!(stream.state.last_chunk.len(), 1000);
-
-    // Simulate reconnect to a device with different capabilities
-    stream.info.caps.max_points_per_chunk = 500;
-    stream.reset_state_for_reconnect();
-
-    assert_eq!(stream.state.chunk_buffer.len(), 500);
-    assert_eq!(stream.state.last_chunk.len(), 500);
-    assert_eq!(stream.state.last_chunk_len, 0);
-    assert_eq!(stream.state.stats.reconnect_count, 1);
-}
-
-#[test]
-fn test_reset_state_for_reconnect_clears_timing() {
-    let backend = TestBackend::new();
-    let mut stream = make_test_stream(backend);
-
-    // Set some state
-    stream.state.shutter_open = true;
-    stream.state.last_armed = true;
-    stream.state.startup_blank_remaining = 10;
-
-    stream.reset_state_for_reconnect();
-
-    assert!(!stream.state.shutter_open);
-    assert!(!stream.state.last_armed);
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-    assert!(stream.state.color_delay_line.is_empty());
 }
 
 #[test]
@@ -2232,278 +2116,6 @@ fn test_fill_result_end_closes_shutter() {
 }
 
 // =========================================================================
-// Color delay tests
-// =========================================================================
-
-#[test]
-fn test_color_delay_zero_is_passthrough() {
-    // With delay=0, colors should pass through unchanged
-    let mut stream = make_test_stream(TestBackend::new());
-
-    // Arm the stream so points aren't blanked
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-    stream.state.last_armed = true;
-
-    // Fill chunk_buffer with colored points
-    let n = 5;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(0.0, 0.0, (i as u16 + 1) * 1000, 0, 0, 65535);
-    }
-
-    // write_fill_points applies color delay internally
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Delay line should remain empty
-    assert!(stream.state.color_delay_line.is_empty());
-}
-
-#[test]
-fn test_color_delay_shifts_colors() {
-    // With delay=3 points, first 3 outputs should be blanked, rest shifted
-    // 10000 PPS, delay = 300µs → ceil(0.0003 * 10000) = 3 points
-    let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(300));
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    // Arm the stream
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-    // handle_shutter_transition pre-fills the delay line on arm
-    stream.state.last_armed = true;
-
-    // Pre-fill delay line as handle_shutter_transition would on arm
-    stream.state.color_delay_line.clear();
-    for _ in 0..3 {
-        stream.state.color_delay_line.push_back((0, 0, 0, 0));
-    }
-
-    // Fill 5 points with distinct colors
-    let n = 5;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(
-            i as f32 * 0.1,
-            0.0,
-            (i as u16 + 1) * 10000,
-            (i as u16 + 1) * 5000,
-            (i as u16 + 1) * 2000,
-            65535,
-        );
-    }
-
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // After write, check the chunk_buffer was modified:
-    // We can't inspect what was written to the backend directly,
-    // but we can verify the delay line state.
-    // After processing 5 points through a 3-point delay,
-    // the delay line should still have 3 entries (the last 3 input colors).
-    assert_eq!(stream.state.color_delay_line.len(), 3);
-
-    // The delay line should contain colors from inputs 3, 4, 5 (0-indexed: 2, 3, 4)
-    let expected: Vec<(u16, u16, u16, u16)> = (3..=5)
-        .map(|i| (i * 10000u16, i * 5000, i * 2000, 65535))
-        .collect();
-    let actual: Vec<(u16, u16, u16, u16)> = stream.state.color_delay_line.iter().copied().collect();
-    assert_eq!(actual, expected);
-}
-
-#[test]
-fn test_color_delay_resets_on_disarm_arm() {
-    // Disarm should clear the delay line, arm should re-fill it
-    // 10000 PPS, delay = 200µs → ceil(0.0002 * 10000) = 2 points
-    let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    // Arm: should pre-fill delay line
-    stream.handle_shutter_transition(true);
-    assert_eq!(stream.state.color_delay_line.len(), 2);
-    assert_eq!(stream.state.color_delay_line.front(), Some(&(0, 0, 0, 0)));
-
-    // Disarm: should clear delay line
-    stream.handle_shutter_transition(false);
-    assert!(stream.state.color_delay_line.is_empty());
-
-    // Arm again: should re-fill
-    stream.handle_shutter_transition(true);
-    assert_eq!(stream.state.color_delay_line.len(), 2);
-}
-
-#[test]
-fn test_color_delay_dynamic_change() {
-    // Changing delay at runtime via atomic should resize the deque
-    // Start with 200µs delay at 10000 PPS → 2 points
-    let cfg = StreamConfig::new(10000).with_color_delay(Duration::from_micros(200));
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    // Arm
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-    stream.state.last_armed = true;
-
-    // Pre-fill as handle_shutter_transition would
-    stream.state.color_delay_line.clear();
-    for _ in 0..2 {
-        stream.state.color_delay_line.push_back((0, 0, 0, 0));
-    }
-
-    // Fill and write a chunk
-    let n = 3;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(0.0, 0.0, (i as u16 + 1) * 10000, 0, 0, 65535);
-    }
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Now change delay to 500µs → ceil(0.0005 * 10000) = 5 points
-    stream.control.set_color_delay(Duration::from_micros(500));
-
-    // Write another chunk — delay line should resize to 5
-    for i in 0..n {
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(0.0, 0.0, (i as u16 + 4) * 10000, 0, 0, 65535);
-    }
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    assert_eq!(stream.state.color_delay_line.len(), 5);
-
-    // Now disable delay entirely
-    stream.control.set_color_delay(Duration::ZERO);
-
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 50000, 0, 0, 65535);
-    }
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Delay line should be cleared
-    assert!(stream.state.color_delay_line.is_empty());
-}
-
-// =========================================================================
-// Startup blanking tests
-// =========================================================================
-
-#[test]
-fn test_startup_blank_blanks_first_n_points() {
-    // 10000 PPS, startup_blank = 500µs → ceil(0.0005 * 10000) = 5 points
-    // Disable color delay to isolate startup blanking
-    let cfg = StreamConfig::new(10000)
-        .with_startup_blank(Duration::from_micros(500))
-        .with_color_delay(Duration::ZERO);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    assert_eq!(stream.state.startup_blank_points, 5);
-
-    // Arm the stream (triggers handle_shutter_transition which resets counter)
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-
-    // Simulate arm transition in write path
-    stream.state.last_armed = false; // Force transition detection
-
-    // Fill 10 colored points
-    let n = 10;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] =
-            LaserPoint::new(i as f32 * 0.1, 0.0, 65535, 32000, 16000, 65535);
-    }
-
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // After write, check what was sent: we can't inspect backend directly,
-    // but we can verify the counter decremented and the buffer was modified
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-
-    // Write another chunk — should NOT be blanked (counter exhausted)
-    stream.state.last_armed = true; // No transition this time
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
-    }
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Verify colors pass through unmodified (no startup blanking)
-    // The chunk_buffer is modified in-place before write, so after write
-    // it should still have the original colors (startup blank is exhausted)
-    assert_eq!(stream.state.chunk_buffer[0].r, 65535);
-    assert_eq!(stream.state.chunk_buffer[0].g, 32000);
-}
-
-#[test]
-fn test_startup_blank_resets_on_rearm() {
-    // 10000 PPS, startup_blank = 500µs → 5 points
-    let cfg = StreamConfig::new(10000)
-        .with_startup_blank(Duration::from_micros(500))
-        .with_color_delay(Duration::ZERO);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    // First arm cycle: consume startup blanking
-    stream.state.last_armed = false;
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-
-    let n = 10;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
-    }
-    let mut on_error = |_: Error| {};
-    // This triggers disarmed→armed transition, which resets counter
-    stream.state.last_armed = false;
-    stream.write_fill_points(n, &mut on_error).unwrap();
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-
-    // Disarm → re-arm
-    stream.control.disarm().unwrap();
-    stream.process_control_messages();
-
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-
-    // Write again — should trigger new arm transition and reset counter
-    stream.state.last_armed = false;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 65535, 65535, 65535);
-    }
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Counter should have been reset to 5 and then decremented to 0
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-}
-
-#[test]
-fn test_startup_blank_zero_is_noop() {
-    // Disable startup blanking
-    let cfg = StreamConfig::new(10000)
-        .with_startup_blank(Duration::ZERO)
-        .with_color_delay(Duration::ZERO);
-    let mut stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
-
-    assert_eq!(stream.state.startup_blank_points, 0);
-
-    // Arm and write colored points
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-    stream.state.last_armed = false; // Force arm transition
-
-    let n = 5;
-    for i in 0..n {
-        stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 65535, 32000, 16000, 65535);
-    }
-    let mut on_error = |_: Error| {};
-    stream.write_fill_points(n, &mut on_error).unwrap();
-
-    // Colors should pass through unmodified — no startup blanking
-    assert_eq!(stream.state.chunk_buffer[0].r, 65535);
-    assert_eq!(stream.state.chunk_buffer[0].g, 32000);
-    assert_eq!(stream.state.chunk_buffer[0].b, 16000);
-    assert_eq!(stream.state.chunk_buffer[0].intensity, 65535);
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-}
-
-// =========================================================================
 // OutputModel coverage
 // =========================================================================
 
@@ -2526,137 +2138,6 @@ fn test_device_start_stream_rejects_frame_swap_backend() {
         }
         Ok(_) => panic!("expected start_stream to reject frame-swap backend"),
     }
-}
-
-#[test]
-fn test_network_fifo_accumulates_via_estimator() {
-    let cfg = StreamConfig::new(30000).with_color_delay(Duration::ZERO);
-    let backend = TestBackend::new();
-    let queued = backend.queued.clone();
-    let mut stream = make_test_stream_with_cfg(backend, cfg);
-
-    // Arm and write two chunks of 50 points each
-    stream.control.arm().unwrap();
-    stream.process_control_messages();
-
-    let n = 50;
-    for _ in 0..2 {
-        for i in 0..n {
-            stream.state.chunk_buffer[i] = LaserPoint::new(0.0, 0.0, 0, 0, 0, 0);
-        }
-        let mut on_error = |_: Error| {};
-        stream.write_fill_points(n, &mut on_error).unwrap();
-    }
-
-    // The backend's queue (which now drives the estimator) accumulates across writes.
-    assert_eq!(queued.load(Ordering::SeqCst), 2 * n as u64);
-    assert_eq!(stream.state.stats.chunks_written, 2);
-    assert_eq!(stream.state.stats.points_written, 2 * n as u64);
-}
-
-#[test]
-fn test_udp_timed_prefills_to_max_points_per_chunk() {
-    let backend = TestBackend::new()
-        .with_output_model(OutputModel::UdpTimed)
-        .with_max_points_per_chunk(179);
-    let estimator = backend.estimator.clone();
-    let cfg = StreamConfig::new(1000).with_target_buffer(Duration::from_millis(500));
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    // UdpTimed target = max_points_per_chunk = 179
-    // One write of 179 exceeds the target → stops after 1 write
-    let mut writes = 0;
-    while stream.estimate_buffer_points() <= stream.scheduler_target_buffer_points() {
-        let buffered = stream.estimate_buffer_points();
-        let req = stream.build_fill_request(179, buffered);
-        assert_eq!(req.target_points, 179);
-        // Simulate the write reaching the device queue.
-        estimator.record_send(Instant::now(), req.target_points as u64, stream.config.pps);
-        writes += 1;
-    }
-
-    assert_eq!(
-        writes, 2,
-        "UdpTimed target is max_points_per_chunk (179) — two writes to exceed"
-    );
-}
-
-#[test]
-fn test_udp_timed_uses_max_points_per_chunk_for_lead() {
-    let backend = TestBackend::new()
-        .with_output_model(OutputModel::UdpTimed)
-        .with_max_points_per_chunk(179);
-    let stream = make_test_stream(backend);
-
-    // UdpTimed target = max_points_per_chunk, not target_buffer_points
-    assert_eq!(stream.scheduler_target_buffer_points(), 179);
-}
-
-#[test]
-fn test_udp_timed_build_fill_request_uses_full_packet() {
-    let backend = TestBackend::new()
-        .with_output_model(OutputModel::UdpTimed)
-        .with_max_points_per_chunk(179);
-    let estimator = backend.estimator.clone();
-    let stream = make_test_stream(backend);
-    estimator.seed(120, stream.config.pps);
-
-    let req = stream.build_fill_request(179, 120);
-
-    assert_eq!(req.target_points, 179);
-}
-
-#[test]
-fn test_udp_timed_sleep_slice_caps_coarse_sleep() {
-    assert_eq!(
-        Stream::udp_timed_sleep_slice(Duration::from_millis(5)),
-        Some(Duration::from_millis(1))
-    );
-}
-
-#[test]
-fn test_udp_timed_sleep_slice_switches_to_busy_wait_near_deadline() {
-    assert_eq!(
-        Stream::udp_timed_sleep_slice(Duration::from_micros(400)),
-        None
-    );
-}
-
-// =========================================================================
-// NetworkFifo + LaserCube-like config scheduler tests
-// =========================================================================
-
-#[test]
-fn test_network_fifo_lasercube_default_target_requests_topup() {
-    // LaserCube-like: 5700 max, 30kpps, default 50ms target buffer
-    let backend = TestBackend::new()
-        .with_output_model(OutputModel::NetworkFifo)
-        .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(50));
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    // At 30kpps and 50ms target, target_points = ceil(0.05 * 30000) = 1500
-    let buffered = stream.estimate_buffer_points();
-    let req = stream.build_fill_request(5700, buffered);
-    assert_eq!(
-        req.target_points, 1500,
-        "should request ~1500 top-up, not full 5700"
-    );
-}
-
-#[test]
-fn test_network_fifo_lasercube_large_target_uses_more_capacity() {
-    // Explicit large target buffer can request larger chunks
-    let backend = TestBackend::new()
-        .with_output_model(OutputModel::NetworkFifo)
-        .with_max_points_per_chunk(5700);
-    let cfg = StreamConfig::new(30_000).with_target_buffer(Duration::from_millis(200));
-    let stream = make_test_stream_with_cfg(backend, cfg);
-
-    let buffered = stream.estimate_buffer_points();
-    let req = stream.build_fill_request(5700, buffered);
-    // At 30kpps and 200ms: ceil(0.2 * 30000) = 6000, clamped to 5700
-    assert_eq!(req.target_points, 5700);
 }
 
 #[test]
@@ -3106,93 +2587,14 @@ fn test_status_reports_disconnected() {
 }
 
 // =========================================================================
-// handle_shutter_transition tests
-// =========================================================================
-
-#[test]
-fn test_handle_shutter_transition_arm_prefills_and_opens() {
-    // 10000 PPS, color delay 300µs → 3 points, startup blank 500µs → 5 points.
-    let cfg = StreamConfig::new(10_000)
-        .with_color_delay(Duration::from_micros(300))
-        .with_startup_blank(Duration::from_micros(500));
-    let backend = TestBackend::new();
-    let shutter = backend.shutter_open.clone();
-    let mut stream = make_test_stream_with_cfg(backend, cfg);
-
-    assert!(!stream.state.shutter_open);
-    assert!(!stream.state.last_armed);
-
-    stream.handle_shutter_transition(true);
-
-    assert!(stream.state.last_armed);
-    assert!(stream.state.shutter_open);
-    assert!(shutter.load(Ordering::SeqCst), "hardware shutter opened");
-    // Color delay line pre-filled with blanked entries.
-    assert_eq!(stream.state.color_delay_line.len(), 3);
-    assert!(stream
-        .state
-        .color_delay_line
-        .iter()
-        .all(|&c| c == (0, 0, 0, 0)));
-    // Startup blank window reset.
-    assert_eq!(stream.state.startup_blank_points, 5);
-    assert_eq!(stream.state.startup_blank_remaining, 5);
-}
-
-#[test]
-fn test_handle_shutter_transition_disarm_clears_and_closes() {
-    let backend = TestBackend::new();
-    let shutter = backend.shutter_open.clone();
-    let mut stream = make_test_stream(backend);
-
-    // Arm first so the disarm transition fires.
-    stream.handle_shutter_transition(true);
-    assert!(stream.state.shutter_open);
-    // Seed the color delay line with content that disarm must flush.
-    stream.state.color_delay_line.push_back((1, 2, 3, 4));
-
-    stream.handle_shutter_transition(false);
-
-    assert!(!stream.state.last_armed);
-    assert!(!stream.state.shutter_open);
-    assert!(!shutter.load(Ordering::SeqCst), "hardware shutter closed");
-    assert!(stream.state.color_delay_line.is_empty());
-}
-
-#[test]
-fn test_handle_shutter_transition_noop_when_state_unchanged() {
-    let backend = TestBackend::new();
-    let shutter = backend.shutter_open.clone();
-    let mut stream = make_test_stream(backend);
-
-    // disarmed -> disarmed: nothing happens.
-    stream.handle_shutter_transition(false);
-    assert!(!stream.state.shutter_open);
-    assert!(!shutter.load(Ordering::SeqCst));
-
-    // Arm once.
-    stream.handle_shutter_transition(true);
-    assert!(stream.state.shutter_open);
-
-    // armed -> armed: no re-prefill, no shutter toggling. Seed a marker and
-    // verify the armed->armed branch leaves the delay line untouched.
-    stream.state.color_delay_line.push_back((9, 9, 9, 9));
-    stream.handle_shutter_transition(true);
-    assert!(stream.state.shutter_open);
-    assert!(shutter.load(Ordering::SeqCst));
-    assert_eq!(stream.state.color_delay_line.back(), Some(&(9, 9, 9, 9)));
-}
-
-// =========================================================================
 // Streaming-side reconnect tests
 //
-// Two flavours:
-//   1. `handle_reconnect` exercised directly as an isolated helper (covers
-//      the backend swap, frame-swap rejection, PPS revalidation, and
-//      stop-during-reconnect branches deterministically).
-//   2. An end-to-end reconnect through the REAL `Stream::run` unified driver
-//      path (not the legacy helpers): a FIFO backend that disconnects after N
-//      writes plus a registered mock Discoverer that supplies the replacement.
+// All flavours drive the REAL `Stream::run` unified driver path: a FIFO
+// backend that disconnects after N writes plus a registered mock Discoverer
+// that supplies the replacement. Covered:
+//   - Accepted swap end-to-end (`stream_reconnects_through_run_driver_path`).
+//   - Rejected swap when the replacement is a frame-swap device.
+//   - Rejected swap when the replacement's PPS range excludes the config PPS.
 // =========================================================================
 
 /// Stable id shared by the streaming reconnect mock discoverer and the Dac.
@@ -3201,8 +2603,6 @@ const STREAM_RECON_ID: &str = "streamrecon:swap";
 /// What kind of replacement backend the mock discoverer hands back on connect.
 #[derive(Clone, Copy)]
 enum ReplacementKind {
-    /// A compatible FIFO backend (accepts the swap).
-    Fifo,
     /// A frame-swap backend — incompatible with streaming, must be rejected.
     FrameSwap,
     /// A FIFO backend whose PPS range excludes the stream config PPS.
@@ -3290,7 +2690,6 @@ impl crate::discovery::Discoverer for StreamReconDiscoverer {
     fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> Result<BackendKind> {
         self.connect_count.fetch_add(1, Ordering::SeqCst);
         Ok(match self.kind {
-            ReplacementKind::Fifo => BackendKind::Fifo(Box::new(ReconnectFifoBackend::new())),
             ReplacementKind::FrameSwap => {
                 BackendKind::FrameSwap(Box::new(FrameSwapTestBackend::new()))
             }
@@ -3300,13 +2699,16 @@ impl crate::discovery::Discoverer for StreamReconDiscoverer {
 }
 
 /// Build a Stream whose reconnect policy re-opens `STREAM_RECON_ID` via a
-/// freshly-registered `StreamReconDiscoverer` of the given kind.
+/// freshly-registered `StreamReconDiscoverer` of the given kind. The `initial`
+/// backend is the one the stream starts on; pass a `DisconnectAfterNBackend`
+/// to make `run()` actually drop the connection and drive the driver's
+/// reconnect → validator path.
 fn make_reconnecting_stream(
+    initial: impl FifoBackend + 'static,
     kind: ReplacementKind,
     connect_count: Arc<AtomicUsize>,
     reconnected: Arc<AtomicBool>,
 ) -> Stream {
-    let initial = ReconnectFifoBackend::new();
     let info = DacInfo {
         id: STREAM_RECON_ID.to_string(),
         name: "Stream Recon Device".to_string(),
@@ -3337,54 +2739,30 @@ fn make_reconnecting_stream(
 }
 
 #[test]
-fn handle_reconnect_swaps_backend_and_fires_callback() {
+fn run_rejects_frame_swap_replacement_and_returns_disconnected() {
+    // Drive the REAL `Stream::run` driver: the initial FIFO backend disconnects
+    // after 2 writes, the discoverer hands back a frame-swap device, and the
+    // driver's reconnect → validator path must reject it (frame-swap is
+    // incompatible with streaming) and exit `Disconnected` without reconnecting.
     let connect_count = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(AtomicBool::new(false));
-    let mut stream = make_reconnecting_stream(
-        ReplacementKind::Fifo,
-        connect_count.clone(),
-        reconnected.clone(),
-    );
-
-    // Dirty some state so we can prove the reset happened.
-    stream.state.shutter_open = true;
-    stream.state.last_armed = true;
-    stream.state.startup_blank_remaining = 42;
-
-    let result = stream.handle_reconnect();
-    assert!(
-        result.is_ok(),
-        "reconnect to compatible FIFO should succeed"
-    );
-
-    // New backend is swapped in and connected.
-    assert!(stream.backend.as_ref().unwrap().is_connected());
-    assert_eq!(stream.info.id, STREAM_RECON_ID);
-    // State was reset for the new connection.
-    assert!(!stream.state.shutter_open);
-    assert!(!stream.state.last_armed);
-    assert_eq!(stream.state.startup_blank_remaining, 0);
-    assert_eq!(stream.state.stats.reconnect_count, 1);
-    // Callback fired and the discoverer actually connected.
-    assert!(reconnected.load(Ordering::SeqCst));
-    assert!(connect_count.load(Ordering::SeqCst) >= 1);
-}
-
-#[test]
-fn handle_reconnect_rejects_frame_swap_device() {
-    let connect_count = Arc::new(AtomicUsize::new(0));
-    let reconnected = Arc::new(AtomicBool::new(false));
-    let mut stream = make_reconnecting_stream(
+    let stream = make_reconnecting_stream(
+        DisconnectAfterNBackend::new(2),
         ReplacementKind::FrameSwap,
         connect_count.clone(),
         reconnected.clone(),
     );
 
-    let result = stream.handle_reconnect();
+    let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
-        result,
-        Err(RunExit::Disconnected),
-        "a frame-swap device is incompatible with streaming"
+        result.unwrap(),
+        RunExit::Disconnected,
+        "a frame-swap replacement is incompatible with streaming"
+    );
+    assert!(
+        connect_count.load(Ordering::SeqCst) > 0,
+        "the discoverer must have produced a replacement that was then rejected \
+         (proving the validator path, not a discovery miss)"
     );
     assert!(
         !reconnected.load(Ordering::SeqCst),
@@ -3393,44 +2771,29 @@ fn handle_reconnect_rejects_frame_swap_device() {
 }
 
 #[test]
-fn handle_reconnect_rejects_incompatible_pps() {
+fn run_rejects_incompatible_pps_replacement_and_returns_disconnected() {
+    // Same path, but the replacement's PPS range excludes the 30 kpps config —
+    // the validator must reject it and `run()` exits `Disconnected`.
     let connect_count = Arc::new(AtomicUsize::new(0));
     let reconnected = Arc::new(AtomicBool::new(false));
-    let mut stream = make_reconnecting_stream(
+    let stream = make_reconnecting_stream(
+        DisconnectAfterNBackend::new(2),
         ReplacementKind::NarrowPps,
         connect_count.clone(),
         reconnected.clone(),
     );
 
-    let result = stream.handle_reconnect();
+    let result = stream.run(blank_producer, |_e| {});
     assert_eq!(
-        result,
-        Err(RunExit::Disconnected),
+        result.unwrap(),
+        RunExit::Disconnected,
         "reconnected device PPS range must contain the stream config PPS"
     );
+    assert!(
+        connect_count.load(Ordering::SeqCst) > 0,
+        "the discoverer must have produced a replacement that was then rejected"
+    );
     assert!(!reconnected.load(Ordering::SeqCst));
-}
-
-#[test]
-fn handle_reconnect_stops_when_stop_requested() {
-    let connect_count = Arc::new(AtomicUsize::new(0));
-    let reconnected = Arc::new(AtomicBool::new(false));
-    let mut stream = make_reconnecting_stream(
-        ReplacementKind::Fifo,
-        connect_count.clone(),
-        reconnected.clone(),
-    );
-
-    // Request stop before reconnecting — the retry loop should bail out.
-    stream.control.stop().unwrap();
-
-    let result = stream.handle_reconnect();
-    assert_eq!(result, Err(RunExit::Stopped));
-    assert_eq!(
-        connect_count.load(Ordering::SeqCst),
-        0,
-        "no connect attempt should occur once stop is requested"
-    );
 }
 
 #[test]
