@@ -429,6 +429,26 @@ fn format_stable_id_ip(ip: IpAddr) -> String {
     format!("{}:{}", PREFIX, ip)
 }
 
+/// Build the discovered-device info for one LaserCube.
+///
+/// The primary id keys on the hardware serial when available, else the IP.
+/// Pre-0.13 the id was *always* the IP form, so when we key on the serial we
+/// also record the IP id as a legacy alias — that keeps saved pairings
+/// resolving without a re-pair. When the primary id is already the IP form, no
+/// alias is needed.
+fn build_device_info(status: &LaserCubeNetworkStatus, ip: IpAddr) -> DiscoveredDeviceInfo {
+    let stable_id = stable_id_for(status);
+    let name = device_name(status, ip);
+    let legacy_id = format_stable_id_ip(ip);
+    let mut info = DiscoveredDeviceInfo::new(DacType::LaserCubeNetwork, stable_id, name)
+        .with_ip(ip)
+        .with_hardware_name(status.serial_number.clone());
+    if info.stable_id() != legacy_id {
+        info = info.with_legacy_id(legacy_id);
+    }
+    info
+}
+
 /// Human-readable device name, preferring the advertised model name and always
 /// disambiguating by IP.
 fn device_name(status: &LaserCubeNetworkStatus, ip: IpAddr) -> String {
@@ -465,12 +485,8 @@ impl Discoverer for LaserCubeNetworkDiscoverer {
                 Err(_) => continue,
             };
             let ip = addressed.source_addr.ip();
-            let stable_id = stable_id_for(&addressed.status);
-            let name = device_name(&addressed.status, ip);
             let caps = super::capabilities_for_status(addressed.profile, &addressed.status);
-            let info = DiscoveredDeviceInfo::new(DacType::LaserCubeNetwork, stable_id, name)
-                .with_ip(ip)
-                .with_hardware_name(addressed.status.serial_number.clone());
+            let info = build_device_info(&addressed.status, ip);
             out.push(
                 DiscoveredDevice::new(info, Box::new(ConnectData { addressed })).with_caps(caps),
             );
@@ -539,6 +555,31 @@ mod tests {
     fn stable_id_ip_form_keeps_existing_prefix() {
         let ip: IpAddr = "192.168.1.50".parse().unwrap();
         assert_eq!(format_stable_id_ip(ip), "lasercube-network:192.168.1.50");
+    }
+
+    #[test]
+    fn serial_form_info_carries_legacy_ip_id() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let mut status = LaserCubeNetworkStatus::minimal(ip);
+        status.serial_number = "010203040506".to_string();
+        let info = build_device_info(&status, ip);
+        // Serial-based primary id, with the pre-0.13 IP id as a legacy alias.
+        assert_eq!(info.stable_id(), "lasercube-network:010203040506");
+        assert_eq!(
+            info.legacy_ids,
+            vec!["lasercube-network:192.168.1.50".to_string()]
+        );
+    }
+
+    #[test]
+    fn ip_form_info_has_no_legacy_alias() {
+        let ip: IpAddr = "192.168.1.50".parse().unwrap();
+        let mut status = LaserCubeNetworkStatus::minimal(ip);
+        status.serial_number = String::new();
+        // Without a serial the primary id already *is* the old IP form.
+        let info = build_device_info(&status, ip);
+        assert_eq!(info.stable_id(), "lasercube-network:192.168.1.50");
+        assert!(info.legacy_ids.is_empty());
     }
 
     #[test]

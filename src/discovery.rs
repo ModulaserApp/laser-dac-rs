@@ -183,6 +183,14 @@ pub struct DiscoveredDeviceInfo {
     pub dac_type: DacType,
     /// Canonical, namespaced identifier set by the producing [`Discoverer`].
     pub stable_id: String,
+    /// Prior-format identifiers this device also answers to.
+    ///
+    /// A protocol that changed its `stable_id` scheme records the old id(s)
+    /// here so callers holding a saved (pre-change) id can still resolve the
+    /// device without re-pairing. Does not participate in identity
+    /// ([`PartialEq`]/[`Eq`]/[`Hash`] consider only `stable_id`) and is
+    /// consulted only by `open_by_id`.
+    pub legacy_ids: Vec<String>,
     /// Human-readable name set by the producing [`Discoverer`].
     pub name: String,
     /// IP address for network devices.
@@ -207,6 +215,7 @@ impl DiscoveredDeviceInfo {
         Self {
             dac_type,
             stable_id: stable_id.into(),
+            legacy_ids: Vec::new(),
             name: name.into(),
             ip_address: None,
             mac_address: None,
@@ -244,6 +253,13 @@ impl DiscoveredDeviceInfo {
 
     pub fn with_device_index(mut self, index: u16) -> Self {
         self.device_index = Some(index);
+        self
+    }
+
+    /// Record a prior-format id this device also answers to (see
+    /// [`legacy_ids`](Self::legacy_ids)). Chainable; pushes onto the list.
+    pub fn with_legacy_id(mut self, id: impl Into<String>) -> Self {
+        self.legacy_ids.push(id.into());
         self
     }
 
@@ -481,6 +497,11 @@ impl DacDiscovery {
     /// protocol's discoverer is scanned. If the prefix matches no registered
     /// discoverer, the call fails fast without scanning. A prefix-less id
     /// falls back to scanning every registered discoverer.
+    ///
+    /// A device matches when `id` equals its current `stable_id` **or** any of
+    /// its [`legacy_ids`](DiscoveredDeviceInfo::legacy_ids), so ids saved before
+    /// a protocol changed its id scheme still resolve without re-pairing. Legacy
+    /// ids keep the same prefix, so prefix dispatch is unaffected.
     pub(crate) fn open_by_id(&mut self, id: &str) -> Result<crate::stream::Dac> {
         let (id_prefix, has_prefix) = match id.split_once(':') {
             Some((p, _)) => (p, true),
@@ -503,7 +524,7 @@ impl DacDiscovery {
 
         let device = discovered
             .into_iter()
-            .find(|d| d.info.stable_id == id)
+            .find(|d| d.info.stable_id == id || d.info.legacy_ids.iter().any(|l| l == id))
             .ok_or_else(|| Error::disconnected(format!("DAC not found: {}", id)))?;
 
         self.open_discovered(device)
@@ -588,6 +609,8 @@ mod tests {
         connect_called: Arc<AtomicBool>,
         prefix: String,
         devices_to_return: Vec<(u32, Option<IpAddr>)>,
+        /// Legacy id attached to every scanned device (prefixed with `prefix`).
+        legacy_id: Option<String>,
     }
 
     impl MockDiscoverer {
@@ -597,11 +620,17 @@ mod tests {
                 connect_called: Arc::new(AtomicBool::new(false)),
                 prefix: "mockdac".to_string(),
                 devices_to_return: devices,
+                legacy_id: None,
             }
         }
 
         fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
             self.prefix = prefix.into();
+            self
+        }
+
+        fn with_legacy_id(mut self, id: impl Into<String>) -> Self {
+            self.legacy_id = Some(id.into());
             self
         }
     }
@@ -633,6 +662,9 @@ mod tests {
                     .with_hardware_name(hardware_name);
                     if let Some(addr) = ip {
                         info = info.with_ip(*addr);
+                    }
+                    if let Some(legacy) = &self.legacy_id {
+                        info = info.with_legacy_id(legacy.clone());
                     }
                     DiscoveredDevice::new(info, Box::new(MockConnectionInfo { _device_id: *id }))
                 })
@@ -806,6 +838,64 @@ mod tests {
     fn registering_empty_prefix_panics() {
         let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
         discovery.register(Box::new(MockDiscoverer::new(vec![]).with_prefix("")));
+    }
+
+    #[test]
+    fn open_by_id_resolves_via_legacy_id() {
+        // Device's primary id is the IP form; it also answers to a legacy id.
+        let discoverer = MockDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))])
+            .with_prefix("mockdac")
+            .with_legacy_id("mockdac:old-saved-id");
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        // Querying by the legacy id resolves the same device...
+        let dac = discovery.open_by_id("mockdac:old-saved-id").unwrap();
+        // ...but the returned Dac carries the *new* (primary) id.
+        assert_eq!(dac.id(), "mockdac:10.0.0.1");
+    }
+
+    #[test]
+    fn open_by_id_still_resolves_via_primary_id_when_legacy_present() {
+        let discoverer = MockDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))])
+            .with_prefix("mockdac")
+            .with_legacy_id("mockdac:old-saved-id");
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        let dac = discovery.open_by_id("mockdac:10.0.0.1").unwrap();
+        assert_eq!(dac.id(), "mockdac:10.0.0.1");
+    }
+
+    #[test]
+    fn open_by_id_unknown_id_with_known_prefix_still_fails() {
+        let discoverer = MockDiscoverer::new(vec![(1, Some("10.0.0.1".parse().unwrap()))])
+            .with_prefix("mockdac")
+            .with_legacy_id("mockdac:old-saved-id");
+
+        let mut discovery = DacDiscovery::new(EnabledDacTypes::none());
+        discovery.register(Box::new(discoverer));
+
+        // Neither primary nor legacy — must not resolve.
+        assert!(discovery.open_by_id("mockdac:nope").is_err());
+    }
+
+    #[test]
+    fn legacy_ids_do_not_affect_identity() {
+        let a = DiscoveredDeviceInfo::new(DacType::Custom("X".into()), "x:1", "a")
+            .with_legacy_id("x:old");
+        let b = DiscoveredDeviceInfo::new(DacType::Custom("X".into()), "x:1", "b");
+        // Same stable_id, differing legacy_ids → still equal + same hash.
+        assert_eq!(a, b);
+
+        use std::collections::hash_map::DefaultHasher;
+        let mut h1 = DefaultHasher::new();
+        a.hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        b.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
     }
 
     #[test]

@@ -116,7 +116,12 @@ fn servers_to_devices(servers: Vec<ServerInfo>) -> Vec<DiscoveredDevice> {
                 base_name
             };
 
+            // Pre-0.13 the id was `idn:<hostname>` (no unit-id / no service
+            // granularity). Keep resolving it so saved pairings survive. A
+            // multi-service server maps several new ids to one legacy id;
+            // `open_by_id` takes the first match, preserving old behavior.
             let mut info = DiscoveredDeviceInfo::new(DacType::Idn, stable_id, name)
+                .with_legacy_id(format!("{}:{}", PREFIX, hostname))
                 .with_hostname(hostname.clone());
             if let Some(ip) = ip_address {
                 info = info.with_ip(ip);
@@ -242,5 +247,31 @@ mod tests {
             .collect();
         assert!(ids.contains(&"idn:11111111111111111111111111111111:1".to_string()));
         assert!(ids.contains(&"idn:11111111111111111111111111111111:2".to_string()));
+    }
+
+    #[test]
+    fn devices_carry_legacy_hostname_id() {
+        use crate::protocols::idn::dac::{ServiceInfo, ServiceType};
+
+        let mut server = ServerInfo::new([0x22; 16], "laser-projector".to_string(), (1, 0), 0);
+        server
+            .addresses
+            .push("10.0.0.9:7255".parse::<std::net::SocketAddr>().unwrap());
+        server.services.push(ServiceInfo {
+            service_id: 1,
+            service_type: ServiceType::LaserProjector,
+            name: "Main".to_string(),
+            flags: 0,
+            relay_number: 0,
+        });
+
+        let devices = servers_to_devices(vec![server]);
+        assert_eq!(devices.len(), 1);
+        // Pre-0.13 the id was `idn:<hostname>`; it lives on as a legacy alias
+        // so saved pairings resolve without a re-pair.
+        assert_eq!(
+            devices[0].info().legacy_ids,
+            vec!["idn:laser-projector".to_string()]
+        );
     }
 }
