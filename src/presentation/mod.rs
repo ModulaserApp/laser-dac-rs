@@ -142,11 +142,22 @@ impl Frame {
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
+
+    /// Create a frame from an already-shared point buffer, without copying.
+    pub fn from_shared(points: Arc<Vec<LaserPoint>>) -> Self {
+        Self { points }
+    }
 }
 
 impl From<Vec<LaserPoint>> for Frame {
     fn from(points: Vec<LaserPoint>) -> Self {
         Self::new(points)
+    }
+}
+
+impl From<Arc<Vec<LaserPoint>>> for Frame {
+    fn from(points: Arc<Vec<LaserPoint>>) -> Self {
+        Self { points }
     }
 }
 
