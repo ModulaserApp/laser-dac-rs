@@ -1331,7 +1331,9 @@ fn test_stream_disarm_during_streaming() {
     );
 
     assert_eq!(result.unwrap(), RunExit::Stopped);
-    // Shutter should have been closed by disarm
+    // Stopping must never leave the shutter open, regardless of whether the
+    // queued disarm was drained before the stop was observed (the driver
+    // closes it on every stop-exit path — see stop_and_close_shutter).
     assert!(!shutter_open.load(Ordering::SeqCst));
 }
 

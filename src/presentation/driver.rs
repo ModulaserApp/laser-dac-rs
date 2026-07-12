@@ -164,7 +164,10 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
     loop {
         inputs.metrics.mark_loop_activity();
         if inputs.control.is_stop_requested() {
-            return Ok(RunExit::Stopped);
+            return Ok(stop_and_close_shutter(
+                &mut inputs.backend,
+                &mut shutter_open,
+            ));
         }
 
         let pps = inputs.control.pps();
@@ -198,7 +201,10 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
         }
 
         if process_control_messages(&inputs.control_rx, &mut shutter_open, &mut inputs.backend) {
-            return Ok(RunExit::Stopped);
+            return Ok(stop_and_close_shutter(
+                &mut inputs.backend,
+                &mut shutter_open,
+            ));
         }
         let is_armed = inputs.control.is_armed();
         handle_shutter_transition(
@@ -230,7 +236,12 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<RunExit> {
 
         match outcome {
             StepOutcome::Continue => {}
-            StepOutcome::Stopped => return Ok(RunExit::Stopped),
+            StepOutcome::Stopped => {
+                return Ok(stop_and_close_shutter(
+                    &mut inputs.backend,
+                    &mut shutter_open,
+                ))
+            }
             StepOutcome::Disconnected => {
                 match reconnect(
                     &mut inputs.backend,
@@ -354,4 +365,21 @@ fn handle_shutter_transition(
         }
     }
     *last_armed = is_armed;
+}
+
+/// Close the shutter (best-effort) and return [`RunExit::Stopped`].
+///
+/// A `Stop` request must never leave the shutter open — otherwise the beam
+/// freezes on the last bright point ("freeze on last bright point" hazard).
+/// The graceful end-of-stream path closes the shutter via `drain_and_blank`;
+/// this is the equivalent for every abrupt-stop exit. It also removes a race:
+/// `is_stop_requested()` is checked before the control channel is drained, so a
+/// `Disarm` queued just before `Stop` could otherwise be dropped, leaving the
+/// shutter open.
+fn stop_and_close_shutter(backend: &mut BackendKind, shutter_open: &mut bool) -> RunExit {
+    if *shutter_open {
+        let _ = backend.set_shutter(false);
+        *shutter_open = false;
+    }
+    RunExit::Stopped
 }
