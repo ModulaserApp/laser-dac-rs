@@ -272,6 +272,12 @@ fn handle_connection(mut sock: TcpStream, shared: &Arc<MockShared>, stop: &Arc<A
             None => return, // Unknown command or truncated read.
         };
 
+        // Record the command as received BEFORE sending the ACK. The client's
+        // `submit()` returns as soon as it reads the ACK, so a test that reads
+        // `received()` right after `submit()` would otherwise race this thread
+        // and miss the last command. Recording first makes it deterministic.
+        shared.received.lock().unwrap().push(c);
+
         // Advance the simulated device status.
         {
             let mut st = shared.status.lock().unwrap();
@@ -327,7 +333,6 @@ fn handle_connection(mut sock: TcpStream, shared: &Arc<MockShared>, stop: &Arc<A
         if sock.write_all(&encode_response(&resp)).is_err() {
             return;
         }
-        shared.received.lock().unwrap().push(c);
         idx += 1;
     }
 }
