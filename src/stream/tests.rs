@@ -1972,7 +1972,14 @@ fn test_fill_result_end_drains_with_queue_depth() {
     let backend = TestBackend::new().with_initial_queue(1000);
     let queued = backend.queued.clone();
 
-    let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_millis(100));
+    // Use a deliberately large drain timeout as a sentinel: if the empty-queue
+    // fast path were broken and actually waited the timeout, `run()` would take
+    // ~2s. The empty-queue path breaks out of the drain loop before its first
+    // poll sleep, so it returns in `run()`'s setup/teardown overhead (tens of
+    // ms). The generous ceiling below stays well under the 2s sentinel while
+    // giving loaded CI runners enough headroom not to flake on scheduling
+    // jitter (a tight sub-100ms wall-clock budget does).
+    let cfg = StreamConfig::new(30000).with_drain_timeout(Duration::from_secs(2));
     let stream = make_test_stream_with_cfg(backend, cfg);
 
     // Simulate queue draining by setting it to 0 before the stream runs
@@ -1984,10 +1991,11 @@ fn test_fill_result_end_drains_with_queue_depth() {
     let elapsed = start.elapsed();
 
     assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-    // Should return quickly since queue was empty
+    // An empty queue must not consume the 2s drain timeout.
     assert!(
-        elapsed.as_millis() < 50,
-        "Should return quickly when queue is empty, took {:?}",
+        elapsed < Duration::from_millis(500),
+        "Should return promptly when queue is empty (not wait the 2s drain \
+         timeout), took {:?}",
         elapsed
     );
 }
