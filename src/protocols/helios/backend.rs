@@ -337,20 +337,22 @@ impl DacBackend for HeliosBackend {
 
 impl Drop for HeliosBackend {
     fn drop(&mut self) {
-        if self.fatal_disconnect {
-            // The device was physically disconnected: `libusb_close()` can
-            // segfault on macOS for a handle whose device is no longer present,
-            // so leak the claimed handle instead (a bounded ~200-byte leak).
-            self.leak_handle();
-        } else {
-            // Graceful teardown of a still-present device: close normally so the
-            // claimed interface is released and the DAC can be reopened in the
-            // same process (avoids LIBUSB_ERROR_BUSY). The macOS close segfault
-            // only affects handles whose device has been unplugged — that case
-            // is handled by the branch above — so closing a present device here
-            // is safe on all platforms.
-            self.close_handle();
+        // Always leak an open USB handle at final teardown rather than closing
+        // it. `libusb_close()` can segfault on macOS for a handle whose device
+        // was surprise-removed, and `Drop` cannot reliably tell a still-present
+        // device from one unplugged while idle: an idle unplug is never observed
+        // by any USB op, so `fatal_disconnect` stays false even though closing
+        // would hit the exact crash this leak works around. Interface release for
+        // reopening the DAC in the same process is handled by `disconnect()` /
+        // `connect()`, which run on a live backend *before* `Drop` — so leaking
+        // here costs only a bounded ~200-byte handle the OS reclaims at process
+        // exit. `close_handle()` remains the right choice on those live paths.
+        if !self.fatal_disconnect {
+            // Reaching teardown with an open handle and no observed disconnect is
+            // the ambiguous case above; log it so an idle-unplug leak is visible.
+            log::debug!("helios: leaking USB handle at teardown (no observed disconnect)");
         }
+        self.leak_handle();
     }
 }
 
