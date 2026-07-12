@@ -316,6 +316,18 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 self.packet_sample_counts[s as usize] = 0;
                 s = s.wrapping_add(1);
             }
+        } else {
+            // First applied data ACK on a fresh connection: earlier packets
+            // (0..sequence) are implicitly delivered — the device would not ACK
+            // this packet otherwise, and its reported free space already
+            // reflects them. Release their slots so they don't linger as
+            // phantom in-flight and double-discount the free estimate.
+            let mut s: u8 = 0;
+            while s != sequence {
+                self.packet_send_times[s as usize] = None;
+                self.packet_sample_counts[s as usize] = 0;
+                s = s.wrapping_add(1);
+            }
         }
 
         // Remaining outstanding packets were sent after this ACK's packet and
@@ -857,6 +869,33 @@ mod tests {
         assert_eq!(worker.packet_sample_counts[3], 0);
         assert_eq!(worker.packet_sample_counts[4], 0);
         assert_eq!(worker.packet_sample_counts[5], 0);
+    }
+
+    #[test]
+    fn first_data_ack_releases_earlier_startup_slots() {
+        let (mut worker, _cmd_socket, _data_socket) = fake_worker();
+        let now = Instant::now();
+        // Fresh connection: packets 0..=3 sent, their ACKs (0,1,2) were lost,
+        // so the first applied data ACK is for seq 3.
+        worker.packet_sample_counts[0] = 80;
+        worker.packet_sample_counts[1] = 80;
+        worker.packet_sample_counts[2] = 80;
+        worker.packet_sample_counts[3] = 80;
+        worker.apply_ack(
+            now,
+            BufferAck {
+                source: AckSource::Data,
+                packet_sequence: Some(3),
+                free_space: 6000,
+            },
+        );
+        // Earlier slots are implicitly delivered and must not count as phantom
+        // in-flight, so free_space is not double-discounted.
+        assert_eq!(worker.packet_sample_counts[0], 0);
+        assert_eq!(worker.packet_sample_counts[1], 0);
+        assert_eq!(worker.packet_sample_counts[2], 0);
+        assert_eq!(worker.packet_sample_counts[3], 0);
+        assert_eq!(worker.state.diagnostics().device_free_estimate, 6000);
     }
 
     #[test]
