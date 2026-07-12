@@ -3,6 +3,11 @@
 //! This module contains the low-level protocol implementations for each
 //! supported DAC type. Each protocol is gated behind a feature flag.
 
+/// Shared USB endpoint seam used by the USB-based backends (Helios, LaserCube
+/// USB) so their transfer logic can be tested against a fake device.
+#[cfg(any(feature = "helios", feature = "lasercube-usb"))]
+pub mod usb_transfer;
+
 #[cfg(feature = "helios")]
 pub mod helios;
 

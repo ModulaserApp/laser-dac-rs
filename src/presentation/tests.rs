@@ -2021,6 +2021,273 @@ impl FifoBackend for RetryUdpTimedTestBackend {
     }
 }
 
+/// Session-level BlockingFifo backend for FrameSession/driver tests. Unlike the
+/// inline `FakeBlockingFifo` in `output_model/blocking_fifo.rs` (which always
+/// returns `Written`), this can be forced to return `WouldBlock` for the next N
+/// writes via `block_next_writes`, exercising the branch the inline fake never
+/// reaches. `max_points_per_chunk` is 128 so an emitted chunk is
+/// `min(CHUNK_POINTS=512, 128) = 128` — proving both the fixed-chunk model and
+/// the clamp without importing the private `CHUNK_POINTS`.
+struct BlockingFifoTestBackend {
+    connected: bool,
+    dac_type: crate::device::DacType,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    resets: Arc<AtomicUsize>,
+    shutter_open: Arc<AtomicBool>,
+    block_next_writes: Arc<AtomicUsize>,
+    estimator: SoftwareDecayEstimator,
+}
+
+impl BlockingFifoTestBackend {
+    fn new() -> Self {
+        Self {
+            connected: false,
+            dac_type: crate::device::DacType::Custom("BlockingFifoTest".into()),
+            writes: Arc::new(Mutex::new(Vec::new())),
+            resets: Arc::new(AtomicUsize::new(0)),
+            shutter_open: Arc::new(AtomicBool::new(false)),
+            block_next_writes: Arc::new(AtomicUsize::new(0)),
+            estimator: SoftwareDecayEstimator::new(),
+        }
+    }
+}
+
+impl DacBackend for BlockingFifoTestBackend {
+    fn dac_type(&self) -> crate::device::DacType {
+        self.dac_type.clone()
+    }
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
+            pps_min: 1,
+            pps_max: 100000,
+            max_points_per_chunk: 128,
+            output_model: crate::device::OutputModel::BlockingFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, open: bool) -> DacResult<()> {
+        self.shutter_open.store(open, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl FifoBackend for BlockingFifoTestBackend {
+    fn try_write_points(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        let remaining = self.block_next_writes.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.block_next_writes
+                .store(remaining - 1, Ordering::SeqCst);
+            return Ok(crate::backend::WriteOutcome::WouldBlock);
+        }
+        self.writes.lock().unwrap().push(points.to_vec());
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+
+    fn reset_device_buffer(&mut self) -> DacResult<()> {
+        self.resets.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// BlockingFifo backend that errors with a disconnect after `fail_after` writes,
+/// used to drive the reconnect path end-to-end.
+struct DisconnectAfterNBlockingFifoBackend {
+    connected: bool,
+    fail_after: usize,
+    write_count: AtomicUsize,
+    estimator: SoftwareDecayEstimator,
+}
+
+impl DisconnectAfterNBlockingFifoBackend {
+    fn new(fail_after: usize) -> Self {
+        Self {
+            connected: false,
+            fail_after,
+            write_count: AtomicUsize::new(0),
+            estimator: SoftwareDecayEstimator::new(),
+        }
+    }
+}
+
+impl DacBackend for DisconnectAfterNBlockingFifoBackend {
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("ReconnectBlockingFifo".into())
+    }
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
+            pps_min: 1,
+            pps_max: 100000,
+            max_points_per_chunk: 128,
+            output_model: crate::device::OutputModel::BlockingFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _: bool) -> DacResult<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for DisconnectAfterNBlockingFifoBackend {
+    fn try_write_points(
+        &mut self,
+        _pps: u32,
+        _points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        let count = self.write_count.fetch_add(1, Ordering::SeqCst);
+        if count >= self.fail_after {
+            self.connected = false;
+            Err(crate::error::Error::disconnected("simulated disconnect"))
+        } else {
+            Ok(crate::backend::WriteOutcome::Written)
+        }
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+}
+
+/// The BlockingFifo backend a reconnect resolves to. Holds shared `writes` and
+/// `resets` Arcs so the test can observe the post-reconnect ring clear (driven
+/// through the adapter's `on_reconnect` rising-edge path).
+struct ReconnectBlockingFifoBackend {
+    connected: bool,
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    resets: Arc<AtomicUsize>,
+    estimator: SoftwareDecayEstimator,
+}
+
+impl ReconnectBlockingFifoBackend {
+    fn new(writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>, resets: Arc<AtomicUsize>) -> Self {
+        Self {
+            connected: false,
+            writes,
+            resets,
+            estimator: SoftwareDecayEstimator::new(),
+        }
+    }
+}
+
+impl DacBackend for ReconnectBlockingFifoBackend {
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("ReconnectBlockingFifo".into())
+    }
+    fn caps(&self) -> &crate::device::DacCapabilities {
+        static CAPS: crate::device::DacCapabilities = crate::device::DacCapabilities {
+            pps_min: 1,
+            pps_max: 100000,
+            max_points_per_chunk: 128,
+            output_model: crate::device::OutputModel::BlockingFifo,
+        };
+        &CAPS
+    }
+    fn connect(&mut self) -> DacResult<()> {
+        self.connected = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) -> DacResult<()> {
+        self.connected = false;
+        Ok(())
+    }
+    fn is_connected(&self) -> bool {
+        self.connected
+    }
+    fn stop(&mut self) -> DacResult<()> {
+        Ok(())
+    }
+    fn set_shutter(&mut self, _: bool) -> DacResult<()> {
+        Ok(())
+    }
+}
+
+impl FifoBackend for ReconnectBlockingFifoBackend {
+    fn try_write_points(
+        &mut self,
+        _pps: u32,
+        points: &[LaserPoint],
+    ) -> DacResult<crate::backend::WriteOutcome> {
+        self.writes.lock().unwrap().push(points.to_vec());
+        Ok(crate::backend::WriteOutcome::Written)
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+
+    fn reset_device_buffer(&mut self) -> DacResult<()> {
+        self.resets.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ReconnectBlockingFifoDiscoverer {
+    writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
+    resets: Arc<AtomicUsize>,
+}
+
+impl crate::discovery::Discoverer for ReconnectBlockingFifoDiscoverer {
+    fn dac_type(&self) -> crate::device::DacType {
+        crate::device::DacType::Custom("ReconnectBlockingFifo".into())
+    }
+
+    fn prefix(&self) -> &str {
+        "reconnectblockingfifo"
+    }
+
+    fn scan(&mut self) -> Vec<crate::discovery::DiscoveredDevice> {
+        let info = crate::discovery::DiscoveredDeviceInfo::new(
+            crate::device::DacType::Custom("ReconnectBlockingFifo".into()),
+            "reconnectblockingfifo:10.0.0.99",
+            "Reconnect BlockingFifo",
+        )
+        .with_ip("10.0.0.99".parse().unwrap())
+        .with_hardware_name("Reconnect BlockingFifo");
+        vec![crate::discovery::DiscoveredDevice::new(info, Box::new(()))]
+    }
+
+    fn connect(&mut self, _opaque: Box<dyn std::any::Any + Send>) -> DacResult<BackendKind> {
+        Ok(BackendKind::Fifo(Box::new(
+            ReconnectBlockingFifoBackend::new(self.writes.clone(), self.resets.clone()),
+        )))
+    }
+}
+
 fn wait_for_writes(
     writes: &Arc<Mutex<Vec<Vec<LaserPoint>>>>,
     min_len: usize,
@@ -2953,6 +3220,280 @@ fn test_frame_session_metrics_write_success_only_advances_on_successful_write() 
 }
 
 #[test]
+fn test_frame_session_blocking_fifo_writes_fixed_chunk_when_armed() {
+    let backend = BlockingFifoTestBackend::new();
+    let writes = backend.writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    // A ~300-point frame is larger than the 128 max-chunk, so every emitted
+    // chunk must be the fixed CHUNK size clamped to max_points_per_chunk (128),
+    // not an estimator-derived trickle.
+    session.send_frame(Frame::new(
+        (0..300)
+            .map(|i| make_point(i as f32 * 0.001, 0.0))
+            .collect(),
+    ));
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(500));
+
+    let recorded = writes.lock().unwrap().clone();
+    for chunk in &recorded {
+        assert_eq!(
+            chunk.len(),
+            128,
+            "every blocking write is the fixed chunk clamped to max_points_per_chunk (128), not an estimator trickle"
+        );
+    }
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for BlockingFifo session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_blocking_fifo_no_writes_while_disarmed() {
+    let backend = BlockingFifoTestBackend::new();
+    let writes = backend.writes.clone();
+    let shutter = backend.shutter_open.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    // Never armed: a frame is available but the disarmed BlockingFifo must not
+    // write (a blocking write to a disabled device would wedge).
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "disarmed BlockingFifo must issue no writes"
+    );
+    assert!(
+        !shutter.load(Ordering::SeqCst),
+        "shutter stays closed while disarmed"
+    );
+
+    // Arm → writes resume.
+    session.control().arm().unwrap();
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(500));
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for BlockingFifo session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_blocking_fifo_arm_disarm_clears_ring_on_each_rearm() {
+    let backend = BlockingFifoTestBackend::new();
+    let writes = backend.writes.clone();
+    let resets = backend.resets.clone();
+    let shutter = backend.shutter_open.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    session.control().arm().unwrap();
+    wait_for_writes(&writes, 1, std::time::Duration::from_millis(500));
+
+    // Rising arm edge cleared the ring exactly once (a write only happens after
+    // the clear, and nothing re-clears while continuously armed).
+    assert!(shutter.load(Ordering::SeqCst), "shutter open once armed");
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "ring cleared once on the first rising arm edge"
+    );
+
+    // Disarm: shutter closes and writes stop advancing.
+    session.control().disarm().unwrap();
+    let disarm_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while shutter.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < disarm_deadline,
+            "timed out waiting for disarm to close the shutter"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let writes_at_disarm = writes.lock().unwrap().len();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(
+        writes.lock().unwrap().len(),
+        writes_at_disarm,
+        "no writes advance while disarmed"
+    );
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        1,
+        "disarm itself does not clear the ring"
+    );
+
+    // Re-arm: a second ring clear on the new rising edge.
+    session.control().arm().unwrap();
+    let rearm_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while resets.load(Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < rearm_deadline,
+            "timed out waiting for the re-arm ring clear"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        resets.load(Ordering::SeqCst),
+        2,
+        "exactly one clear per rising arm edge, driven end-to-end"
+    );
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for BlockingFifo session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_blocking_fifo_output_filter_applied() {
+    let backend = BlockingFifoTestBackend::new();
+    let writes = backend.writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+    let (filter, observations) = RecordingFilter::new();
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(1)
+        .with_output_filter(Box::new(filter));
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![
+        make_point(0.0, 0.0),
+        make_point(0.5, 0.0),
+        make_point(1.0, 0.0),
+    ]));
+    wait_for_filter_calls(&observations, 1, std::time::Duration::from_millis(500));
+
+    let call = observations.invocations.lock().unwrap()[0].clone();
+    assert_eq!(call.ctx.kind, PresentedSliceKind::FifoChunk);
+    assert!(!call.ctx.is_cyclic);
+
+    // The backend must receive the exact filtered chunk (filter not bypassed on
+    // the BlockingFifo write path).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while !writes.lock().unwrap().contains(&call.points) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the filtered chunk to be written"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for BlockingFifo session, got {exit:?}"
+    );
+}
+
+#[test]
+fn test_frame_session_blocking_fifo_metrics_write_success_only_on_write() {
+    let backend = BlockingFifoTestBackend::new();
+    let block_next_writes = backend.block_next_writes.clone();
+    let backend_kind = BackendKind::Fifo(Box::new(backend));
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0);
+    let session = FrameSession::start(backend_kind, config, None).unwrap();
+    let metrics = session.metrics();
+
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0)]));
+    wait_for_write_success(&metrics, std::time::Duration::from_millis(500));
+
+    // Disarm: the loop idles (marking activity) but records no writes.
+    session.control().disarm().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let baseline = metrics.last_write_success().unwrap();
+    let before_idle = metrics.last_loop_activity().unwrap();
+    let after_idle =
+        wait_for_loop_activity_after(&metrics, before_idle, std::time::Duration::from_millis(500));
+    assert!(
+        after_idle > before_idle,
+        "disarmed idle marks loop activity"
+    );
+    assert_eq!(
+        metrics.last_write_success(),
+        Some(baseline),
+        "write-success must not advance while disarmed/idle"
+    );
+
+    // Re-arm with every write forced to WouldBlock: the loop stays live (100µs
+    // backoff marks activity) but no write completes, so write-success stays
+    // frozen. This covers the WouldBlock branch the always-Written inline fake
+    // never reaches.
+    block_next_writes.store(1_000_000, Ordering::SeqCst);
+    session.control().arm().unwrap();
+    let before_block = metrics.last_loop_activity().unwrap();
+    let after_block = wait_for_loop_activity_after(
+        &metrics,
+        before_block,
+        std::time::Duration::from_millis(500),
+    );
+    assert!(
+        after_block > before_block,
+        "WouldBlock retry still marks loop activity"
+    );
+    assert_eq!(
+        metrics.last_write_success(),
+        Some(baseline),
+        "WouldBlock retries must not advance write-success"
+    );
+
+    session.control().stop().unwrap();
+    let exit = session.join();
+    assert!(
+        matches!(
+            exit,
+            Ok(RunExit::Stopped) | Err(crate::error::Error::Stopped)
+        ),
+        "expected clean stop for BlockingFifo session, got {exit:?}"
+    );
+}
+
+#[test]
 fn test_color_delay_line_carries_across_chunks() {
     use super::ColorDelayLine;
 
@@ -3276,6 +3817,83 @@ fn test_frame_session_metrics_advance_during_reconnect_backoff() {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+
+    drop(session);
+}
+
+#[test]
+fn test_frame_session_blocking_fifo_reconnect_clears_ring() {
+    use crate::config::ReconnectConfig;
+    use crate::device::{DacInfo, DacType};
+    use crate::stream::Dac;
+
+    let reconnect_writes = Arc::new(Mutex::new(Vec::new()));
+    let reconnect_resets = Arc::new(AtomicUsize::new(0));
+    let writes_factory = reconnect_writes.clone();
+    let resets_factory = reconnect_resets.clone();
+
+    // Initial backend disconnects after its first write, forcing a reconnect.
+    let initial_backend = DisconnectAfterNBlockingFifoBackend::new(1);
+    let info = DacInfo {
+        id: "reconnectblockingfifo:10.0.0.99".to_string(),
+        name: "Reconnect BlockingFifo".to_string(),
+        kind: DacType::Custom("ReconnectBlockingFifo".to_string()),
+        caps: initial_backend.caps().clone(),
+    };
+    let device = Dac::new(info, BackendKind::Fifo(Box::new(initial_backend)))
+        .with_discovery_factory(move || {
+            let mut discovery =
+                crate::discovery::DacDiscovery::new(crate::device::EnabledDacTypes::none());
+            discovery.register(Box::new(ReconnectBlockingFifoDiscoverer {
+                writes: writes_factory.clone(),
+                resets: resets_factory.clone(),
+            }));
+            discovery
+        });
+
+    let config = FrameSessionConfig::new(30_000)
+        .with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint| {
+            TransitionPlan::Transition(vec![])
+        }))
+        .with_startup_blank(std::time::Duration::ZERO)
+        .with_color_delay_points(0)
+        .with_reconnect(
+            ReconnectConfig::new()
+                .max_retries(5)
+                .backoff(std::time::Duration::from_millis(20)),
+        );
+
+    let (session, _info) = device.start_frame_session(config).unwrap();
+    session.control().arm().unwrap();
+    session.send_frame(Frame::new(vec![make_point(1.0, 0.0), make_point(2.0, 0.0)]));
+
+    // After reconnect, the adapter's `on_reconnect` forces the armed edge to
+    // re-fire, so the next armed step clears the ring on the reconnected backend
+    // and then resumes writing. Both are observed on the shared Arcs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+    loop {
+        let cleared = reconnect_resets.load(Ordering::SeqCst) >= 1;
+        let wrote = !reconnect_writes.lock().unwrap().is_empty();
+        if cleared && wrote {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for post-reconnect ring clear + write (resets={}, writes={})",
+            reconnect_resets.load(Ordering::SeqCst),
+            reconnect_writes.lock().unwrap().len()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    assert!(
+        reconnect_resets.load(Ordering::SeqCst) >= 1,
+        "ring must be cleared through the on_reconnect rising-edge path after reconnect"
+    );
+    assert!(
+        !reconnect_writes.lock().unwrap().is_empty(),
+        "reconnected BlockingFifo backend should receive writes"
+    );
 
     drop(session);
 }
@@ -3656,4 +4274,196 @@ fn test_color_delay_line_resize_from_zero() {
     assert_eq!((points2[0].r, points2[0].g), (0, 0));
     assert_eq!((points2[1].r, points2[1].g), (0, 0));
     assert_eq!((points2[2].r, points2[2].g), (10, 10));
+}
+
+// =========================================================================
+// driver::run with an injected virtual clock (audit finding #6)
+//
+// Realizes the injectable-`Clock` seam end-to-end: drives the shared
+// `driver::run` loop with a virtual clock so its pacing sleeps advance
+// deterministically with zero wall-clock delay. Targets a `BlockingFifo`
+// backend on purpose — its pacing goes only through the clock-driven
+// `sleep_*` helpers, never `sleep_until_precise`, whose busy-wait branch
+// consults a real-`Instant` deadline and would hang under a virtual clock
+// (see the WARNING on `LoopCtx::sleep_until_precise`).
+// =========================================================================
+mod driver_run_virtual_clock {
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+    use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
+    use crate::device::{DacCapabilities, DacInfo, DacType, OutputModel};
+    use crate::error::{Error, Result as DacResult};
+    use crate::point::LaserPoint;
+    use crate::presentation::content_source::FifoContentSource;
+    use crate::presentation::driver::{self, DriverInputs, SourceOwned};
+    use crate::presentation::output_model::Clock;
+    use crate::presentation::session::FrameSessionMetrics;
+    use crate::stream::{ControlMsg, RunExit, StreamControl};
+
+    /// A `Clock` whose `sleep` advances a shared virtual `now` instantly and
+    /// tallies total virtual time slept. Its counters live behind `Arc` (unlike
+    /// the crate-internal `FakeClock`) so the test can still observe them after
+    /// the clock is boxed into `DriverInputs` and consumed by `driver::run`.
+    struct SharedVirtualClock {
+        now: Arc<Mutex<Instant>>,
+        slept: Arc<Mutex<Duration>>,
+    }
+
+    impl Clock for SharedVirtualClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+        fn sleep(&self, dur: Duration) {
+            *self.now.lock().unwrap() += dur;
+            *self.slept.lock().unwrap() += dur;
+        }
+    }
+
+    /// Minimal connected BlockingFifo backend: accepts writes, empty estimator.
+    struct FakeBlockingBackend {
+        caps: DacCapabilities,
+        estimator: SoftwareDecayEstimator,
+    }
+
+    impl DacBackend for FakeBlockingBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("FakeBlocking".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn stop(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, _open: bool) -> DacResult<()> {
+            Ok(())
+        }
+    }
+
+    impl FifoBackend for FakeBlockingBackend {
+        fn try_write_points(
+            &mut self,
+            _pps: u32,
+            _points: &[LaserPoint],
+        ) -> DacResult<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
+    }
+
+    /// Fifo source that never produces content and reports `is_ended` after a
+    /// fixed number of driver iterations, so `driver::run` terminates cleanly
+    /// with `ProducerEnded`. (`is_ended` takes `&self`, so the poll counter uses
+    /// a `Cell`.)
+    struct EndAfter {
+        polls: Cell<usize>,
+        limit: usize,
+        empty: Vec<LaserPoint>,
+    }
+
+    impl FifoContentSource for EndAfter {
+        fn produce_chunk(&mut self, _target: usize, _pps: u32, _armed: bool) -> &[LaserPoint] {
+            &self.empty
+        }
+        fn cached_slice(&self) -> Option<&[LaserPoint]> {
+            None
+        }
+        fn commit_written(&mut self, _n: usize, _armed: bool) {}
+        fn discard_cached(&mut self) {}
+        fn reserve_buf(&mut self, _n: usize) {}
+        fn on_reconnect(&mut self, _info: &DacInfo) {}
+        fn is_ended(&self) -> bool {
+            let n = self.polls.get() + 1;
+            self.polls.set(n);
+            n >= self.limit
+        }
+    }
+
+    #[test]
+    fn driver_run_paces_deterministically_under_virtual_clock() {
+        const IDLE_STEPS: usize = 3;
+        // BlockingFifo idles disarmed via `sleep_with_control_check(IDLE_SLEEP)`;
+        // IDLE_SLEEP is 2ms, so each idle iteration advances the virtual clock
+        // by exactly 2ms.
+        const IDLE_SLEEP: Duration = Duration::from_millis(2);
+
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let slept = Arc::new(Mutex::new(Duration::ZERO));
+        let clock = SharedVirtualClock {
+            now: Arc::clone(&now),
+            slept: Arc::clone(&slept),
+        };
+
+        let backend = BackendKind::Fifo(Box::new(FakeBlockingBackend {
+            caps: DacCapabilities {
+                pps_min: 1,
+                pps_max: 35_000,
+                max_points_per_chunk: 4096,
+                output_model: OutputModel::BlockingFifo,
+            },
+            estimator: SoftwareDecayEstimator::new(),
+        }));
+
+        let source = SourceOwned::Fifo(Box::new(EndAfter {
+            polls: Cell::new(0),
+            limit: IDLE_STEPS,
+            empty: Vec::new(),
+        }));
+
+        let (tx, control_rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, 30_000); // disarmed by default
+        let metrics = FrameSessionMetrics::new(true);
+
+        let inputs = DriverInputs {
+            backend,
+            source,
+            control,
+            control_rx,
+            metrics,
+            reconnect_policy: None,
+            validator: Box::new(|_: &DacInfo, _: &BackendKind, _: u32| Ok(())),
+            error_sink: Box::new(|_: Error| {}),
+            target_buffer: Duration::from_millis(20),
+            drain_timeout: Duration::ZERO,
+            pending_frame: None,
+            clock: Box::new(clock),
+        };
+
+        let wall_start = Instant::now();
+        let exit = driver::run(inputs).expect("driver::run should exit cleanly");
+        let wall_elapsed = wall_start.elapsed();
+
+        assert_eq!(
+            exit,
+            RunExit::ProducerEnded,
+            "source ended, so the driver should drain-and-blank then exit"
+        );
+        // The seam is realized: the loop's pacing ran entirely on virtual time.
+        assert_eq!(
+            *slept.lock().unwrap(),
+            IDLE_SLEEP * IDLE_STEPS as u32,
+            "each of the {IDLE_STEPS} idle iterations must advance the virtual \
+             clock by exactly one IDLE_SLEEP"
+        );
+        // And it cost effectively no real wall-clock time (no real sleeps).
+        assert!(
+            wall_elapsed < Duration::from_millis(500),
+            "virtual-clock pacing must not block on the real clock, took {wall_elapsed:?}"
+        );
+    }
 }

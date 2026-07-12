@@ -192,7 +192,9 @@ mod tests {
     use crate::point::LaserPoint;
     use crate::presentation::content_source::{ContentSourceKind, FifoContentSource};
     use crate::presentation::engine::PresentationEngine;
-    use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
+    use crate::presentation::output_model::{
+        drain_via_estimator, LoopCtx, OutputModelAdapter, StepOutcome, SystemClock,
+    };
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
@@ -205,7 +207,7 @@ mod tests {
         caps: DacCapabilities,
         writes: Arc<Mutex<Vec<Vec<LaserPoint>>>>,
         resets: Arc<AtomicUsize>,
-        estimator: SoftwareDecayEstimator,
+        estimator: Box<dyn BufferEstimator>,
     }
 
     impl DacBackend for FakeBlockingFifo {
@@ -242,7 +244,7 @@ mod tests {
             Ok(WriteOutcome::Written)
         }
         fn estimator(&self) -> &dyn BufferEstimator {
-            &self.estimator
+            &*self.estimator
         }
         fn reset_device_buffer(&mut self) -> DacResult<()> {
             self.resets.fetch_add(1, Ordering::SeqCst);
@@ -286,7 +288,7 @@ mod tests {
                 caps: caps(),
                 writes: Arc::clone(&writes),
                 resets: Arc::clone(&resets),
-                estimator: SoftwareDecayEstimator::new(),
+                estimator: Box::new(SoftwareDecayEstimator::new()),
             };
             let backend = BackendKind::Fifo(Box::new(backend));
             let adapter = BlockingFifoAdapter::new(&backend);
@@ -325,6 +327,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed,
+                clock: &SystemClock,
             };
             self.adapter.step(&mut ctx)
         }
@@ -342,6 +345,7 @@ mod tests {
                 target_buffer: std::time::Duration::from_millis(20),
                 pps: 30_000,
                 is_armed: true,
+                clock: &SystemClock,
             };
             self.adapter.drain_and_blank(&mut ctx, timeout);
         }
@@ -403,6 +407,82 @@ mod tests {
         assert!(
             h.resets.load(Ordering::SeqCst) > before,
             "ring must be cleared before the trailing blank write so it can't wedge"
+        );
+    }
+
+    /// Estimator that records the `pps` it is polled at and always reports the
+    /// queue empty, so the drain loop polls exactly once and exits immediately.
+    struct CapturingEstimator {
+        queried_pps: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl BufferEstimator for CapturingEstimator {
+        fn estimated_fullness(&self, _now: std::time::Instant, pps: u32) -> u64 {
+            self.queried_pps.lock().unwrap().push(pps);
+            0
+        }
+    }
+
+    /// Regression (audit finding #2): when the configured `pps` exceeds the
+    /// connected device's real max, `write_frame` clamps the programmed rate and
+    /// `record_send` anchors the estimator at that *effective* (clamped) rate.
+    /// The drain poll must read the estimator at the SAME clamped rate — reading
+    /// at the unclamped configured `pps` decays the software model faster than
+    /// the hardware and blanks the tail of the final frame early.
+    #[test]
+    fn drain_via_estimator_polls_at_device_clamped_rate() {
+        const DEVICE_MAX: u32 = 30_000; // connected device's real max_dac_rate
+        const CONFIGURED_PPS: u32 = 33_000; // survived pre-connect validation
+
+        let queried_pps = Arc::new(Mutex::new(Vec::new()));
+        let mut device_caps = caps();
+        device_caps.pps_max = DEVICE_MAX;
+        let backend = FakeBlockingFifo {
+            caps: device_caps,
+            writes: Arc::new(Mutex::new(Vec::new())),
+            resets: Arc::new(AtomicUsize::new(0)),
+            estimator: Box::new(CapturingEstimator {
+                queried_pps: Arc::clone(&queried_pps),
+            }),
+        };
+        let mut backend = BackendKind::Fifo(Box::new(backend));
+
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        engine.set_pending(frame_with_points(64));
+        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, std::time::Duration::ZERO, CONFIGURED_PPS);
+        let metrics = FrameSessionMetrics::new(true);
+        let mut shutter = true;
+
+        let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+        let mut ctx = LoopCtx {
+            backend: &mut backend,
+            source,
+            control: &control,
+            control_rx: &rx,
+            metrics: &metrics,
+            shutter_open: &mut shutter,
+            error_sink: &mut |_| {},
+            target_buffer: std::time::Duration::from_millis(20),
+            pps: CONFIGURED_PPS,
+            is_armed: true,
+            clock: &SystemClock,
+        };
+        // Non-zero timeout so the drain loop actually polls the estimator.
+        drain_via_estimator(&mut ctx, std::time::Duration::from_secs(1));
+
+        let polled = queried_pps.lock().unwrap();
+        assert!(
+            !polled.is_empty(),
+            "drain must poll the estimator at least once"
+        );
+        assert!(
+            polled.iter().all(|&p| p == DEVICE_MAX),
+            "drain must poll at the device-clamped rate {DEVICE_MAX}, not the \
+             configured {CONFIGURED_PPS}; got {polled:?}"
         );
     }
 }

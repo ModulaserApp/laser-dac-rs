@@ -8,11 +8,21 @@ if [ -n "$STAGED" ]; then
     echo "$STAGED" | xargs git add
 fi
 
-# Run validation on any Rust changes
+# Run validation on any Rust changes. Use --all-features so feature-gated code
+# (e.g. the `receiver`/`testutils` integration tests) is compiled locally just
+# like CI does — otherwise a plain default-feature check silently skips it and
+# the breakage only surfaces on CI.
 if [ -n "$STAGED" ]; then
     echo "Running cargo check..."
-    cargo check --all-targets || exit 1
+    cargo check --all-features --all-targets || exit 1
 
     echo "Running cargo clippy..."
-    cargo clippy --all-targets -- -D warnings || exit 1
+    cargo clippy --all-features --all-targets -- -D warnings || exit 1
+
+    # Mirror CI's `doc` job, which runs `cargo doc --all-features --no-deps`
+    # with RUSTDOCFLAGS="-D warnings" so a broken intra-doc link is fatal.
+    # A cargo alias can't set env vars, so set it here to catch doc breakage
+    # locally instead of only on CI.
+    echo "Running cargo doc..."
+    RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps || exit 1
 fi

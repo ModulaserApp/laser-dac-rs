@@ -178,7 +178,9 @@ mod tests {
     use crate::point::LaserPoint;
     use crate::presentation::content_source::{ContentSourceKind, FifoContentSource};
     use crate::presentation::engine::PresentationEngine;
-    use crate::presentation::output_model::{LoopCtx, OutputModelAdapter, StepOutcome};
+    use crate::presentation::output_model::{
+        FakeClock, LoopCtx, OutputModelAdapter, StepOutcome, SystemClock,
+    };
     use crate::presentation::session::FrameSessionMetrics;
     use crate::presentation::slice_pipeline::SlicePipeline;
     use crate::presentation::{Frame, TransitionPlan};
@@ -300,6 +302,7 @@ mod tests {
                 target_buffer: Duration::from_millis(20),
                 pps: PPS,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -349,6 +352,7 @@ mod tests {
                 target_buffer: Duration::from_millis(20),
                 pps: PPS,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
         }
@@ -400,6 +404,7 @@ mod tests {
                 target_buffer: Duration::from_millis(20),
                 pps: PPS,
                 is_armed: true,
+                clock: &SystemClock,
             };
             assert!(matches!(adapter.step(&mut ctx), StepOutcome::Stopped));
         }
@@ -409,5 +414,271 @@ mod tests {
             &[false],
             "exactly one set_shutter(false) from the Disarm"
         );
+    }
+
+    /// `on_reconnect` must adopt the reconnected device's `max_points_per_chunk`
+    /// so the next write is clamped to the new (smaller) capacity.
+    #[test]
+    fn on_reconnect_updates_max_points() {
+        use crate::device::{DacInfo, DacType};
+        const PPS: u32 = 30_000;
+
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        engine.set_pending(frame_with_points(2_000));
+        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeFifo {
+            caps: caps(4_096),
+            always_block: false,
+            writes: Arc::clone(&writes),
+            shutter_calls: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(), // empty → large deficit
+        };
+        let mut backend = BackendKind::Fifo(Box::new(backend));
+        let mut adapter = NetworkFifoAdapter::new(&backend); // max_points = 4096
+
+        // Reconnect to a device advertising a much smaller chunk capacity.
+        let info = DacInfo {
+            id: "fakefifo:reconnect".to_string(),
+            name: "FakeFifo".to_string(),
+            kind: DacType::Custom("FakeFifo".to_string()),
+            caps: caps(3),
+        };
+        adapter.on_reconnect(&info, &mut backend);
+
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let metrics = FrameSessionMetrics::new(true);
+        let mut shutter = true;
+        {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+            let mut ctx = LoopCtx {
+                backend: &mut backend,
+                source,
+                control: &control,
+                control_rx: &rx,
+                metrics: &metrics,
+                shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: Duration::from_millis(20),
+                pps: PPS,
+                is_armed: true,
+                clock: &SystemClock,
+            };
+            assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
+        }
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 1, "one write after reconnect");
+        assert_eq!(
+            w[0], 3,
+            "write must be clamped to the reconnected device's max_points_per_chunk"
+        );
+    }
+
+    /// When the estimator reports more buffered than the target, the adapter
+    /// sleeps to let the queue drain and issues no write this step.
+    #[test]
+    fn buffered_above_target_sleeps_without_writing() {
+        const PPS: u32 = 30_000;
+        // 20ms target = 600 points. Anchor the send in the future so the
+        // estimator does not decay below the target during construction, then
+        // prefill to 800 → buffered above target.
+        let mut estimator = SoftwareDecayEstimator::new();
+        estimator.record_send(Instant::now() + Duration::from_secs(1), 800, PPS);
+
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        engine.set_pending(frame_with_points(2_000));
+        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeFifo {
+            caps: caps(4_096),
+            always_block: false,
+            writes: Arc::clone(&writes),
+            shutter_calls: Arc::new(Mutex::new(Vec::new())),
+            estimator,
+        };
+        let mut backend = BackendKind::Fifo(Box::new(backend));
+        let mut adapter = NetworkFifoAdapter::new(&backend);
+
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let metrics = FrameSessionMetrics::new(true);
+        let mut shutter = true;
+        {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+            let mut ctx = LoopCtx {
+                backend: &mut backend,
+                source,
+                control: &control,
+                control_rx: &rx,
+                metrics: &metrics,
+                shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: Duration::from_millis(20),
+                pps: PPS,
+                is_armed: true,
+                clock: &SystemClock,
+            };
+            assert!(matches!(adapter.step(&mut ctx), StepOutcome::Continue));
+        }
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "a buffer above target must not be topped up with a write"
+        );
+    }
+
+    /// `drain_and_blank` closes the shutter and emits a trailing blank chunk.
+    #[test]
+    fn drain_and_blank_closes_shutter_and_writes_blank() {
+        const PPS: u32 = 30_000;
+        let mut engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        engine.set_pending(frame_with_points(2_000));
+        let mut pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let shutter_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeFifo {
+            caps: caps(4_096),
+            always_block: false,
+            writes: Arc::clone(&writes),
+            shutter_calls: Arc::clone(&shutter_calls),
+            estimator: SoftwareDecayEstimator::new(),
+        };
+        let mut backend = BackendKind::Fifo(Box::new(backend));
+        let mut adapter = NetworkFifoAdapter::new(&backend);
+
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let metrics = FrameSessionMetrics::new(true);
+        let mut shutter = true;
+        {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+            let mut ctx = LoopCtx {
+                backend: &mut backend,
+                source,
+                control: &control,
+                control_rx: &rx,
+                metrics: &metrics,
+                shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: Duration::from_millis(20),
+                pps: PPS,
+                is_armed: true,
+                clock: &SystemClock,
+            };
+            // Zero timeout → drain is a no-op; only the blank-and-close runs.
+            adapter.drain_and_blank(&mut ctx, Duration::ZERO);
+        }
+        assert!(!shutter, "drain_and_blank must close the shutter");
+        assert_eq!(
+            shutter_calls.lock().unwrap().as_slice(),
+            &[false],
+            "exactly one set_shutter(false) from drain_and_blank"
+        );
+        let w = writes.lock().unwrap();
+        assert_eq!(w.len(), 1, "one trailing blank write");
+        assert_eq!(w[0], 16, "the trailing blank chunk is 16 points");
+    }
+
+    /// Build a minimal `LoopCtx`-ready scaffold (backend/source/control/metrics)
+    /// for exercising the pacing-sleep seam. Returns everything by value so the
+    /// caller can borrow it into a `LoopCtx` with whatever clock it wants.
+    fn sleep_scaffold() -> (
+        BackendKind,
+        SlicePipeline,
+        StreamControl,
+        mpsc::Receiver<ControlMsg>,
+        FrameSessionMetrics,
+    ) {
+        const PPS: u32 = 30_000;
+        let engine =
+            PresentationEngine::new(Box::new(|_, _| TransitionPlan::Transition(Vec::new())));
+        let pipeline = SlicePipeline::new(engine, 0, None, IdlePolicy::Blank, 0);
+        let backend = BackendKind::Fifo(Box::new(FakeFifo {
+            caps: caps(4_096),
+            always_block: false,
+            writes: Arc::new(Mutex::new(Vec::new())),
+            shutter_calls: Arc::new(Mutex::new(Vec::new())),
+            estimator: SoftwareDecayEstimator::new(),
+        }));
+        let (tx, rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, PPS);
+        let metrics = FrameSessionMetrics::new(true);
+        (backend, pipeline, control, rx, metrics)
+    }
+
+    /// The pacing sleep runs entirely on the injected clock: a 30s wait
+    /// completes with no wall-clock delay while virtual time advances the full
+    /// duration. This is the determinism the clock seam exists to enable.
+    #[test]
+    fn pacing_sleep_uses_injected_clock_not_wall_clock() {
+        let (mut backend, mut pipeline, control, rx, metrics) = sleep_scaffold();
+        let clock = FakeClock::new();
+        let mut shutter = true;
+
+        let wall_start = Instant::now();
+        {
+            let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+            let mut ctx = LoopCtx {
+                backend: &mut backend,
+                source,
+                control: &control,
+                control_rx: &rx,
+                metrics: &metrics,
+                shutter_open: &mut shutter,
+                error_sink: &mut |_| {},
+                target_buffer: Duration::from_millis(20),
+                pps: 30_000,
+                is_armed: true,
+                clock: &clock,
+            };
+            assert!(ctx
+                .sleep_with_control_check(Duration::from_secs(30))
+                .is_ok());
+        }
+
+        // No real time was spent (generous bound to avoid CI flakes)...
+        assert!(
+            wall_start.elapsed() < Duration::from_secs(1),
+            "sleep must not block on the wall clock"
+        );
+        // ...but virtual time advanced the full requested duration.
+        assert_eq!(clock.total_slept(), Duration::from_secs(30));
+    }
+
+    /// A stop requested before the wait returns `Stopped` promptly through the
+    /// injected clock, without real sleeping.
+    #[test]
+    fn pacing_sleep_returns_stopped_on_stop_request() {
+        let (mut backend, mut pipeline, control, rx, metrics) = sleep_scaffold();
+        let clock = FakeClock::new();
+        let mut shutter = true;
+        control.stop().unwrap();
+
+        let source = ContentSourceKind::Fifo(&mut pipeline as &mut dyn FifoContentSource);
+        let mut ctx = LoopCtx {
+            backend: &mut backend,
+            source,
+            control: &control,
+            control_rx: &rx,
+            metrics: &metrics,
+            shutter_open: &mut shutter,
+            error_sink: &mut |_| {},
+            target_buffer: Duration::from_millis(20),
+            pps: 30_000,
+            is_armed: true,
+            clock: &clock,
+        };
+        assert!(matches!(
+            ctx.sleep_with_control_check(Duration::from_secs(30)),
+            Err(StepOutcome::Stopped)
+        ));
+        // Returned on the first slice, not after the full 30s of virtual time.
+        assert!(clock.total_slept() < Duration::from_secs(1));
     }
 }

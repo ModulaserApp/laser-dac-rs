@@ -14,7 +14,7 @@ use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDevice
 use super::backend::LaserCubeNetworkBackend;
 use super::command;
 use super::profiles::ConnectionProfile;
-use super::protocol::{ALIVE_PORT, CMD_ALIVE, CMD_PORT};
+use super::protocol::{ALIVE_PORT, CMD_ALIVE, CMD_PORT, DATA_PORT};
 use super::status::LaserCubeNetworkStatus;
 use super::transport::AddressedDevice;
 
@@ -393,6 +393,8 @@ impl DiscoverDacs {
                 source_addr,
                 status,
                 profile,
+                cmd_port: CMD_PORT,
+                data_port: DATA_PORT,
             });
         }
     }

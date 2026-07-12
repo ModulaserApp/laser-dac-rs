@@ -45,6 +45,17 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - run: cargo test --all-features
 
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+      # macOS only brings up 127.0.0.1 by default (no 127.0.0.x aliases), and
+      # its socket/USB behavior differs from Linux. Running the suite here
+      # catches Darwin-specific regressions where many users actually run.
+      - run: cargo test --all-features
+
   doc:
     name: Documentation
     runs-on: ubuntu-latest

@@ -403,6 +403,33 @@ On **Linux** the crate links against the distro-packaged `libusb-1.0` (install v
 
 ## Development Tools
 
+### Running the tests
+
+CI always builds and tests with **all features enabled**. A plain `cargo test`
+uses only the default feature set, which silently compiles out feature-gated
+integration tests (for example `tests/receiver_server.rs` needs the `receiver`
+feature). To avoid "passes locally, fails on CI" surprises, use `--all-features`
+or the provided aliases, which mirror CI's blocking jobs:
+
+```bash
+cargo test-ci     # = cargo test --all-features                       (CI "test" job)
+cargo check-ci    # = cargo check --all-features --all-targets         (CI "check" job + --all-targets)
+cargo clippy-ci   # = cargo clippy --all-features --all-targets -- -D warnings  (CI "clippy" job + --all-targets)
+RUSTDOCFLAGS="-D warnings" cargo doc-ci   # = cargo doc --all-features --no-deps (CI "doc" job)
+```
+
+The `check-ci`/`clippy-ci` aliases add `--all-targets` (examples/tests/benches),
+which CI omits — that only makes the local check stricter. The `doc-ci` alias
+needs `RUSTDOCFLAGS="-D warnings"` set in the environment to match CI, because a
+cargo alias cannot set env vars.
+
+Enable the pre-commit hook with `git config core.hooksPath .githooks`. On staged
+`.rs` changes it runs `cargo fmt` and then the `check`, `clippy`, and `doc`
+checks above (all with `--all-features`, doc with `RUSTDOCFLAGS="-D warnings"`),
+matching CI's blocking jobs. It does **not** run the full `test` suite,
+`test-macos`, the `msrv` check, or the `feature-combinations` matrix — run those
+manually (or rely on CI) before merging.
+
 ### IDN Simulator
 
 The repository includes a debug simulator (in `tools/idn-simulator/`) that acts as a virtual IDN laser DAC. This is useful for testing and development without physical hardware.

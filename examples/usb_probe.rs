@@ -6,7 +6,10 @@
 use laser_dac::protocols::lasercube_usb::{DacController, Sample, Stream};
 use std::time::{Duration, Instant};
 
-type Ctx = laser_dac::protocols::lasercube_usb::rusb::Context;
+use laser_dac::protocols::lasercube_usb::rusb;
+/// `Stream` is now generic over the USB transport; the concrete production type
+/// is a stream over a real `rusb` device handle.
+type UsbStream = Stream<rusb::DeviceHandle<rusb::Context>>;
 
 fn blank_circle(n: usize) -> Vec<Sample> {
     (0..n)
@@ -46,12 +49,12 @@ impl Est {
     }
 }
 
-fn occupancy(stream: &mut Stream<Ctx>, cap: u32) -> u32 {
+fn occupancy(stream: &mut UsbStream, cap: u32) -> u32 {
     cap.saturating_sub(stream.ringbuffer_free_space().unwrap_or(cap))
 }
 
 /// Measure device consumption rate: fill, then watch drain slope via 0x8A.
-fn measure_drain(stream: &mut Stream<Ctx>, cap: u32, label: &str) {
+fn measure_drain(stream: &mut UsbStream, cap: u32, label: &str) {
     stream.clear_ringbuffer().unwrap();
     std::thread::sleep(Duration::from_millis(50));
     let fill = (cap.saturating_sub(200)).min(6000) as usize;

@@ -15,5 +15,8 @@ runs:
         components: rustfmt, clippy
     - uses: Swatinem/rust-cache@v2
     - name: Install system dependencies
+      # Linux-only: libudev/libasound are Linux libraries; macOS uses CoreAudio
+      # and its own USB stack, and has no apt-get.
+      if: runner.os == 'Linux'
       shell: bash
       run: sudo apt-get update && sudo apt-get install -y libudev-dev libusb-1.0-0-dev libasound2-dev

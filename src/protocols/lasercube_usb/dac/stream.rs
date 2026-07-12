@@ -11,17 +11,29 @@ use crate::protocols::lasercube_usb::protocol::{
     DATA_ALT_SETTING, DATA_INTERFACE, ENDPOINT_CONTROL_IN, ENDPOINT_CONTROL_OUT, ENDPOINT_DATA_OUT,
     RUNNER_MODE_SUB_ENABLE, RUNNER_MODE_SUB_RUN, SAMPLE_SIZE_BYTES,
 };
-use rusb::{DeviceHandle, UsbContext};
+use crate::protocols::usb_transfer::UsbEndpoints;
+use rusb::UsbContext;
 use std::time::Duration;
 
 /// Timeout for data endpoint transfers. Zero means infinite/blocking,
 /// matching the reference C implementation for natural backpressure.
 const DATA_TIMEOUT: Duration = Duration::ZERO;
 
+/// Default X flip. Matches the reference laserdocklib: flip X, not Y. Flipping
+/// both would mirror output relative to the reference.
+const DEFAULT_FLIP_X: bool = true;
+/// Default Y flip (see [`DEFAULT_FLIP_X`]).
+const DEFAULT_FLIP_Y: bool = false;
+
 /// A bidirectional USB communication stream with a LaserCube/LaserDock DAC.
-pub struct Stream<T: UsbContext> {
-    /// USB device handle for control operations.
-    handle: DeviceHandle<T>,
+///
+/// Generic over [`UsbEndpoints`] rather than a concrete `rusb` handle so the
+/// streaming logic (chunking, flip, rate clamp, control round-trips) can be
+/// exercised against a fake device in tests. Production code uses
+/// `Stream<rusb::DeviceHandle<rusb::Context>>`, built via [`Stream::open`].
+pub struct Stream<H: UsbEndpoints> {
+    /// USB endpoint transport (real `rusb::DeviceHandle` in production).
+    handle: H,
     /// Device information and status.
     info: DeviceInfo,
     /// Device initialization status.
@@ -34,28 +46,13 @@ pub struct Stream<T: UsbContext> {
     send_buffer: Vec<u8>,
 }
 
-impl<T: UsbContext> Stream<T> {
-    /// Clear any stuck runner mode state from a previous session.
-    ///
-    /// Sends the toggle sequence: enable(1), enable(0), run(1), run(0).
-    /// Errors are ignored since older firmware may not support this command.
-    fn clear_runner_mode(handle: &DeviceHandle<T>) {
-        let packets: [[u8; 3]; 4] = [
-            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 1],
-            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 0],
-            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 1],
-            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 0],
-        ];
-        let mut discard = [0u8; CONTROL_PACKET_SIZE];
-        for packet in &packets {
-            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, CONTROL_TIMEOUT);
-            let _ = handle.read_bulk(ENDPOINT_CONTROL_IN, &mut discard, CONTROL_TIMEOUT);
-        }
-    }
-
+impl<T: UsbContext> Stream<rusb::DeviceHandle<T>> {
     /// Open a stream to a LaserCube/LaserDock USB device.
     ///
-    /// This claims the necessary interfaces and initializes the device.
+    /// This claims the necessary interfaces and initializes the device. The
+    /// device-opening steps (`open`/`claim_interface`/`set_alternate_setting`)
+    /// are inherent to the concrete `rusb` handle, so this constructor stays
+    /// concrete; everything after it runs through the [`UsbEndpoints`] seam.
     pub fn open(device: rusb::Device<T>) -> Result<Self> {
         let handle = device.open()?;
 
@@ -73,10 +70,8 @@ impl<T: UsbContext> Stream<T> {
             handle,
             info: DeviceInfo::default(),
             status: DeviceStatus::Unknown,
-            // Match the reference laserdocklib defaults: flip X, do not flip Y.
-            // Flipping both vertically mirrors output relative to the reference.
-            flip_x: true,
-            flip_y: false,
+            flip_x: DEFAULT_FLIP_X,
+            flip_y: DEFAULT_FLIP_Y,
             send_buffer: Vec::new(),
         };
 
@@ -85,6 +80,26 @@ impl<T: UsbContext> Stream<T> {
         stream.status = DeviceStatus::Initialized;
 
         Ok(stream)
+    }
+}
+
+impl<H: UsbEndpoints> Stream<H> {
+    /// Clear any stuck runner mode state from a previous session.
+    ///
+    /// Sends the toggle sequence: enable(1), enable(0), run(1), run(0).
+    /// Errors are ignored since older firmware may not support this command.
+    fn clear_runner_mode(handle: &H) {
+        let packets: [[u8; 3]; 4] = [
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_ENABLE, 0],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 1],
+            [CMD_RUNNER_MODE, RUNNER_MODE_SUB_RUN, 0],
+        ];
+        let mut discard = [0u8; CONTROL_PACKET_SIZE];
+        for packet in &packets {
+            let _ = handle.write_bulk(ENDPOINT_CONTROL_OUT, packet, CONTROL_TIMEOUT);
+            let _ = handle.read_bulk(ENDPOINT_CONTROL_IN, &mut discard, CONTROL_TIMEOUT);
+        }
     }
 
     /// Refresh device information from the hardware.
@@ -195,19 +210,30 @@ impl<T: UsbContext> Stream<T> {
         Ok(())
     }
 
-    /// Write a frame of samples at the specified rate.
-    ///
-    /// The rate is clamped to the device's maximum DAC rate.
-    pub fn write_frame(&mut self, samples: &[Sample], rate: u32) -> Result<()> {
-        let rate = if self.info.max_dac_rate > 0 {
+    /// The rate this stream would program the device to for a requested `rate`,
+    /// i.e. `rate` clamped to the device's maximum DAC rate. Returned by
+    /// [`Self::write_frame`] so callers can drive their buffer model at the same
+    /// rate the hardware actually runs, not the (possibly higher) requested one.
+    pub fn effective_rate(&self, rate: u32) -> u32 {
+        if self.info.max_dac_rate > 0 {
             rate.min(self.info.max_dac_rate)
         } else {
             rate
-        };
+        }
+    }
+
+    /// Write a frame of samples at the specified rate.
+    ///
+    /// The rate is clamped to the device's maximum DAC rate; the effective
+    /// (clamped) rate that was programmed is returned so the caller's buffer
+    /// estimate can track the real drain rate rather than the requested one.
+    pub fn write_frame(&mut self, samples: &[Sample], rate: u32) -> Result<u32> {
+        let rate = self.effective_rate(rate);
         if self.info.current_rate != rate {
             self.set_rate(rate)?;
         }
-        self.send_samples(samples)
+        self.send_samples(samples)?;
+        Ok(rate)
     }
 
     /// Stop output and clear the buffer.
@@ -308,7 +334,7 @@ impl<T: UsbContext> Stream<T> {
     ///
     /// Uses an infinite timeout so the transfer blocks until the device accepts
     /// the data, providing natural backpressure (matching the reference implementation).
-    fn send_data_to_endpoint(handle: &DeviceHandle<T>, data: &[u8]) -> Result<()> {
+    fn send_data_to_endpoint(handle: &H, data: &[u8]) -> Result<()> {
         let transferred = handle.write_bulk(ENDPOINT_DATA_OUT, data, DATA_TIMEOUT)?;
 
         if transferred != data.len() {
@@ -319,7 +345,7 @@ impl<T: UsbContext> Stream<T> {
     }
 }
 
-impl<T: UsbContext> Drop for Stream<T> {
+impl<H: UsbEndpoints> Drop for Stream<H> {
     fn drop(&mut self) {
         // Best effort to stop output when dropping
         let _ = self.stop();
@@ -327,5 +353,258 @@ impl<T: UsbContext> Drop for Stream<T> {
         // Release interfaces
         let _ = self.handle.release_interface(DATA_INTERFACE);
         let _ = self.handle.release_interface(CONTROL_INTERFACE);
+    }
+}
+
+#[cfg(test)]
+impl<H: UsbEndpoints> Stream<H> {
+    /// Build a stream over an arbitrary [`UsbEndpoints`] transport without
+    /// touching real hardware, for tests. Bypasses the `open()` init handshake;
+    /// callers supply the [`DeviceInfo`] the device would have reported.
+    pub(crate) fn from_parts(
+        handle: H,
+        info: DeviceInfo,
+        status: DeviceStatus,
+        flip_x: bool,
+        flip_y: bool,
+    ) -> Self {
+        Stream {
+            handle,
+            info,
+            status,
+            flip_x,
+            flip_y,
+            send_buffer: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocols::lasercube_usb::protocol::MAX_COORDINATE_VALUE;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// Fake USB endpoint transport that records every write and scripts control
+    /// reads, so `Stream` can be driven without hardware — the USB analogue of
+    /// the network transport's `FakeSocket`.
+    #[derive(Clone, Default)]
+    struct FakeUsb {
+        inner: Arc<Mutex<FakeInner>>,
+    }
+
+    #[derive(Default)]
+    struct FakeInner {
+        /// Every `write_bulk`, recorded as `(endpoint, bytes)`.
+        writes: Vec<(u8, Vec<u8>)>,
+        /// Scripted responses for `ENDPOINT_CONTROL_IN` reads. When empty, a
+        /// zeroed 64-byte buffer is returned (a valid "status OK, value 0").
+        control_reads: VecDeque<[u8; CONTROL_PACKET_SIZE]>,
+        /// If set, the next data-endpoint write reports this many bytes instead
+        /// of the full length (forces a short-write error).
+        short_data_write: Option<usize>,
+    }
+
+    impl FakeUsb {
+        fn writes_to(&self, endpoint: u8) -> Vec<Vec<u8>> {
+            self.inner
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .filter(|(ep, _)| *ep == endpoint)
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+    }
+
+    impl UsbEndpoints for FakeUsb {
+        fn write_bulk(&self, endpoint: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.writes.push((endpoint, buf.to_vec()));
+            if endpoint == ENDPOINT_DATA_OUT {
+                if let Some(n) = inner.short_data_write.take() {
+                    return Ok(n);
+                }
+            }
+            Ok(buf.len())
+        }
+
+        fn read_bulk(&self, endpoint: u8, buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
+            if endpoint == ENDPOINT_CONTROL_IN {
+                let resp = self
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .control_reads
+                    .pop_front()
+                    .unwrap_or([0u8; CONTROL_PACKET_SIZE]);
+                let n = buf.len().min(CONTROL_PACKET_SIZE);
+                buf[..n].copy_from_slice(&resp[..n]);
+                return Ok(CONTROL_PACKET_SIZE);
+            }
+            Ok(0)
+        }
+
+        fn write_interrupt(&self, _e: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
+            Ok(buf.len())
+        }
+        fn read_interrupt(&self, _e: u8, _buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
+            Ok(0)
+        }
+        fn clear_halt(&self, _e: u8) -> rusb::Result<()> {
+            Ok(())
+        }
+        fn release_interface(&self, _i: u8) -> rusb::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn info_with(
+        bulk_packet_sample_count: u32,
+        max_dac_rate: u32,
+        current_rate: u32,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            bulk_packet_sample_count,
+            max_dac_rate,
+            current_rate,
+            ..DeviceInfo::default()
+        }
+    }
+
+    /// Build an Initialized stream over a fresh `FakeUsb`, returning both.
+    fn init_stream(info: DeviceInfo) -> (Stream<FakeUsb>, FakeUsb) {
+        let fake = FakeUsb::default();
+        let stream = Stream::from_parts(
+            fake.clone(),
+            info,
+            DeviceStatus::Initialized,
+            DEFAULT_FLIP_X,
+            DEFAULT_FLIP_Y,
+        );
+        (stream, fake)
+    }
+
+    fn sample_at(x: u16, y: u16) -> Sample {
+        Sample::new(x, y, 10, 20, 30)
+    }
+
+    #[test]
+    fn send_samples_chunks_by_bulk_packet_sample_count() {
+        // 64 samples/packet => 512-byte chunks. 512 samples => exactly 8 chunks.
+        let (mut stream, fake) = init_stream(info_with(64, 0, 0));
+        let samples: Vec<Sample> = (0..512).map(|i| sample_at(i % 4095, 0)).collect();
+        stream.send_samples(&samples).unwrap();
+
+        let data = fake.writes_to(ENDPOINT_DATA_OUT);
+        assert_eq!(data.len(), 8, "expected 8 chunks");
+        assert!(data.iter().all(|c| c.len() == 512), "each chunk 512 bytes");
+    }
+
+    #[test]
+    fn send_samples_chunks_with_remainder() {
+        // 100 samples * 8 bytes = 800 bytes => 512 + 288.
+        let (mut stream, fake) = init_stream(info_with(64, 0, 0));
+        let samples: Vec<Sample> = (0..100).map(|_| sample_at(0, 0)).collect();
+        stream.send_samples(&samples).unwrap();
+
+        let sizes: Vec<usize> = fake
+            .writes_to(ENDPOINT_DATA_OUT)
+            .iter()
+            .map(Vec::len)
+            .collect();
+        assert_eq!(sizes, vec![512, 288]);
+    }
+
+    #[test]
+    fn send_samples_zero_packet_count_sends_single_transfer() {
+        // Fallback: a device reporting bulk_packet_sample_count == 0 gets one
+        // transfer of the whole buffer rather than a divide-by-zero chunk size.
+        let (mut stream, fake) = init_stream(info_with(0, 0, 0));
+        let samples: Vec<Sample> = (0..10).map(|_| sample_at(0, 0)).collect();
+        stream.send_samples(&samples).unwrap();
+
+        let data = fake.writes_to(ENDPOINT_DATA_OUT);
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].len(), 80);
+    }
+
+    #[test]
+    fn send_samples_applies_flip_x_not_flip_y() {
+        // `init_stream` builds with DEFAULT_FLIP_X/DEFAULT_FLIP_Y, so this also
+        // pins the reference-matching defaults: a silent flip regression fails.
+        let (mut stream, fake) = init_stream(info_with(64, 0, 0));
+        stream.send_samples(&[sample_at(1000, 3000)]).unwrap();
+
+        let data = fake.writes_to(ENDPOINT_DATA_OUT);
+        let bytes = &data[0];
+        let x = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let y = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(x, MAX_COORDINATE_VALUE - 1000, "x flipped");
+        assert_eq!(y, 3000, "y not flipped");
+    }
+
+    #[test]
+    fn send_samples_requires_initialized_status() {
+        let fake = FakeUsb::default();
+        let mut stream = Stream::from_parts(
+            fake,
+            info_with(64, 0, 0),
+            DeviceStatus::Unknown,
+            DEFAULT_FLIP_X,
+            DEFAULT_FLIP_Y,
+        );
+        assert!(matches!(
+            stream.send_samples(&[sample_at(0, 0)]),
+            Err(Error::DeviceNotOpened)
+        ));
+    }
+
+    #[test]
+    fn send_samples_short_write_is_io_error() {
+        let (mut stream, fake) = init_stream(info_with(64, 0, 0));
+        fake.inner.lock().unwrap().short_data_write = Some(4);
+        assert!(matches!(
+            stream.send_samples(&[sample_at(0, 0)]),
+            Err(Error::Usb(rusb::Error::Io))
+        ));
+    }
+
+    #[test]
+    fn write_frame_clamps_rate_and_reports_effective_rate() {
+        // The regression guard for the estimator/clamp divergence: a request
+        // above the device max is clamped on the wire AND the clamped value is
+        // returned so the caller drives its buffer model at the real rate.
+        let (mut stream, fake) = init_stream(info_with(64, 30_000, 0));
+        let effective = stream.write_frame(&[], 40_000).unwrap();
+        assert_eq!(effective, 30_000, "returned rate is clamped");
+
+        let ctrl = fake.writes_to(ENDPOINT_CONTROL_OUT);
+        let set_rate = ctrl
+            .iter()
+            .find(|p| p.first() == Some(&CMD_SET_DAC_RATE))
+            .expect("SET_DAC_RATE issued");
+        let programmed = u32::from_le_bytes([set_rate[1], set_rate[2], set_rate[3], set_rate[4]]);
+        assert_eq!(programmed, 30_000, "device programmed to clamped rate");
+    }
+
+    #[test]
+    fn write_frame_does_not_clamp_when_max_rate_unknown() {
+        let (mut stream, _fake) = init_stream(info_with(64, 0, 0));
+        assert_eq!(stream.write_frame(&[], 40_000).unwrap(), 40_000);
+    }
+
+    #[test]
+    fn write_frame_skips_set_rate_when_unchanged() {
+        let (mut stream, fake) = init_stream(info_with(64, 30_000, 30_000));
+        stream.write_frame(&[], 30_000).unwrap();
+        assert!(
+            fake.writes_to(ENDPOINT_CONTROL_OUT)
+                .iter()
+                .all(|p| p.first() != Some(&CMD_SET_DAC_RATE)),
+            "no SET_DAC_RATE when already at target"
+        );
     }
 }

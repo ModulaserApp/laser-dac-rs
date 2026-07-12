@@ -48,11 +48,30 @@ pub struct AddressedDevice {
     pub source_addr: SocketAddr,
     pub status: LaserCubeNetworkStatus,
     pub profile: ConnectionProfile,
+    /// UDP port the device listens on for commands. Production devices use the
+    /// fixed [`super::protocol::CMD_PORT`]; kept configurable so tests can bind
+    /// an ephemeral port on `127.0.0.1` instead of the fixed port on a loopback
+    /// alias (which is unavailable on macOS, where only `127.0.0.1` is up).
+    pub cmd_port: u16,
+    /// UDP port the device listens on for sample data. Production devices use
+    /// the fixed [`super::protocol::DATA_PORT`]; configurable for the same
+    /// reason as [`Self::cmd_port`].
+    pub data_port: u16,
 }
 
 impl AddressedDevice {
     pub fn ip(&self) -> IpAddr {
         self.source_addr.ip()
+    }
+
+    /// Socket address to send commands to.
+    pub fn cmd_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.ip(), self.cmd_port)
+    }
+
+    /// Socket address to send sample data to.
+    pub fn data_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.ip(), self.data_port)
     }
 }
 
