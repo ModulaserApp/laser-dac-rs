@@ -31,6 +31,43 @@ pub trait UsbEndpoints {
     fn release_interface(&self, iface: u8) -> rusb::Result<()>;
 }
 
+/// Forward `UsbEndpoints` through a boxed trait object so a struct can hold
+/// `HeliosComm<Box<dyn UsbEndpoints + Send>>` (the concrete `rusb` handle in
+/// production, a fake in tests) behind a single non-generic type. The `+ Send`
+/// keeps the enclosing DAC `Send`, as the backend trait requires. The trait is
+/// object-safe — every method takes `&self` and only concrete argument/return
+/// types — so this blanket impl needs no changes to the trait itself.
+impl UsbEndpoints for Box<dyn UsbEndpoints + Send> {
+    fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> rusb::Result<usize> {
+        (**self).write_bulk(endpoint, buf, timeout)
+    }
+
+    fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> rusb::Result<usize> {
+        (**self).read_bulk(endpoint, buf, timeout)
+    }
+
+    fn write_interrupt(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> rusb::Result<usize> {
+        (**self).write_interrupt(endpoint, buf, timeout)
+    }
+
+    fn read_interrupt(
+        &self,
+        endpoint: u8,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> rusb::Result<usize> {
+        (**self).read_interrupt(endpoint, buf, timeout)
+    }
+
+    fn clear_halt(&self, endpoint: u8) -> rusb::Result<()> {
+        (**self).clear_halt(endpoint)
+    }
+
+    fn release_interface(&self, iface: u8) -> rusb::Result<()> {
+        (**self).release_interface(iface)
+    }
+}
+
 impl<T: rusb::UsbContext> UsbEndpoints for rusb::DeviceHandle<T> {
     fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> rusb::Result<usize> {
         rusb::DeviceHandle::write_bulk(self, endpoint, buf, timeout)

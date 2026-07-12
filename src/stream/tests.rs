@@ -831,30 +831,45 @@ fn test_fill_result_filled_writes_points_and_updates_state() {
 
 #[test]
 fn test_fill_result_filled_updates_last_chunk_when_armed() {
-    // Test that Filled(n) updates last_chunk for RepeatLast policy when armed
-    let cfg = StreamConfig::new(30000).with_idle_policy(IdlePolicy::RepeatLast);
-    let stream = make_test_stream_with_cfg(TestBackend::new(), cfg);
+    // A Filled chunk must populate `last_chunk` so a later Starved chunk under
+    // RepeatLast replays those exact point VALUES. This asserts the reused
+    // values reach the backend (via `TestBackend::received`) — stronger than
+    // the count-only `test_fill_result_starved_repeat_last_with_stored_chunk`.
+    // If last_chunk were NOT updated, the Starved chunk would fall back to
+    // blanks and the sentinel would appear only once.
+    const SENTINEL: (u16, u16, u16, u16) = (10000, 20000, 30000, 40000);
 
-    // Arm the stream so last_chunk gets updated
-    let control = stream.control();
-    control.arm().unwrap();
+    let backend = TestBackend::new();
+    let received = backend.received();
+    let cfg = StreamConfig::new(30000)
+        .with_idle_policy(IdlePolicy::RepeatLast)
+        // Disable startup blanking so the sentinel isn't masked at stream start.
+        .with_startup_blank(Duration::ZERO);
+    let stream = make_test_stream_with_cfg(backend, cfg);
+    stream.control().arm().unwrap();
 
+    // Count how many sentinel points the PRODUCER actually emitted (one chunk).
+    // The replay is byte-identical, so we can't tell chunks apart by value —
+    // instead we prove the backend received MORE sentinels than the producer
+    // ever wrote, which can only come from RepeatLast reusing last_chunk.
+    let produced = Arc::new(AtomicUsize::new(0));
+    let produced_c = produced.clone();
     let call_count = Arc::new(AtomicUsize::new(0));
     let call_count_clone = call_count.clone();
 
     let result = stream.run(
         move |req, buffer| {
             let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
-
             if count == 0 {
-                // Write specific points that we can verify later
-                let n = req.target_points.min(10);
+                // Fill the whole chunk with a distinctive lit sentinel.
+                let n = req.target_points.min(buffer.len());
                 for pt in buffer.iter_mut().take(n) {
-                    *pt = LaserPoint::new(0.5, 0.5, 10000, 20000, 30000, 40000);
+                    *pt = LaserPoint::new(0.5, 0.5, SENTINEL.0, SENTINEL.1, SENTINEL.2, SENTINEL.3);
                 }
+                produced_c.fetch_add(n, Ordering::SeqCst);
                 ChunkResult::Filled(n)
             } else if count == 1 {
-                // Return Starved to trigger RepeatLast
+                // Starve: RepeatLast must replay the stored last_chunk.
                 ChunkResult::Starved
             } else {
                 ChunkResult::End
@@ -864,8 +879,24 @@ fn test_fill_result_filled_updates_last_chunk_when_armed() {
     );
 
     assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-    // If last_chunk wasn't updated, the Starved would have outputted blanks
-    // The test passes if no assertion fails - the RepeatLast policy used the stored chunk
+
+    let produced = produced.load(Ordering::SeqCst);
+    let pts = received.lock().unwrap();
+    let total_sentinels = pts
+        .iter()
+        .filter(|p| (p.r, p.g, p.b, p.intensity) == SENTINEL)
+        .count();
+    assert!(
+        produced > 0,
+        "the producer must have emitted a Filled chunk"
+    );
+    assert!(
+        total_sentinels > produced,
+        "RepeatLast must replay the stored last_chunk values: producer wrote \
+         {produced} sentinel points but the backend received {total_sentinels} \
+         — the extra points can only come from replaying last_chunk on the \
+         Starved chunk (a non-updated last_chunk would emit blanks)"
+    );
 }
 
 #[test]
@@ -1262,40 +1293,6 @@ fn test_full_stream_lifecycle_into_dac_recovery() {
     // Note: into_dac() would be tested here, but run consumes the stream
     // and doesn't return it. The into_dac pattern is for the blocking API.
     // This test verifies the stream lifecycle completes cleanly.
-}
-
-#[test]
-fn test_stream_stats_tracking() {
-    // Test that stream statistics are tracked correctly
-    let stream = make_test_stream(TestBackend::new());
-
-    // Arm the stream
-    let control = stream.control();
-    control.arm().unwrap();
-
-    let call_count = Arc::new(AtomicUsize::new(0));
-    let call_count_clone = call_count.clone();
-    let points_per_call = 50;
-
-    let result = stream.run(
-        move |req, buffer| {
-            let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
-            if count < 3 {
-                let n = req.target_points.min(buffer.len()).min(points_per_call);
-                for pt in buffer.iter_mut().take(n) {
-                    *pt = LaserPoint::blanked(0.0, 0.0);
-                }
-                ChunkResult::Filled(n)
-            } else {
-                ChunkResult::End
-            }
-        },
-        |_e| {},
-    );
-
-    assert_eq!(result.unwrap(), RunExit::ProducerEnded);
-    // Stats tracking is verified by the successful completion
-    // Detailed stats assertions would require access to stream after run
 }
 
 #[test]

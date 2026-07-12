@@ -18,4 +18,11 @@ if [ -n "$STAGED" ]; then
 
     echo "Running cargo clippy..."
     cargo clippy --all-features --all-targets -- -D warnings || exit 1
+
+    # Mirror CI's `doc` job, which runs `cargo doc --all-features --no-deps`
+    # with RUSTDOCFLAGS="-D warnings" so a broken intra-doc link is fatal.
+    # A cargo alias can't set env vars, so set it here to catch doc breakage
+    # locally instead of only on CI.
+    echo "Running cargo doc..."
+    RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps || exit 1
 fi

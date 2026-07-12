@@ -76,10 +76,11 @@ impl HeliosDacController {
 ///
 /// Owns the USB handle and every request/response operation the device path
 /// uses: bulk frame writes (with STALL/`clear_halt` recovery and short-write
-/// detection), interrupt control round-trips, and the init firmware probe. In
-/// production it is `HeliosComm<rusb::DeviceHandle<Context>>`; tests inject a
-/// fake `UsbEndpoints` to exercise this logic without hardware — the USB
-/// analogue of the LaserCube stream's fake device.
+/// detection), interrupt control round-trips, and the init firmware probe. When
+/// stored in an open [`HeliosDac`] it is boxed as
+/// `HeliosComm<Box<dyn UsbEndpoints + Send>>` (the concrete `rusb::DeviceHandle`
+/// in production); tests inject a fake `UsbEndpoints` to exercise this logic
+/// without hardware — the USB analogue of the LaserCube stream's fake device.
 struct HeliosComm<H: UsbEndpoints> {
     /// USB endpoint transport (real `rusb::DeviceHandle` in production).
     handle: H,
@@ -327,9 +328,16 @@ pub enum HeliosDac {
     /// `HeliosComm` methods are private.
     #[allow(private_interfaces)]
     Open {
-        device: rusb::Device<rusb::Context>,
-        /// USB transfer engine bound to the open handle.
-        comm: HeliosComm<rusb::DeviceHandle<rusb::Context>>,
+        /// Physical USB device backing this handle. Always `Some` in production
+        /// (set by [`open`](Self::open)); `None` only for a test-injected DAC
+        /// built over a fake [`UsbEndpoints`], which has no real `rusb::Device`.
+        device: Option<rusb::Device<rusb::Context>>,
+        /// USB transfer engine bound to the open handle. Boxed behind
+        /// `dyn UsbEndpoints + Send` so the same variant can carry the real
+        /// `rusb` handle in production or a fake transport in tests, without
+        /// leaking a type parameter into the public `HeliosDac` surface. The
+        /// `+ Send` keeps `HeliosDac` `Send`, which the backend trait requires.
+        comm: HeliosComm<Box<dyn UsbEndpoints + Send>>,
     },
 }
 
@@ -351,8 +359,8 @@ impl HeliosDac {
 
                 std::thread::sleep(INIT_SETTLE);
 
-                let mut comm = HeliosComm {
-                    handle,
+                let mut comm: HeliosComm<Box<dyn UsbEndpoints + Send>> = HeliosComm {
+                    handle: Box::new(handle),
                     firmware_version: None,
                 };
 
@@ -364,14 +372,17 @@ impl HeliosDac {
                 log::debug!("helios: connected, firmware version {fw}");
                 comm.send_sdk_version()?;
 
-                Ok(HeliosDac::Open { device, comm })
+                Ok(HeliosDac::Open {
+                    device: Some(device),
+                    comm,
+                })
             }
             open => Ok(open),
         }
     }
 
     /// Borrow the open transfer engine, or error if the device is not opened.
-    fn comm(&self) -> Result<&HeliosComm<rusb::DeviceHandle<rusb::Context>>> {
+    fn comm(&self) -> Result<&HeliosComm<Box<dyn UsbEndpoints + Send>>> {
         match self {
             HeliosDac::Open { comm, .. } => Ok(comm),
             _ => Err(HeliosDacError::DeviceNotOpened),
@@ -382,7 +393,13 @@ impl HeliosDac {
     /// the DAC stays on the same hub/port path.
     pub fn usb_location(&self) -> String {
         match self {
-            HeliosDac::Idle(device) | HeliosDac::Open { device, .. } => format_usb_location(device),
+            HeliosDac::Idle(device) => format_usb_location(device),
+            HeliosDac::Open {
+                device: Some(device),
+                ..
+            } => format_usb_location(device),
+            // Only a test-injected DAC (fake transport) has no real device.
+            HeliosDac::Open { device: None, .. } => "test:fake".to_string(),
         }
     }
 
@@ -399,7 +416,13 @@ impl HeliosDac {
     /// this process, where `claim_interface` fails before any transfer runs.
     pub(crate) fn read_name(&self) -> Result<String> {
         let device = match self {
-            HeliosDac::Idle(device) | HeliosDac::Open { device, .. } => device.clone(),
+            HeliosDac::Idle(device) => device.clone(),
+            HeliosDac::Open {
+                device: Some(device),
+                ..
+            } => device.clone(),
+            // A test-injected DAC has no real device to reopen for a name probe.
+            HeliosDac::Open { device: None, .. } => return Err(HeliosDacError::DeviceNotOpened),
         };
 
         let handle = device.open()?;
@@ -593,7 +616,163 @@ impl<H: UsbEndpoints> HeliosComm<H> {
 }
 
 #[cfg(test)]
+impl HeliosDac {
+    /// Build an `Open` DAC over an arbitrary [`UsbEndpoints`] transport (a fake
+    /// in tests), with no backing `rusb::Device`. Bypasses the `open()` init
+    /// handshake so the backend's public frame/status path can be exercised
+    /// end-to-end without hardware. The USB analogue of `Stream::from_parts`.
+    pub(crate) fn from_endpoints(
+        handle: impl UsbEndpoints + Send + 'static,
+        firmware_version: Option<u32>,
+    ) -> Self {
+        HeliosDac::Open {
+            device: None,
+            comm: HeliosComm {
+                handle: Box::new(handle),
+                firmware_version,
+            },
+        }
+    }
+}
+
+/// Shared test-only fake `UsbEndpoints` transport. Lives outside `mod tests` so
+/// both this module's comm tests and `backend.rs`'s integration tests drive the
+/// same fake through the seam (the finding requires one fake, not two).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::ENDPOINT_BULK_OUT;
+    use crate::protocols::usb_transfer::UsbEndpoints;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// A scripted outcome for a single write on a fake endpoint.
+    #[derive(Clone)]
+    pub(crate) enum WriteScript {
+        /// Report the full buffer length as transferred (success).
+        Full,
+        /// Report `n` bytes transferred (a short write).
+        Short(usize),
+        /// Fail the transfer with the given `rusb` error.
+        Err(rusb::Error),
+    }
+
+    impl WriteScript {
+        fn apply(&self, len: usize) -> rusb::Result<usize> {
+            match self {
+                WriteScript::Full => Ok(len),
+                WriteScript::Short(n) => Ok(*n),
+                WriteScript::Err(e) => Err(*e),
+            }
+        }
+    }
+
+    /// Fake USB endpoint transport for Helios: records every write and scripts
+    /// bulk-OUT / interrupt-OUT outcomes and interrupt-IN reads, so `HeliosComm`
+    /// (and, through it, `HeliosDac`/`HeliosBackend`) can be driven without
+    /// hardware. The USB analogue of the network transports' `FakeSocket`.
+    #[derive(Clone, Default)]
+    pub(crate) struct FakeUsb {
+        pub(crate) inner: Arc<Mutex<FakeInner>>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct FakeInner {
+        /// Every write, recorded as `(endpoint, bytes)`.
+        writes: Vec<(u8, Vec<u8>)>,
+        /// Scripted outcomes for bulk-OUT writes (front = next). Default: `Full`.
+        bulk_out: VecDeque<WriteScript>,
+        /// Scripted outcomes for interrupt-OUT writes (front = next). Default: `Full`.
+        int_out: VecDeque<WriteScript>,
+        /// Scripted interrupt-IN reads (front = next). Empty => `Err(Timeout)`,
+        /// which is what real hardware returns when nothing is pending (and what
+        /// terminates the drain loop).
+        pub(crate) int_in: VecDeque<rusb::Result<Vec<u8>>>,
+        /// Endpoints passed to `clear_halt`, in call order.
+        clear_halt_calls: Vec<u8>,
+    }
+
+    impl FakeUsb {
+        pub(crate) fn writes_to(&self, endpoint: u8) -> Vec<Vec<u8>> {
+            self.inner
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .filter(|(ep, _)| *ep == endpoint)
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+
+        /// Bytes written to the bulk-OUT (frame) endpoint, in order.
+        pub(crate) fn bulk_writes(&self) -> Vec<Vec<u8>> {
+            self.writes_to(ENDPOINT_BULK_OUT)
+        }
+
+        pub(crate) fn clear_halt_calls(&self) -> Vec<u8> {
+            self.inner.lock().unwrap().clear_halt_calls.clone()
+        }
+
+        pub(crate) fn script_bulk_out(&self, scripts: impl IntoIterator<Item = WriteScript>) {
+            self.inner.lock().unwrap().bulk_out.extend(scripts);
+        }
+
+        pub(crate) fn script_int_out(&self, scripts: impl IntoIterator<Item = WriteScript>) {
+            self.inner.lock().unwrap().int_out.extend(scripts);
+        }
+
+        pub(crate) fn script_int_in(&self, reads: impl IntoIterator<Item = rusb::Result<Vec<u8>>>) {
+            self.inner.lock().unwrap().int_in.extend(reads);
+        }
+    }
+
+    impl UsbEndpoints for FakeUsb {
+        fn write_bulk(&self, endpoint: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.writes.push((endpoint, buf.to_vec()));
+            let script = inner.bulk_out.pop_front().unwrap_or(WriteScript::Full);
+            script.apply(buf.len())
+        }
+
+        fn read_bulk(&self, _e: u8, _buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
+            Ok(0)
+        }
+
+        fn write_interrupt(&self, endpoint: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.writes.push((endpoint, buf.to_vec()));
+            let script = inner.int_out.pop_front().unwrap_or(WriteScript::Full);
+            script.apply(buf.len())
+        }
+
+        fn read_interrupt(&self, _e: u8, buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
+            let reply = self
+                .inner
+                .lock()
+                .unwrap()
+                .int_in
+                .pop_front()
+                // Nothing pending: mirror hardware and terminate the drain loop.
+                .unwrap_or(Err(rusb::Error::Timeout))?;
+            let n = reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&reply[..n]);
+            Ok(n)
+        }
+
+        fn clear_halt(&self, endpoint: u8) -> rusb::Result<()> {
+            self.inner.lock().unwrap().clear_halt_calls.push(endpoint);
+            Ok(())
+        }
+
+        fn release_interface(&self, _i: u8) -> rusb::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{FakeUsb, WriteScript};
     use super::*;
     use crate::protocols::helios::{Color, Coordinate, Point, WriteFrameFlags};
 
@@ -659,131 +838,11 @@ mod tests {
     // Fake-device comm tests
     //
     // These drive `HeliosComm` through the `UsbEndpoints` seam with a scripted
-    // fake, exercising the frame/control transfer logic (encode, STALL recovery,
-    // short-write detection, control parsing, firmware probe) without hardware —
-    // the paths that were previously hardware-only behind the `MockOpen` branch.
+    // fake (see `super::test_support`), exercising the frame/control transfer
+    // logic (encode, STALL recovery, short-write detection, control parsing,
+    // firmware probe) without hardware — the paths that were previously
+    // hardware-only behind the `MockOpen` branch.
     // =========================================================================
-
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    /// A scripted outcome for a single write on a fake endpoint.
-    #[derive(Clone)]
-    enum WriteScript {
-        /// Report the full buffer length as transferred (success).
-        Full,
-        /// Report `n` bytes transferred (a short write).
-        Short(usize),
-        /// Fail the transfer with the given `rusb` error.
-        Err(rusb::Error),
-    }
-
-    impl WriteScript {
-        fn apply(&self, len: usize) -> rusb::Result<usize> {
-            match self {
-                WriteScript::Full => Ok(len),
-                WriteScript::Short(n) => Ok(*n),
-                WriteScript::Err(e) => Err(*e),
-            }
-        }
-    }
-
-    /// Fake USB endpoint transport for Helios: records every write and scripts
-    /// bulk-OUT / interrupt-OUT outcomes and interrupt-IN reads, so `HeliosComm`
-    /// can be driven without hardware. The USB analogue of the network transports'
-    /// `FakeSocket`.
-    #[derive(Clone, Default)]
-    struct FakeUsb {
-        inner: Arc<Mutex<FakeInner>>,
-    }
-
-    #[derive(Default)]
-    struct FakeInner {
-        /// Every write, recorded as `(endpoint, bytes)`.
-        writes: Vec<(u8, Vec<u8>)>,
-        /// Scripted outcomes for bulk-OUT writes (front = next). Default: `Full`.
-        bulk_out: VecDeque<WriteScript>,
-        /// Scripted outcomes for interrupt-OUT writes (front = next). Default: `Full`.
-        int_out: VecDeque<WriteScript>,
-        /// Scripted interrupt-IN reads (front = next). Empty => `Err(Timeout)`,
-        /// which is what real hardware returns when nothing is pending (and what
-        /// terminates the drain loop).
-        int_in: VecDeque<rusb::Result<Vec<u8>>>,
-        /// Endpoints passed to `clear_halt`, in call order.
-        clear_halt_calls: Vec<u8>,
-    }
-
-    impl FakeUsb {
-        fn writes_to(&self, endpoint: u8) -> Vec<Vec<u8>> {
-            self.inner
-                .lock()
-                .unwrap()
-                .writes
-                .iter()
-                .filter(|(ep, _)| *ep == endpoint)
-                .map(|(_, b)| b.clone())
-                .collect()
-        }
-
-        fn clear_halt_calls(&self) -> Vec<u8> {
-            self.inner.lock().unwrap().clear_halt_calls.clone()
-        }
-
-        fn script_bulk_out(&self, scripts: impl IntoIterator<Item = WriteScript>) {
-            self.inner.lock().unwrap().bulk_out.extend(scripts);
-        }
-
-        fn script_int_out(&self, scripts: impl IntoIterator<Item = WriteScript>) {
-            self.inner.lock().unwrap().int_out.extend(scripts);
-        }
-
-        fn script_int_in(&self, reads: impl IntoIterator<Item = rusb::Result<Vec<u8>>>) {
-            self.inner.lock().unwrap().int_in.extend(reads);
-        }
-    }
-
-    impl UsbEndpoints for FakeUsb {
-        fn write_bulk(&self, endpoint: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
-            let mut inner = self.inner.lock().unwrap();
-            inner.writes.push((endpoint, buf.to_vec()));
-            let script = inner.bulk_out.pop_front().unwrap_or(WriteScript::Full);
-            script.apply(buf.len())
-        }
-
-        fn read_bulk(&self, _e: u8, _buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
-            Ok(0)
-        }
-
-        fn write_interrupt(&self, endpoint: u8, buf: &[u8], _t: Duration) -> rusb::Result<usize> {
-            let mut inner = self.inner.lock().unwrap();
-            inner.writes.push((endpoint, buf.to_vec()));
-            let script = inner.int_out.pop_front().unwrap_or(WriteScript::Full);
-            script.apply(buf.len())
-        }
-
-        fn read_interrupt(&self, _e: u8, buf: &mut [u8], _t: Duration) -> rusb::Result<usize> {
-            let reply = self
-                .inner
-                .lock()
-                .unwrap()
-                .int_in
-                .pop_front()
-                // Nothing pending: mirror hardware and terminate the drain loop.
-                .unwrap_or(Err(rusb::Error::Timeout))?;
-            let n = reply.len().min(buf.len());
-            buf[..n].copy_from_slice(&reply[..n]);
-            Ok(n)
-        }
-
-        fn clear_halt(&self, endpoint: u8) -> rusb::Result<()> {
-            self.inner.lock().unwrap().clear_halt_calls.push(endpoint);
-            Ok(())
-        }
-
-        fn release_interface(&self, _i: u8) -> rusb::Result<()> {
-            Ok(())
-        }
-    }
 
     fn comm() -> (HeliosComm<FakeUsb>, FakeUsb) {
         let fake = FakeUsb::default();

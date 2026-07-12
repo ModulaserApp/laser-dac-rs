@@ -4275,3 +4275,195 @@ fn test_color_delay_line_resize_from_zero() {
     assert_eq!((points2[1].r, points2[1].g), (0, 0));
     assert_eq!((points2[2].r, points2[2].g), (10, 10));
 }
+
+// =========================================================================
+// driver::run with an injected virtual clock (audit finding #6)
+//
+// Realizes the injectable-`Clock` seam end-to-end: drives the shared
+// `driver::run` loop with a virtual clock so its pacing sleeps advance
+// deterministically with zero wall-clock delay. Targets a `BlockingFifo`
+// backend on purpose — its pacing goes only through the clock-driven
+// `sleep_*` helpers, never `sleep_until_precise`, whose busy-wait branch
+// consults a real-`Instant` deadline and would hang under a virtual clock
+// (see the WARNING on `LoopCtx::sleep_until_precise`).
+// =========================================================================
+mod driver_run_virtual_clock {
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use crate::backend::{BackendKind, DacBackend, FifoBackend, WriteOutcome};
+    use crate::buffer_estimate::{BufferEstimator, SoftwareDecayEstimator};
+    use crate::device::{DacCapabilities, DacInfo, DacType, OutputModel};
+    use crate::error::{Error, Result as DacResult};
+    use crate::point::LaserPoint;
+    use crate::presentation::content_source::FifoContentSource;
+    use crate::presentation::driver::{self, DriverInputs, SourceOwned};
+    use crate::presentation::output_model::Clock;
+    use crate::presentation::session::FrameSessionMetrics;
+    use crate::stream::{ControlMsg, RunExit, StreamControl};
+
+    /// A `Clock` whose `sleep` advances a shared virtual `now` instantly and
+    /// tallies total virtual time slept. Its counters live behind `Arc` (unlike
+    /// the crate-internal `FakeClock`) so the test can still observe them after
+    /// the clock is boxed into `DriverInputs` and consumed by `driver::run`.
+    struct SharedVirtualClock {
+        now: Arc<Mutex<Instant>>,
+        slept: Arc<Mutex<Duration>>,
+    }
+
+    impl Clock for SharedVirtualClock {
+        fn now(&self) -> Instant {
+            *self.now.lock().unwrap()
+        }
+        fn sleep(&self, dur: Duration) {
+            *self.now.lock().unwrap() += dur;
+            *self.slept.lock().unwrap() += dur;
+        }
+    }
+
+    /// Minimal connected BlockingFifo backend: accepts writes, empty estimator.
+    struct FakeBlockingBackend {
+        caps: DacCapabilities,
+        estimator: SoftwareDecayEstimator,
+    }
+
+    impl DacBackend for FakeBlockingBackend {
+        fn dac_type(&self) -> DacType {
+            DacType::Custom("FakeBlocking".into())
+        }
+        fn caps(&self) -> &DacCapabilities {
+            &self.caps
+        }
+        fn connect(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn stop(&mut self) -> DacResult<()> {
+            Ok(())
+        }
+        fn set_shutter(&mut self, _open: bool) -> DacResult<()> {
+            Ok(())
+        }
+    }
+
+    impl FifoBackend for FakeBlockingBackend {
+        fn try_write_points(
+            &mut self,
+            _pps: u32,
+            _points: &[LaserPoint],
+        ) -> DacResult<WriteOutcome> {
+            Ok(WriteOutcome::Written)
+        }
+        fn estimator(&self) -> &dyn BufferEstimator {
+            &self.estimator
+        }
+    }
+
+    /// Fifo source that never produces content and reports `is_ended` after a
+    /// fixed number of driver iterations, so `driver::run` terminates cleanly
+    /// with `ProducerEnded`. (`is_ended` takes `&self`, so the poll counter uses
+    /// a `Cell`.)
+    struct EndAfter {
+        polls: Cell<usize>,
+        limit: usize,
+        empty: Vec<LaserPoint>,
+    }
+
+    impl FifoContentSource for EndAfter {
+        fn produce_chunk(&mut self, _target: usize, _pps: u32, _armed: bool) -> &[LaserPoint] {
+            &self.empty
+        }
+        fn cached_slice(&self) -> Option<&[LaserPoint]> {
+            None
+        }
+        fn commit_written(&mut self, _n: usize, _armed: bool) {}
+        fn discard_cached(&mut self) {}
+        fn reserve_buf(&mut self, _n: usize) {}
+        fn on_reconnect(&mut self, _info: &DacInfo) {}
+        fn is_ended(&self) -> bool {
+            let n = self.polls.get() + 1;
+            self.polls.set(n);
+            n >= self.limit
+        }
+    }
+
+    #[test]
+    fn driver_run_paces_deterministically_under_virtual_clock() {
+        const IDLE_STEPS: usize = 3;
+        // BlockingFifo idles disarmed via `sleep_with_control_check(IDLE_SLEEP)`;
+        // IDLE_SLEEP is 2ms, so each idle iteration advances the virtual clock
+        // by exactly 2ms.
+        const IDLE_SLEEP: Duration = Duration::from_millis(2);
+
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let slept = Arc::new(Mutex::new(Duration::ZERO));
+        let clock = SharedVirtualClock {
+            now: Arc::clone(&now),
+            slept: Arc::clone(&slept),
+        };
+
+        let backend = BackendKind::Fifo(Box::new(FakeBlockingBackend {
+            caps: DacCapabilities {
+                pps_min: 1,
+                pps_max: 35_000,
+                max_points_per_chunk: 4096,
+                output_model: OutputModel::BlockingFifo,
+            },
+            estimator: SoftwareDecayEstimator::new(),
+        }));
+
+        let source = SourceOwned::Fifo(Box::new(EndAfter {
+            polls: Cell::new(0),
+            limit: IDLE_STEPS,
+            empty: Vec::new(),
+        }));
+
+        let (tx, control_rx) = mpsc::channel::<ControlMsg>();
+        let control = StreamControl::new(tx, Duration::ZERO, 30_000); // disarmed by default
+        let metrics = FrameSessionMetrics::new(true);
+
+        let inputs = DriverInputs {
+            backend,
+            source,
+            control,
+            control_rx,
+            metrics,
+            reconnect_policy: None,
+            validator: Box::new(|_: &DacInfo, _: &BackendKind, _: u32| Ok(())),
+            error_sink: Box::new(|_: Error| {}),
+            target_buffer: Duration::from_millis(20),
+            drain_timeout: Duration::ZERO,
+            pending_frame: None,
+            clock: Box::new(clock),
+        };
+
+        let wall_start = Instant::now();
+        let exit = driver::run(inputs).expect("driver::run should exit cleanly");
+        let wall_elapsed = wall_start.elapsed();
+
+        assert_eq!(
+            exit,
+            RunExit::ProducerEnded,
+            "source ended, so the driver should drain-and-blank then exit"
+        );
+        // The seam is realized: the loop's pacing ran entirely on virtual time.
+        assert_eq!(
+            *slept.lock().unwrap(),
+            IDLE_SLEEP * IDLE_STEPS as u32,
+            "each of the {IDLE_STEPS} idle iterations must advance the virtual \
+             clock by exactly one IDLE_SLEEP"
+        );
+        // And it cost effectively no real wall-clock time (no real sleeps).
+        assert!(
+            wall_elapsed < Duration::from_millis(500),
+            "virtual-clock pacing must not block on the real clock, took {wall_elapsed:?}"
+        );
+    }
+}

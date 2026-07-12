@@ -613,4 +613,123 @@ mod tests {
         let backend = HeliosBackend::new(0);
         assert!(!backend.is_connected());
     }
+
+    // -------------------------------------------------------------------------
+    // Public backend surface driven end-to-end through a fake `UsbEndpoints`.
+    //
+    // These restore the integration coverage lost when the old `MockOpen`-based
+    // tests were deleted: they build a `HeliosDac::from_endpoints(fake)` (no real
+    // `rusb::Device`), wrap it in a backend via `from_dac`, and drive
+    // `is_ready_for_frame` / `write_frame` through the real call path — status
+    // parsing, the `on_status_error` state machine, frame encode + bulk write,
+    // and fatal-disconnect flagging — reusing the single fake in `native`.
+    // -------------------------------------------------------------------------
+
+    use crate::protocols::helios::native::test_support::{FakeUsb, WriteScript};
+
+    fn one_point() -> Vec<LaserPoint> {
+        vec![LaserPoint::new(0.0, 0.0, 65535, 0, 0, 65535)]
+    }
+
+    /// Wrap a fake transport in an open backend. The fake is cloned so callers
+    /// keep a handle to inspect recorded writes after `from_dac` takes the DAC.
+    fn backend_over(fake: &FakeUsb) -> HeliosBackend {
+        HeliosBackend::from_dac(HeliosDac::from_endpoints(fake.clone(), Some(1)))
+    }
+
+    // (1) is_ready_for_frame happy path: Ready -> true, NotReady -> false.
+
+    #[test]
+    fn is_ready_for_frame_true_when_status_ready() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Ok(vec![0x83, 1])]); // CONTROL_GET_STATUS -> Ready
+        let mut backend = backend_over(&fake);
+        assert!(backend.is_ready_for_frame());
+        assert_eq!(
+            backend.status_error_count, 0,
+            "no error recorded on success"
+        );
+    }
+
+    #[test]
+    fn is_ready_for_frame_false_when_status_not_ready() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Ok(vec![0x83, 0])]); // CONTROL_GET_STATUS -> NotReady
+        let mut backend = backend_over(&fake);
+        assert!(!backend.is_ready_for_frame());
+        assert_eq!(backend.status_error_count, 0);
+    }
+
+    // (2) is_ready_for_frame error branch wires through to on_status_error.
+
+    #[test]
+    fn is_ready_for_frame_nonfatal_error_counts_via_on_status_error() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Err(rusb::Error::Timeout)]); // status poll fails (non-fatal)
+        let mut backend = backend_over(&fake);
+        assert!(!backend.is_ready_for_frame());
+        // Reached on_status_error: non-fatal timeout is counted, not disconnected.
+        assert_eq!(backend.status_error_count, 1);
+        assert!(!backend.fatal_disconnect);
+    }
+
+    #[test]
+    fn is_ready_for_frame_fatal_error_flags_disconnect_via_on_status_error() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Err(rusb::Error::NoDevice)]); // fatal: device gone
+        let mut backend = backend_over(&fake);
+        assert!(!backend.is_ready_for_frame());
+        // Reached on_status_error's fatal branch through the real status path.
+        assert!(backend.fatal_disconnect);
+    }
+
+    // (3) public write_frame success path: Ready -> write_frame_ready -> Written.
+
+    #[test]
+    fn write_frame_ready_status_writes_frame_and_reports_written() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Ok(vec![0x83, 1])]); // status poll -> Ready
+        let mut backend = backend_over(&fake);
+
+        let outcome = backend.write_frame(30_000, &one_point()).unwrap();
+        assert_eq!(outcome, WriteOutcome::Written);
+        assert_eq!(
+            fake.bulk_writes().len(),
+            1,
+            "exactly one bulk-OUT frame transfer"
+        );
+        // The wire buffer carries the single encoded point (7 bytes) + 5 footer.
+        assert_eq!(fake.bulk_writes()[0].len(), 7 + 5);
+    }
+
+    #[test]
+    fn write_frame_not_ready_status_would_block_without_writing() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Ok(vec![0x83, 0])]); // status poll -> NotReady
+        let mut backend = backend_over(&fake);
+
+        let outcome = backend.write_frame(30_000, &one_point()).unwrap();
+        assert_eq!(outcome, WriteOutcome::WouldBlock);
+        assert!(
+            fake.bulk_writes().is_empty(),
+            "no frame written when not ready"
+        );
+    }
+
+    // (4) fatal error during the write sets fatal_disconnect via the real path.
+
+    #[test]
+    fn write_frame_fatal_bulk_error_flags_fatal_disconnect() {
+        let fake = FakeUsb::default();
+        fake.script_int_in([Ok(vec![0x83, 1])]); // status poll -> Ready
+        fake.script_bulk_out([WriteScript::Err(rusb::Error::Io)]); // fatal on frame write
+        let mut backend = backend_over(&fake);
+
+        let err = backend.write_frame(30_000, &one_point()).unwrap_err();
+        assert!(err.is_disconnected());
+        assert!(
+            backend.fatal_disconnect,
+            "a fatal USB error during the write must flag Drop to leak the handle"
+        );
+    }
 }

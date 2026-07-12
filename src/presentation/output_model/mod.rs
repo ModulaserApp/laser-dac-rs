@@ -141,6 +141,20 @@ impl<'a> LoopCtx<'a> {
     }
 
     /// High-precision sleep until `deadline` (UDP-timed pacing).
+    ///
+    /// WARNING — do NOT drive this method with a virtual [`Clock`]. Its
+    /// `deadline` is sourced from real wall-clock time (`Instant::now()` in
+    /// `UdpTimedAdapter::next_send`), so it is only coherent when
+    /// `self.clock.now()` is also real wall-clock time (i.e. [`SystemClock`]).
+    /// Under a [`FakeClock`] whose `now` only advances on `sleep`, the final
+    /// sub-threshold approach falls into the busy-wait branch below, which spins
+    /// `thread::yield_now()` *without advancing the clock* — so `clock.now()`
+    /// never reaches the real `deadline` and the loop hangs forever. Tests that
+    /// inject a virtual clock into `driver::run` must therefore exercise a
+    /// pacing path that never calls this (e.g. the `BlockingFifo` model, which
+    /// paces only through the clock-driven `sleep_*` helpers). Making UDP-timed
+    /// pacing virtual-clock-safe would require sourcing `deadline` from
+    /// `clock.now()` too — a deliberately separate, larger change.
     pub fn sleep_until_precise(&mut self, deadline: Instant) -> Result<(), StepOutcome> {
         const BUSY_WAIT_THRESHOLD: Duration = Duration::from_micros(500);
         const SLEEP_SLICE: Duration = Duration::from_millis(1);
@@ -158,6 +172,10 @@ impl<'a> LoopCtx<'a> {
                     .min(SLEEP_SLICE);
                 self.clock.sleep(slice);
             } else {
+                // Busy-wait for sub-threshold precision. NOTE: this does not
+                // touch `self.clock`, so it only makes progress against a real
+                // wall clock. See the method doc: never drive this with a
+                // virtual clock — `now` would never reach `deadline`.
                 std::thread::yield_now();
             }
             self.metrics.mark_loop_activity();
@@ -268,12 +286,22 @@ pub(crate) fn drain_via_estimator(ctx: &mut LoopCtx<'_>, timeout: Duration) {
     if timeout.is_zero() {
         return;
     }
+    // Drain at the rate the device actually plays back, not the caller's
+    // configured `ctx.pps`. The backend clamps the programmed rate to
+    // `caps.pps_max` (updated to the device's real `max_dac_rate` at connect)
+    // and anchors its estimator via `record_send` at that *effective* rate.
+    // `validate_pps` runs against the pre-connect default caps, so a configured
+    // `pps` above the connected device's true max survives validation; reading
+    // the drain at that unclamped rate would decay the software model faster
+    // than the hardware drains and blank the tail of the final frame early —
+    // the exact symptom the record-side clamp is meant to prevent.
+    let drain_pps = ctx.pps.min(ctx.backend.caps().pps_max);
     let start = ctx.clock.now();
     let deadline = start + timeout;
     const POLL: Duration = Duration::from_millis(5);
     let mut now = start;
     while now < deadline {
-        let buffered = estimator_fullness(ctx.backend.estimator(), ctx.pps);
+        let buffered = estimator_fullness(ctx.backend.estimator(), drain_pps);
         if buffered == 0 {
             break;
         }
