@@ -249,12 +249,20 @@ impl FrameSession {
         let slot_clone = frame_slot.clone();
         let metrics_clone = metrics.clone();
 
-        // Named for diagnosability in profilers / thread dumps. Elevating this
-        // thread's scheduling priority so pacing sleeps aren't preempted under
-        // load is tracked separately (see issue #35).
+        // Named for diagnosability in profilers / thread dumps.
         let thread = std::thread::Builder::new()
             .name("laser-frame-scheduler".to_string())
             .spawn(move || {
+                // Elevate this thread's scheduling priority so pacing sleeps are
+                // less likely to be preempted under system load. Best-effort:
+                // many systems disallow raising priority without privileges
+                // (e.g. Linux without CAP_SYS_NICE), so we log and continue at
+                // default priority rather than fail the session.
+                if let Err(e) = thread_priority::set_current_thread_priority(
+                    thread_priority::ThreadPriority::Max,
+                ) {
+                    log::warn!("laser-frame-scheduler: could not raise thread priority: {e:?}");
+                }
                 let _disconnect_guard = MetricsDisconnectGuard(metrics_clone.clone());
                 Self::run_loop(
                     backend,

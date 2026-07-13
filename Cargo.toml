@@ -55,6 +55,9 @@ thiserror = "1.0"
 bitflags = "2"
 byteorder = "1.5"
 log = "0.4"
+# Cross-platform thread priority for the frame-scheduler thread, so pacing
+# sleeps are less likely to be preempted under system load (see issue #35).
+thread-priority = "3"
 cpal = { version = "0.15", optional = true }
 crossbeam-queue = { version = "0.3", optional = true }
 
