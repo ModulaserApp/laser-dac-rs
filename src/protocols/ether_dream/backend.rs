@@ -36,8 +36,6 @@ pub struct EtherDreamBackend {
     last_ping_time: Option<Instant>,
     /// When we last attempted to clear an emergency-stop condition.
     last_estop_attempt: Option<Instant>,
-    /// Pre-allocated conversion buffer (avoids per-write heap allocation).
-    point_buffer: Vec<DacPoint>,
     /// Status-anchored buffer estimator, consulted by the NetworkFifo adapter
     /// for pacing and rebased on every authoritative status report.
     estimator: StatusDecayEstimator,
@@ -54,7 +52,6 @@ impl EtherDreamBackend {
             last_point_rate: 0,
             last_ping_time: None,
             last_estop_attempt: None,
-            point_buffer: Vec::new(),
             estimator: StatusDecayEstimator::new(),
         }
     }
@@ -218,10 +215,6 @@ impl FifoBackend for EtherDreamBackend {
             return Ok(WriteOutcome::WouldBlock);
         }
 
-        // Convert points into pre-allocated buffer (avoids per-write allocation).
-        self.point_buffer.clear();
-        self.point_buffer.extend(points.iter().map(DacPoint::from));
-
         let playback_flags = stream.dac().status.playback_flags;
         let current_point_rate = stream.dac().status.point_rate;
 
@@ -236,16 +229,19 @@ impl FifoBackend for EtherDreamBackend {
                 .map_err(Error::backend)?;
         }
 
+        // `CommandQueue::data` converts straight into the stream's own staging
+        // buffer, so each point is written once rather than staged through a
+        // second backend-owned buffer first.
         let send_result = if playback == Playback::Playing && current_point_rate != point_rate {
             stream
                 .queue_commands()
                 .update(0, point_rate)
-                .data(self.point_buffer.iter().copied())
+                .data(points.iter().map(DacPoint::from))
                 .submit()
         } else {
             stream
                 .queue_commands()
-                .data(self.point_buffer.iter().copied())
+                .data(points.iter().map(DacPoint::from))
                 .submit()
         };
 
@@ -269,7 +265,7 @@ impl FifoBackend for EtherDreamBackend {
                             .map_err(Error::backend)?;
                         match stream
                             .queue_commands()
-                            .data(self.point_buffer.iter().copied())
+                            .data(points.iter().map(DacPoint::from))
                             .submit()
                         {
                             Ok(()) => {}
@@ -392,6 +388,7 @@ mod tests {
     };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -481,10 +478,31 @@ mod tests {
         initial: Addressed,
         handler: impl FnMut(u8) -> DacResponse + Send + 'static,
     ) -> (EtherDreamBackend, Arc<Mutex<Vec<u8>>>) {
+        let (backend, commands, _payloads) = connect_mock_capturing(initial, handler);
+        (backend, commands)
+    }
+
+    /// A mock DAC wired to a backend: the backend, the log of command bytes the
+    /// mock received, and the raw `DacPoint` bytes of each Data command.
+    type MockDac = (
+        EtherDreamBackend,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+    );
+
+    /// As [`connect_mock`], but also records the raw `DacPoint` bytes of each
+    /// Data command as its own entry, so a test can assert what actually
+    /// reached the wire on each individual submit.
+    fn connect_mock_capturing(
+        initial: Addressed,
+        handler: impl FnMut(u8) -> DacResponse + Send + 'static,
+    ) -> MockDac {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let commands_srv = commands.clone();
+        let payloads = Arc::new(Mutex::new(Vec::new()));
+        let payloads_srv = payloads.clone();
         let mut handler = handler;
 
         thread::spawn(move || {
@@ -511,12 +529,16 @@ mod tests {
                     }
                     _ => 0,
                 };
-                if extra > 0 {
-                    let mut buf = vec![0u8; extra];
-                    if sock.read_exact(&mut buf).is_err() {
-                        break;
-                    }
+                let mut buf = vec![0u8; extra];
+                if extra > 0 && sock.read_exact(&mut buf).is_err() {
+                    break;
                 }
+                if cmd == protocol::command::Data::START_BYTE {
+                    payloads_srv.lock().unwrap().push(buf);
+                }
+                // Record before responding: `submit()` returns as soon as it
+                // reads the ACK, so a test that inspects the log after the call
+                // must not race the mock's own bookkeeping.
                 commands_srv.lock().unwrap().push(cmd);
                 let resp = handler(cmd);
                 let mut out = Vec::new();
@@ -531,7 +553,31 @@ mod tests {
         let stream = stream::Stream::from_tcp_stream_for_test(initial, client).unwrap();
         let mut backend = EtherDreamBackend::new(test_broadcast(), "127.0.0.1".parse().unwrap());
         backend.stream = Some(stream);
-        (backend, commands)
+        (backend, commands, payloads)
+    }
+
+    /// The wire bytes a Data command should carry for `pts`: each point encoded
+    /// exactly once, in authored order.
+    fn expected_payload(pts: &[LaserPoint]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for p in pts {
+            DacPoint::from(p)
+                .write_to_bytes(&mut out)
+                .expect("writing to Vec<u8> cannot fail");
+        }
+        out
+    }
+
+    /// Points with distinct coordinates and colours, so a dropped, duplicated
+    /// or reordered point cannot coincidentally match the expected payload.
+    fn distinct_points(n: usize) -> Vec<LaserPoint> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / n as f32;
+                let i = i as u16;
+                LaserPoint::new(t * 2.0 - 1.0, 1.0 - t, i * 7, i * 11, i * 13, i * 17)
+            })
+            .collect()
     }
 
     fn points(n: usize) -> Vec<LaserPoint> {
@@ -641,6 +687,98 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&protocol::command::Data::START_BYTE));
+    }
+
+    // -- copy-elision contract: every call site still sends every point ----
+    //
+    // `try_write_points` converts each LaserPoint straight into the command
+    // queue's staging buffer instead of staging it through a buffer of its
+    // own. That is a pure copy elision, so each of the three `.data(...)` call
+    // sites must still put every authored point on the wire exactly once, in
+    // order. The two call sites below are the ones no other test reaches.
+
+    #[test]
+    fn rate_change_while_playing_updates_rate_and_sends_all_points() {
+        // Playing, and the DAC's current rate (0, per `addressed`) differs from
+        // the requested 30_000 — the one path that batches Update with Data.
+        let (mut backend, cmds, payloads) = connect_mock_capturing(
+            addressed(LightEngine::Ready, Playback::Playing, 0, 1000),
+            |cmd| ack(cmd, mk_status(0, DacStatus::PLAYBACK_PLAYING, 500, 30_000)),
+        );
+
+        let pts = distinct_points(10);
+        let outcome = backend.try_write_points(30_000, &pts).unwrap();
+        assert_eq!(outcome, WriteOutcome::Written);
+
+        // The rate change went out, and the points rode along with it.
+        let log = cmds.lock().unwrap();
+        assert!(log.contains(&protocol::command::Update::START_BYTE));
+        assert!(log.contains(&protocol::command::Data::START_BYTE));
+
+        let payloads = payloads.lock().unwrap();
+        assert_eq!(payloads.len(), 1, "exactly one Data command");
+        assert_eq!(
+            payloads[0],
+            expected_payload(&pts),
+            "the update+data call site must send every authored point, in order"
+        );
+    }
+
+    #[test]
+    fn idle_nak_invalid_reprepares_and_resends_every_point() {
+        // Idle + NAK-Invalid on the data submit: the firmware wants a fresh
+        // prepare before it will take streaming data. The retry re-converts the
+        // points, so it must resend the identical payload — a retry that sent a
+        // stale or empty buffer would still report Written, and the adapter
+        // commits the whole slice on Written, silently dropping the chunk.
+        let data_seen = Arc::new(AtomicUsize::new(0));
+        let data_seen_srv = data_seen.clone();
+        let (mut backend, cmds, payloads) = connect_mock_capturing(
+            addressed(LightEngine::Ready, Playback::Idle, 0, 1000),
+            move |cmd| {
+                let idle = mk_status(0, DacStatus::PLAYBACK_IDLE, 0, 30_000);
+                if cmd == protocol::command::Data::START_BYTE
+                    && data_seen_srv.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    // Only the first Data is rejected; the retry is accepted.
+                    return nak(DacResponse::NAK_INVALID, cmd, idle);
+                }
+                ack(cmd, mk_status(0, DacStatus::PLAYBACK_PREPARED, 10, 30_000))
+            },
+        );
+
+        let pts = distinct_points(10);
+        let outcome = backend.try_write_points(30_000, &pts).unwrap();
+        assert_eq!(
+            outcome,
+            WriteOutcome::Written,
+            "the accepted retry must be reported as written"
+        );
+
+        // Prepare, rejected data, re-prepare, accepted data.
+        let log = cmds.lock().unwrap();
+        let prepares = log
+            .iter()
+            .filter(|&&c| c == protocol::command::PrepareStream::START_BYTE)
+            .count();
+        assert_eq!(prepares, 2, "the retry re-prepares the stream");
+        assert_eq!(
+            data_seen.load(Ordering::SeqCst),
+            2,
+            "the data submit retries"
+        );
+
+        let payloads = payloads.lock().unwrap();
+        let expected = expected_payload(&pts);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(
+            payloads[1], expected,
+            "the retry must resend every authored point, in order"
+        );
+        assert_eq!(
+            payloads[0], expected,
+            "the rejected attempt carried the same payload"
+        );
     }
 
     #[test]

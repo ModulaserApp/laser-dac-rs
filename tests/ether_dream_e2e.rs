@@ -43,7 +43,7 @@ use laser_dac::protocols::ether_dream::dac::stream::{
     self, CommunicationError, Nak, ResponseErrorKind,
 };
 use laser_dac::protocols::ether_dream::protocol::{
-    self, DacBroadcast, DacResponse, DacStatus, ReadBytes, SizeBytes, WriteBytes,
+    self, DacBroadcast, DacPoint, DacResponse, DacStatus, ReadBytes, SizeBytes, WriteBytes,
 };
 use laser_dac::protocols::ether_dream::{recv_dac_broadcasts, EtherDreamBackend};
 use laser_dac::types::EnabledDacTypes;
@@ -151,6 +151,9 @@ struct MockShared {
     status: Mutex<DacStatus>,
     received: Mutex<Vec<u8>>,
     data_points_total: Mutex<u32>,
+    /// Raw `DacPoint` bytes from every Data command, concatenated in arrival
+    /// order. Lets a test assert what actually reached the wire.
+    data_payload: Mutex<Vec<u8>>,
     config: MockConfig,
 }
 
@@ -177,6 +180,7 @@ impl MockServer {
             status: Mutex::new(config.handshake_status),
             received: Mutex::new(Vec::new()),
             data_points_total: Mutex::new(0),
+            data_payload: Mutex::new(Vec::new()),
             config,
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -205,6 +209,11 @@ impl MockServer {
 
     fn data_points_total(&self) -> u32 {
         *self.shared.data_points_total.lock().unwrap()
+    }
+
+    /// Raw `DacPoint` bytes received across all Data commands, in order.
+    fn data_payload(&self) -> Vec<u8> {
+        self.shared.data_payload.lock().unwrap().clone()
     }
 }
 
@@ -267,10 +276,17 @@ fn handle_connection(mut sock: TcpStream, shared: &Arc<MockShared>, stop: &Arc<A
         }
 
         let c = cmd[0];
-        let n_points = match read_command_payload(&mut sock, c) {
-            Some(n) => n,
+        let (n_points, point_bytes) = match read_command_payload(&mut sock, c) {
+            Some(payload) => payload,
             None => return, // Unknown command or truncated read.
         };
+        if !point_bytes.is_empty() {
+            shared
+                .data_payload
+                .lock()
+                .unwrap()
+                .extend_from_slice(&point_bytes);
+        }
 
         // Record the command as received BEFORE sending the ACK. The client's
         // `submit()` returns as soon as it reads the ACK, so a test that reads
@@ -340,7 +356,9 @@ fn handle_connection(mut sock: TcpStream, shared: &Arc<MockShared>, stop: &Arc<A
 /// Consume the fixed-size payload that follows a command byte. Returns the point
 /// count for `data` commands (0 for all others), or `None` on an unknown command
 /// or a truncated read.
-fn read_command_payload(sock: &mut TcpStream, cmd: u8) -> Option<u16> {
+/// Reads `cmd`'s payload. Returns the point count and, for a Data command, the
+/// raw `DacPoint` bytes that arrived with it.
+fn read_command_payload(sock: &mut TcpStream, cmd: u8) -> Option<(u16, Vec<u8>)> {
     let extra = match cmd {
         CMD_PREPARE | CMD_STOP | CMD_ESTOP | CMD_ESTOP_ALT | CMD_CLEAR_ESTOP | CMD_PING => 0,
         CMD_BEGIN | CMD_UPDATE => 6, // u16 low_water_mark + u32 point_rate
@@ -349,9 +367,9 @@ fn read_command_payload(sock: &mut TcpStream, cmd: u8) -> Option<u16> {
             let mut n = [0u8; 2];
             sock.read_exact(&mut n).ok()?;
             let n_points = u16::from_le_bytes(n);
-            let mut pts = vec![0u8; n_points as usize * 18];
+            let mut pts = vec![0u8; n_points as usize * DacPoint::SIZE_BYTES];
             sock.read_exact(&mut pts).ok()?;
-            return Some(n_points);
+            return Some((n_points, pts));
         }
         _ => return None,
     };
@@ -359,7 +377,7 @@ fn read_command_payload(sock: &mut TcpStream, cmd: u8) -> Option<u16> {
         let mut buf = vec![0u8; extra];
         sock.read_exact(&mut buf).ok()?;
     }
-    Some(0)
+    Some((0, Vec::new()))
 }
 
 /// Convenience: connect a real [`stream::Stream`] to a mock server.
@@ -744,6 +762,51 @@ fn test_backend_write_points_prepares_and_writes() {
         "playback should begin once buffered: {received:?}"
     );
     assert!(server.data_points_total() >= 256);
+
+    drop(server);
+}
+
+/// The backend converts each `LaserPoint` straight into the command queue's
+/// staging buffer rather than through a second buffer of its own. That is a
+/// pure copy elision, so every authored point must still reach the wire once,
+/// in order, byte-for-byte identical to `DacPoint::from` of that point.
+#[test]
+fn test_backend_write_points_encodes_each_point_once_on_the_wire() {
+    let _guard = port_lock();
+    let server = MockServer::start(MockConfig::default());
+    let broadcast = broadcast_with(ready_status(), 1800);
+
+    let mut backend = EtherDreamBackend::new(broadcast, server.ip());
+    backend.connect().expect("connect");
+
+    // Distinct coordinates and colours so a dropped, duplicated or reordered
+    // point cannot coincidentally match.
+    let pts: Vec<LaserPoint> = (0..300)
+        .map(|i| {
+            let t = i as f32 / 300.0;
+            LaserPoint::new(t * 2.0 - 1.0, 1.0 - t, i * 7, i * 11, i * 13, i * 17)
+        })
+        .collect();
+
+    let outcome = backend
+        .try_write_points(30_000, &pts)
+        .expect("write should succeed");
+    assert_eq!(outcome, WriteOutcome::Written);
+
+    // Every authored point, encoded exactly once, in authored order.
+    let mut expected = Vec::new();
+    for p in &pts {
+        expected
+            .write_bytes(DacPoint::from(p))
+            .expect("writing to Vec<u8> cannot fail");
+    }
+
+    assert_eq!(
+        server.data_payload(),
+        expected,
+        "wire payload must match the authored points exactly"
+    );
+    assert_eq!(server.data_points_total(), pts.len() as u32);
 
     drop(server);
 }
