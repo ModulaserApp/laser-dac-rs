@@ -89,7 +89,7 @@ struct DeviceCandidate<D> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StreamPoint {
+pub(crate) struct StreamPoint {
     x: f32,
     y: f32,
     r: f32,

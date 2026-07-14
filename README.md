@@ -430,6 +430,14 @@ matching CI's blocking jobs. It does **not** run the full `test` suite,
 `test-macos`, the `msrv` check, or the `feature-combinations` matrix — run those
 manually (or rely on CI) before merging.
 
+### Benchmarks
+
+The hardware-free benchmark suite covers presentation, resampling, and protocol
+encoding. Run it locally with `cargo bench-all` — a plain `cargo bench` silently
+builds nothing, because every bench target is behind `required-features`. See
+[`BENCHMARKS.md`](BENCHMARKS.md) for individual targets, measurement limits,
+and local baseline comparisons.
+
 ### IDN Simulator
 
 The repository includes a debug simulator (in `tools/idn-simulator/`) that acts as a virtual IDN laser DAC. This is useful for testing and development without physical hardware.

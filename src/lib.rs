@@ -92,6 +92,9 @@
 //! Each backend handles conversion to its native format internally.
 
 pub mod backend;
+#[cfg(feature = "testutils")]
+#[doc(hidden)]
+pub mod benchmark_support;
 pub mod buffer_estimate;
 pub mod config;
 pub mod device;

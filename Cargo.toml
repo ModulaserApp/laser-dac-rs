@@ -13,6 +13,9 @@ homepage = "https://github.com/ModulaserApp/laser-dac-rs"
 documentation = "https://docs.rs/laser-dac"
 rust-version = "1.87"
 
+[lib]
+bench = false
+
 [workspace]
 members = [".", "tools/idn-simulator"]
 
@@ -49,6 +52,18 @@ receiver = ["idn"]
 
 # Test utilities (exposes additional APIs for testing)
 testutils = []
+
+# The fused per-chunk benchmark fixture (`ChunkPipelineBenchmark`). It models
+# every protocol's driver-thread buffer discipline in one type, so it needs all
+# five point-based protocols compiled in rather than a subset.
+chunk-pipeline-bench = [
+    "testutils",
+    "helios",
+    "ether-dream",
+    "idn",
+    "lasercube-network",
+    "lasercube-usb",
+]
 
 [dependencies]
 thiserror = "1.0"
@@ -90,6 +105,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 cpal = "0.15"
 hound = "3.5"
+criterion = { version = "=0.8.2", features = ["html_reports"] }
 
 [[example]]
 name = "stream"
@@ -116,15 +132,25 @@ required-features = ["oscilloscope"]
 name = "transitions"
 path = "examples/transitions.rs"
 
-[[example]]
-name = "bench_fill_chunk"
-path = "examples/bench_fill_chunk.rs"
+[[bench]]
+name = "presentation"
+harness = false
 required-features = ["testutils"]
 
-[[example]]
-name = "bench_transition"
-path = "examples/bench_transition.rs"
+[[bench]]
+name = "resampling"
+harness = false
+required-features = ["testutils", "avb"]
 
+[[bench]]
+name = "protocol_encoding"
+harness = false
+required-features = ["testutils", "usb-dacs", "network-dacs"]
+
+[[bench]]
+name = "chunk_pipeline"
+harness = false
+required-features = ["chunk-pipeline-bench"]
 
 [package.metadata.docs.rs]
 features = ["all-dacs"]

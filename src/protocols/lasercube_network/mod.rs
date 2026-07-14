@@ -22,6 +22,11 @@ pub use discovery::LaserCubeNetworkDiscoverer;
 pub use profiles::{ConnectionProfile, ConnectionType, ProfileSource};
 pub use status::LaserCubeNetworkStatus;
 
+#[cfg(feature = "testutils")]
+pub(crate) use packetizer::encode_sample_packet as benchmark_encode_sample_packet;
+#[cfg(feature = "testutils")]
+pub(crate) use protocol::Point as BenchmarkPoint;
+
 use crate::device::{DacCapabilities, OutputModel};
 use protocol::{DEFAULT_BUFFER_CAPACITY, DEFAULT_POINT_RATE};
 

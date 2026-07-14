@@ -20,3 +20,10 @@ clippy-ci = "clippy --all-features --all-targets -- -D warnings"
 #   RUSTDOCFLAGS="-D warnings" cargo doc-ci
 # (The `.githooks/pre-commit` hook already sets it for you.)
 doc-ci = "doc --all-features --no-deps"
+# Full benchmark suite as documented in BENCHMARKS.md. Every bench target sets
+# `required-features`, and none of those features are defaults, so a plain
+# `cargo bench` silently builds ZERO targets and exits 0 — the same class of
+# trap as `cargo test` above, but quieter. Prefer this alias.
+# `oscilloscope` is deliberately excluded: it is a debug backend and pulls GUI
+# work into a measurement run. Add it explicitly to benchmark its resampler.
+bench-all = "bench --no-default-features --features testutils,usb-dacs,network-dacs,avb,chunk-pipeline-bench"
