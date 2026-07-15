@@ -460,7 +460,7 @@ pub(crate) struct ColorDelayLine {
     delay: usize,
     /// Ring buffer of the last `delay` colors from the previous chunk.
     carry: Vec<(u16, u16, u16, u16)>,
-    /// Pre-allocated buffer for current chunk colors (avoids per-chunk allocation).
+    /// Pre-allocated buffer for the chunk tail the in-place shift overwrites.
     scratch: Vec<(u16, u16, u16, u16)>,
 }
 
@@ -517,32 +517,38 @@ impl ColorDelayLine {
             return;
         }
 
-        // Collect current colors into pre-allocated scratch buffer
+        let n = points.len();
+        let delay = self.delay;
+        // Tail colors that shift past the end of this chunk and into the next.
+        let keep = delay.min(n);
+
         self.scratch.clear();
-        self.scratch
-            .extend(points.iter().map(|p| (p.r, p.g, p.b, p.intensity)));
+        self.scratch.extend(
+            points[n - keep..]
+                .iter()
+                .map(|p| (p.r, p.g, p.b, p.intensity)),
+        );
 
-        // Apply delay: for the first `delay` points use carry; for the rest, scratch.
-        for (i, point) in points.iter_mut().enumerate() {
-            (point.r, point.g, point.b, point.intensity) = if i < self.delay {
-                self.carry[i]
-            } else {
-                self.scratch[i - self.delay]
-            };
+        // Back-to-front so each source is read before it is overwritten.
+        for i in (delay..n).rev() {
+            let src = points[i - delay];
+            let dst = &mut points[i];
+            (dst.r, dst.g, dst.b, dst.intensity) = (src.r, src.g, src.b, src.intensity);
         }
 
-        // Update carry buffer: keep the last `delay` colors from this chunk
-        let n = self.scratch.len();
-        if n >= self.delay {
-            self.carry.clear();
-            self.carry
-                .extend_from_slice(&self.scratch[n - self.delay..]);
+        // `carry` holds `delay` entries, so this fills exactly the vacated `keep` head.
+        for (point, &(r, g, b, intensity)) in points.iter_mut().zip(&self.carry) {
+            (point.r, point.g, point.b, point.intensity) = (r, g, b, intensity);
+        }
+
+        // Roll `carry` forward by `keep`.
+        if keep == delay {
+            self.carry.copy_from_slice(&self.scratch);
         } else {
-            // Chunk smaller than delay: shift carry and append
-            self.carry.drain(..n);
-            self.carry.extend_from_slice(&self.scratch);
-            debug_assert_eq!(self.carry.len(), self.delay);
+            self.carry.copy_within(keep.., 0);
+            self.carry[delay - keep..].copy_from_slice(&self.scratch);
         }
+        debug_assert_eq!(self.carry.len(), self.delay);
     }
 }
 

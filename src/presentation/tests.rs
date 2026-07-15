@@ -4276,6 +4276,62 @@ fn test_color_delay_line_resize_from_zero() {
     assert_eq!((points2[2].r, points2[2].g), (10, 10));
 }
 
+/// The delay is a property of the stream, not of how it is cut into chunks:
+/// point `i` must carry the colour authored at `i - delay`, blacked out before
+/// the stream starts. Chunk sizes straddle the delay in both directions — the
+/// three regimes the carry state has to bridge.
+#[test]
+fn test_color_delay_line_shifts_stream_by_delay_regardless_of_chunking() {
+    const DELAY: usize = 3;
+
+    for chunk_sizes in [
+        vec![1, 1, 1, 1, 1, 1, 1, 1],
+        vec![2, 5, 1, 8],
+        vec![3, 3, 3, 3],
+        vec![16],
+        vec![7, 2, 4, 1, 2],
+    ] {
+        let total: usize = chunk_sizes.iter().sum();
+        // Distinct, non-zero authored colours so a misplaced one is visible.
+        let authored: Vec<LaserPoint> = (0..total)
+            .map(|i| {
+                let c = (i + 1) as u16;
+                LaserPoint::new(i as f32 * 0.01, 0.0, c, c * 2, c * 3, c * 4)
+            })
+            .collect();
+
+        let mut cdl = ColorDelayLine::new(DELAY);
+        let mut got: Vec<LaserPoint> = Vec::with_capacity(total);
+        let mut offset = 0;
+        for size in &chunk_sizes {
+            let mut chunk = authored[offset..offset + size].to_vec();
+            cdl.apply(&mut chunk);
+            got.extend_from_slice(&chunk);
+            offset += size;
+        }
+
+        for (i, point) in got.iter().enumerate() {
+            // Positions are never delayed, only colours.
+            assert_eq!(
+                point.x, authored[i].x,
+                "chunking {chunk_sizes:?}, point {i}"
+            );
+
+            let expected = if i < DELAY {
+                (0, 0, 0, 0)
+            } else {
+                let src = &authored[i - DELAY];
+                (src.r, src.g, src.b, src.intensity)
+            };
+            assert_eq!(
+                (point.r, point.g, point.b, point.intensity),
+                expected,
+                "chunking {chunk_sizes:?}, point {i}"
+            );
+        }
+    }
+}
+
 // =========================================================================
 // driver::run with an injected virtual clock (audit finding #6)
 //
