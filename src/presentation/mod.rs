@@ -16,15 +16,14 @@ mod slice_pipeline;
 pub use session::FrameSessionMetrics;
 pub use session::{FrameSession, FrameSessionConfig};
 
-// Re-export internal types for tests (they live in sub-modules but tests use `super::*`)
-#[cfg(all(test, not(feature = "testutils")))]
+// Shared by `SlicePipeline` and the streaming path (`ChunkProducer`).
 pub(crate) use engine::ColorDelayLine;
+
+// Re-export internal types for tests (they live in sub-modules but tests use `super::*`)
 #[cfg(all(test, not(feature = "testutils")))]
 pub(crate) use engine::PresentationEngine;
 
 // Re-export narrow internals used by the feature-gated benchmark fixtures.
-#[cfg(feature = "testutils")]
-pub(crate) use engine::ColorDelayLine;
 #[cfg(feature = "testutils")]
 pub use engine::PresentationEngine;
 #[cfg(feature = "testutils")]

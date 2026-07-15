@@ -4,7 +4,6 @@
 //! countdown, idle policy, and end-of-stream flag. The streaming-mode analogue
 //! of [`SlicePipeline`](crate::presentation::slice_pipeline::SlicePipeline).
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::config::IdlePolicy;
@@ -12,6 +11,7 @@ use crate::device::DacInfo;
 use crate::error::Error;
 use crate::point::LaserPoint;
 use crate::presentation::content_source::FifoContentSource;
+use crate::presentation::ColorDelayLine;
 use crate::stream::{ChunkRequest, ChunkResult, StreamControl, StreamInstant, StreamStats};
 
 type FillFn = Box<dyn FnMut(&ChunkRequest, &mut [LaserPoint]) -> ChunkResult + Send + 'static>;
@@ -45,7 +45,7 @@ pub(crate) struct ChunkProducer {
     pending_raw: Vec<LaserPoint>,
     pending_raw_len: usize,
 
-    color_delay_line: VecDeque<(u16, u16, u16, u16)>,
+    color_delay_line: ColorDelayLine,
     startup_blank_remaining: usize,
 
     current_instant: StreamInstant,
@@ -80,7 +80,7 @@ impl ChunkProducer {
             last_chunk_len: 0,
             pending_raw: vec![LaserPoint::default(); initial_capacity],
             pending_raw_len: 0,
-            color_delay_line: VecDeque::new(),
+            color_delay_line: ColorDelayLine::new(0),
             startup_blank_remaining: 0,
             current_instant: StreamInstant::new(0),
             stats: StreamStats::default(),
@@ -103,7 +103,7 @@ impl ChunkProducer {
     /// Disarm transition: clear the color delay line so stale colors don't
     /// leak past a re-arm.
     pub fn on_disarm(&mut self) {
-        self.color_delay_line.clear();
+        self.color_delay_line.reset();
     }
 
     fn invalidate(&mut self) {
@@ -156,22 +156,9 @@ impl ChunkProducer {
             self.startup_blank_remaining -= blank_count;
         }
 
-        let color_delay_points = duration_micros_to_points(delay_micros, pps);
-        if color_delay_points > 0 {
-            self.color_delay_line
-                .resize(color_delay_points, (0, 0, 0, 0));
-            for p in &mut self.buf[..n] {
-                self.color_delay_line
-                    .push_back((p.r, p.g, p.b, p.intensity));
-                let (r, g, b, i) = self.color_delay_line.pop_front().unwrap();
-                p.r = r;
-                p.g = g;
-                p.b = b;
-                p.intensity = i;
-            }
-        } else if !self.color_delay_line.is_empty() {
-            self.color_delay_line.clear();
-        }
+        self.color_delay_line
+            .resize(duration_micros_to_points(delay_micros, pps));
+        self.color_delay_line.apply(&mut self.buf[..n]);
     }
 
     /// Fill a range with the appropriate idle-policy fallback. Returns
@@ -309,7 +296,7 @@ impl FifoContentSource for ChunkProducer {
         self.ensure_buf(max);
         self.last_chunk_len = 0;
         self.pending_raw_len = 0;
-        self.color_delay_line.clear();
+        self.color_delay_line.reset();
         self.startup_blank_remaining = 0;
         self.invalidate();
         self.stats.reconnect_count += 1;
@@ -734,6 +721,77 @@ mod tests {
         assert!(
             c3.iter().all(|p| p.r == 5000),
             "delay reset to 0 must clear the line → no leading blanks"
+        );
+    }
+
+    /// Growing between two non-zero delays keeps the colours the line still
+    /// holds aligned to the positions they were authored against.
+    /// `set_color_delay_mid_stream_resizes_and_clears_line` only covers 0→n and
+    /// n→0, where every entry is black and any ordering looks the same.
+    #[test]
+    fn growing_between_two_nonzero_color_delays_keeps_colour_aligned() {
+        let (mut cp, ctrl) = make_producer_cfg(
+            |_req, buf| {
+                for (i, p) in buf.iter_mut().enumerate() {
+                    let c = 1000 * (i as u16 + 1);
+                    *p = LaserPoint::new(0.5, -0.25, c, c, c, c);
+                }
+                ChunkResult::Filled(buf.len())
+            },
+            Duration::from_micros(200), // 2 delay points at 10k pps
+            Duration::ZERO,
+            10_000,
+        );
+
+        let c1 = cp.produce_chunk(4, 10_000, true).to_vec();
+        assert_eq!(
+            c1.iter().map(|p| p.r).collect::<Vec<_>>(),
+            vec![0, 0, 1000, 2000],
+            "delay=2 steady state; line left holding [3000,4000]"
+        );
+        cp.commit_written(4, true);
+
+        ctrl.set_color_delay(Duration::from_micros(400)); // 2 → 4 points
+        let c2 = cp.produce_chunk(4, 10_000, true).to_vec();
+        assert_eq!(
+            c2.iter().map(|p| p.r).collect::<Vec<_>>(),
+            vec![0, 0, 3000, 4000],
+            "grown delay must blank the unavailable history and keep [3000,4000] \
+             at the positions they were authored against"
+        );
+    }
+
+    /// Shrinking between two non-zero delays keeps the line's most recent
+    /// colours and drops the ones that fell outside the shorter window.
+    #[test]
+    fn shrinking_between_two_nonzero_color_delays_keeps_most_recent_colour() {
+        let (mut cp, ctrl) = make_producer_cfg(
+            |_req, buf| {
+                for (i, p) in buf.iter_mut().enumerate() {
+                    let c = 1000 * (i as u16 + 1);
+                    *p = LaserPoint::new(0.5, -0.25, c, c, c, c);
+                }
+                ChunkResult::Filled(buf.len())
+            },
+            Duration::from_micros(400), // 4 delay points at 10k pps
+            Duration::ZERO,
+            10_000,
+        );
+
+        let c1 = cp.produce_chunk(4, 10_000, true).to_vec();
+        assert_eq!(
+            c1.iter().map(|p| p.r).collect::<Vec<_>>(),
+            vec![0, 0, 0, 0],
+            "delay=4 over a 4-point chunk blanks all of it; line holds the raw chunk"
+        );
+        cp.commit_written(4, true);
+
+        ctrl.set_color_delay(Duration::from_micros(200)); // 4 → 2 points
+        let c2 = cp.produce_chunk(4, 10_000, true).to_vec();
+        assert_eq!(
+            c2.iter().map(|p| p.r).collect::<Vec<_>>(),
+            vec![3000, 4000, 1000, 2000],
+            "shrunk delay must keep the most recent [3000,4000], not the stalest"
         );
     }
 
