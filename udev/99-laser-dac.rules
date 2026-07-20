@@ -1,0 +1,25 @@
+# udev rules for USB laser DACs supported by laser-dac-rs.
+#
+# On Linux, a USB device node defaults to 0664 root:root, so a non-root user
+# (i.e. any normal desktop app) cannot claim the interface — discovery may see
+# the device, but opening it fails with a permission error. These rules grant
+# the logged-in desktop user access to the device node.
+#
+# `TAG+="uaccess"` grants access to the user of the active local session via
+# systemd-logind (the modern, group-free mechanism). `GROUP="plugdev"` +
+# `MODE="0660"` is kept as a fallback for systems without logind/uaccess; add
+# your user to the `plugdev` group there (`sudo usermod -aG plugdev "$USER"`).
+#
+# Install:
+#   sudo cp udev/99-laser-dac.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then replug the DAC (or re-login) for the change to take effect
+#
+# Downstream packagers (.deb/.rpm) should ship this to
+# /usr/lib/udev/rules.d/99-laser-dac.rules and run the reload in a postinst hook.
+
+# Helios Laser DAC (Gitle Mikkelsen)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="e500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# LaserCube / LaserDock USB
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1fc9", ATTRS{idProduct}=="04d8", MODE="0660", GROUP="plugdev", TAG+="uaccess"
