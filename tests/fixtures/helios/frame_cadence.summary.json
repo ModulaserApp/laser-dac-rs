@@ -1,0 +1,41 @@
+{
+  "device": {
+    "firmware": 5,
+    "name": "Helios 909127731",
+    "vid": "0x1209",
+    "pid": "0xe500"
+  },
+  "method": "500-pt blanked frame, poll status as-fast-as-possible until Ready, 50 cycles/pps, ~2ms/poll round-trip",
+  "per_pps": {
+    "5000": {
+      "ideal_playtime_ms": 100.0,
+      "notready_ms_median": 97.55,
+      "notready_ms_min": 95.55,
+      "notready_ms_max": 97.55,
+      "notready_polls_median": 48,
+      "notready_polls_min": 47,
+      "notready_polls_max": 48,
+      "cycles_used": 49
+    },
+    "20000": {
+      "ideal_playtime_ms": 25.0,
+      "notready_ms_median": 21.55,
+      "notready_ms_min": 21.55,
+      "notready_ms_max": 23.55,
+      "notready_polls_median": 10,
+      "notready_polls_min": 10,
+      "notready_polls_max": 11,
+      "cycles_used": 49
+    },
+    "30000": {
+      "ideal_playtime_ms": 16.67,
+      "notready_ms_median": 13.55,
+      "notready_ms_min": 11.55,
+      "notready_ms_max": 13.61,
+      "notready_polls_median": 6,
+      "notready_polls_min": 5,
+      "notready_polls_max": 6,
+      "cycles_used": 49
+    }
+  }
+}

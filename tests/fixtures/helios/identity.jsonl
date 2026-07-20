@@ -1,0 +1,32 @@
+{"seq":1,"phase":"init","op":"claim_interface","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":14,"dur_us":22,"t_us":37,"note":""}
+{"seq":2,"phase":"init","op":"set_alternate_setting","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":14,"dur_us":10141,"t_us":10193,"note":"iface=0 alt=1"}
+{"seq":3,"phase":"init","op":"settle_begin","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":5,"dur_us":0,"t_us":10199,"note":"sleep 100ms"}
+{"seq":4,"phase":"init","op":"settle_end","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":100058,"dur_us":0,"t_us":110257,"note":""}
+{"seq":5,"phase":"init_drain","op":"drain_read","ep":"0x83","req":"","resp":"","status":"timeout","n":-1,"dt_us":5,"dur_us":5087,"t_us":115350,"note":""}
+{"seq":6,"phase":"init_drain","op":"drain_done","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":5,"dur_us":0,"t_us":115355,"note":"drained 0 packets"}
+{"seq":7,"phase":"init_fw_probe","op":"fw_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":2,"dur_us":628,"t_us":115986,"note":"out_attempt 1/2"}
+{"seq":8,"phase":"init_fw_probe","op":"fw_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":3,"dur_us":997,"t_us":116988,"note":"in_attempt 1/3"}
+{"seq":9,"phase":"init_fw_probe","op":"fw_probe_done","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":4,"dur_us":0,"t_us":116992,"note":"firmware=Some(5)"}
+{"seq":10,"phase":"init_sdk","op":"sdk_out","ep":"0x06","req":"0706","resp":"","status":"ok","n":2,"dt_us":1,"dur_us":992,"t_us":117986,"note":"send sdk version"}
+{"seq":11,"phase":"identity","op":"firmware_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":11,"dur_us":987,"t_us":118985,"note":"read 0"}
+{"seq":12,"phase":"identity","op":"firmware_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":3,"dur_us":998,"t_us":119987,"note":"read 0"}
+{"seq":13,"phase":"identity","op":"firmware_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":3,"dur_us":994,"t_us":120985,"note":"read 1"}
+{"seq":14,"phase":"identity","op":"firmware_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":2,"dur_us":999,"t_us":121987,"note":"read 1"}
+{"seq":15,"phase":"identity","op":"firmware_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":3,"dur_us":995,"t_us":122986,"note":"read 2"}
+{"seq":16,"phase":"identity","op":"firmware_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":2,"dur_us":1003,"t_us":123992,"note":"read 2"}
+{"seq":17,"phase":"identity","op":"firmware_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":990,"t_us":124988,"note":"read 3"}
+{"seq":18,"phase":"identity","op":"firmware_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":3,"dur_us":996,"t_us":125988,"note":"read 3"}
+{"seq":19,"phase":"identity","op":"firmware_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":3,"dur_us":994,"t_us":126985,"note":"read 4"}
+{"seq":20,"phase":"identity","op":"firmware_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":2,"dur_us":999,"t_us":127987,"note":"read 4"}
+{"seq":21,"phase":"identity","op":"name_out","ep":"0x06","req":"0500","resp":"","status":"ok","n":2,"dt_us":3,"dur_us":994,"t_us":128985,"note":"read 0"}
+{"seq":22,"phase":"identity","op":"name_in","ep":"0x83","req":"","resp":"8548656c696f732039303931323737333100e3c28f7fc41e08205031ba896f3b","status":"ok","n":32,"dt_us":2,"dur_us":1022,"t_us":130011,"note":"read 0"}
+{"seq":23,"phase":"identity","op":"name_out","ep":"0x06","req":"0500","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":969,"t_us":130986,"note":"read 1"}
+{"seq":24,"phase":"identity","op":"name_in","ep":"0x83","req":"","resp":"8548656c696f732039303931323737333100e3c28f7fc41e08205031ba896f3b","status":"ok","n":32,"dt_us":2,"dur_us":1021,"t_us":132010,"note":"read 1"}
+{"seq":25,"phase":"identity","op":"name_out","ep":"0x06","req":"0500","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":970,"t_us":132985,"note":"read 2"}
+{"seq":26,"phase":"identity","op":"name_in","ep":"0x83","req":"","resp":"8548656c696f732039303931323737333100e3c28f7fc41e08205031ba896f3b","status":"ok","n":32,"dt_us":2,"dur_us":1022,"t_us":134011,"note":"read 2"}
+{"seq":27,"phase":"identity","op":"name_out","ep":"0x06","req":"0500","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":968,"t_us":134985,"note":"read 3"}
+{"seq":28,"phase":"identity","op":"name_in","ep":"0x83","req":"","resp":"8548656c696f732039303931323737333100e3c28f7fc41e08205031ba896f3b","status":"ok","n":32,"dt_us":2,"dur_us":1022,"t_us":136010,"note":"read 3"}
+{"seq":29,"phase":"identity","op":"name_out","ep":"0x06","req":"0500","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":970,"t_us":136985,"note":"read 4"}
+{"seq":30,"phase":"identity","op":"name_in","ep":"0x83","req":"","resp":"8548656c696f732039303931323737333100e3c28f7fc41e08205031ba896f3b","status":"ok","n":32,"dt_us":2,"dur_us":1022,"t_us":138010,"note":"read 4"}
+{"seq":31,"phase":"identity","op":"string_descriptors","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":15981,"dur_us":0,"t_us":153992,"note":"manufacturer=Gitle Mikkelsen | product=Helios Laser DAC | serial="}
+{"seq":32,"phase":"identity","op":"final_stop","ep":"0x06","req":"0100","resp":"","status":"ok","n":2,"dt_us":5,"dur_us":989,"t_us":154986,"note":"cleanup stop"}

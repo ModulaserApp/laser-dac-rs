@@ -1,0 +1,29 @@
+{"seq":1,"phase":"init","op":"claim_interface","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":18,"dur_us":19,"t_us":37,"note":""}
+{"seq":2,"phase":"init","op":"set_alternate_setting","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":21,"dur_us":10347,"t_us":10407,"note":"iface=0 alt=1"}
+{"seq":3,"phase":"init","op":"settle_begin","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":8,"dur_us":0,"t_us":10415,"note":"sleep 100ms"}
+{"seq":4,"phase":"init","op":"settle_end","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":100059,"dur_us":0,"t_us":110474,"note":""}
+{"seq":5,"phase":"init_drain","op":"drain_read","ep":"0x83","req":"","resp":"","status":"timeout","n":-1,"dt_us":6,"dur_us":5097,"t_us":115578,"note":""}
+{"seq":6,"phase":"init_drain","op":"drain_done","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":7,"dur_us":0,"t_us":115586,"note":"drained 0 packets"}
+{"seq":7,"phase":"init_fw_probe","op":"fw_out","ep":"0x06","req":"0400","resp":"","status":"ok","n":2,"dt_us":3,"dur_us":591,"t_us":116181,"note":"out_attempt 1/2"}
+{"seq":8,"phase":"init_fw_probe","op":"fw_in","ep":"0x83","req":"","resp":"8405000000","status":"ok","n":5,"dt_us":5,"dur_us":996,"t_us":117183,"note":"in_attempt 1/3"}
+{"seq":9,"phase":"init_fw_probe","op":"fw_probe_done","ep":null,"req":"","resp":"","status":"ok","n":0,"dt_us":5,"dur_us":0,"t_us":117188,"note":"firmware=Some(5)"}
+{"seq":10,"phase":"init_sdk","op":"sdk_out","ep":"0x06","req":"0706","resp":"","status":"ok","n":2,"dt_us":2,"dur_us":988,"t_us":118180,"note":"send sdk version"}
+{"seq":11,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"ok","n":705,"dt_us":19,"dur_us":700,"t_us":118900,"note":"requested_pps=1 footer_pps_lo=0x01 footer_pps_hi=0x00 points=100"}
+{"seq":12,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":11,"dur_us":271,"t_us":119183,"note":"after pps=1"}
+{"seq":13,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8301","status":"ok","n":2,"dt_us":5,"dur_us":993,"t_us":120181,"note":"after pps=1"}
+{"seq":14,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"ok","n":705,"dt_us":50063,"dur_us":695,"t_us":170940,"note":"requested_pps=100 footer_pps_lo=0x64 footer_pps_hi=0x00 points=100"}
+{"seq":15,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":8,"dur_us":233,"t_us":171181,"note":"after pps=100"}
+{"seq":16,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8300","status":"ok","n":2,"dt_us":4,"dur_us":995,"t_us":172181,"note":"after pps=100"}
+{"seq":17,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"ok","n":128,"dt_us":50061,"dur_us":30093,"t_us":252336,"note":"requested_pps=1000 footer_pps_lo=0xe8 footer_pps_hi=0x03 points=100"}
+{"seq":18,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":7,"dur_us":838,"t_us":253182,"note":"after pps=1000"}
+{"seq":19,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8300","status":"ok","n":2,"dt_us":4,"dur_us":995,"t_us":254182,"note":"after pps=1000"}
+{"seq":20,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"timeout","n":-1,"dt_us":50067,"dur_us":30152,"t_us":334402,"note":"requested_pps=30000 footer_pps_lo=0x30 footer_pps_hi=0x75 points=100"}
+{"seq":21,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":13,"dur_us":769,"t_us":335185,"note":"after pps=30000"}
+{"seq":22,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8300","status":"ok","n":2,"dt_us":4,"dur_us":994,"t_us":336184,"note":"after pps=30000"}
+{"seq":23,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"timeout","n":-1,"dt_us":50061,"dur_us":30094,"t_us":416340,"note":"requested_pps=65535 footer_pps_lo=0xff footer_pps_hi=0xff points=100"}
+{"seq":24,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":8,"dur_us":836,"t_us":417185,"note":"after pps=65535"}
+{"seq":25,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8300","status":"ok","n":2,"dt_us":4,"dur_us":994,"t_us":418184,"note":"after pps=65535"}
+{"seq":26,"phase":"pps_sweep","op":"frame","ep":"0x02","req":"80080000000000","resp":"","status":"timeout","n":-1,"dt_us":50062,"dur_us":30094,"t_us":498341,"note":"requested_pps=100000 footer_pps_lo=0xa0 footer_pps_hi=0x86 points=100"}
+{"seq":27,"phase":"pps_sweep","op":"status_out","ep":"0x06","req":"0300","resp":"","status":"ok","n":2,"dt_us":9,"dur_us":836,"t_us":499186,"note":"after pps=100000"}
+{"seq":28,"phase":"pps_sweep","op":"status_in","ep":"0x83","req":"","resp":"8300","status":"ok","n":2,"dt_us":4,"dur_us":995,"t_us":500186,"note":"after pps=100000"}
+{"seq":29,"phase":"pps_sweep","op":"final_stop","ep":"0x06","req":"0100","resp":"","status":"ok","n":2,"dt_us":50060,"dur_us":940,"t_us":551186,"note":"cleanup stop"}
