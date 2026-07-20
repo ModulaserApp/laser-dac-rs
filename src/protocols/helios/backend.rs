@@ -103,6 +103,12 @@ impl HeliosBackend {
         )
     }
 
+    /// Returns `true` if the error is a USB access-permission failure — on Linux
+    /// the device node needs a udev rule before a non-root user can claim it.
+    fn is_access_error(e: &HeliosDacError) -> bool {
+        matches!(e, HeliosDacError::UsbError(rusb::Error::Access))
+    }
+
     /// Classify a Helios DAC error into the appropriate streaming error type.
     ///
     /// Fatal USB errors (`NoDevice`, `Io`, `Pipe`) indicate the device was
@@ -110,7 +116,9 @@ impl HeliosBackend {
     /// stream layer can enter the reconnection path instead of calling
     /// `disconnect()` on a dead handle.
     fn map_err(e: HeliosDacError) -> Error {
-        if Self::is_fatal_usb_error(&e) {
+        if Self::is_access_error(&e) {
+            Error::usb_permission_denied("helios")
+        } else if Self::is_fatal_usb_error(&e) {
             Error::disconnected(format!("USB device error: {e}"))
         } else {
             Error::backend(std::io::Error::other(e.to_string()))
@@ -119,7 +127,9 @@ impl HeliosBackend {
 
     fn map_err_with_context(context: impl Into<String>, e: HeliosDacError) -> Error {
         let context = context.into();
-        if Self::is_fatal_usb_error(&e) {
+        if Self::is_access_error(&e) {
+            Error::usb_permission_denied(context)
+        } else if Self::is_fatal_usb_error(&e) {
             Error::disconnected(format!("{context}: USB device error: {e}"))
         } else {
             Error::backend(std::io::Error::other(format!("{context}: {e}")))
@@ -462,6 +472,29 @@ mod tests {
         let err = HeliosBackend::map_err(HeliosDacError::DeviceNotOpened);
         assert!(!err.is_disconnected());
         assert!(matches!(err, Error::Backend(_)));
+    }
+
+    #[test]
+    fn map_err_usb_access_is_permission_denied() {
+        // A permission failure (no udev rule on Linux) must surface as a distinct
+        // PermissionDenied error, not a generic backend/disconnect, so consumers
+        // can guide the user to grant device access.
+        let err = HeliosBackend::map_err(HeliosDacError::UsbError(rusb::Error::Access));
+        assert!(err.is_permission_denied());
+        assert!(!err.is_disconnected());
+        assert!(!matches!(err, Error::Backend(_)));
+    }
+
+    #[test]
+    fn map_err_ctx_usb_access_is_permission_denied_and_not_fatal() {
+        let mut backend = HeliosBackend::new(0);
+        let err = backend.map_err_ctx(
+            "helios connect",
+            HeliosDacError::UsbError(rusb::Error::Access),
+        );
+        assert!(err.is_permission_denied());
+        // Access is not a physical disconnect, so Drop must not be flagged to leak.
+        assert!(!backend.fatal_disconnect);
     }
 
     #[test]

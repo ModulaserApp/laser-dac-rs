@@ -33,6 +33,20 @@ LaserCube, IDN) work with both Frame and Streaming APIs.
 
 All DACs have been manually verified to work.
 
+### Linux: USB device permissions
+
+USB DACs (Helios, LaserCube/LaserDock) need a udev rule on Linux; without it
+opening the device fails with a permission error (surfaced as
+[`Error::PermissionDenied`](src/error.rs)). Network DACs are unaffected.
+
+```bash
+sudo cp udev/99-laser-dac.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+# then replug the DAC (or re-login)
+```
+
+Downstream packages should ship the rule to `/usr/lib/udev/rules.d/`.
+
 ## Quick Start
 
 Connect your laser DAC and run an example:

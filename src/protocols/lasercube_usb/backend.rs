@@ -84,6 +84,21 @@ fn classify_stream_error(err: &UsbError) -> StreamErrorClass {
     }
 }
 
+/// Map an error from opening the USB stream into the public error type.
+///
+/// A `rusb::Error::Access` means the OS denied access to the device — on Linux
+/// the LaserCube/LaserDock needs a udev rule granting the user access to the
+/// device node. Surfacing it as [`Error::PermissionDenied`] (rather than a
+/// generic backend error) lets consumers guide the user to the fix. Every other
+/// open failure stays a backend error.
+fn map_open_error(err: UsbError) -> Error {
+    if matches!(err, UsbError::Usb(rusb::Error::Access)) {
+        Error::usb_permission_denied("laser-cube usb")
+    } else {
+        Error::backend(err)
+    }
+}
+
 impl DacBackend for LaserCubeUsbBackend {
     fn dac_type(&self) -> DacType {
         DacType::LaserCubeUsb
@@ -103,9 +118,9 @@ impl DacBackend for LaserCubeUsbBackend {
             .take()
             .ok_or_else(|| Error::disconnected("No device available"))?;
 
-        let mut stream = Stream::open(device).map_err(Error::backend)?;
+        let mut stream = Stream::open(device).map_err(map_open_error)?;
 
-        stream.enable_output().map_err(Error::backend)?;
+        stream.enable_output().map_err(map_open_error)?;
 
         let info = stream.info();
         if info.max_dac_rate > 0 {
@@ -204,7 +219,8 @@ impl FifoBackend for LaserCubeUsbBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_stream_error, StreamErrorClass};
+    use super::{classify_stream_error, map_open_error, StreamErrorClass};
+    use crate::error::Error;
     use crate::protocols::lasercube_usb::error::Error as UsbError;
     use crate::protocols::lasercube_usb::rusb;
 
@@ -229,5 +245,21 @@ mod tests {
                 "classification of {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn map_open_error_access_is_permission_denied() {
+        // A denied open (no udev rule on Linux) surfaces as PermissionDenied so
+        // the consumer can guide the user, not a generic backend error.
+        let err = map_open_error(UsbError::Usb(rusb::Error::Access));
+        assert!(err.is_permission_denied());
+        assert!(!matches!(err, Error::Backend(_)));
+    }
+
+    #[test]
+    fn map_open_error_other_stays_backend() {
+        let err = map_open_error(UsbError::Usb(rusb::Error::Timeout));
+        assert!(!err.is_permission_denied());
+        assert!(matches!(err, Error::Backend(_)));
     }
 }
