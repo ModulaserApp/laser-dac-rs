@@ -35,23 +35,17 @@ All DACs have been manually verified to work.
 
 ### Linux: USB device permissions
 
-USB DACs (Helios, LaserCube/LaserDock) need a udev rule on Linux. Without it the
-device node is owned by `root` and a non-root app can enumerate the device but
-cannot open it — connecting fails with a permission error (surfaced as
-[`Error::PermissionDenied`](src/error.rs), which `Error::is_permission_denied()`
-lets you detect and guide the user through the fix). Network DACs are unaffected.
-
-Install the bundled rule ([`udev/99-laser-dac.rules`](udev/99-laser-dac.rules)):
+USB DACs (Helios, LaserCube/LaserDock) need a udev rule on Linux; without it
+opening the device fails with a permission error (surfaced as
+[`Error::PermissionDenied`](src/error.rs)). Network DACs are unaffected.
 
 ```bash
 sudo cp udev/99-laser-dac.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-# then replug the DAC (or re-login) for the change to take effect
+# then replug the DAC (or re-login)
 ```
 
-Applications that redistribute this library should ship the rule in their Linux
-package (e.g. to `/usr/lib/udev/rules.d/` from a `.deb`/`.rpm` postinst) so users
-get zero-config USB access.
+Downstream packages should ship the rule to `/usr/lib/udev/rules.d/`.
 
 ## Quick Start
 
