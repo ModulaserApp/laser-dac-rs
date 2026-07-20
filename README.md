@@ -40,10 +40,15 @@ opening the device fails with a permission error (surfaced as
 [`Error::PermissionDenied`](src/error.rs)). Network DACs are unaffected.
 
 ```bash
-sudo cp udev/99-laser-dac.rules /etc/udev/rules.d/
+sudo cp udev/70-laser-dac.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 # then replug the DAC (or re-login)
 ```
+
+The `70-` filename prefix matters: udev applies rule files in lexical order,
+and `TAG+="uaccess"` only becomes an access-granting ACL if the rule runs
+before systemd's `73-seat-late.rules`. A `99-` prefix runs too late and the
+rule silently falls back to `plugdev`-group access only — don't renumber it.
 
 Downstream packages should ship the rule to `/usr/lib/udev/rules.d/`.
 

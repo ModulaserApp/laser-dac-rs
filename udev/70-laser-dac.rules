@@ -10,16 +10,24 @@
 # `MODE="0660"` is kept as a fallback for systems without logind/uaccess; add
 # your user to the `plugdev` group there (`sudo usermod -aG plugdev "$USER"`).
 #
+# The `70-` filename prefix is load-bearing, not cosmetic. udev applies rule
+# files in lexical filename order, and `TAG+="uaccess"` is only turned into a
+# POSIX ACL by systemd's own `73-seat-late.rules`. A file numbered >= 73 (the
+# old `99-`) sets the tag too late — the uaccess builtin never sees it and the
+# rule silently no-ops, falling back to `plugdev` only. Keep this below 73.
+# (See systemd#4288; hidapi's 69-hid.rules uses a low number for the same
+# reason.) Do not renumber it back to 99-.
+#
 # Install:
-#   sudo cp udev/99-laser-dac.rules /etc/udev/rules.d/
+#   sudo cp udev/70-laser-dac.rules /etc/udev/rules.d/
 #   sudo udevadm control --reload-rules && sudo udevadm trigger
 #   # then replug the DAC (or re-login) for the change to take effect
 #
 # Downstream packagers (.deb/.rpm) should ship this to
-# /usr/lib/udev/rules.d/99-laser-dac.rules and run the reload in a postinst hook.
+# /usr/lib/udev/rules.d/70-laser-dac.rules and run the reload in a postinst hook.
 
 # Helios Laser DAC (Gitle Mikkelsen)
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="e500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="e500", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 
 # LaserCube / LaserDock USB
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1fc9", ATTRS{idProduct}=="04d8", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="1fc9", ATTRS{idProduct}=="04d8", MODE="0660", GROUP="plugdev", TAG+="uaccess"
