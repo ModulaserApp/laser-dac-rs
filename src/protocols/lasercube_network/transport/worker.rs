@@ -12,12 +12,22 @@ use super::super::pacing::{packet_interval, send_budget, PacerInputs};
 use super::super::packetizer::encode_sample_packet;
 use super::super::protocol::{Point, CMD_GET_FULL_INFO, DEFAULT_POINT_RATE};
 use super::super::status::LaserCubeNetworkStatus;
-use super::state::{buffer_total_from_max, SharedTransportState, TransportState};
+use super::state::{buffer_total_from_max, decayed_free, SharedTransportState, TransportState};
 use super::{
     send_repeated, would_block, AddressedDevice, DatagramSocket, PriorityCommand, TransportCommand,
     DIAGNOSTIC_LOG_PERIOD, FULL_INFO_POLL_ACTIVE, FULL_INFO_POLL_INACTIVE, MAX_ACK_DRAIN_PER_LOOP,
     MAX_CONTROL_DRAIN_PER_LOOP, MAX_IDLE_SLEEP,
 };
+
+// LaserCube Wi-Fi hardware drops packets when a producer sends more than about
+// 20 datagrams in one burst. Prime conservatively, then limit deadline catch-up
+// so scheduler stalls cannot turn into another unbounded burst.
+const INITIAL_TOPUP_PACKET_LIMIT: usize = 4;
+const INITIAL_TOPUP_PAUSE: Duration = Duration::from_millis(10);
+const MAX_CATCHUP_PACKETS_PER_WAKE: usize = 2;
+const SEND_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+const MAX_CONSECUTIVE_SEND_ERRORS: usize = 100;
+const RATE_COMMAND_SETTLE: Duration = Duration::from_millis(50);
 
 pub(super) struct TransportWorker<S> {
     device: AddressedDevice,
@@ -33,15 +43,18 @@ pub(super) struct TransportWorker<S> {
     packet_sequence: u8,
     transfer_sequence: u8,
     packet_send_times: [Option<Instant>; 256],
-    // Samples carried by each still-outstanding (sent-but-unacked) packet,
-    // indexed by packet sequence. Used to discount in-flight points from an
-    // ACK's reported free space. Zero means the slot is idle/acked.
-    packet_sample_counts: [u16; 256],
     current_rate: u32,
+    /// Requested output state from the presentation session.
     output_enabled: bool,
+    /// State last commanded on the device. Enabling is deferred until the first
+    /// enqueue establishes the requested point rate.
+    output_commanded_enabled: bool,
+    rate_initialized: bool,
+    startup_burst_done: bool,
     next_send_due: Instant,
     next_full_info_due: Instant,
     next_diagnostic_log_due: Instant,
+    consecutive_send_errors: usize,
     running: bool,
 }
 
@@ -53,7 +66,13 @@ impl<S: DatagramSocket> TransportWorker<S> {
         state: SharedTransportState,
         generation: Arc<AtomicU64>,
     ) -> Self {
-        let current_rate = super::super::clamp_point_rate(&device.status, DEFAULT_POINT_RATE);
+        // Keep the device-reported rate until the first enqueue establishes the
+        // session's requested rate.
+        let current_rate = if device.status.point_rate > 0 {
+            super::super::clamp_point_rate(&device.status, device.status.point_rate)
+        } else {
+            super::super::clamp_point_rate(&device.status, DEFAULT_POINT_RATE)
+        };
         let now = Instant::now();
         Self {
             device,
@@ -69,12 +88,15 @@ impl<S: DatagramSocket> TransportWorker<S> {
             packet_sequence: 0,
             transfer_sequence: 0,
             packet_send_times: [None; 256],
-            packet_sample_counts: [0; 256],
             current_rate,
             output_enabled: false,
+            output_commanded_enabled: false,
+            rate_initialized: false,
+            startup_burst_done: false,
             next_send_due: now,
             next_full_info_due: now + FULL_INFO_POLL_INACTIVE,
             next_diagnostic_log_due: now + DIAGNOSTIC_LOG_PERIOD,
+            consecutive_send_errors: 0,
             running: true,
         }
     }
@@ -121,22 +143,21 @@ impl<S: DatagramSocket> TransportWorker<S> {
                     self.output_enabled = enabled;
                     self.next_full_info_due =
                         Instant::now() + full_info_poll_period(self.output_enabled);
-                    self.record_output_enabled(enabled);
-                    let _ = send_repeated(&self.cmd_socket, &command::set_output(enabled));
+                    if !enabled || self.rate_initialized {
+                        self.command_output(enabled);
+                    }
                 }
                 Ok(PriorityCommand::StopOutput { generation }) => {
                     self.active_generation = generation;
                     self.clear_pending_points();
                     self.output_enabled = false;
-                    self.record_output_enabled(false);
-                    let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
+                    self.command_output(false);
                 }
                 Ok(PriorityCommand::Shutdown { generation }) => {
                     self.active_generation = generation;
                     self.clear_pending_points();
                     self.output_enabled = false;
-                    self.record_output_enabled(false);
-                    let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
+                    self.command_output(false);
                     self.running = false;
                     break;
                 }
@@ -144,8 +165,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
                     self.active_generation = self.generation.load(Ordering::SeqCst);
                     self.clear_pending_points();
                     self.output_enabled = false;
-                    self.record_output_enabled(false);
-                    let _ = send_repeated(&self.cmd_socket, &command::set_output(false));
+                    self.command_output(false);
                     self.running = false;
                     break;
                 }
@@ -168,8 +188,13 @@ impl<S: DatagramSocket> TransportWorker<S> {
                     {
                         continue;
                     }
-                    if point_rate != self.current_rate {
-                        let _ = self.set_rate(point_rate);
+                    if (!self.rate_initialized || point_rate != self.current_rate)
+                        && self.apply_rate(point_rate).is_err()
+                    {
+                        continue;
+                    }
+                    if self.output_enabled && !self.output_commanded_enabled {
+                        self.command_output(true);
                     }
                     self.queue.extend(points);
                     _reservation.commit();
@@ -184,10 +209,35 @@ impl<S: DatagramSocket> TransportWorker<S> {
         }
     }
 
+    fn command_output(&mut self, enabled: bool) {
+        self.output_commanded_enabled = enabled;
+        self.record_output_enabled(enabled);
+        let _ = send_repeated(&self.cmd_socket, &command::set_output(enabled));
+    }
+
     fn clear_pending_points(&mut self) {
         self.queue.clear();
         self.packet_buffer.clear();
+        self.rate_initialized = false;
+        self.startup_burst_done = false;
+        self.next_send_due = Instant::now();
         self.state.clear_host_queue();
+    }
+
+    /// Apply a runtime rate while output is off. Firmware 0.21 can ignore rate
+    /// commands sent in the same UDP burst as output enable.
+    fn apply_rate(&mut self, point_rate: u32) -> io::Result<()> {
+        let restore_output = self.output_commanded_enabled;
+        if restore_output {
+            self.command_output(false);
+        }
+        self.set_rate(point_rate)?;
+        self.rate_initialized = true;
+        thread::sleep(RATE_COMMAND_SETTLE);
+        if restore_output {
+            self.command_output(true);
+        }
+        Ok(())
     }
 
     fn set_rate(&mut self, point_rate: u32) -> io::Result<()> {
@@ -206,8 +256,10 @@ impl<S: DatagramSocket> TransportWorker<S> {
             .inner
             .lock()
             .expect("LaserCube transport state poisoned");
+        // This is the intended runtime rate, used for local pacing/decay. Keep
+        // the status snapshot unchanged until full-info confirms the device
+        // applied the UDP command.
         state.point_rate = point_rate;
-        state.status.point_rate = point_rate;
         Ok(())
     }
 
@@ -221,6 +273,9 @@ impl<S: DatagramSocket> TransportWorker<S> {
                     {
                         let reported_output_enabled = status.output_enabled;
                         let interlock_enabled = status.interlock_enabled;
+                        let reported_rate = status.point_rate;
+                        let applied_rate = (reported_rate > 0)
+                            .then(|| super::super::clamp_point_rate(&status, reported_rate));
                         {
                             let mut state = self
                                 .state
@@ -229,7 +284,18 @@ impl<S: DatagramSocket> TransportWorker<S> {
                                 .expect("LaserCube transport state poisoned");
                             apply_status(&mut state, status, now);
                         }
-                        self.reconcile_output_enable(reported_output_enabled, interlock_enabled);
+                        if applied_rate.is_some_and(|rate| rate != self.current_rate) {
+                            log::warn!(
+                                "LaserCube network: device reports {reported_rate} pps, expected {} pps; re-applying rate",
+                                self.current_rate
+                            );
+                            let _ = self.apply_rate(self.current_rate);
+                        } else {
+                            self.reconcile_output_enable(
+                                reported_output_enabled,
+                                interlock_enabled,
+                            );
+                        }
                     }
                 }
                 Ok(len) => {
@@ -266,11 +332,6 @@ impl<S: DatagramSocket> TransportWorker<S> {
         }
     }
 
-    /// Total samples still outstanding across all sent-but-unacked packets.
-    fn in_flight_samples(&self) -> usize {
-        self.packet_sample_counts.iter().map(|&c| c as usize).sum()
-    }
-
     fn apply_ack(&mut self, now: Instant, ack: BufferAck) {
         match ack.packet_sequence {
             Some(sequence) => self.apply_data_ack(now, ack, sequence),
@@ -287,14 +348,12 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 .expect("LaserCube transport state poisoned");
             state.last_data_ack_sequence
         };
-        // Take this packet's send slot regardless (records RTT, frees the slot).
         let rtt = self.packet_send_times[sequence as usize]
             .take()
             .map(|sent_at| now.saturating_duration_since(sent_at));
-        self.packet_sample_counts[sequence as usize] = 0;
 
-        // Reject ACKs that are not strictly newer than the last applied one:
-        // out-of-order or duplicated ACKs must not rewind the buffer estimate.
+        // Reject reordered/duplicate ACKs and clear skipped RTT slots so a later
+        // sequence wrap cannot produce a bogus multi-second measurement.
         if let Some(prev) = prev_sequence {
             if !seq_newer(prev, sequence) {
                 let mut state = self
@@ -308,39 +367,28 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 }
                 return;
             }
-            // Packets between the last applied ACK and this one are delivered;
-            // release their slots so they don't linger as phantom in-flight.
             let mut s = prev.wrapping_add(1);
             while s != sequence {
                 self.packet_send_times[s as usize] = None;
-                self.packet_sample_counts[s as usize] = 0;
                 s = s.wrapping_add(1);
             }
         } else {
-            // First applied data ACK on a fresh connection: earlier packets
-            // (0..sequence) are implicitly delivered — the device would not ACK
-            // this packet otherwise, and its reported free space already
-            // reflects them. Release their slots so they don't linger as
-            // phantom in-flight and double-discount the free estimate.
-            let mut s: u8 = 0;
+            let mut s = 0;
             while s != sequence {
                 self.packet_send_times[s as usize] = None;
-                self.packet_sample_counts[s as usize] = 0;
                 s = s.wrapping_add(1);
             }
         }
 
-        // Remaining outstanding packets were sent after this ACK's packet and
-        // are not yet reflected in its reported free space — discount them.
-        let in_flight = self.in_flight_samples();
+        // Data ACKs on Wi-Fi can be delayed beyond a complete 8-bit sequence
+        // cycle. Keep them for liveness/diagnostics, but do not let stale free-
+        // space readings perturb wire pacing. Local decay and periodic full-info
+        // snapshots remain the authoritative fullness estimate.
         let mut state = self
             .state
             .inner
             .lock()
             .expect("LaserCube transport state poisoned");
-        let adjusted_free = (ack.free_space as usize).saturating_sub(in_flight);
-        state.free_estimate = adjusted_free.min(state.buffer_total);
-        state.last_estimate = now;
         state.last_ack_free_space = Some(ack.free_space);
         state.last_data_ack_sequence = Some(sequence);
         if let Some(rtt) = rtt {
@@ -351,18 +399,13 @@ impl<S: DatagramSocket> TransportWorker<S> {
     }
 
     fn apply_command_ack(&mut self, now: Instant, ack: BufferAck) {
-        // Command-channel ACKs carry no packet sequence, so we cannot order them
-        // against data ACKs. Discount all outstanding in-flight samples to stay
-        // conservative.
-        let in_flight = self.in_flight_samples();
+        // Command-channel free-space ACKs are likewise diagnostic only; they
+        // cannot be ordered against the data stream.
         let mut state = self
             .state
             .inner
             .lock()
             .expect("LaserCube transport state poisoned");
-        let adjusted_free = (ack.free_space as usize).saturating_sub(in_flight);
-        state.free_estimate = adjusted_free.min(state.buffer_total);
-        state.last_estimate = now;
         state.last_ack_free_space = Some(ack.free_space);
         state.last_ack = Some(now);
         state.last_comms = Some(now);
@@ -372,10 +415,10 @@ impl<S: DatagramSocket> TransportWorker<S> {
     /// A correlated loss of both `set_output` datagrams would otherwise leave the
     /// device out of sync with the worker's intent (dark show / stuck-on beam).
     fn reconcile_output_enable(&mut self, reported_enabled: bool, interlock_enabled: bool) {
-        if reported_enabled == self.output_enabled {
+        if reported_enabled == self.output_commanded_enabled {
             return;
         }
-        if self.output_enabled {
+        if self.output_commanded_enabled {
             if interlock_enabled {
                 log::warn!(
                     "LaserCube network: output intended ON but device reports OFF with interlock \
@@ -414,24 +457,61 @@ impl<S: DatagramSocket> TransportWorker<S> {
         }
     }
 
-    /// Send as many due packets as the device buffer will accept for this wake,
-    /// catching up after an oversleep instead of dribbling one packet per wake.
+    /// Send up to four currently queued packets in one startup burst, then use
+    /// point-rate deadlines. Catch-up remains bounded so scheduler stalls cannot
+    /// flood the Cube's small Wi-Fi receive queue.
     fn try_send_due_packet(&mut self, now: Instant) {
-        if self.active_generation != self.generation.load(Ordering::SeqCst) {
+        if self.active_generation != self.generation.load(Ordering::SeqCst)
+            || now < self.next_send_due
+            || self.queue.is_empty()
+        {
             return;
         }
-        while now >= self.next_send_due && !self.queue.is_empty() {
+
+        if !self.startup_burst_done {
+            let mut sent = 0;
+            while sent < INITIAL_TOPUP_PACKET_LIMIT && !self.queue.is_empty() {
+                if !self.send_one_packet(now) {
+                    break;
+                }
+                sent += 1;
+            }
+            if sent > 0 {
+                self.transfer_sequence = self.transfer_sequence.wrapping_add(1);
+                self.startup_burst_done = true;
+                self.next_send_due = now + INITIAL_TOPUP_PAUSE;
+            }
+            return;
+        }
+
+        let mut sent = 0;
+        while now >= self.next_send_due
+            && !self.queue.is_empty()
+            && sent < MAX_CATCHUP_PACKETS_PER_WAKE
+        {
             if !self.send_one_packet(now) {
                 break;
             }
+            sent += 1;
+        }
+        if sent > 0 {
+            // All packets emitted by one worker wake form one logical transfer.
+            self.transfer_sequence = self.transfer_sequence.wrapping_add(1);
+        }
+        if sent == MAX_CATCHUP_PACKETS_PER_WAKE && now >= self.next_send_due {
+            // Drop excess catch-up debt. Sustained throughput remains governed
+            // by the requested point rate instead of a burst backlog.
+            self.next_send_due = now
+                + packet_interval(
+                    self.device.profile.max_udp_samples_per_packet,
+                    self.current_rate,
+                );
         }
     }
 
-    /// Attempt to send a single packet. Returns `true` if a packet was sent and
-    /// the caller should keep topping up the device buffer this wake, `false` if
-    /// it should stop (paced, waiting for buffer room, or a send error).
+    /// Attempt to send one packet and advance the point-rate deadline.
     fn send_one_packet(&mut self, now: Instant) -> bool {
-        let (budget, free_estimate, buffer_total, remote_buffer_cutoff, full_packet) = {
+        let (budget, full_packet) = {
             let state = self
                 .state
                 .inner
@@ -444,13 +524,7 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 remote_buffer_cutoff: state.profile.remote_buffer_cutoff,
                 per_tick_packet_budget: state.profile.max_udp_samples_per_packet,
             });
-            (
-                budget,
-                state.free_estimate,
-                state.buffer_total,
-                state.profile.remote_buffer_cutoff,
-                state.profile.max_udp_samples_per_packet,
-            )
+            (budget, state.profile.max_udp_samples_per_packet)
         };
 
         // Coalesce to full packets: a full profile-sized packet when the queue
@@ -477,32 +551,21 @@ impl<S: DatagramSocket> TransportWorker<S> {
             return false;
         }
 
-        if encode_sample_packet(
+        let send_result = encode_sample_packet(
             self.packet_sequence,
             self.transfer_sequence,
             &self.packet_buffer,
             &mut self.send_buffer,
         )
-        .and_then(|_| self.data_socket.send(&self.send_buffer).map(|_| ()))
-        .is_ok()
-        {
+        .and_then(|_| self.data_socket.send(&self.send_buffer).map(|_| ()));
+        if send_result.is_ok() {
             let sent = self.packet_buffer.len();
             self.packet_send_times[self.packet_sequence as usize] = Some(now);
-            self.packet_sample_counts[self.packet_sequence as usize] = sent as u16;
             self.record_send(now, sent);
+            self.consecutive_send_errors = 0;
             self.packet_sequence = self.packet_sequence.wrapping_add(1);
-            // NOTE: transfer_sequence advances in lockstep with packet_sequence
-            // here. Reference LaserCube senders bump transfer_sequence only per
-            // logical frame/transfer; we intentionally keep the simpler per-packet
-            // increment, which the firmware tolerates. Left unchanged on purpose.
-            self.transfer_sequence = self.transfer_sequence.wrapping_add(1);
-            if should_continue_topup(free_estimate, buffer_total, remote_buffer_cutoff, sent) {
-                self.next_send_due = now;
-                true
-            } else {
-                self.next_send_due = now + packet_interval(sent, self.current_rate);
-                false
-            }
+            self.next_send_due += packet_interval(sent, self.current_rate);
+            true
         } else {
             let mut state = self
                 .state
@@ -510,11 +573,28 @@ impl<S: DatagramSocket> TransportWorker<S> {
                 .lock()
                 .expect("LaserCube transport state poisoned");
             state.send_errors = state.send_errors.saturating_add(1);
+            let send_errors = state.send_errors;
             drop(state);
+            self.consecutive_send_errors = self.consecutive_send_errors.saturating_add(1);
+            let error = send_result.expect_err("failed send result");
+            if send_errors == 1 || send_errors.is_multiple_of(100) {
+                log::warn!(
+                    "LaserCube network data send failed ({send_errors} total, {} consecutive): {error}",
+                    self.consecutive_send_errors
+                );
+            }
             for point in self.packet_buffer.drain(..).rev() {
                 self.queue.push_front(point);
             }
-            self.next_send_due = now + self.device.profile.wait_buffer_sleep;
+            self.next_send_due = now + SEND_ERROR_BACKOFF;
+            if self.consecutive_send_errors >= MAX_CONSECUTIVE_SEND_ERRORS {
+                log::warn!(
+                    "LaserCube network data sends failed {} times consecutively; disconnecting transport",
+                    self.consecutive_send_errors
+                );
+                self.state.mark_disconnected();
+                self.running = false;
+            }
             false
         }
     }
@@ -649,8 +729,10 @@ fn full_info_poll_period(output_enabled: bool) -> Duration {
 fn apply_status(state: &mut TransportState, status: LaserCubeNetworkStatus, now: Instant) {
     state.connection_type = status.connection_type;
     state.packet_errors = status.packet_errors;
+    let local_free = decayed_free(state, now);
     state.buffer_total = buffer_total_from_max(status.buffer_max);
-    state.free_estimate = (status.buffer_free as usize).min(state.buffer_total);
+    let reported_free = (status.buffer_free as usize).min(state.buffer_total);
+    state.free_estimate = local_free.min(reported_free);
     if status.point_rate > 0 {
         state.point_rate = super::super::clamp_point_rate(&status, status.point_rate);
     }
@@ -658,16 +740,6 @@ fn apply_status(state: &mut TransportState, status: LaserCubeNetworkStatus, now:
     state.last_full_info = Some(now);
     state.last_comms = Some(now);
     state.status = status;
-}
-
-fn should_continue_topup(
-    free_estimate_before_send: usize,
-    buffer_total: usize,
-    remote_buffer_cutoff: usize,
-    sent: usize,
-) -> bool {
-    let buffered_before_send = buffer_total.saturating_sub(free_estimate_before_send);
-    buffered_before_send.saturating_add(sent) < remote_buffer_cutoff
 }
 
 #[cfg(test)]
@@ -683,6 +755,7 @@ mod tests {
     struct FakeSocket {
         sent: Arc<Mutex<Vec<Vec<u8>>>>,
         recv_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        send_error: Arc<Mutex<Option<io::ErrorKind>>>,
     }
 
     impl FakeSocket {
@@ -693,10 +766,17 @@ mod tests {
         fn sent_packets(&self) -> Vec<Vec<u8>> {
             self.sent.lock().unwrap().clone()
         }
+
+        fn set_send_error(&self, kind: Option<io::ErrorKind>) {
+            *self.send_error.lock().unwrap() = kind;
+        }
     }
 
     impl DatagramSocket for FakeSocket {
         fn send(&self, buffer: &[u8]) -> io::Result<usize> {
+            if let Some(kind) = *self.send_error.lock().unwrap() {
+                return Err(io::Error::new(kind, "injected send failure"));
+            }
             self.sent.lock().unwrap().push(buffer.to_vec());
             Ok(buffer.len())
         }
@@ -796,11 +876,9 @@ mod tests {
     }
 
     #[test]
-    fn data_ack_discounts_in_flight_samples() {
+    fn data_ack_does_not_perturb_pacing_estimate() {
         let (mut worker, _cmd_socket, _data_socket) = fake_worker();
         let now = Instant::now();
-        // A later packet (seq 20) is still outstanding with 140 samples.
-        worker.packet_sample_counts[20] = 140;
         let ack = BufferAck {
             source: AckSource::Data,
             packet_sequence: Some(10),
@@ -810,7 +888,7 @@ mod tests {
         worker.apply_ack(now, ack);
 
         let diag = worker.state.diagnostics();
-        assert_eq!(diag.device_free_estimate, 1000 - 140);
+        assert_eq!(diag.device_free_estimate, 6000);
         assert_eq!(diag.last_data_ack_sequence, Some(10));
     }
 
@@ -826,9 +904,9 @@ mod tests {
                 free_space: 1000,
             },
         );
-        assert_eq!(worker.state.diagnostics().device_free_estimate, 1000);
+        assert_eq!(worker.state.diagnostics().device_free_estimate, 6000);
 
-        // A reordered, older ACK must not overwrite the estimate.
+        // A reordered, older ACK must not overwrite diagnostics or pacing.
         worker.apply_ack(
             now,
             BufferAck {
@@ -837,18 +915,18 @@ mod tests {
                 free_space: 5000,
             },
         );
-        assert_eq!(worker.state.diagnostics().device_free_estimate, 1000);
+        assert_eq!(worker.state.diagnostics().device_free_estimate, 6000);
         assert_eq!(worker.state.diagnostics().last_data_ack_sequence, Some(10));
     }
 
     #[test]
-    fn data_ack_releases_delivered_intermediate_slots() {
+    fn data_ack_clears_skipped_rtt_slots() {
         let (mut worker, _cmd_socket, _data_socket) = fake_worker();
         let now = Instant::now();
         // Packets 3, 4, 5 outstanding; ACK for 5 implies 3 and 4 delivered.
-        worker.packet_sample_counts[3] = 80;
-        worker.packet_sample_counts[4] = 80;
-        worker.packet_sample_counts[5] = 80;
+        worker.packet_send_times[3] = Some(now);
+        worker.packet_send_times[4] = Some(now);
+        worker.packet_send_times[5] = Some(now);
         worker.apply_ack(
             now,
             BufferAck {
@@ -866,21 +944,21 @@ mod tests {
                 free_space: 6000,
             },
         );
-        assert_eq!(worker.packet_sample_counts[3], 0);
-        assert_eq!(worker.packet_sample_counts[4], 0);
-        assert_eq!(worker.packet_sample_counts[5], 0);
+        assert_eq!(worker.packet_send_times[3], None);
+        assert_eq!(worker.packet_send_times[4], None);
+        assert_eq!(worker.packet_send_times[5], None);
     }
 
     #[test]
-    fn first_data_ack_releases_earlier_startup_slots() {
+    fn first_data_ack_clears_earlier_rtt_slots() {
         let (mut worker, _cmd_socket, _data_socket) = fake_worker();
         let now = Instant::now();
         // Fresh connection: packets 0..=3 sent, their ACKs (0,1,2) were lost,
         // so the first applied data ACK is for seq 3.
-        worker.packet_sample_counts[0] = 80;
-        worker.packet_sample_counts[1] = 80;
-        worker.packet_sample_counts[2] = 80;
-        worker.packet_sample_counts[3] = 80;
+        worker.packet_send_times[0] = Some(now);
+        worker.packet_send_times[1] = Some(now);
+        worker.packet_send_times[2] = Some(now);
+        worker.packet_send_times[3] = Some(now);
         worker.apply_ack(
             now,
             BufferAck {
@@ -889,12 +967,12 @@ mod tests {
                 free_space: 6000,
             },
         );
-        // Earlier slots are implicitly delivered and must not count as phantom
-        // in-flight, so free_space is not double-discounted.
-        assert_eq!(worker.packet_sample_counts[0], 0);
-        assert_eq!(worker.packet_sample_counts[1], 0);
-        assert_eq!(worker.packet_sample_counts[2], 0);
-        assert_eq!(worker.packet_sample_counts[3], 0);
+        // Earlier slots cannot produce meaningful RTT measurements once their
+        // ACKs have been skipped.
+        assert_eq!(worker.packet_send_times[0], None);
+        assert_eq!(worker.packet_send_times[1], None);
+        assert_eq!(worker.packet_send_times[2], None);
+        assert_eq!(worker.packet_send_times[3], None);
         assert_eq!(worker.state.diagnostics().device_free_estimate, 6000);
     }
 
@@ -902,6 +980,7 @@ mod tests {
     fn full_info_reconciles_lost_output_enable() {
         let (mut worker, cmd_socket, _data_socket) = fake_worker();
         worker.output_enabled = true;
+        worker.output_commanded_enabled = true;
         cmd_socket.push_recv(full_info_bytes(false, false));
 
         worker.drain_acks(Instant::now());
@@ -916,11 +995,55 @@ mod tests {
     fn full_info_does_not_resend_when_output_matches() {
         let (mut worker, cmd_socket, _data_socket) = fake_worker();
         worker.output_enabled = true;
+        worker.output_commanded_enabled = true;
         cmd_socket.push_recv(full_info_bytes(true, false));
 
         worker.drain_acks(Instant::now());
 
         assert!(cmd_socket.sent_packets().is_empty());
+    }
+
+    #[test]
+    fn full_info_retries_unapplied_rate_change() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
+        worker.current_rate = 30_000;
+        let mut info = full_info_bytes(false, false);
+        info[10..14].copy_from_slice(&15_000u32.to_le_bytes());
+        info[14..18].copy_from_slice(&30_000u32.to_le_bytes());
+        cmd_socket.push_recv(info);
+
+        worker.drain_acks(Instant::now());
+
+        let expected = command::set_rate(30_000).to_vec();
+        assert_eq!(cmd_socket.sent_packets(), vec![expected.clone(), expected]);
+        assert_eq!(worker.current_rate, 30_000);
+        assert_eq!(worker.state.diagnostics().status.point_rate, 15_000);
+    }
+
+    #[test]
+    fn combined_output_and_rate_mismatch_reconciles_rate_first() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
+        worker.current_rate = 10_000;
+        worker.output_enabled = true;
+        worker.output_commanded_enabled = true;
+        let mut info = full_info_bytes(false, false);
+        info[10..14].copy_from_slice(&30_000u32.to_le_bytes());
+        info[14..18].copy_from_slice(&30_000u32.to_le_bytes());
+        cmd_socket.push_recv(info);
+
+        worker.drain_acks(Instant::now());
+
+        assert_eq!(
+            cmd_socket.sent_packets(),
+            vec![
+                command::set_output(false).to_vec(),
+                command::set_output(false).to_vec(),
+                command::set_rate(10_000).to_vec(),
+                command::set_rate(10_000).to_vec(),
+                command::set_output(true).to_vec(),
+                command::set_output(true).to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -946,9 +1069,8 @@ mod tests {
     }
 
     #[test]
-    fn catches_up_with_multiple_full_packets_after_oversleep() {
+    fn initial_topup_is_bounded_below_firmware_burst_limit() {
         let (mut worker, _cmd_socket, data_socket) = fake_worker();
-        // A large backlog (more than the remote cutoff worth of points).
         let reservation = worker.state.reserve_host_points(3000).unwrap();
         worker.queue.extend(vec![Point::blank(); 3000]);
         reservation.commit();
@@ -958,12 +1080,60 @@ mod tests {
         worker.try_send_due_packet(now);
 
         let sent = data_socket.sent_packets();
-        // Fills the device up to the remote cutoff (1800) in 80-point packets,
-        // then stops and paces; the remaining backlog stays queued.
-        assert_eq!(sent.len(), 22);
+        assert_eq!(sent.len(), INITIAL_TOPUP_PACKET_LIMIT);
         assert!(sent.iter().all(|p| p.len() == 4 + 80 * 10));
+        assert!(worker.startup_burst_done);
+        assert_eq!(worker.next_send_due, now + INITIAL_TOPUP_PAUSE);
+        assert_eq!(worker.queue.len(), 3000 - INITIAL_TOPUP_PACKET_LIMIT * 80);
+    }
+
+    #[test]
+    fn startup_burst_uses_only_points_already_queued() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(80).unwrap();
+        worker.queue.extend(vec![Point::blank(); 80]);
+        reservation.commit();
+        let now = Instant::now();
+
+        worker.try_send_due_packet(now);
+
+        assert!(worker.startup_burst_done);
+        assert_eq!(data_socket.sent_packets().len(), 1);
+    }
+
+    #[test]
+    fn steady_state_catchup_is_bounded() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(3000).unwrap();
+        worker.queue.extend(vec![Point::blank(); 3000]);
+        reservation.commit();
+        let now = Instant::now();
+        worker.startup_burst_done = true;
+        worker.next_send_due = now - Duration::from_secs(1);
+
+        worker.try_send_due_packet(now);
+
+        assert_eq!(
+            data_socket.sent_packets().len(),
+            MAX_CATCHUP_PACKETS_PER_WAKE
+        );
         assert!(worker.next_send_due > now);
-        assert_eq!(worker.queue.len(), 3000 - 22 * 80);
+    }
+
+    #[test]
+    fn steady_state_does_not_send_before_deadline() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(200).unwrap();
+        worker.queue.extend(vec![Point::blank(); 200]);
+        reservation.commit();
+        let now = Instant::now();
+        worker.startup_burst_done = true;
+        worker.next_send_due = now + Duration::from_millis(5);
+
+        worker.try_send_due_packet(now);
+
+        assert!(data_socket.sent_packets().is_empty());
+        assert_eq!(worker.queue.len(), 200);
     }
 
     #[test]
@@ -987,8 +1157,48 @@ mod tests {
     }
 
     #[test]
-    fn process_commands_updates_worker_owned_host_queue_len() {
-        let (mut worker, _cmd_socket, _data_socket) = fake_worker();
+    fn transient_send_error_requeues_points_and_recovers() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(80).unwrap();
+        worker.queue.extend(vec![Point::blank(); 80]);
+        reservation.commit();
+        let now = Instant::now();
+        data_socket.set_send_error(Some(io::ErrorKind::Other));
+
+        worker.try_send_due_packet(now);
+        assert_eq!(worker.queue.len(), 80);
+        assert_eq!(worker.consecutive_send_errors, 1);
+
+        data_socket.set_send_error(None);
+        worker.next_send_due = now;
+        worker.try_send_due_packet(now);
+        assert!(worker.queue.is_empty());
+        assert_eq!(worker.consecutive_send_errors, 0);
+        assert!(worker.running);
+    }
+
+    #[test]
+    fn persistent_send_errors_disconnect_transport() {
+        let (mut worker, _cmd_socket, data_socket) = fake_worker();
+        let reservation = worker.state.reserve_host_points(80).unwrap();
+        worker.queue.extend(vec![Point::blank(); 80]);
+        reservation.commit();
+        data_socket.set_send_error(Some(io::ErrorKind::Other));
+        let now = Instant::now();
+
+        for _ in 0..MAX_CONSECUTIVE_SEND_ERRORS {
+            worker.next_send_due = now;
+            worker.try_send_due_packet(now);
+        }
+
+        assert!(!worker.running);
+        assert!(!worker.state.diagnostics().connected);
+        assert_eq!(worker.queue.len(), 80);
+    }
+
+    #[test]
+    fn first_enqueue_reasserts_same_rate_and_updates_host_queue() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(TransportCommand::Enqueue {
             generation: 0,
@@ -1002,6 +1212,72 @@ mod tests {
 
         assert_eq!(worker.queue.len(), 5);
         assert_eq!(worker.state.diagnostics().host_queue_len, 5);
+        let rate = command::set_rate(DEFAULT_POINT_RATE).to_vec();
+        assert_eq!(cmd_socket.sent_packets(), vec![rate.clone(), rate]);
+    }
+
+    #[test]
+    fn output_enable_waits_for_requested_rate() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
+        let (priority_tx, priority_rx) = mpsc::channel();
+        priority_tx
+            .send(PriorityCommand::SetOutput {
+                enabled: true,
+                generation: 0,
+            })
+            .unwrap();
+        worker.process_priority_commands(&priority_rx);
+        assert!(cmd_socket.sent_packets().is_empty());
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(TransportCommand::Enqueue {
+            generation: 0,
+            point_rate: 10_000,
+            points: vec![Point::blank()],
+            _reservation: worker.state.reserve_host_points(1).unwrap(),
+        })
+        .unwrap();
+        worker.process_commands(&rx);
+
+        assert_eq!(
+            cmd_socket.sent_packets(),
+            vec![
+                command::set_rate(10_000).to_vec(),
+                command::set_rate(10_000).to_vec(),
+                command::set_output(true).to_vec(),
+                command::set_output(true).to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_rate_change_cycles_output() {
+        let (mut worker, cmd_socket, _data_socket) = fake_worker();
+        worker.rate_initialized = true;
+        worker.output_enabled = true;
+        worker.output_commanded_enabled = true;
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(TransportCommand::Enqueue {
+            generation: 0,
+            point_rate: 10_000,
+            points: vec![Point::blank()],
+            _reservation: worker.state.reserve_host_points(1).unwrap(),
+        })
+        .unwrap();
+
+        worker.process_commands(&rx);
+
+        assert_eq!(
+            cmd_socket.sent_packets(),
+            vec![
+                command::set_output(false).to_vec(),
+                command::set_output(false).to_vec(),
+                command::set_rate(10_000).to_vec(),
+                command::set_rate(10_000).to_vec(),
+                command::set_output(true).to_vec(),
+                command::set_output(true).to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -1021,6 +1297,8 @@ mod tests {
 
         assert!(worker.queue.is_empty());
         assert_eq!(worker.state.diagnostics().host_queue_len, 0);
+        assert!(!worker.startup_burst_done);
+        assert!(!worker.rate_initialized);
         let sent = cmd_socket.sent_packets();
         assert_eq!(sent, vec![vec![0x80, 0x00], vec![0x80, 0x00]]);
     }

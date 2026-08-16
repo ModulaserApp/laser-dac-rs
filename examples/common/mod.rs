@@ -23,6 +23,10 @@ pub struct Args {
     /// Geometry scale around center (0,0); range: (0, 10]
     #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
     pub scale: f32,
+
+    /// Output point rate in points per second
+    #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u32).range(1..))]
+    pub pps: u32,
 }
 
 #[derive(Copy, Clone, ValueEnum)]

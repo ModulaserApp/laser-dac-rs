@@ -29,7 +29,7 @@ fn main() -> Result<()> {
     println!("  Found: {} ({})", device_info.name, device_info.kind);
 
     // Open device and create a reconnecting stream via config
-    let config = StreamConfig::new(30_000).with_reconnect(
+    let config = StreamConfig::new(args.pps).with_reconnect(
         ReconnectConfig::new()
             .backoff(Duration::from_secs(1))
             .on_disconnect(|err| eprintln!("\nDisconnected: {}", err))

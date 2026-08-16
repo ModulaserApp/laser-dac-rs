@@ -422,6 +422,9 @@ mod tests {
         backend.connect().unwrap();
 
         backend.set_shutter(true).unwrap();
+        backend
+            .try_write_points(30_000, &[LaserPoint::blanked(0.0, 0.0)])
+            .unwrap();
         assert!(
             mock::wait_until(Duration::from_millis(1000), || dac
                 .cmd_packets()

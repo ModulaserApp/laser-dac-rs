@@ -33,7 +33,9 @@ pub struct LaserCubeNetworkDiscoverer {
 impl LaserCubeNetworkDiscoverer {
     pub fn new() -> Self {
         Self {
-            timeout: Duration::from_millis(100),
+            // Wi-Fi LaserCubes can take well over 100 ms to answer broadcast
+            // discovery, especially while their output worker is active.
+            timeout: Duration::from_millis(500),
         }
     }
 }
@@ -153,6 +155,26 @@ fn send_discovery_broadcasts(
     interface_sockets: &[UdpSocket],
 ) {
     let alive_socket = passive_socket.unwrap_or(socket);
+
+    // Broadcast discovery is unreliable on some LaserCube AP firmware. Allow a
+    // known address to be probed from the same socket that receives the reply.
+    if let Some(ip) = std::env::var_os("LASER_DAC_LASERCUBE_IP") {
+        match ip.to_string_lossy().parse::<Ipv4Addr>() {
+            Ok(ip) => {
+                let addr = SocketAddrV4::new(ip, CMD_PORT);
+                if let Err(e) = socket.send_to(&command::get_full_info(), addr) {
+                    log::warn!("discovery: unicast probe to {addr} failed: {e}");
+                }
+                // A known address is authoritative. Avoid also flooding fragile
+                // AP-mode firmware with every broadcast discovery variant.
+                return;
+            }
+            Err(e) => log::warn!(
+                "discovery: ignoring invalid LASER_DAC_LASERCUBE_IP={:?}: {e}",
+                ip
+            ),
+        }
+    }
     for iface in interfaces {
         log::debug!(
             "discovery: interface {} netmask {} -> directed broadcast {}",

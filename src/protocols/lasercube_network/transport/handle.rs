@@ -1,3 +1,4 @@
+use socket2::SockRef;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender, SyncSender, TrySendError};
@@ -7,7 +8,7 @@ use std::time::Duration;
 
 use super::super::command;
 use super::super::error::CommunicationError;
-use super::super::protocol::CMD_GET_FULL_INFO;
+use super::super::protocol::{CMD_GET_FULL_INFO, CMD_PORT, DATA_PORT};
 use super::state::SharedTransportState;
 use super::worker::TransportWorker;
 use super::{
@@ -19,6 +20,8 @@ use super::{
 const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Number of retries (in addition to the first attempt) for the handshake.
 const CONNECT_HANDSHAKE_RETRIES: usize = 2;
+/// Socket buffer size used by the reference LaserCube network driver.
+const SOCKET_BUFFER_BYTES: usize = 5_250_000;
 
 pub struct TransportHandle {
     tx: SyncSender<TransportCommand>,
@@ -30,11 +33,13 @@ pub struct TransportHandle {
 
 impl TransportHandle {
     pub fn connect(device: AddressedDevice) -> Result<Self, CommunicationError> {
-        let cmd_socket = UdpSocket::bind("0.0.0.0:0")?;
+        let cmd_socket = bind_transport_socket(CMD_PORT, device.cmd_port)?;
         cmd_socket.connect(device.cmd_addr())?;
+        configure_socket_buffers(&cmd_socket)?;
 
-        let data_socket = UdpSocket::bind("0.0.0.0:0")?;
+        let data_socket = bind_transport_socket(DATA_PORT, device.data_port)?;
         data_socket.connect(device.data_addr())?;
+        configure_socket_buffers(&data_socket)?;
         data_socket.set_nonblocking(true)?;
 
         for cmd in startup_commands(&device.status, device.profile) {
@@ -142,6 +147,35 @@ impl Drop for TransportHandle {
     }
 }
 
+/// Production firmware and the reference driver use the well-known ports at
+/// both ends. Loopback tests use ephemeral remote ports and therefore keep an
+/// ephemeral local endpoint. If another local LaserCube client already owns a
+/// production port, fall back rather than making discovery/open fail outright.
+fn bind_transport_socket(
+    preferred_port: u16,
+    remote_port: u16,
+) -> Result<UdpSocket, CommunicationError> {
+    if remote_port == preferred_port {
+        match UdpSocket::bind(("0.0.0.0", preferred_port)) {
+            Ok(socket) => return Ok(socket),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                log::warn!(
+                    "LaserCube network local UDP port {preferred_port} is already in use; falling back to an ephemeral port"
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(UdpSocket::bind("0.0.0.0:0")?)
+}
+
+fn configure_socket_buffers(socket: &UdpSocket) -> Result<(), CommunicationError> {
+    let socket = SockRef::from(socket);
+    socket.set_send_buffer_size(SOCKET_BUFFER_BYTES)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES)?;
+    Ok(())
+}
+
 /// Request full-info and wait for a reply, retrying a couple of times with a
 /// short timeout. Returns an error if the device never answers, so `connect()`
 /// fails fast for an unreachable cube. The socket is left blocking; the caller
@@ -213,7 +247,6 @@ mod tests {
                 let cmds = dac.cmd_packets();
                 cmds.iter().any(|p| p.as_slice() == [0x80, 0x00]) // set_output(false)
                     && cmds.iter().any(|p| p.as_slice() == [0x78, 0x01]) // enable buffer size resp
-                    && cmds.iter().any(|p| p.first() == Some(&0x82)) // set_rate
             }),
             "startup commands missing: {:?}",
             dac.cmd_packets()
@@ -226,6 +259,7 @@ mod tests {
         let handle = TransportHandle::connect(device_for(&dac)).unwrap();
 
         handle.set_output(true).unwrap();
+        handle.enqueue(30_000, vec![Point::blank()]).unwrap();
         assert!(
             mock::wait_until(Duration::from_millis(1000), || dac
                 .cmd_packets()

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
     let device = open_device(&device_info.id)?;
 
-    let config = FrameSessionConfig::new(30_000);
+    let config = FrameSessionConfig::new(args.pps);
     let (session, info) = device.start_frame_session(config)?;
 
     println!(
