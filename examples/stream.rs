@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let device = open_device(&device_info.id)?;
 
     // Start streaming
-    let config = StreamConfig::new(30_000);
+    let config = StreamConfig::new(args.pps);
     let (stream, info) = device.start_stream(config)?;
 
     println!(

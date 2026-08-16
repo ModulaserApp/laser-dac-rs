@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use super::command;
 use super::profiles::ConnectionProfile;
-use super::protocol::DEFAULT_POINT_RATE;
 use super::status::LaserCubeNetworkStatus;
 
 pub use handle::TransportHandle;
@@ -111,7 +110,6 @@ pub(super) fn startup_commands(
     let mut commands = vec![
         command::set_output(false).to_vec(),
         command::enable_buffer_size_response(true).to_vec(),
-        command::set_rate(super::clamp_point_rate(status, DEFAULT_POINT_RATE)).to_vec(),
     ];
     if command::threshold_supported(status) {
         let threshold = profile.remote_buffer_cutoff;
@@ -133,7 +131,6 @@ pub(super) fn would_block(err: &io::Error) -> bool {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use super::super::command;
     use super::super::profiles::ConnectionProfile;
     use super::super::status::LaserCubeNetworkStatus;
     use super::*;
@@ -146,17 +143,8 @@ mod tests {
         let commands = startup_commands(&status, profile);
         assert_eq!(commands[0], vec![0x80, 0x00]);
         assert_eq!(commands[1], vec![0x78, 0x01]);
-        assert_eq!(commands[2], vec![0x82, 0x30, 0x75, 0x00, 0x00]);
+        assert!(commands.iter().all(|cmd| cmd.first() != Some(&0x82)));
         assert!(commands.iter().all(|cmd| cmd.first() != Some(&0x8D)));
         assert!(commands.iter().all(|cmd| cmd.first() != Some(&0xA9)));
-    }
-
-    #[test]
-    fn startup_rate_is_clamped_to_advertised_device_max() {
-        let mut status = LaserCubeNetworkStatus::minimal(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        status.point_rate_max = 20_000;
-        let profile = ConnectionProfile::unknown_conservative(6000);
-        let commands = startup_commands(&status, profile);
-        assert_eq!(commands[2], command::set_rate(20_000).to_vec());
     }
 }
