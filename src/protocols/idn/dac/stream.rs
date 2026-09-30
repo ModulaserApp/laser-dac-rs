@@ -416,9 +416,9 @@ impl Stream {
     ///   in one datagram) carries the sample chunk header with the **whole
     ///   frame** duration.
     /// * **Sequel** fragments (`FRAME_SEQUEL`) use the sequel layout — no
-    ///   sample chunk header, just continuation samples — and share the first
-    ///   fragment's message timestamp (the timestamp does not advance between
-    ///   fragments of one frame).
+    ///   sample chunk header, just continuation samples — and their message
+    ///   timestamp is the first fragment's plus the 0-based fragment number
+    ///   (IDN-Stream rev002, chunk types 0xC0..0xFF).
     /// * The **final** sequel sets `IDNFLG_CONTENTID_CONFIG_LSTFRG` (0x4000) to
     ///   mark the last fragment of the frame.
     ///
@@ -428,8 +428,6 @@ impl Stream {
     fn write_frame_fragmented<P: Point>(&mut self, points: &[P], first_command: u8) -> Result<u16> {
         let now = Instant::now();
         let bytes_per_sample = P::SIZE_BYTES;
-        let service_id = self.dac.service_id();
-        let channel_id = self.channel_id();
 
         let needs_config = Self::needs_config(
             self.frame_count,
@@ -444,7 +442,8 @@ impl Stream {
             0
         };
 
-        // All fragments share one timestamp; the whole frame has one duration.
+        // The whole frame has one duration; send_frame_fragment derives each
+        // fragment's timestamp from ts_start.
         let ts_start = self.current_timestamp_us();
         let total_points = points.len() as u64;
         let points_after = self.points_since_anchor + total_points;
@@ -469,17 +468,11 @@ impl Stream {
         let mut offset = 0usize;
         for i in 0..num_packets {
             let count = base + if i < rem { 1 } else { 0 };
-            let is_first = i == 0;
-            let is_last = i == num_packets - 1;
-            let is_single = num_packets == 1;
             self.send_frame_fragment(
                 &points[offset..offset + count],
-                is_first,
-                is_last,
-                is_single,
-                needs_config && is_first,
-                service_id,
-                channel_id,
+                i,
+                num_packets,
+                needs_config,
                 ts_start,
                 frame_duration_us,
                 now,
@@ -498,23 +491,30 @@ impl Stream {
         Ok(first_seq)
     }
 
-    /// Build and send one fragment of a Frame-mode frame.
+    /// Build and send fragment `index` (0-based) of a Frame-mode frame split
+    /// into `num_fragments` datagrams. The config header, when `needs_config`,
+    /// rides on the first fragment only.
     #[allow(clippy::too_many_arguments)]
     fn send_frame_fragment<P: Point>(
         &mut self,
         points: &[P],
-        is_first: bool,
-        is_last: bool,
-        is_single: bool,
-        write_cfg: bool,
-        service_id: u8,
-        channel_id: u16,
-        timestamp_us: u64,
+        index: usize,
+        num_fragments: usize,
+        needs_config: bool,
+        ts_start: u64,
         frame_duration_us: u32,
         now: Instant,
         first_command: u8,
     ) -> Result<()> {
         let bytes_per_sample = P::SIZE_BYTES;
+        let is_first = index == 0;
+        let is_last = index == num_fragments - 1;
+        let is_single = num_fragments == 1;
+        let write_cfg = needs_config && is_first;
+        // IDN-Stream rev002: fragment timestamps are the first fragment's plus
+        // the 0-based fragment number. The offset is applied before the 32-bit
+        // truncation below on purpose — the wire timestamp is modular.
+        let timestamp_us = ts_start + index as u64;
 
         let cnk_type = if is_single {
             IDNVAL_CNKTYPE_LPGRF_FRAME
@@ -524,7 +524,7 @@ impl Stream {
             IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL
         };
 
-        let mut content_id = IDNFLG_CONTENTID_CHANNELMSG | channel_id | cnk_type as u16;
+        let mut content_id = IDNFLG_CONTENTID_CHANNELMSG | self.channel_id() | cnk_type as u16;
         // The config bit rides on the first fragment when a config header is
         // present; the LSTFRG bit marks the final sequel of a fragmented frame.
         if write_cfg {
@@ -571,7 +571,7 @@ impl Stream {
         })?;
 
         if write_cfg {
-            self.write_config(service_id, now)?;
+            self.write_config(self.dac.service_id(), now)?;
         }
         if has_chunk_header {
             let chunk_header = SampleChunkHeader::new(self.sdm_flags(), frame_duration_us);
@@ -1897,14 +1897,18 @@ mod tests {
         let sch: SampleChunkHeader = cursor.read_bytes().unwrap();
         assert_eq!(sch.duration_us(), 13_333);
 
-        // Fragment 1: a sequel — no sample chunk header, same timestamp.
+        // Fragment 1: a sequel — no sample chunk header, timestamp advances by
+        // the fragment number.
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         let (_, cmh1) = read_headers(&buf[..n]);
         assert_eq!(
             cmh1.content_id,
             chan | IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL as u16
         );
-        assert_eq!(cmh1.timestamp, 1_000_000, "sequel shares frame timestamp");
+        assert_eq!(
+            cmh1.timestamp, 1_000_001,
+            "sequel carries ts + fragment number"
+        );
         // No LSTFRG on the middle sequel.
         assert_eq!(cmh1.content_id & IDNFLG_CONTENTID_CONFIG_LSTFRG, 0);
         // Sequel body starts immediately after the channel message header.
@@ -1913,14 +1917,140 @@ mod tests {
             ChannelMessageHeader::SIZE_BYTES + 133 * PointXyrgbi::SIZE_BYTES
         );
 
-        // Fragment 2: last sequel — LSTFRG set, same timestamp.
+        // Fragment 2: last sequel — LSTFRG set, timestamp advances again.
         let (n, _) = receiver.recv_from(&mut buf).unwrap();
         let (_, cmh2) = read_headers(&buf[..n]);
         assert_eq!(
             cmh2.content_id,
             chan | IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL as u16 | IDNFLG_CONTENTID_CONFIG_LSTFRG
         );
-        assert_eq!(cmh2.timestamp, 1_000_000);
+        assert_eq!(cmh2.timestamp, 1_000_002);
+    }
+
+    /// Send `n` points as one Frame-mode frame that must carry a config header,
+    /// and check fragment 0 holds config + sample chunk header, the fragment
+    /// count accounts for the config bytes, and sequel timestamps advance by
+    /// the fragment number. Returns fragment 0's timestamp.
+    fn assert_config_bearing_fragments(stream: &mut Stream, receiver: &UdpSocket) -> u32 {
+        let config_size =
+            ChannelConfigHeader::SIZE_BYTES + PointFormat::Xyrgbi.descriptors().len() * 2;
+        let max_with_cfg = (MAX_UDP_PAYLOAD
+            - PacketHeader::SIZE_BYTES
+            - ChannelMessageHeader::SIZE_BYTES
+            - config_size
+            - SampleChunkHeader::SIZE_BYTES)
+            / PointXyrgbi::SIZE_BYTES;
+        let max_without_cfg = (MAX_UDP_PAYLOAD
+            - PacketHeader::SIZE_BYTES
+            - ChannelMessageHeader::SIZE_BYTES
+            - SampleChunkHeader::SIZE_BYTES)
+            / PointXyrgbi::SIZE_BYTES;
+        // Needs 3 fragments with the config header, would fit in 2 without it.
+        let n = 2 * max_with_cfg + 1;
+        assert!(n <= 2 * max_without_cfg);
+
+        let points: Vec<PointXyrgbi> = (0..n)
+            .map(|i| PointXyrgbi::new(i as i16, 0, 0, 0, 0, 0))
+            .collect();
+        stream.write_frame(&points).unwrap();
+
+        let chan = IDNFLG_CONTENTID_CHANNELMSG; // channel_id == 0 for service 1
+        let first_count = n / 3 + 1;
+        let sequel_count = n / 3;
+        let mut buf = [0u8; 2048];
+
+        // Fragment 0: FRAME_FIRST with the config bit, config header, then the
+        // sample chunk header carrying the whole-frame duration.
+        let (len, _) = receiver.recv_from(&mut buf).unwrap();
+        let (_, cmh0) = read_headers(&buf[..len]);
+        assert_eq!(
+            cmh0.content_id,
+            chan | IDNVAL_CNKTYPE_LPGRF_FRAME_FIRST as u16 | IDNFLG_CONTENTID_CONFIG_LSTFRG
+        );
+        assert_eq!(
+            cmh0.total_size as usize,
+            ChannelMessageHeader::SIZE_BYTES
+                + config_size
+                + SampleChunkHeader::SIZE_BYTES
+                + first_count * PointXyrgbi::SIZE_BYTES
+        );
+        let sch_offset = PacketHeader::SIZE_BYTES + ChannelMessageHeader::SIZE_BYTES + config_size;
+        let mut cursor = &buf[sch_offset..len];
+        let sch: SampleChunkHeader = cursor.read_bytes().unwrap();
+        assert_eq!(
+            sch.duration_us() as usize,
+            n * 1_000_000 / 30_000,
+            "whole-frame duration"
+        );
+
+        // Fragments 1 and 2: header-less sequels, ts + fragment number, LSTFRG
+        // only on the last.
+        for i in 1..3u32 {
+            let (len, _) = receiver.recv_from(&mut buf).unwrap();
+            let (_, cmh) = read_headers(&buf[..len]);
+            let lstfrg = if i == 2 {
+                IDNFLG_CONTENTID_CONFIG_LSTFRG
+            } else {
+                0
+            };
+            assert_eq!(
+                cmh.content_id,
+                chan | IDNVAL_CNKTYPE_LPGRF_FRAME_SEQUEL as u16 | lstfrg
+            );
+            assert_eq!(
+                cmh.total_size as usize,
+                ChannelMessageHeader::SIZE_BYTES + sequel_count * PointXyrgbi::SIZE_BYTES
+            );
+            assert_eq!(cmh.timestamp, cmh0.timestamp.wrapping_add(i));
+        }
+
+        // Exactly three fragments.
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        assert!(
+            receiver.recv_from(&mut buf).is_err(),
+            "unexpected 4th fragment"
+        );
+
+        cmh0.timestamp
+    }
+
+    #[test]
+    fn frame_mode_first_frame_fragments_carry_config() {
+        let (mut stream, receiver) = connected_stream();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        stream.set_frame_mode(FrameMode::Frame);
+        stream.set_scan_speed(30_000);
+        // frame_count == 0: the very first frame always carries config. Its
+        // timestamp anchor comes from the wall clock, so only relative
+        // fragment timestamps are asserted.
+        assert_eq!(stream.frame_count, 0);
+        assert_config_bearing_fragments(&mut stream, &receiver);
+    }
+
+    #[test]
+    fn frame_mode_config_refresh_fragments_carry_config() {
+        let (mut stream, receiver) = connected_stream();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        stream.set_frame_mode(FrameMode::Frame);
+        stream.set_scan_speed(30_000);
+        // A later frame whose config is stale → periodic config refresh.
+        stream.frame_count = 1;
+        stream.previous_format = Some(PointFormat::Xyrgbi);
+        stream.last_config_time = Instant::now().checked_sub(CONFIG_REFRESH_INTERVAL * 2);
+        stream.timestamp_anchor_us = 2_000_000;
+        stream.points_since_anchor = 0;
+        stream.anchor_pps = 30_000;
+
+        let ts = assert_config_bearing_fragments(&mut stream, &receiver);
+        assert_eq!(ts, 2_000_000);
     }
 
     #[test]

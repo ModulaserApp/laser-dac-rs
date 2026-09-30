@@ -1056,9 +1056,16 @@ impl ParsedPacket {
         }
 
         let content_id = u16::from_be_bytes([data[6], data[7]]);
-        let has_config = content_id & 0x4000 != 0; // IDNFLG_CONTENTID_CONFIG_LSTFRG
+        // Chunk types 0xC0..=0xFF are frame sequels: no config or sample chunk
+        // header, and 0x4000 means LSTFRG (last fragment) rather than config.
+        let is_sequel = content_id & 0xC0 == 0xC0;
+        let has_config = !is_sequel && content_id & 0x4000 != 0; // IDNFLG_CONTENTID_CONFIG_LSTFRG
 
         let mut offset = 8; // past ChannelMessageHeader
+
+        if is_sequel {
+            return (channel_msg_payload.len() - offset) / bytes_per_sample;
+        }
 
         if has_config {
             // ChannelConfigHeader is 4 bytes + descriptors
@@ -1468,6 +1475,116 @@ fn test_small_frame_padded_to_minimum() {
         "Frame should be padded to at least 20 samples, got {}",
         sample_count
     );
+
+    drop_stream_without_close(stream);
+}
+
+#[test]
+fn test_frame_mode_fragment_timestamps_advance_by_fragment_number() {
+    use laser_dac::protocols::idn::dac::stream::FrameMode;
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("FragmentTimestampTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+    stream.set_frame_mode(FrameMode::Frame);
+
+    // 400 points don't fit in one datagram → FRAME_FIRST + 2 sequels.
+    let points: Vec<PointXyrgbi> = (0..400)
+        .map(|i| PointXyrgbi::new(i as i16, 0, 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_packets();
+    stream.write_frame(&points).expect("Should write frame");
+    thread::sleep(Duration::from_millis(50));
+
+    let packets = handle.received_packets.lock().unwrap();
+    let fragments: Vec<&Vec<u8>> = packets
+        .iter()
+        .filter(|p| !p.is_empty() && p[0] == IDNCMD_RT_CNLMSG)
+        .collect();
+    assert_eq!(fragments.len(), 3, "Expected 3 fragments");
+
+    let parsed: Vec<ParsedPacket> = fragments
+        .iter()
+        .map(|p| ParsedPacket::from_bytes(p))
+        .collect();
+    let chunk_types: Vec<u16> = parsed
+        .iter()
+        .map(|p| p.content_id.unwrap() & 0xFF)
+        .collect();
+    assert_eq!(chunk_types, [0x03, 0xC0, 0xC0]); // FRAME_FIRST, SEQUEL, SEQUEL
+
+    // IDN-Stream rev002: sequel timestamp = first fragment's + fragment number.
+    let ts = parsed[0].timestamp.unwrap();
+    let timestamps: Vec<u32> = parsed.iter().map(|p| p.timestamp.unwrap()).collect();
+    assert_eq!(timestamps, [ts, ts.wrapping_add(1), ts.wrapping_add(2)]);
+
+    // LSTFRG only on the last sequel; all samples accounted for.
+    assert_eq!(parsed[1].content_id.unwrap() & 0x4000, 0);
+    assert_ne!(parsed[2].content_id.unwrap() & 0x4000, 0);
+    let total: usize = fragments
+        .iter()
+        .map(|p| ParsedPacket::count_samples(p, 8))
+        .sum();
+    assert_eq!(total, 400);
+
+    drop(packets);
+    drop_stream_without_close(stream);
+}
+
+/// Frame-mode sender → real receiver: each frame's sequel timestamps are the
+/// first fragment's plus the fragment number (IDN-Stream rev002), and the
+/// next frame starts later than the previous frame's last sequel.
+#[test]
+#[ignore = "needs the receiver sequel fix from PR #40 (fix-sequel-chunk-header); remove on merge"]
+fn test_receiver_sees_frame_mode_fragment_timestamps() {
+    use laser_dac::protocols::idn::dac::stream::FrameMode;
+    use laser_dac::protocols::idn::PointXyrgbi;
+
+    let handle = test_server("FragmentTimestampReceiverTest").unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = connect_stream(&handle);
+    stream.set_frame_mode(FrameMode::Frame);
+
+    // 400 points need three datagrams per frame.
+    let points: Vec<PointXyrgbi> = (0..400)
+        .map(|i| PointXyrgbi::new(i as i16, 0, 255, 0, 0, 255))
+        .collect();
+
+    handle.clear_received_chunks();
+    stream.write_frame(&points).expect("Should write frame 1");
+    stream.write_frame(&points).expect("Should write frame 2");
+
+    let chunks = wait_for_chunks(&handle, 6);
+    assert_eq!(chunks.len(), 6, "expected three chunks per frame");
+
+    for frame in chunks.chunks(3) {
+        let types: Vec<ChunkType> = frame.iter().map(|c| c.chunk_type).collect();
+        assert_eq!(
+            types,
+            [
+                ChunkType::FrameFirst,
+                ChunkType::FrameSequel,
+                ChunkType::FrameSequel
+            ]
+        );
+        let last: Vec<bool> = frame.iter().map(|c| c.is_last_fragment).collect();
+        assert_eq!(last, [false, false, true]);
+        assert_eq!(frame.iter().map(|c| c.point_count).sum::<usize>(), 400);
+
+        let ts = frame[0].timestamp_us_u32;
+        let timestamps: Vec<u32> = frame.iter().map(|c| c.timestamp_us_u32).collect();
+        assert_eq!(timestamps, [ts, ts.wrapping_add(1), ts.wrapping_add(2)]);
+    }
+
+    // Frame 2 starts after frame 1's last sequel (modular u32 comparison).
+    let gap = chunks[3]
+        .timestamp_us_u32
+        .wrapping_sub(chunks[2].timestamp_us_u32) as i32;
+    assert!(gap > 0, "frame 2 must start after frame 1, gap {gap} us");
 
     drop_stream_without_close(stream);
 }
