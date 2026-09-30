@@ -7,8 +7,10 @@ use crate::device::DacType;
 use crate::discovery::{
     downcast_connect_data, slugify_device_id, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer,
 };
-use crate::protocols::avb::{discover_device_selectors, normalize_device_name, AvbSelector};
+use crate::protocols::avb::backend::{cpal_engine, discover_with, AudioEngine};
+use crate::protocols::avb::{normalize_device_name, AvbSelector};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const PREFIX: &str = "avb";
 
@@ -21,11 +23,19 @@ struct ConnectData {
     scan_duplicate_count: usize,
 }
 
-pub struct AvbDiscoverer;
+pub struct AvbDiscoverer {
+    engine: Arc<dyn AudioEngine>,
+}
 
 impl AvbDiscoverer {
     pub fn new() -> Self {
-        Self
+        Self::with_engine(cpal_engine())
+    }
+
+    /// Discovery and every backend it connects share one engine, and through
+    /// it one host.
+    pub(super) fn with_engine(engine: Arc<dyn AudioEngine>) -> Self {
+        Self { engine }
     }
 }
 
@@ -49,7 +59,7 @@ impl Discoverer for AvbDiscoverer {
     }
 
     fn scan(&mut self) -> Vec<DiscoveredDevice> {
-        let selectors = match discover_device_selectors() {
+        let selectors = match discover_with(&*self.engine) {
             Ok(selectors) => selectors,
             Err(e) => {
                 log::warn!("AVB: device discovery failed: {}", e);
@@ -93,6 +103,7 @@ impl Discoverer for AvbDiscoverer {
         BackendKind::fifo(Box::new(AvbBackend::from_selector_with_scan_count(
             data.selector,
             data.scan_duplicate_count,
+            Arc::clone(&self.engine),
         )))
     }
 }

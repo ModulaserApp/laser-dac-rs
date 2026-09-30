@@ -34,7 +34,7 @@ lasercube-usb = ["dep:rusb"]
 ether-dream = ["dep:socket2"]
 idn = ["dep:socket2", "dep:if-addrs", "dep:crossbeam-queue"]
 lasercube-network = ["dep:socket2", "dep:if-addrs", "dep:crossbeam-queue"]
-avb = ["dep:cpal", "dep:crossbeam-queue"]
+avb = ["dep:cpal", "dep:crossbeam-queue", "dep:windows-sys"]
 
 # Oscilloscope XY mode via audio output
 oscilloscope = ["dep:cpal", "dep:crossbeam-queue"]
@@ -96,6 +96,8 @@ rusb = { version = "0.9", optional = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rusb = { version = "0.9", optional = true, features = ["vendored"] }
+# COM initialization for ASIO driver loading on AVB audio threads.
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_Com"] }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }

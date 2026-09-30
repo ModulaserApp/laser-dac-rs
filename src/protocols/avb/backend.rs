@@ -1,5 +1,7 @@
 //! AVB DAC streaming backend implementation.
 
+use super::apartment;
+use super::host::{cpal_host_access, AudioHost, HostAccess, OutputDevice, SerializedStream};
 use crate::backend::{DacBackend, FifoBackend, WriteOutcome};
 use crate::buffer_estimate::{BufferEstimator, QueueDepthSource, RuntimeAuthorityEstimator};
 use crate::device::{DacCapabilities, DacType};
@@ -8,7 +10,6 @@ use crate::point::LaserPoint;
 use crate::protocols::audio_sink::{push_chunk_resampled, AudioSinkState, RunningAudioStream};
 use crate::protocols::avb::{is_blacklisted_device, normalize_device_name};
 use crate::resample::{CatmullInterp, StreamingResampler};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,28 +31,6 @@ fn queue_capacity_for_rate(sample_rate: u32) -> usize {
     (sample_rate as usize * QUEUE_DURATION_MS as usize) / 1000
 }
 
-/// Returns the cpal audio host to use for AVB output.
-///
-/// - Windows with the `asio` default feature: the ASIO host (recommended
-///   for reliable multichannel output on pro audio interfaces).
-/// - Otherwise: the cpal default host — CoreAudio on macOS, WASAPI on
-///   Windows (when `asio` is disabled), ALSA on Linux.
-fn get_audio_host() -> Result<cpal::Host> {
-    #[cfg(all(target_os = "windows", feature = "asio"))]
-    {
-        cpal::host_from_id(cpal::HostId::Asio).map_err(|e| {
-            Error::invalid_config(format!(
-                "ASIO host not available (is the ASIO SDK installed?): {}",
-                e
-            ))
-        })
-    }
-    #[cfg(not(all(target_os = "windows", feature = "asio")))]
-    {
-        Ok(cpal::default_host())
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AvbSelector {
     pub name: String,
@@ -59,18 +38,18 @@ pub struct AvbSelector {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct OutputConfigRange {
-    channels: u16,
-    min_sample_rate: u32,
-    max_sample_rate: u32,
-    sample_format: SampleFormat,
+pub(super) struct OutputConfigRange {
+    pub(super) channels: u16,
+    pub(super) min_sample_rate: u32,
+    pub(super) max_sample_rate: u32,
+    pub(super) sample_format: SampleFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SelectedStreamConfig {
-    channels: u16,
-    sample_rate: u32,
-    sample_format: SampleFormat,
+pub(super) struct SelectedStreamConfig {
+    pub(super) channels: u16,
+    pub(super) sample_rate: u32,
+    pub(super) sample_format: SampleFormat,
 }
 
 struct DeviceRecord<D> {
@@ -119,7 +98,7 @@ impl CatmullInterp for StreamPoint {
     }
 }
 
-struct RuntimeState {
+pub(super) struct RuntimeState {
     /// Lock-free core: point ring + sample rate + last-output atomics (see
     /// `crate::protocols::audio_sink`).
     sink: AudioSinkState<StreamPoint>,
@@ -147,7 +126,7 @@ impl RuntimeState {
         self.sink.queued_points()
     }
 
-    fn mark_stream_failed(&self) {
+    pub(super) fn mark_stream_failed(&self) {
         self.stream_failed.store(true, Ordering::Release);
     }
 
@@ -194,12 +173,13 @@ impl RuntimeState {
 /// of same-named devices visible at resolve time (for the reconnect identity
 /// guard). `same_name_count` is `None` when the engine can't enumerate a stable
 /// device set (test fakes), in which case the guard is skipped.
-struct ResolvedConfig {
+pub(super) struct ResolvedConfig {
     config: SelectedStreamConfig,
     same_name_count: Option<usize>,
 }
 
-trait AudioEngine: Send + Sync {
+pub(super) trait AudioEngine: Send + Sync {
+    fn discover(&self) -> Result<Vec<AvbSelector>>;
     fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig>;
     fn open_stream(
         &self,
@@ -209,15 +189,64 @@ trait AudioEngine: Send + Sync {
     ) -> Result<Box<dyn RunningAudioStream>>;
 }
 
+pub(super) fn cpal_engine() -> Arc<dyn AudioEngine> {
+    Arc::new(CpalAudioEngine)
+}
+
+/// Production engine: the process-wide cpal host (ASIO on Windows).
 struct CpalAudioEngine;
 
+impl CpalAudioEngine {
+    fn engine() -> Result<HostAudioEngine<cpal::Host>> {
+        Ok(HostAudioEngine::new(cpal_host_access()?))
+    }
+}
+
 impl AudioEngine for CpalAudioEngine {
+    fn discover(&self) -> Result<Vec<AvbSelector>> {
+        Self::engine()?.discover()
+    }
+
     fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig> {
+        Self::engine()?.resolve_stream_config(selector)
+    }
+
+    fn open_stream(
+        &self,
+        selector: &AvbSelector,
+        stream_config: SelectedStreamConfig,
+        runtime: Arc<RuntimeState>,
+    ) -> Result<Box<dyn RunningAudioStream>> {
+        Self::engine()?.open_stream(selector, stream_config, runtime)
+    }
+}
+
+/// Engine over any [`AudioHost`]. Every host operation runs inside a
+/// [`HostAccess::session`], and devices are dropped before it ends.
+pub(super) struct HostAudioEngine<H> {
+    access: Arc<HostAccess<H>>,
+}
+
+impl<H: AudioHost> HostAudioEngine<H> {
+    pub(super) fn new(access: Arc<HostAccess<H>>) -> Self {
+        Self { access }
+    }
+}
+
+impl<H: AudioHost> AudioEngine for HostAudioEngine<H> {
+    fn discover(&self) -> Result<Vec<AvbSelector>> {
+        let host = self.access.session();
+        let candidates = collect_candidates(&*host, |_| false)?;
+        Ok(candidates.into_iter().map(|c| c.selector).collect())
+    }
+
+    fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig> {
+        let host = self.access.session();
         // Enumerate once: derive both the stream config and the same-named
         // device count from a single candidate list (the worker thread does a
         // second, unavoidable enumeration to build the !Send stream).
-        let candidates = collect_candidates()?;
         let key = normalize_device_name(&selector.name);
+        let candidates = collect_candidates(&*host, |name| normalize_device_name(name) == key)?;
         let same_name_count = candidates
             .iter()
             .filter(|c| normalize_device_name(&c.selector.name) == key)
@@ -228,15 +257,7 @@ impl AudioEngine for CpalAudioEngine {
                 candidate.selector.name == selector.name
                     && candidate.selector.duplicate_index == selector.duplicate_index
             })
-            .ok_or_else(|| {
-                Error::disconnected(
-                    super::error::Error::DeviceNotFound(format!(
-                        "{} (index {})",
-                        selector.name, selector.duplicate_index
-                    ))
-                    .to_string(),
-                )
-            })?;
+            .ok_or_else(|| device_not_found(selector))?;
         Ok(ResolvedConfig {
             config: select_stream_config(&candidate)?,
             same_name_count: Some(same_name_count),
@@ -249,72 +270,23 @@ impl AudioEngine for CpalAudioEngine {
         stream_config: SelectedStreamConfig,
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>> {
-        let selected = select_device(selector)?;
-        let output_channels = stream_config.channels as usize;
-        let sample_format = stream_config.sample_format;
-
-        let config = build_cpal_stream_config(stream_config);
-        let stream = build_output_stream_for_format(
-            &selected.device,
-            &config,
-            output_channels,
-            sample_format,
-            &runtime,
-        )?;
-
-        stream.play().map_err(Error::backend)?;
-
-        Ok(crate::protocols::audio_sink::CpalStreamHandle::boxed(
-            stream,
-        ))
+        let host = self.access.session();
+        let selected = select_device(&*host, selector)?;
+        let stream = selected.start_output(stream_config, &runtime)?;
+        drop(selected);
+        drop(host);
+        Ok(SerializedStream::boxed(stream, Arc::clone(&self.access)))
     }
 }
 
-/// Build an output stream for the given sample format, converting f32 samples
-/// to the device's native format inside the callback.
-fn build_output_stream_for_format(
-    device: &cpal::Device,
-    config: &cpal::StreamConfig,
-    output_channels: usize,
-    sample_format: SampleFormat,
-    runtime: &Arc<RuntimeState>,
-) -> Result<cpal::Stream> {
-    let callback_state = Arc::clone(runtime);
-    let err_state = Arc::clone(runtime);
-    let err_fn = move |err: cpal::StreamError| {
-        log::error!("AVB output stream error: {}", err);
-        if matches!(err, cpal::StreamError::DeviceNotAvailable) {
-            err_state.mark_stream_failed();
-        }
-    };
-
-    let built = match sample_format {
-        SampleFormat::F32 => device.build_output_stream(
-            config,
-            move |data: &mut [f32], _| fill_output_buffer(data, output_channels, &callback_state),
-            err_fn,
-            None,
-        ),
-        SampleFormat::I16 => device.build_output_stream(
-            config,
-            move |data: &mut [i16], _| {
-                fill_output_buffer_converted(data, output_channels, &callback_state)
-            },
-            err_fn,
-            None,
-        ),
-        SampleFormat::I32 => device.build_output_stream(
-            config,
-            move |data: &mut [i32], _| {
-                fill_output_buffer_converted(data, output_channels, &callback_state)
-            },
-            err_fn,
-            None,
-        ),
-        _ => return Err(Error::backend(super::error::Error::UnsupportedOutputConfig)),
-    };
-
-    built.map_err(Error::backend)
+fn device_not_found(selector: &AvbSelector) -> Error {
+    Error::disconnected(
+        super::error::Error::DeviceNotFound(format!(
+            "{} (index {})",
+            selector.name, selector.duplicate_index
+        ))
+        .to_string(),
+    )
 }
 
 /// AVB DAC backend using system audio output.
@@ -384,17 +356,18 @@ impl AvbBackend {
                 name,
                 duplicate_index,
             },
-            Arc::new(CpalAudioEngine),
+            cpal_engine(),
         )
     }
 
     /// Build from a discovered selector, recording how many same-named devices
     /// were visible at scan time for the reconnect identity guard.
-    pub(crate) fn from_selector_with_scan_count(
+    pub(super) fn from_selector_with_scan_count(
         selector: AvbSelector,
         scan_duplicate_count: usize,
+        engine: Arc<dyn AudioEngine>,
     ) -> Self {
-        let mut backend = Self::build(selector, Arc::new(CpalAudioEngine));
+        let mut backend = Self::build(selector, engine);
         backend.scan_duplicate_count = Some(scan_duplicate_count);
         backend
     }
@@ -650,8 +623,11 @@ impl FifoBackend for AvbBackend {
 }
 
 pub fn discover_device_selectors() -> Result<Vec<AvbSelector>> {
-    let candidates = collect_candidates()?;
-    let selectors: Vec<AvbSelector> = candidates.into_iter().map(|c| c.selector).collect();
+    discover_with(&CpalAudioEngine)
+}
+
+pub(super) fn discover_with(engine: &dyn AudioEngine) -> Result<Vec<AvbSelector>> {
+    let selectors = engine.discover()?;
     if selectors.is_empty() {
         log::debug!("AVB: no candidate devices found");
     } else {
@@ -674,6 +650,9 @@ fn run_audio_worker(
     stop_rx: mpsc::Receiver<()>,
     init_tx: mpsc::Sender<Result<()>>,
 ) {
+    // The driver is created in this thread's apartment, so the apartment must
+    // outlive the stream (declared first, dropped last).
+    let _apartment = apartment::enter();
     log::debug!(
         "AVB: audio worker starting for {:?} (duplicate_index={})",
         selector.name,
@@ -712,13 +691,14 @@ fn run_audio_worker(
     log::debug!("AVB: audio worker stopped");
 }
 
-fn select_device(selector: &AvbSelector) -> Result<DeviceCandidate<cpal::Device>> {
+fn select_device<H: AudioHost>(host: &H, selector: &AvbSelector) -> Result<H::Device> {
     log::debug!(
         "AVB: selecting device {:?} (duplicate_index={})",
         selector.name,
         selector.duplicate_index
     );
-    let candidates = collect_candidates()?;
+    let key = normalize_device_name(&selector.name);
+    let candidates = collect_candidates(host, |name| normalize_device_name(name) == key)?;
     log::debug!(
         "AVB: {} candidate(s) available for selection",
         candidates.len()
@@ -729,55 +709,45 @@ fn select_device(selector: &AvbSelector) -> Result<DeviceCandidate<cpal::Device>
             candidate.selector.name == selector.name
                 && candidate.selector.duplicate_index == selector.duplicate_index
         })
+        .and_then(|candidate| candidate.device)
         .ok_or_else(|| {
             log::warn!(
                 "AVB: device {:?} (index {}) not found among candidates",
                 selector.name,
                 selector.duplicate_index
             );
-            Error::disconnected(
-                super::error::Error::DeviceNotFound(format!(
-                    "{} (index {})",
-                    selector.name, selector.duplicate_index
-                ))
-                .to_string(),
-            )
+            device_not_found(selector)
         })
 }
 
-fn collect_candidates() -> Result<Vec<DeviceCandidate<cpal::Device>>> {
-    let records = collect_device_records()?;
+/// Enumerates output devices, keeping the device handle only for names that
+/// `keep_device` accepts. Every other handle is dropped before the next device
+/// is enumerated: ASIO can load only one driver at a time, so holding one
+/// would make every later driver fail to load and silently vanish.
+fn collect_candidates<H: AudioHost>(
+    host: &H,
+    keep_device: impl Fn(&str) -> bool,
+) -> Result<Vec<DeviceCandidate<Option<H::Device>>>> {
+    let records = collect_device_records(host, keep_device)?;
     Ok(collect_candidates_from_records(records))
 }
 
-fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
-    let host = get_audio_host()?;
-    let devices = host.output_devices().map_err(Error::backend)?;
+fn collect_device_records<H: AudioHost>(
+    host: &H,
+    keep_device: impl Fn(&str) -> bool,
+) -> Result<Vec<DeviceRecord<Option<H::Device>>>> {
     let mut records = Vec::new();
 
-    for device in devices {
-        let Ok(name) = device.name() else {
+    for device in host.output_devices()? {
+        let Some(name) = device.name() else {
             log::debug!("AVB: skipping audio output with unreadable name");
             continue;
         };
 
-        let output_config_ranges = device
-            .supported_output_configs()
-            .map(|configs| {
-                configs
-                    .map(|cfg| OutputConfigRange {
-                        channels: cfg.channels(),
-                        min_sample_rate: cfg.min_sample_rate().0,
-                        max_sample_rate: cfg.max_sample_rate().0,
-                        sample_format: cfg.sample_format(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let default_config = device.default_output_config().ok();
-        let default_output_channels = default_config.as_ref().map(|cfg| cfg.channels());
-        let default_output_sample_rate = default_config.as_ref().map(|cfg| cfg.sample_rate().0);
+        let output_config_ranges = device.output_config_ranges();
+        let default_output = device.default_output();
+        let default_output_channels = default_output.map(|(channels, _)| channels);
+        let default_output_sample_rate = default_output.map(|(_, rate)| rate);
 
         log::debug!(
             "AVB: found audio output {:?} — config ranges: [{}], default channels: {:?}, default sample rate: {:?}",
@@ -794,6 +764,7 @@ fn collect_device_records() -> Result<Vec<DeviceRecord<cpal::Device>>> {
             default_output_sample_rate,
         );
 
+        let device = keep_device(&name).then_some(device);
         records.push(DeviceRecord {
             name,
             device,
@@ -871,7 +842,7 @@ fn supports_required_channels<D>(record: &DeviceRecord<D>) -> bool {
         .is_some_and(|channels| channels >= MIN_CHANNELS)
 }
 
-fn select_stream_config(candidate: &DeviceCandidate<cpal::Device>) -> Result<SelectedStreamConfig> {
+fn select_stream_config<D>(candidate: &DeviceCandidate<D>) -> Result<SelectedStreamConfig> {
     let (channels, sample_rate) = match choose_stream_config(
         &candidate.output_config_ranges,
         candidate.default_output_sample_rate,
@@ -930,20 +901,6 @@ fn choose_sample_format(
         .map(|r| r.sample_format)
         .next()
         .unwrap_or(SampleFormat::F32)
-}
-
-fn build_cpal_stream_config(stream_config: SelectedStreamConfig) -> cpal::StreamConfig {
-    // Always let the host/driver pick the buffer size. Requesting a fixed
-    // size fails on drivers that don't support it: ASIO drivers (e.g. RME)
-    // only accept the buffer size configured in their own control panel, and
-    // WASAPI shared mode can reject buffer durations that don't match the
-    // engine period. The queue provides the jitter cushion, so the device
-    // buffer size only affects callback granularity, not correctness.
-    cpal::StreamConfig {
-        channels: stream_config.channels,
-        sample_rate: cpal::SampleRate(stream_config.sample_rate),
-        buffer_size: cpal::BufferSize::Default,
-    }
 }
 
 /// Choose the best (channels, sample_rate) pair from the available config ranges.
@@ -1015,9 +972,10 @@ fn scale_u16_to_f32(value: u16) -> f32 {
     value as f32 / u16::MAX as f32
 }
 
-/// Fill an f32 output buffer. Kept as a concrete entry point for tests and the
-/// fake engine; delegates to the format-generic implementation.
-fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &RuntimeState) {
+/// Fill an f32 output buffer. Concrete entry point for the test engines;
+/// delegates to the format-generic implementation.
+#[cfg(test)]
+pub(super) fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &RuntimeState) {
     fill_output_buffer_converted(data, output_channels, runtime);
 }
 
@@ -1028,7 +986,7 @@ fn fill_output_buffer(data: &mut [f32], output_channels: usize, runtime: &Runtim
 /// the point intensity; on a 6-channel (XYRGBI) config intensity is written to
 /// its own channel. On underrun the last XY position is held and RGB blanked
 /// (laser-safe); on shutter-closed RGB is blanked but XY still tracks.
-fn fill_output_buffer_converted<S: Sample + cpal::FromSample<f32>>(
+pub(super) fn fill_output_buffer_converted<S: Sample + cpal::FromSample<f32>>(
     data: &mut [S],
     output_channels: usize,
     runtime: &RuntimeState,
@@ -1237,6 +1195,10 @@ mod tests {
     }
 
     impl AudioEngine for FakeAudioEngine {
+        fn discover(&self) -> Result<Vec<AvbSelector>> {
+            Ok(Vec::new())
+        }
+
         fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<ResolvedConfig> {
             if self.fail_open.load(Ordering::Acquire) {
                 return Err(Error::backend(
@@ -1353,6 +1315,10 @@ mod tests {
     }
 
     impl AudioEngine for BlockingOpenEngine {
+        fn discover(&self) -> Result<Vec<AvbSelector>> {
+            Ok(Vec::new())
+        }
+
         fn resolve_stream_config(&self, _selector: &AvbSelector) -> Result<ResolvedConfig> {
             Ok(ResolvedConfig {
                 config: SelectedStreamConfig {
@@ -1377,18 +1343,6 @@ mod tests {
                 crate::protocols::avb::error::Error::StreamStartFailed,
             ))
         }
-    }
-
-    #[test]
-    fn build_cpal_stream_config_uses_default_buffer_size() {
-        let config = build_cpal_stream_config(SelectedStreamConfig {
-            channels: 6,
-            sample_rate: 48_000,
-            sample_format: SampleFormat::F32,
-        });
-        assert_eq!(config.buffer_size, cpal::BufferSize::Default);
-        assert_eq!(config.channels, 6);
-        assert_eq!(config.sample_rate, cpal::SampleRate(48_000));
     }
 
     #[test]
