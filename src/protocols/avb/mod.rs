@@ -36,9 +36,13 @@
 //!   configured in Windows sound settings, so an endpoint must be configured
 //!   for 5.1/7.1 output to pass the >= 5 channel filter.
 
+mod apartment;
+#[cfg(test)]
+mod asio_model_tests;
 pub mod backend;
 mod discovery;
 pub mod error;
+mod host;
 
 pub use backend::{discover_device_selectors, AvbBackend, AvbSelector};
 pub use discovery::AvbDiscoverer;
