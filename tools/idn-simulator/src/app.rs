@@ -11,11 +11,11 @@ use eframe::egui;
 
 use crate::fps_estimator::FpsEstimator;
 use crate::persistence_buffer::{PersistenceBuffer, BUFFER_RESOLUTION};
-use crate::protocol_handler::RenderPoint;
+use crate::protocol_handler::{ParsedChunk, RenderPoint};
 use crate::renderer::{self, RenderSettings};
 use crate::server::ServerEvent;
 use crate::settings::{AckErrorOption, BeamStyle, ColorMode, RenderMode, SimulatorSettings};
-use crate::timing::{TimedPoint, TimestampUnwrapper};
+use crate::timing::{FrameAssembler, TimedPoint, TimestampUnwrapper};
 
 /// Maximum stream time to keep in buffer (seconds).
 /// Points older than this are trimmed.
@@ -30,6 +30,8 @@ pub struct SimulatorApp {
     point_buffer: VecDeque<TimedPoint>,
     /// Timestamp unwrapper for converting u32 timestamps to monotonic u64.
     timestamp_unwrapper: TimestampUnwrapper,
+    /// Joins Frame-mode fragments so each frame is timed as one chunk.
+    frame_assembler: FrameAssembler,
 
     /// Maximum stream timestamp received so far (the "leading edge" of received data).
     max_received_stream_us: u64,
@@ -100,6 +102,7 @@ impl SimulatorApp {
             settings,
             point_buffer: VecDeque::new(),
             timestamp_unwrapper: TimestampUnwrapper::new(),
+            frame_assembler: FrameAssembler::new(),
             max_received_stream_us: 0,
             playback_stream_us: 0,
             playback_start_real: None,
@@ -123,6 +126,46 @@ impl SimulatorApp {
             underruns_in_window: 0,
             current_underruns_per_sec: 0.0,
             current_lead_us: 0,
+        }
+    }
+
+    /// Expand a chunk into timed points in the playback buffer.
+    fn push_timed_points(&mut self, chunk: ParsedChunk) {
+        // Unwrap the timestamp to monotonic u64
+        let chunk_ts_us = self.timestamp_unwrapper.unwrap(chunk.timestamp_us_u32);
+
+        // Calculate per-point timestamps
+        let n_points = chunk.points.len();
+        let duration_us = chunk.duration_us;
+
+        // Feed points to FPS estimator
+        // Calculate PPS from chunk duration
+        let chunk_pps = if n_points > 0 && duration_us > 0 {
+            (n_points as f64 * 1_000_000.0 / duration_us as f64) as u32
+        } else {
+            30_000 // fallback
+        };
+        let xy_points: Vec<(f32, f32)> = chunk.points.iter().map(|p| (p.x, p.y)).collect();
+        self.fps_estimator.push_points(&xy_points, chunk_pps);
+
+        // Calculate time delta between points
+        // If duration_us is 0 or parsing fails, assume 30k PPS (~33µs per point)
+        let dt_us = if n_points > 0 && duration_us > 0 {
+            duration_us as f64 / n_points as f64
+        } else {
+            33.0 // fallback: ~30k PPS
+        };
+
+        // Expand chunk into timed points and track max timestamp
+        for (i, point) in chunk.points.into_iter().enumerate() {
+            let point_ts_us = chunk_ts_us + (i as f64 * dt_us) as u64;
+            self.point_buffer.push_back(TimedPoint {
+                t_us: point_ts_us,
+                p: point,
+                is_chunk_start: i == 0, // First point of chunk
+            });
+            // Track the leading edge of received data
+            self.max_received_stream_us = self.max_received_stream_us.max(point_ts_us);
         }
     }
 }
@@ -197,46 +240,12 @@ impl eframe::App for SimulatorApp {
                     self.chunks_received += 1;
                     self.chunks_in_window += 1;
 
-                    // Unwrap the timestamp to monotonic u64
-                    let chunk_ts_us = self.timestamp_unwrapper.unwrap(chunk.timestamp_us_u32);
-
-                    // Calculate per-point timestamps
-                    let n_points = chunk.points.len();
-                    let duration_us = chunk.duration_us;
-
                     // Track stats
-                    self.points_in_window += n_points as u64;
-                    self.last_chunk_size = n_points;
+                    self.points_in_window += chunk.points.len() as u64;
+                    self.last_chunk_size = chunk.points.len();
 
-                    // Feed points to FPS estimator
-                    // Calculate PPS from chunk duration
-                    let chunk_pps = if n_points > 0 && duration_us > 0 {
-                        (n_points as f64 * 1_000_000.0 / duration_us as f64) as u32
-                    } else {
-                        30_000 // fallback
-                    };
-                    let xy_points: Vec<(f32, f32)> =
-                        chunk.points.iter().map(|p| (p.x, p.y)).collect();
-                    self.fps_estimator.push_points(&xy_points, chunk_pps);
-
-                    // Calculate time delta between points
-                    // If duration_us is 0 or parsing fails, assume 30k PPS (~33µs per point)
-                    let dt_us = if n_points > 0 && duration_us > 0 {
-                        duration_us as f64 / n_points as f64
-                    } else {
-                        33.0 // fallback: ~30k PPS
-                    };
-
-                    // Expand chunk into timed points and track max timestamp
-                    for (i, point) in chunk.points.into_iter().enumerate() {
-                        let point_ts_us = chunk_ts_us + (i as f64 * dt_us) as u64;
-                        self.point_buffer.push_back(TimedPoint {
-                            t_us: point_ts_us,
-                            p: point,
-                            is_chunk_start: i == 0, // First point of chunk
-                        });
-                        // Track the leading edge of received data
-                        self.max_received_stream_us = self.max_received_stream_us.max(point_ts_us);
+                    for chunk in self.frame_assembler.push(chunk) {
+                        self.push_timed_points(chunk);
                     }
                 }
                 ServerEvent::ClientConnected(addr) => {
@@ -247,6 +256,7 @@ impl eframe::App for SimulatorApp {
                     // Reset playback state on disconnect
                     self.point_buffer.clear();
                     self.timestamp_unwrapper.reset();
+                    self.frame_assembler.reset();
                     self.max_received_stream_us = 0;
                     self.playback_stream_us = 0;
                     self.playback_start_real = None;

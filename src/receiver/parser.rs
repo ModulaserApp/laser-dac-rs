@@ -251,6 +251,9 @@ pub struct ParsedChunk {
     /// Timestamp from the channel message header (u32, microseconds, wraps).
     pub timestamp_us_u32: u32,
     /// Duration of this chunk in microseconds (24-bit value from sample chunk header).
+    ///
+    /// Always `0` for [`ChunkType::FrameSequel`]: sequels carry no sample chunk
+    /// header, and the whole frame's duration is on its `FrameFirst` chunk.
     pub duration_us: u32,
     /// Sample format used for this chunk (after descriptor dispatch).
     pub format: SampleFormat,
@@ -395,23 +398,26 @@ fn parse_frame_data_with_metadata(
         });
     }
 
-    // Sample chunk header (4 bytes): upper 8 bits = flags, lower 24 bits = duration_us
-    let flags_duration = cursor.read_u32::<BE>().ok()?;
-    let chunk_flags = (flags_duration >> 24) as u8;
-    if (chunk_flags & IDNMSK_CHUNKFLAGS_SCM) != state.service_data_match {
-        log::warn!(
-            "Service data match mismatch on channel {}: chunk=0x{:02X}, config=0x{:02X}",
-            metadata.channel_id,
-            chunk_flags & IDNMSK_CHUNKFLAGS_SCM,
-            state.service_data_match
-        );
-        return Some(ParsedPacket {
-            chunk: None,
-            state_update: StateUpdate::Remove,
-        });
-    }
-
-    let duration_us = flags_duration & 0x00FF_FFFF;
+    // Sequels have no sample chunk header; their sample data starts here.
+    let duration_us = if metadata.chunk_type == ChunkType::FrameSequel {
+        0
+    } else {
+        let flags_duration = cursor.read_u32::<BE>().ok()?;
+        let chunk_flags = (flags_duration >> 24) as u8;
+        if (chunk_flags & IDNMSK_CHUNKFLAGS_SCM) != state.service_data_match {
+            log::warn!(
+                "Service data match mismatch on channel {}: chunk=0x{:02X}, config=0x{:02X}",
+                metadata.channel_id,
+                chunk_flags & IDNMSK_CHUNKFLAGS_SCM,
+                state.service_data_match
+            );
+            return Some(ParsedPacket {
+                chunk: None,
+                state_update: StateUpdate::Remove,
+            });
+        }
+        flags_duration & 0x00FF_FFFF
+    };
 
     let remaining = data.len() as u64 - cursor.position();
     let sample_size = state.format.sample_size() as u64;
@@ -751,7 +757,8 @@ mod tests {
         sample_bytes: &[u8],
     ) -> Vec<u8> {
         let mut pkt = header(seq);
-        let total_size = 8 + 4 + sample_bytes.len();
+        // No sample chunk header on a sequel: ChannelMessage (8) + sample bytes.
+        let total_size = 8 + sample_bytes.len();
         let content_id = 0x8000
             | if last_fragment { 0x4000 } else { 0x0000 }
             | (((channel_id as u16) & 0x3F) << 8)
@@ -760,7 +767,6 @@ mod tests {
         pkt.extend_from_slice(&(total_size as u16).to_be_bytes());
         pkt.extend_from_slice(&content_id.to_be_bytes());
         pkt.extend_from_slice(&0x87654321u32.to_be_bytes());
-        pkt.extend_from_slice(&1000u32.to_be_bytes());
         pkt.extend_from_slice(sample_bytes);
         pkt
     }
@@ -1003,6 +1009,57 @@ mod tests {
         assert!(!parsed.config_or_last_fragment);
         assert!(!parsed.has_config);
         assert!(!parsed.is_last_fragment);
+    }
+
+    /// The first X is 12288 (0x3000): masked with `IDNMSK_CHUNKFLAGS_SCM` its top
+    /// byte gives 0x30 against the configured 0x00, so misreading it as chunk
+    /// flags removes the cached channel state.
+    #[test]
+    fn frame_sequel_yields_its_points_and_keeps_the_cached_config() {
+        fn sample(x: i16, y: i16, rgbi: [u8; 4]) -> Vec<u8> {
+            let mut s = Vec::with_capacity(8);
+            s.extend_from_slice(&x.to_be_bytes());
+            s.extend_from_slice(&y.to_be_bytes());
+            s.extend_from_slice(&rgbi);
+            s
+        }
+
+        let mut parser = FrameParser::new();
+
+        let opening = sample(0, 0, [0, 0, 0, 0]);
+        let config_pkt = build_packet_on_channel(
+            &descriptors_xyrgbi(),
+            0,
+            IDNVAL_CNKTYPE_LPGRF_FRAME_FIRST,
+            &opening,
+        );
+        parser
+            .parse_frame_data(source_addr(), &config_pkt)
+            .expect("the opening fragment should parse and cache the config");
+
+        let mut samples = sample(12288, 4096, [255, 0, 0, 255]);
+        samples.extend_from_slice(&sample(-2048, 1024, [0, 255, 0, 255]));
+        let sequel = build_sequel_packet(2, 0, false, &samples);
+
+        let parsed = parser
+            .parse_frame_data(source_addr(), &sequel)
+            .expect("a sequel must parse against the cached config");
+
+        assert_eq!(parsed.chunk_type, ChunkType::FrameSequel);
+        assert_eq!(parsed.format, SampleFormat::Xyrgbi);
+        assert_eq!(parsed.points.len(), 2);
+        assert!((parsed.points[0].x - (12288.0 / 32767.0)).abs() < 1e-4);
+        assert!((parsed.points[0].y - (4096.0 / 32767.0)).abs() < 1e-4);
+        assert!((parsed.points[1].x - (-2048.0 / 32767.0)).abs() < 1e-4);
+        assert_eq!(parsed.duration_us, 0);
+
+        // The cached config must survive, so a following sequel still parses.
+        let closing = build_sequel_packet(3, 0, true, &samples);
+        let parsed = parser
+            .parse_frame_data(source_addr(), &closing)
+            .expect("the cached config must survive the previous sequel");
+        assert_eq!(parsed.points.len(), 2);
+        assert!(parsed.is_last_fragment);
     }
 
     #[test]

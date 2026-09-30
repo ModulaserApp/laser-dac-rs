@@ -32,6 +32,9 @@ pub struct ReceivedChunk<'a> {
     /// Timestamp from the channel message header (u32, microseconds, wraps).
     pub timestamp_us_u32: u32,
     /// Duration of this chunk in microseconds.
+    ///
+    /// Always `0` for [`ChunkType::FrameSequel`]: sequels carry no sample chunk
+    /// header, and the whole frame's duration is on its `FrameFirst` chunk.
     pub duration_us: u32,
     /// Sample format used for this chunk.
     pub format: SampleFormat,

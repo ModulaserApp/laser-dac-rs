@@ -399,7 +399,7 @@ impl Stream {
                 }
             }
             FrameMode::Frame => {
-                self.write_frame_fragmented(points)?;
+                self.write_frame_fragmented(points, IDNCMD_RT_CNLMSG)?;
             }
         }
 
@@ -421,7 +421,11 @@ impl Stream {
     ///   fragments of one frame).
     /// * The **final** sequel sets `IDNFLG_CONTENTID_CONFIG_LSTFRG` (0x4000) to
     ///   mark the last fragment of the frame.
-    fn write_frame_fragmented<P: Point>(&mut self, points: &[P]) -> Result<()> {
+    ///
+    /// `first_command` is the packet command of the first fragment (sequels
+    /// always use `IDNCMD_RT_CNLMSG`). Returns the first fragment's sequence
+    /// number, so an ACKREQ caller can match the acknowledgment.
+    fn write_frame_fragmented<P: Point>(&mut self, points: &[P], first_command: u8) -> Result<u16> {
         let now = Instant::now();
         let bytes_per_sample = P::SIZE_BYTES;
         let service_id = self.dac.service_id();
@@ -460,6 +464,8 @@ impl Stream {
         let base = points.len() / num_packets;
         let rem = points.len() % num_packets;
 
+        // The first fragment takes the next sequence number.
+        let first_seq = self.sequence;
         let mut offset = 0usize;
         for i in 0..num_packets {
             let count = base + if i < rem { 1 } else { 0 };
@@ -477,6 +483,7 @@ impl Stream {
                 ts_start,
                 frame_duration_us,
                 now,
+                first_command,
             )?;
             offset += count;
         }
@@ -488,7 +495,7 @@ impl Stream {
         self.last_data_send_time = Some(now);
         self.frame_count += 1;
 
-        Ok(())
+        Ok(first_seq)
     }
 
     /// Build and send one fragment of a Frame-mode frame.
@@ -505,6 +512,7 @@ impl Stream {
         timestamp_us: u64,
         frame_duration_us: u32,
         now: Instant,
+        first_command: u8,
     ) -> Result<()> {
         let bytes_per_sample = P::SIZE_BYTES;
 
@@ -548,7 +556,11 @@ impl Stream {
 
         let seq = self.next_sequence();
         self.packet_buffer.write_bytes(PacketHeader {
-            command: IDNCMD_RT_CNLMSG,
+            command: if is_first {
+                first_command
+            } else {
+                IDNCMD_RT_CNLMSG
+            },
             flags: self.client_group,
             sequence: seq,
         })?;
@@ -572,7 +584,8 @@ impl Stream {
         Ok(())
     }
 
-    /// Send remaining points without config header.
+    /// Send the remaining points of a **Wave**-mode frame as independent
+    /// chunks, each with its own sample chunk header.
     fn write_frame_continuation<P: Point>(&mut self, points: &[P]) -> Result<()> {
         if points.is_empty() {
             return Ok(());
@@ -668,6 +681,11 @@ impl Stream {
     /// This is similar to `write_frame` but uses IDNCMD_RT_CNLMSG_ACKREQ
     /// and waits for an acknowledgment response from the server.
     ///
+    /// Only the first datagram requests an acknowledgment; any further
+    /// datagrams are fire-and-forget. In Frame mode the fragments use the same
+    /// layout as `write_frame` (header-less sequels, LSTFRG on the last), and
+    /// the whole frame is sent before waiting for the acknowledgment.
+    ///
     /// # Arguments
     ///
     /// * `points` - The points to send
@@ -683,6 +701,12 @@ impl Stream {
 
         let mut padded = Vec::new();
         let points = self.prepare_points(points, &mut padded)?;
+
+        if self.frame_mode == FrameMode::Frame {
+            let ack_seq = self.write_frame_fragmented(points, IDNCMD_RT_CNLMSG_ACKREQ)?;
+            return self.recv_acknowledge(timeout, ack_seq);
+        }
+
         let (ack_seq, points_to_send) =
             self.build_and_send_first_packet(points, IDNCMD_RT_CNLMSG_ACKREQ)?;
 
