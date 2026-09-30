@@ -24,19 +24,23 @@
 //! - SDK calls must not overlap across threads.
 //! - A driver must be released before its creating thread leaves the
 //!   apartment it was created in.
+//! - A driver runs one stream. Opening a second one through the same loaded
+//!   driver (which asio-sys hands out for a matching name) disposes and
+//!   replaces the buffers the first stream's callback is still using.
 //!
-//! Breaking the last three is recorded as a violation instead of panicking
+//! Breaking the last four is recorded as a violation instead of panicking
 //! (it can happen on driver or worker threads), and every test asserts none
 //! occurred.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use super::apartment::model as com;
 use super::backend::{
-    fill_output_buffer, AudioEngine, HostAudioEngine, OutputConfigRange, RuntimeState,
+    fill_output_buffer, AudioEngine, AvbSelector, HostAudioEngine, OutputConfigRange, RuntimeState,
     SelectedStreamConfig,
 };
 use super::discovery::AvbDiscoverer;
@@ -66,6 +70,7 @@ const REALTEK: DriverSpec = DriverSpec {
 };
 
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy)]
 struct DriverSpec {
@@ -85,6 +90,9 @@ struct Sdk {
     violations: Mutex<Vec<String>>,
     /// Frames written by the driver callback, most recent last.
     frames: Mutex<Vec<Vec<f32>>>,
+    /// When set, the next stream start blocks inside the driver until the
+    /// paired sender is dropped (a hung `ASIOCreateBuffers`).
+    hang_next_start: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl Sdk {
@@ -97,6 +105,7 @@ impl Sdk {
             in_call: AtomicBool::new(false),
             violations: Mutex::new(Vec::new()),
             frames: Mutex::new(Vec::new()),
+            hang_next_start: Mutex::new(None),
         })
     }
 
@@ -123,6 +132,13 @@ impl Sdk {
         *lock(&self.current)
     }
 
+    /// Makes the next stream start hang until the returned sender is dropped.
+    fn hang_next_start(&self) -> mpsc::Sender<()> {
+        let (release, hang) = mpsc::channel();
+        *lock(&self.hang_next_start) = Some(hang);
+        release
+    }
+
     fn clear_frames(&self) {
         lock(&self.frames).clear();
     }
@@ -147,6 +163,7 @@ struct LoadedDriver {
     spec: DriverSpec,
     generation: u64,
     apartment: u64,
+    streams: AtomicUsize,
 }
 
 impl ModelAsio {
@@ -175,6 +192,7 @@ impl ModelAsio {
                 spec,
                 generation,
                 apartment,
+                streams: AtomicUsize::new(0),
             }))
         })?;
         *lock(&self.loaded) = Arc::downgrade(&driver);
@@ -206,6 +224,10 @@ impl AudioHost for ModelAsio {
         Ok(Box::new(self.sdk.drivers.iter().filter_map(|spec| {
             self.load_driver(*spec).map(|driver| ModelDevice { driver })
         })))
+    }
+
+    fn single_stream(&self) -> bool {
+        true
     }
 }
 
@@ -245,9 +267,19 @@ impl OutputDevice for ModelDevice {
         let driver = Arc::clone(&self.driver);
         let sdk = Arc::clone(&driver.sdk);
         let started = sdk.call("create buffers + start", || {
+            if let Some(hang) = lock(&sdk.hang_next_start).take() {
+                let _ = hang.recv();
+            }
+            if driver.streams.fetch_add(1, Ordering::SeqCst) > 0 {
+                sdk.violation(format!(
+                    "second stream on {:?} disposed the live stream's buffers",
+                    driver.spec.name
+                ));
+            }
             sdk.current_generation() == Some(driver.generation)
         });
         if !started {
+            driver.streams.fetch_sub(1, Ordering::SeqCst);
             return Err(Error::backend(super::error::Error::StreamStartFailed));
         }
 
@@ -309,7 +341,9 @@ impl Drop for ModelStream {
         if let Some(callback) = self.callback.take() {
             let _ = callback.join();
         }
-        self.driver.sdk.call("stop + dispose buffers", || {});
+        self.driver.sdk.call("stop + dispose buffers", || {
+            self.driver.streams.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -335,7 +369,8 @@ impl Process {
             sdk: Arc::clone(&sdk),
             loaded: Mutex::new(Weak::new()),
         };
-        let engine = Arc::new(HostAudioEngine::new(Arc::new(HostAccess::new(host))));
+        let access = HostAccess::with_session_timeout(host, SESSION_TIMEOUT);
+        let engine = Arc::new(HostAudioEngine::new(Arc::new(access)));
         Self { sdk, engine }
     }
 
@@ -532,5 +567,90 @@ fn background_scans_do_not_disturb_a_live_stream() {
             "a scan lost the MADIface: {names:?}"
         );
     }
+    process.assert_no_violations();
+}
+
+#[test]
+fn second_stream_on_the_live_asio_driver_is_refused() {
+    // Two lasers mapped to the same ASIO device would share one loaded driver;
+    // the second open must fail instead of pulling the first stream's buffers.
+    let process = Process::with_drivers(&[MADIFACE]);
+    let (discovery, first) = scan_on_discovery_thread(process.discovery());
+    let (discovery, second) = scan_on_discovery_thread(discovery);
+    let (first, second) = (
+        take_device(first, MADIFACE.name),
+        take_device(second, MADIFACE.name),
+    );
+
+    let sdk = Arc::clone(&process.sdk);
+    run_on_thread("pipeline", CallerApartment::None, move || {
+        let mut discovery = discovery;
+        let mut live = connect(&mut discovery, first).expect("connect");
+        assert_streams(&mut live, &sdk, 0.5, 0.5);
+
+        let err = connect(&mut discovery, second)
+            .err()
+            .expect("second stream on the same ASIO driver must be refused");
+        assert!(err.to_string().contains("already streaming"), "{err}");
+
+        assert_streams(&mut live, &sdk, -0.5, -0.5);
+        live.disconnect().unwrap();
+    });
+
+    process.assert_no_violations();
+}
+
+#[test]
+fn a_hung_driver_call_does_not_wedge_other_callers() {
+    // A driver that never returns from stream setup keeps its worker (and the
+    // host) busy forever. Everyone else must get an error, not hang with it.
+    let process = Process::with_drivers(&[MADIFACE]);
+    let engine = Arc::clone(&process.engine);
+    let selector = AvbSelector {
+        name: MADIFACE.name.to_string(),
+        duplicate_index: 0,
+    };
+    let config = run_on_thread("pipeline", CallerApartment::None, {
+        let (engine, selector) = (Arc::clone(&engine), selector.clone());
+        move || engine.resolve_stream_config(&selector).unwrap().config
+    });
+
+    let release = process.sdk.hang_next_start();
+    let (opening_tx, opening) = mpsc::channel();
+    let hung_worker = {
+        let (engine, selector) = (Arc::clone(&engine), selector.clone());
+        thread::spawn(move || {
+            // Holds an apartment for the stream's lifetime, as the AVB worker does.
+            let _apartment = super::apartment::enter();
+            opening_tx.send(()).unwrap();
+            let runtime = Arc::new(RuntimeState::new(false, config.sample_rate));
+            drop(engine.open_stream(&selector, config, runtime));
+        })
+    };
+    opening.recv().unwrap();
+    thread::sleep(SESSION_TIMEOUT / 3);
+
+    let (result_tx, results) = mpsc::channel();
+    thread::spawn({
+        let (engine, selector) = (Arc::clone(&engine), selector.clone());
+        move || {
+            let _ = result_tx.send((
+                engine.discover().is_err(),
+                engine.resolve_stream_config(&selector).is_err(),
+            ));
+        }
+    });
+    let (discover_failed, resolve_failed) = results
+        .recv_timeout(SESSION_TIMEOUT * 4)
+        .expect("discovery/connect blocked behind a hung driver call");
+    assert!(discover_failed, "discovery should report the host busy");
+    assert!(resolve_failed, "connect should report the host busy");
+
+    drop(release);
+    hung_worker.join().unwrap();
+    assert!(
+        engine.discover().is_ok(),
+        "host must recover once the driver returns"
+    );
     process.assert_no_violations();
 }

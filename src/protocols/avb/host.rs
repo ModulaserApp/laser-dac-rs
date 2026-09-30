@@ -19,7 +19,8 @@
 //! SDK instead of a stubbed engine.
 
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
@@ -48,60 +49,124 @@ pub(super) trait AudioHost: Send + Sync + 'static {
     /// Lazily yields output devices. On ASIO each `next()` loads a driver, and
     /// a driver that fails to load is skipped rather than reported.
     fn output_devices(&self) -> Result<Box<dyn Iterator<Item = Self::Device> + '_>>;
+    /// Whether the host can run only one output stream at a time (ASIO).
+    fn single_stream(&self) -> bool;
 }
+
+/// How long a caller waits for the host before giving up. A driver call that
+/// never returns keeps the host busy; everyone else gets an error instead of
+/// blocking with it.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) struct HostAccess<H> {
     host: H,
-    lock: Mutex<()>,
+    state: Mutex<HostState>,
+    released: Condvar,
+    session_timeout: Duration,
 }
 
-impl<H> HostAccess<H> {
+#[derive(Default)]
+struct HostState {
+    busy: bool,
+    live_streams: usize,
+}
+
+impl<H: AudioHost> HostAccess<H> {
     pub(super) fn new(host: H) -> Self {
+        Self::with_session_timeout(host, SESSION_TIMEOUT)
+    }
+
+    pub(super) fn with_session_timeout(host: H, session_timeout: Duration) -> Self {
         Self {
             host,
-            lock: Mutex::new(()),
+            state: Mutex::new(HostState::default()),
+            released: Condvar::new(),
+            session_timeout,
         }
     }
 
     /// Exclusive, apartment-initialized use of the host. Anything that loads,
     /// queries, or releases a driver must happen while a session is alive, and
     /// device handles obtained through it must be dropped before it ends.
-    pub(super) fn session(&self) -> HostSession<'_, H> {
-        HostSession {
-            host: &self.host,
-            _lock: self.lock.lock().unwrap_or_else(PoisonError::into_inner),
-            _thread: apartment::enter(),
+    pub(super) fn session(&self) -> Result<HostSession<'_, H>> {
+        let deadline = Instant::now() + self.session_timeout;
+        let mut state = self.lock_state();
+        while state.busy {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::disconnected(format!(
+                    "AVB audio host busy for over {:?} (a driver call may be hung)",
+                    self.session_timeout
+                )));
+            }
+            state = self
+                .released
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
+        state.busy = true;
+        Ok(HostSession {
+            access: self,
+            _thread: apartment::enter(),
+        })
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, HostState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-pub(super) struct HostSession<'a, H> {
-    host: &'a H,
-    // Field order is drop order: release the lock before leaving the apartment.
-    _lock: MutexGuard<'a, ()>,
+pub(super) struct HostSession<'a, H: AudioHost> {
+    access: &'a HostAccess<H>,
     _thread: AudioThreadScope,
 }
 
-impl<H> Deref for HostSession<'_, H> {
-    type Target = H;
-
-    fn deref(&self) -> &H {
-        self.host
+impl<H: AudioHost> HostSession<'_, H> {
+    /// ASIO runs one stream per driver: a second open through the loaded
+    /// driver disposes the buffers the live stream's callback is using.
+    pub(super) fn ensure_stream_slot_free(&self) -> Result<()> {
+        if self.access.host.single_stream() && self.access.lock_state().live_streams > 0 {
+            return Err(Error::disconnected(
+                "an AVB device is already streaming on this ASIO host; \
+                 ASIO drives one device at a time",
+            ));
+        }
+        Ok(())
     }
 }
 
-/// A running stream whose teardown (which releases the ASIO driver) is
-/// serialized with every other host operation.
+impl<H: AudioHost> Deref for HostSession<'_, H> {
+    type Target = H;
+
+    fn deref(&self) -> &H {
+        &self.access.host
+    }
+}
+
+impl<H: AudioHost> Drop for HostSession<'_, H> {
+    // Releases the host before `_thread` leaves the apartment.
+    fn drop(&mut self) {
+        self.access.lock_state().busy = false;
+        self.access.released.notify_one();
+    }
+}
+
+/// A running stream that counts against the host's stream limit and whose
+/// teardown (which releases the ASIO driver) is serialized with every other
+/// host operation.
 pub(super) struct SerializedStream<H: AudioHost> {
     stream: Option<Box<dyn RunningAudioStream>>,
     access: Arc<HostAccess<H>>,
 }
 
 impl<H: AudioHost> SerializedStream<H> {
+    /// Must be called inside the session that opened `stream`.
     pub(super) fn boxed(
         stream: Box<dyn RunningAudioStream>,
         access: Arc<HostAccess<H>>,
     ) -> Box<dyn RunningAudioStream> {
+        access.lock_state().live_streams += 1;
         Box::new(Self {
             stream: Some(stream),
             access,
@@ -113,8 +178,17 @@ impl<H: AudioHost> RunningAudioStream for SerializedStream<H> {}
 
 impl<H: AudioHost> Drop for SerializedStream<H> {
     fn drop(&mut self) {
-        let _session = self.access.session();
+        // Stopping output beats waiting on a hung host: tear down regardless.
+        let session = self.access.session();
+        if let Err(err) = &session {
+            log::error!(
+                "AVB: stopping stream without exclusive host access: {}",
+                err
+            );
+        }
         self.stream.take();
+        self.access.lock_state().live_streams -= 1;
+        drop(session);
     }
 }
 
@@ -158,6 +232,17 @@ impl AudioHost for cpal::Host {
     fn output_devices(&self) -> Result<Box<dyn Iterator<Item = cpal::Device> + '_>> {
         let devices = HostTrait::output_devices(self).map_err(Error::backend)?;
         Ok(Box::new(devices))
+    }
+
+    fn single_stream(&self) -> bool {
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        {
+            self.id() == cpal::HostId::Asio
+        }
+        #[cfg(not(all(target_os = "windows", feature = "asio")))]
+        {
+            false
+        }
     }
 }
 

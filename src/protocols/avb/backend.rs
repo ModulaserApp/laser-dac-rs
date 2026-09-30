@@ -110,7 +110,7 @@ pub(super) struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(shutter_open: bool, sample_rate: u32) -> Self {
+    pub(super) fn new(shutter_open: bool, sample_rate: u32) -> Self {
         Self {
             sink: AudioSinkState::new(queue_capacity_for_rate(sample_rate), sample_rate),
             shutter_open: AtomicBool::new(shutter_open),
@@ -174,7 +174,7 @@ impl RuntimeState {
 /// guard). `same_name_count` is `None` when the engine can't enumerate a stable
 /// device set (test fakes), in which case the guard is skipped.
 pub(super) struct ResolvedConfig {
-    config: SelectedStreamConfig,
+    pub(super) config: SelectedStreamConfig,
     same_name_count: Option<usize>,
 }
 
@@ -235,13 +235,14 @@ impl<H: AudioHost> HostAudioEngine<H> {
 
 impl<H: AudioHost> AudioEngine for HostAudioEngine<H> {
     fn discover(&self) -> Result<Vec<AvbSelector>> {
-        let host = self.access.session();
+        let host = self.access.session()?;
         let candidates = collect_candidates(&*host, |_| false)?;
         Ok(candidates.into_iter().map(|c| c.selector).collect())
     }
 
     fn resolve_stream_config(&self, selector: &AvbSelector) -> Result<ResolvedConfig> {
-        let host = self.access.session();
+        let host = self.access.session()?;
+        host.ensure_stream_slot_free()?;
         // Enumerate once: derive both the stream config and the same-named
         // device count from a single candidate list (the worker thread does a
         // second, unavoidable enumeration to build the !Send stream).
@@ -270,12 +271,14 @@ impl<H: AudioHost> AudioEngine for HostAudioEngine<H> {
         stream_config: SelectedStreamConfig,
         runtime: Arc<RuntimeState>,
     ) -> Result<Box<dyn RunningAudioStream>> {
-        let host = self.access.session();
+        let host = self.access.session()?;
+        host.ensure_stream_slot_free()?;
         let selected = select_device(&*host, selector)?;
         let stream = selected.start_output(stream_config, &runtime)?;
         drop(selected);
+        let stream = SerializedStream::boxed(stream, Arc::clone(&self.access));
         drop(host);
-        Ok(SerializedStream::boxed(stream, Arc::clone(&self.access)))
+        Ok(stream)
     }
 }
 
