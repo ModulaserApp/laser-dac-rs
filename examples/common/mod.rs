@@ -473,13 +473,14 @@ fn test_pattern_points() -> Vec<LaserPoint> {
     pattern_points
         .into_iter()
         .map(|p| {
+            // The pattern file stores coordinates in 0..1 and colors as 0/1
             LaserPoint::new(
-                p.x,
-                p.y,
-                p.r as u16 * 257,
-                p.g as u16 * 257,
-                p.b as u16 * 257,
-                65535,
+                p.x * 2.0 - 1.0,
+                p.y * 2.0 - 1.0,
+                p.r as u16 * u16::MAX,
+                p.g as u16 * u16::MAX,
+                p.b as u16 * u16::MAX,
+                u16::MAX,
             )
         })
         .collect()
@@ -508,6 +509,16 @@ mod tests {
             generate_frame(Shape::TestPattern, 5000, 1.0).len(),
             full.len()
         );
+    }
+
+    #[test]
+    fn test_pattern_fills_full_range_at_full_brightness() {
+        let points = test_pattern_points();
+        let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(min_x < -0.99 && max_x > 0.99);
+        let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
+        assert_eq!(max_channel, Some(u16::MAX));
     }
 
     #[test]
