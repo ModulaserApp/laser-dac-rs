@@ -8,7 +8,7 @@
 mod common;
 
 use clap::Parser;
-use common::{make_producer, Args};
+use common::{make_producer, select_device, Args};
 use laser_dac::{list_devices, open_device, ReconnectConfig, Result, StreamConfig};
 use std::time::Duration;
 
@@ -24,8 +24,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Get first device ID
-    let device_info = &devices[0];
+    let Some(device_info) = select_device(&devices, args.device.as_deref()) else {
+        println!("No DAC matching {:?}.", args.device.unwrap_or_default());
+        return Ok(());
+    };
     println!("  Found: {} ({})", device_info.name, device_info.kind);
 
     // Open device and create a reconnecting stream via config

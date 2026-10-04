@@ -12,7 +12,7 @@
 mod common;
 
 use clap::Parser;
-use common::{generate_frame, Args};
+use common::{generate_frame, select_device, Args};
 use laser_dac::{list_devices, open_device, Frame, FrameSessionConfig, Result};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,7 +29,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let device_info = &devices[0];
+    let Some(device_info) = select_device(&devices, args.device.as_deref()) else {
+        println!("No DAC matching {:?}.", args.device.unwrap_or_default());
+        return Ok(());
+    };
     println!("  Found: {} ({})", device_info.name, device_info.kind);
 
     let device = open_device(&device_info.id)?;

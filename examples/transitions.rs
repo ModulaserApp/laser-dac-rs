@@ -16,6 +16,7 @@
 mod common;
 
 use clap::Parser;
+use common::select_device;
 use laser_dac::{
     default_transition, list_devices, open_device, Frame, FrameSessionConfig, LaserPoint, Result,
     TransitionFn, TransitionPlan,
@@ -34,6 +35,10 @@ struct Args {
     /// Points per shape
     #[arg(short, long, default_value_t = 200)]
     points: usize,
+
+    /// Only use a DAC whose name, type or id contains this (case-insensitive)
+    #[arg(short, long)]
+    device: Option<String>,
 }
 
 #[derive(Copy, Clone, clap::ValueEnum)]
@@ -70,7 +75,10 @@ fn main() -> Result<()> {
         println!("  Found: {} ({})", device.name, device.kind);
     }
 
-    let device_info = &devices[0];
+    let Some(device_info) = select_device(&devices, args.device.as_deref()) else {
+        println!("No DAC matching {:?}.", args.device.unwrap_or_default());
+        return Ok(());
+    };
     let device = open_device(&device_info.id)?;
 
     let transition_fn: TransitionFn = match args.mode {

@@ -5,7 +5,7 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
+use laser_dac::{ChunkRequest, ChunkResult, DacInfo, LaserPoint};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
 
@@ -16,13 +16,41 @@ pub struct Args {
     #[arg(value_enum, default_value_t = Shape::Triangle)]
     pub shape: Shape,
 
-    /// Number of points per frame (detail level for static shapes)
+    /// Number of points per frame (detail level for static shapes; ignored by
+    /// orientation and test-pattern, which have a fixed point count)
     #[arg(short, long, default_value_t = 200)]
     pub points: usize,
 
     /// Geometry scale around center (0,0); range: (0, 10]
     #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
     pub scale: f32,
+
+    /// Only use a DAC whose name, type or id contains this (case-insensitive,
+    /// e.g. "etherdream", "helios"); defaults to the first DAC found
+    #[arg(short, long)]
+    pub device: Option<String>,
+}
+
+/// Pick the first device matching `filter`, or the first device if no filter.
+///
+/// Matching ignores case, spaces and punctuation, so "etherdream" matches the
+/// "Ether Dream" type.
+pub fn select_device<'a>(devices: &'a [DacInfo], filter: Option<&str>) -> Option<&'a DacInfo> {
+    let Some(filter) = filter else {
+        return devices.first();
+    };
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let filter = normalize(filter);
+    devices.iter().find(|d| {
+        [d.name.as_str(), d.kind.display_name(), d.id.as_str()]
+            .iter()
+            .any(|field| normalize(field).contains(&filter))
+    })
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -49,9 +77,10 @@ impl Shape {
 
 /// Generate a complete frame of points for a shape.
 ///
-/// The frame contains exactly `n_points` points representing one full cycle
-/// of the shape. This frame is then streamed continuously by wrapping around
-/// — the DAC never waits for frame boundaries.
+/// The frame contains `n_points` points representing one full cycle of the
+/// shape (Orientation and TestPattern have a fixed point count instead). This
+/// frame is then streamed continuously by wrapping around — the DAC never
+/// waits for frame boundaries.
 ///
 /// For time-based shapes (OrbitingCircle), this produces a static circle.
 /// Use `make_producer` for timestamp-driven animation in the stream API.
@@ -61,10 +90,10 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
         Shape::Circle | Shape::OrbitingCircle => fill_circle_points(&mut frame, n_points),
         Shape::Orientation => return fill_orientation_points(n_points, scale),
-        Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
+        Shape::TestPattern => frame = test_pattern_points(),
     }
     if (scale - 1.0).abs() > f32::EPSILON {
-        scale_points(&mut frame[..n_points], scale);
+        scale_points(&mut frame, scale);
     }
     frame
 }
@@ -437,11 +466,11 @@ struct PatternPoint {
     b: u8,
 }
 
-fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
+fn test_pattern_points() -> Vec<LaserPoint> {
     let json_str = include_str!("test-pattern.json");
     let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
 
-    let points: Vec<LaserPoint> = pattern_points
+    pattern_points
         .into_iter()
         .map(|p| {
             LaserPoint::new(
@@ -453,11 +482,7 @@ fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
                 65535,
             )
         })
-        .collect();
-
-    for (i, point) in points.iter().cycle().take(n_points).enumerate() {
-        buffer[i] = *point;
-    }
+        .collect()
 }
 
 #[cfg(test)]
@@ -470,6 +495,19 @@ mod tests {
         assert_eq!(frame.len(), 200);
         // All points have color (no leading blanks)
         assert!(frame.iter().all(|p| p.intensity != 0));
+    }
+
+    #[test]
+    fn test_pattern_ignores_point_count() {
+        let full = test_pattern_points();
+        assert_eq!(
+            generate_frame(Shape::TestPattern, 200, 1.0).len(),
+            full.len()
+        );
+        assert_eq!(
+            generate_frame(Shape::TestPattern, 5000, 1.0).len(),
+            full.len()
+        );
     }
 
     #[test]
