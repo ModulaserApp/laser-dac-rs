@@ -1493,6 +1493,13 @@ impl FifoTestBackend {
             ..Self::new()
         }
     }
+
+    fn with_dac_type(dac_type: crate::device::DacType) -> Self {
+        Self {
+            dac_type,
+            ..Self::new()
+        }
+    }
 }
 
 impl DacBackend for FifoTestBackend {
@@ -1553,6 +1560,30 @@ fn frame_session_uses_lasercube_network_target_buffer() {
     assert_eq!(
         super::session::target_buffer_for_backend(&backend),
         crate::config::StreamConfig::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+    );
+}
+
+#[test]
+fn frame_session_uses_ether_dream_target_buffer() {
+    let backend = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::with_dac_type(
+        crate::device::DacType::EtherDream,
+    )));
+
+    assert_eq!(
+        super::session::target_buffer_for_backend(&backend),
+        std::time::Duration::from_millis(80)
+    );
+}
+
+#[test]
+fn frame_session_uses_network_target_buffer_for_other_network_backends() {
+    let backend = crate::backend::BackendKind::Fifo(Box::new(FifoTestBackend::with_dac_type(
+        crate::device::DacType::Idn,
+    )));
+
+    assert_eq!(
+        super::session::target_buffer_for_backend(&backend),
+        std::time::Duration::from_millis(50)
     );
 }
 

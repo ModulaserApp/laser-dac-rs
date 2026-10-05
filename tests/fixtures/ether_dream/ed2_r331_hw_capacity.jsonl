@@ -1,0 +1,9 @@
+{"dt_us":998,"dur_us":640,"n":0,"note":"","op":"hello","phase":"capacity","req":"","resp":"613f0000000000003177000000000000000000000000","seq":1,"status":"ok","t_us":1638}
+{"dt_us":99,"dur_us":378,"n":1,"note":"","op":"prepare","phase":"capacity","req":"70","resp":"61700000010000003177000000000000000000000000","seq":2,"status":"ok","t_us":2116}
+{"dt_us":1927,"dur_us":2177,"n":18003,"note":"payload elided: 1000 blanked points, 18 zero bytes each","op":"data","phase":"capacity","req":"64e803","resp":"616400000100000031770000e8030000000000000000","seq":3,"status":"ok","t_us":6222}
+{"dt_us":5382,"dur_us":5425,"n":52185,"note":"payload elided: 2899 blanked points, 18 zero bytes each","op":"data","phase":"capacity","req":"64530b","resp":"6164000001000000317700003b0f0000000000000000","seq":4,"status":"ok","t_us":17030}
+{"dt_us":380,"dur_us":3033,"n":1803,"note":"beyond advertised capacity; payload elided: 100 blanked points, 18 zero bytes each","op":"data","phase":"capacity","req":"646400","resp":"4964000001000000317700003b0f0000000000000000","seq":5,"status":"ok","t_us":20445}
+{"dt_us":112,"dur_us":378,"n":1,"note":"","op":"ping","phase":"capacity","req":"3f","resp":"613f000001000000317700003b0f0000000000000000","seq":6,"status":"ok","t_us":20935}
+{"dt_us":95,"dur_us":362,"n":7,"note":"","op":"begin","phase":"capacity","req":"620000e8030000","resp":"6162000002000000317700003b0fe803000000000000","seq":7,"status":"ok","t_us":21393}
+{"dt_us":54735,"dur_us":768,"n":1,"note":"50 ms at 1 kpps","op":"ping","phase":"capacity","req":"3f","resp":"613f00000200000031770000040fe803000037000000","seq":8,"status":"ok","t_us":76897}
+{"dt_us":157,"dur_us":445,"n":1,"note":"","op":"stop","phase":"capacity","req":"73","resp":"617300000000000031770000030f0000000000000000","seq":9,"status":"ok","t_us":77499}

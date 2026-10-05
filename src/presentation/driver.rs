@@ -159,6 +159,31 @@ impl DriverInputs {
 /// The unified driver loop. Lifted from the old `FrameSession::run_loop`,
 /// generalised to either content source.
 pub(crate) fn run(mut inputs: DriverInputs) -> Result<SessionExit> {
+    let result = run_loop(&mut inputs);
+    end_session(&mut inputs.backend);
+    result
+}
+
+/// Stop the device and drop the connection when the session ends.
+///
+/// The driver owns the backend and drops it on return, so nothing else will
+/// ever stop it. Every exit path has already closed the shutter (or drained
+/// and blanked); without an explicit stop, protocols such as Ether Dream are
+/// left holding stale points and a playback state that only a later stop
+/// resets. This matches `Stream::stop()`: stop output, then disconnect.
+fn end_session(backend: &mut BackendKind) {
+    if !backend.is_connected() {
+        return;
+    }
+    if let Err(e) = backend.stop() {
+        log::debug!("backend stop at session end failed: {e}");
+    }
+    if let Err(e) = backend.disconnect() {
+        log::debug!("backend disconnect at session end failed: {e}");
+    }
+}
+
+fn run_loop(inputs: &mut DriverInputs) -> Result<SessionExit> {
     let expected_frame_swap = inputs.source.is_frame();
     let mut adapter = match output_model::for_backend(&inputs.backend, expected_frame_swap) {
         Ok(adapter) => adapter,
@@ -189,7 +214,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<SessionExit> {
         }
 
         if !inputs.backend.is_connected() {
-            match reconnect(&mut inputs, &mut *adapter, &mut state) {
+            match reconnect(inputs, &mut *adapter, &mut state) {
                 Ok(()) => continue,
                 Err(exit) => return Ok(exit),
             }
@@ -216,7 +241,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<SessionExit> {
             ),
             TransitionOutcome::Disconnected
         ) {
-            match reconnect(&mut inputs, &mut *adapter, &mut state) {
+            match reconnect(inputs, &mut *adapter, &mut state) {
                 Ok(()) => continue,
                 Err(exit) => return Ok(exit),
             }
@@ -249,7 +274,7 @@ pub(crate) fn run(mut inputs: DriverInputs) -> Result<SessionExit> {
                     &mut state.shutter_state,
                 ))
             }
-            StepOutcome::Disconnected => match reconnect(&mut inputs, &mut *adapter, &mut state) {
+            StepOutcome::Disconnected => match reconnect(inputs, &mut *adapter, &mut state) {
                 Ok(()) => continue,
                 Err(exit) => return Ok(exit),
             },
@@ -504,8 +529,8 @@ mod lifecycle_tests {
     use crate::session::{DesiredState, SessionControl, SessionExit};
 
     use super::{
-        handle_shutter_transition, reconnect, stop_and_close_shutter, DriverInputs, LoopState,
-        SourceOwned,
+        end_session, handle_shutter_transition, reconnect, stop_and_close_shutter, DriverInputs,
+        LoopState, SourceOwned,
     };
 
     struct LifecycleBackend {
@@ -682,6 +707,7 @@ mod lifecycle_tests {
             self.connected
         }
         fn stop(&mut self) -> Result<()> {
+            self.events.lock().unwrap().push("stop");
             Ok(())
         }
         fn set_shutter(&mut self, open: bool) -> Result<()> {
@@ -733,6 +759,37 @@ mod lifecycle_tests {
                 caps: self.caps.clone(),
             })))
         }
+    }
+
+    fn cleanup_backend(connected: bool) -> (BackendKind, Arc<Mutex<Vec<&'static str>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend = ReconnectCleanupBackend {
+            connected,
+            events: Arc::clone(&events),
+            estimator: SoftwareDecayEstimator::new(),
+            caps: DacCapabilities {
+                pps_min: 1_000,
+                pps_max: 100_000,
+                max_points_per_chunk: 100,
+                output_model: OutputModel::NetworkFifo,
+            },
+        };
+        (BackendKind::Fifo(Box::new(backend)), events)
+    }
+
+    #[test]
+    fn end_session_stops_then_disconnects_a_connected_backend() {
+        let (mut backend, events) = cleanup_backend(true);
+        end_session(&mut backend);
+        assert_eq!(*events.lock().unwrap(), vec!["stop", "disconnect"]);
+        assert!(!backend.is_connected());
+    }
+
+    #[test]
+    fn end_session_skips_a_disconnected_backend() {
+        let (mut backend, events) = cleanup_backend(false);
+        end_session(&mut backend);
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]

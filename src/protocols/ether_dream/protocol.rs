@@ -357,6 +357,29 @@ pub mod command {
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
     pub struct Ping;
 
+    /// Request the firmware build string (`'v'`).
+    ///
+    /// Unlike every other command, the DAC does not answer with a
+    /// [`DacResponse`](super::DacResponse). It replies with exactly
+    /// [`Version::RESPONSE_SIZE_BYTES`] bytes holding a NUL-padded ASCII build
+    /// identifier (for example `r331-ed4bef5`). Firmware that does not know the
+    /// command may close the connection instead.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct Version;
+
+    impl Version {
+        /// Size of the raw reply to a [`Version`] command.
+        pub const RESPONSE_SIZE_BYTES: usize = 32;
+
+        /// Decode a raw version reply into its printable build string.
+        ///
+        /// Trailing NUL padding is stripped and non-UTF-8 bytes are replaced.
+        pub fn decode_response(raw: &[u8]) -> String {
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        }
+    }
+
     impl Begin {
         pub fn read_fields<R: ReadBytesExt>(mut reader: R) -> io::Result<Self> {
             Ok(Begin {
@@ -426,7 +449,9 @@ pub mod command {
         const START_BYTE: u8 = 0x75;
     }
     impl Command for PointRate {
-        const START_BYTE: u8 = 0x74;
+        /// `'q'` (0x71). Earlier releases of this crate sent 0x74 (`'t'`), which
+        /// real firmware does not recognise and answers by closing the socket.
+        const START_BYTE: u8 = 0x71;
     }
     impl<'a> Command for Data<'a> {
         const START_BYTE: u8 = 0x64;
@@ -445,6 +470,9 @@ pub mod command {
     }
     impl Command for Ping {
         const START_BYTE: u8 = 0x3f;
+    }
+    impl Command for Version {
+        const START_BYTE: u8 = b'v';
     }
 
     impl SizeBytes for PrepareStream {
@@ -469,6 +497,9 @@ pub mod command {
         const SIZE_BYTES: usize = 1;
     }
     impl SizeBytes for Ping {
+        const SIZE_BYTES: usize = 1;
+    }
+    impl SizeBytes for Version {
         const SIZE_BYTES: usize = 1;
     }
 
@@ -496,7 +527,7 @@ pub mod command {
         };
     }
 
-    impl_unit_command_bytes!(PrepareStream, Stop, ClearEmergencyStop, Ping);
+    impl_unit_command_bytes!(PrepareStream, Stop, ClearEmergencyStop, Ping, Version);
 
     impl WriteToBytes for Begin {
         fn write_to_bytes<W: WriteBytesExt>(&self, mut writer: W) -> io::Result<()> {
@@ -919,11 +950,29 @@ mod tests {
         assert_eq!(command::PrepareStream::START_BYTE, b'p');
         assert_eq!(command::Begin::START_BYTE, b'b');
         assert_eq!(command::Update::START_BYTE, b'u');
-        assert_eq!(command::PointRate::START_BYTE, 0x74);
+        // Regression: this was 0x74 ('t'), which real firmware rejects by
+        // closing the TCP connection. The spec and j4cDAC source use 'q'.
+        assert_eq!(command::PointRate::START_BYTE, b'q');
+        assert_eq!(command::Version::START_BYTE, b'v');
         assert_eq!(command::Data::START_BYTE, b'd');
         assert_eq!(command::Stop::START_BYTE, b's');
         assert_eq!(command::ClearEmergencyStop::START_BYTE, b'c');
         assert_eq!(command::Ping::START_BYTE, b'?');
+    }
+
+    #[test]
+    fn test_version_response_decodes_build_string() {
+        // Raw reply captured from an Ether Dream 2 running r331-ed4bef5.
+        let raw = hex32("723333312d656434626566350000000000000000000000000000000000000000");
+        assert_eq!(command::Version::decode_response(&raw), "r331-ed4bef5");
+        assert_eq!(command::Version::decode_response(&[0u8; 32]), "");
+    }
+
+    fn hex32(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]

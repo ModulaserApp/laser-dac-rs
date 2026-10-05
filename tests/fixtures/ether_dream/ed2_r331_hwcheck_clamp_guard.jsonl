@@ -1,0 +1,9 @@
+{"dt_us":59186,"dur_us":824,"n":0,"note":"","op":"hello","phase":"clamp_guard","req":"","resp":"613f000000000000317700003b0f0000000000000000","seq":1,"status":"ok","t_us":60011}
+{"dt_us":60577,"dur_us":645,"n":0,"note":"","op":"hello","phase":"clamp_guard","req":"","resp":"613f000000000000317700003b0f0000000000000000","seq":2,"status":"ok","t_us":121234}
+{"dt_us":167,"dur_us":271,"n":1,"note":"","op":"version","phase":"clamp_guard","req":"76","resp":"723333312d656434626566350000000000000000000000000000000000000000","seq":3,"status":"ok","t_us":121673}
+{"dt_us":881,"dur_us":276,"n":1,"note":"","op":"prepare","phase":"clamp_guard","req":"70","resp":"61700000010000003177000000000000000000000000","seq":4,"status":"ok","t_us":122832}
+{"dt_us":605,"dur_us":2245,"n":21603,"note":"payload elided: 1200 blanked points, 18 zero bytes each","op":"data","phase":"clamp_guard","req":"64b004","resp":"616400000100000031770000b0040000000000000000","seq":5,"status":"ok","t_us":125683}
+{"dt_us":132,"dur_us":250,"n":7,"note":"","op":"begin","phase":"clamp_guard","req":"6200006a180000","resp":"616200000200000031770000b0046a18000000000000","seq":6,"status":"ok","t_us":126066}
+{"dt_us":122,"dur_us":0,"n":7,"note":"rate 100000 outside 1000..=30000; not sent: refused by the safety interlock","op":"update","phase":"clamp_guard","req":"750000a0860100","resp":"","seq":7,"status":"blocked","t_us":126188}
+{"dt_us":13,"dur_us":250,"n":1,"note":"interlock: stop before closing; injected by the proxy, reply not forwarded","op":"stop","phase":"clamp_guard","req":"73","resp":"617300000000000031770000ae040000000000000000","seq":8,"status":"ok","t_us":126452}
+{"dt_us":377316,"dur_us":713,"n":0,"note":"","op":"hello","phase":"clamp_guard","req":"","resp":"613f00000000000031770000ae040000000000000000","seq":9,"status":"ok","t_us":504482}

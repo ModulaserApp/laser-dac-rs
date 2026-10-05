@@ -94,6 +94,18 @@ pub trait FifoBackend: DacBackend {
     /// query estimated fullness via this getter.
     fn estimator(&self) -> &dyn BufferEstimator;
 
+    /// The most points the adapter should ever try to keep buffered in the
+    /// device. `None` means no device-imposed limit.
+    ///
+    /// The network FIFO adapter clamps its target buffer
+    /// (`target_buffer * pps`) to this, so a target longer than the device ring
+    /// at high point rates does not leave a permanent deficit that keeps
+    /// asking for chunks that cannot fit. Other adapters ignore it. Called
+    /// every adapter step, so it may change across reconnects.
+    fn target_buffer_ceiling(&self) -> Option<usize> {
+        None
+    }
+
     /// Clear the device-side queue (drop all buffered-but-unplayed points) and
     /// reset queue-depth bookkeeping.
     ///
@@ -351,6 +363,16 @@ impl BackendKind {
     pub fn estimator(&self) -> Option<&dyn BufferEstimator> {
         match &self.inner {
             BackendVariant::Fifo(b) => Some(b.estimator()),
+            BackendVariant::FrameSwap(_) => None,
+        }
+    }
+
+    /// The FIFO backend's [`FifoBackend::target_buffer_ceiling`].
+    ///
+    /// Frame-swap backends never queue points, so they return `None`.
+    pub fn target_buffer_ceiling(&self) -> Option<usize> {
+        match &self.inner {
+            BackendVariant::Fifo(b) => b.target_buffer_ceiling(),
             BackendVariant::FrameSwap(_) => None,
         }
     }

@@ -1,0 +1,26 @@
+{"dt_us":841,"dur_us":646,"n":0,"note":"","op":"hello","phase":"lifecycle","req":"","resp":"613f0000000000003177000078050000000000000000","seq":1,"status":"ok","t_us":1488}
+{"dt_us":119,"dur_us":375,"n":1,"note":"","op":"prepare","phase":"lifecycle","req":"70","resp":"61700000010000003177000000000000000000000000","seq":2,"status":"ok","t_us":1983}
+{"dt_us":1066,"dur_us":1421,"n":9003,"note":"payload elided: 500 blanked points, 18 zero bytes each","op":"data","phase":"lifecycle","req":"64f401","resp":"616400000100000031770000f4010000000000000000","seq":3,"status":"ok","t_us":4472}
+{"dt_us":135,"dur_us":375,"n":7,"note":"","op":"begin","phase":"lifecycle","req":"62000030750000","resp":"616200000200000031770000f4013075000000000000","seq":4,"status":"ok","t_us":4983}
+{"dt_us":5076,"dur_us":506,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f000002000000317700004f0130750000a5000000","seq":5,"status":"ok","t_us":10567}
+{"dt_us":5175,"dur_us":528,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f00000200000031770000a4003075000050010000","seq":6,"status":"ok","t_us":16271}
+{"dt_us":5162,"dur_us":548,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f0000000000003377000000000000000000000000","seq":7,"status":"ok","t_us":21982}
+{"dt_us":4781,"dur_us":479,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f0000000000003377000000000000000000000000","seq":8,"status":"ok","t_us":27242}
+{"dt_us":5136,"dur_us":517,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f0000000000003377000000000000000000000000","seq":9,"status":"ok","t_us":32897}
+{"dt_us":5175,"dur_us":458,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f0000000000003377000000000000000000000000","seq":10,"status":"ok","t_us":38531}
+{"dt_us":186,"dur_us":3175,"n":1803,"note":"after underflow; payload elided: 100 blanked points, 18 zero bytes each","op":"data","phase":"lifecycle","req":"646400","resp":"49640000000000003377000000000000000000000000","seq":11,"status":"ok","t_us":41893}
+{"dt_us":114,"dur_us":406,"n":7,"note":"begin while idle","op":"begin","phase":"lifecycle","req":"62000030750000","resp":"61620000000000003377000000000000000000000000","seq":12,"status":"ok","t_us":42414}
+{"dt_us":103,"dur_us":390,"n":1,"note":"","op":"prepare","phase":"lifecycle","req":"70","resp":"61700000010000003177000000000000000000000000","seq":13,"status":"ok","t_us":42909}
+{"dt_us":653,"dur_us":895,"n":5403,"note":"payload elided: 300 blanked points, 18 zero bytes each","op":"data","phase":"lifecycle","req":"642c01","resp":"6164000001000000317700002c010000000000000000","seq":14,"status":"ok","t_us":44458}
+{"dt_us":117,"dur_us":297,"n":7,"note":"","op":"begin","phase":"lifecycle","req":"62000030750000","resp":"6162000002000000317700002c013075000000000000","seq":15,"status":"ok","t_us":44873}
+{"dt_us":51,"dur_us":443,"n":7,"note":"","op":"update","phase":"lifecycle","req":"750000204e0000","resp":"6175000002000000317700002301204e000009000000","seq":16,"status":"ok","t_us":45367}
+{"dt_us":104,"dur_us":382,"n":5,"note":"","op":"point_rate","phase":"lifecycle","req":"71a8610000","resp":"6171000002000000317700001701204e000015000000","seq":17,"status":"ok","t_us":45854}
+{"dt_us":92,"dur_us":387,"n":1,"note":"","op":"stop","phase":"lifecycle","req":"73","resp":"6173000000000000317700000e010000000000000000","seq":18,"status":"ok","t_us":46334}
+{"dt_us":93,"dur_us":365,"n":1,"note":"stop while idle","op":"stop","phase":"lifecycle","req":"73","resp":"4973000000000000317700000e010000000000000000","seq":19,"status":"ok","t_us":46794}
+{"dt_us":146,"dur_us":5659,"n":183,"note":"data while idle; payload elided: 10 blanked points, 18 zero bytes each","op":"data","phase":"lifecycle","req":"640a00","resp":"4964000000000000317700000e010000000000000000","seq":20,"status":"ok","t_us":52600}
+{"dt_us":60,"dur_us":1868,"n":1,"note":"","op":"estop","phase":"lifecycle","req":"00","resp":"6100000300000300357700000e010000000000000000","seq":21,"status":"ok","t_us":54529}
+{"dt_us":78,"dur_us":383,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f000300000300357700000e010000000000000000","seq":22,"status":"ok","t_us":54992}
+{"dt_us":55,"dur_us":364,"n":1,"note":"","op":"clear_estop","phase":"lifecycle","req":"63","resp":"6163000000000000357700000e010000000000000000","seq":23,"status":"ok","t_us":55411}
+{"dt_us":85,"dur_us":358,"n":1,"note":"","op":"ping","phase":"lifecycle","req":"3f","resp":"613f000000000000357700000e010000000000000000","seq":24,"status":"ok","t_us":55855}
+{"dt_us":53,"dur_us":413,"n":1,"note":"clears the sticky flags","op":"prepare","phase":"lifecycle","req":"70","resp":"61700000010000003177000000000000000000000000","seq":25,"status":"ok","t_us":56322}
+{"dt_us":99,"dur_us":359,"n":1,"note":"","op":"stop","phase":"lifecycle","req":"73","resp":"61730000000000003177000000000000000000000000","seq":26,"status":"ok","t_us":56781}

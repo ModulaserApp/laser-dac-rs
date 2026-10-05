@@ -1,0 +1,4 @@
+{"dt_us":1215,"dur_us":718,"n":0,"note":"","op":"hello","phase":"identity","req":"","resp":"613f0000000000003177000078050000000000000000","seq":1,"status":"ok","t_us":1933}
+{"dt_us":1758,"dur_us":591,"n":1,"note":"","op":"ping","phase":"identity","req":"3f","resp":"613f0000000000003177000078050000000000000000","seq":2,"status":"ok","t_us":4283}
+{"dt_us":105,"dur_us":431,"n":1,"note":"","op":"version","phase":"identity","req":"76","resp":"723333312d656434626566350000000000000000000000000000000000000000","seq":3,"status":"ok","t_us":4820}
+{"dt_us":112,"dur_us":422,"n":1,"note":"connection still in sync after 'v'","op":"ping","phase":"identity","req":"3f","resp":"613f0000000000003177000078050000000000000000","seq":4,"status":"ok","t_us":5355}

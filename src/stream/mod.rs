@@ -160,6 +160,8 @@ pub struct ChunkRequest {
     /// Ideal number of points to reach target buffer level.
     ///
     /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
+    /// On network FIFO backends the target is first capped to the backend's
+    /// [`FifoBackend::target_buffer_ceiling`](crate::FifoBackend::target_buffer_ceiling).
     pub target_points: usize,
 }
 

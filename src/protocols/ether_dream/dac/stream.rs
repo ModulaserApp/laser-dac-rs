@@ -17,6 +17,10 @@ pub struct Stream {
     command_buffer: Vec<QueuedCommand>,
     point_buffer: Vec<protocol::DacPoint>,
     bytes: Vec<u8>,
+    /// When the command whose reply carried the current status was sent.
+    status_sent_at: time::Instant,
+    /// When the reply that carried the current status was read.
+    status_received_at: time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +34,18 @@ pub enum QueuedCommand {
     EmergencyStop,
     ClearEmergencyStop,
     Ping,
+}
+
+impl QueuedCommand {
+    /// The point rate this command sends, if it carries one.
+    fn point_rate(&self) -> Option<u32> {
+        match self {
+            QueuedCommand::Begin(b) => Some(b.point_rate),
+            QueuedCommand::Update(u) => Some(u.point_rate),
+            QueuedCommand::PointRate(r) => Some(r.0),
+            _ => None,
+        }
+    }
 }
 
 pub struct CommandQueue<'a> {
@@ -83,6 +99,62 @@ impl Stream {
         &self.dac
     }
 
+    /// When the command that produced the current [`dac`](Self::dac) status
+    /// was sent; for the connection hello, when the connection was opened.
+    ///
+    /// The firmware samples its status while it processes a command, so this
+    /// is a better anchor for decaying the reported fullness than the time
+    /// the reply arrived. A delayed reply otherwise makes the ring look
+    /// fuller than it is. Erring early is the conservative direction.
+    pub fn status_sent_at(&self) -> time::Instant {
+        self.status_sent_at
+    }
+
+    /// When the reply that produced the current [`dac`](Self::dac) status was
+    /// read from the socket; for the connection hello, when it was read.
+    ///
+    /// The firmware sampled the status no later than this, so decaying the
+    /// reported fullness from here never under-reads it. Use it where
+    /// over-reading is the safe direction, such as deciding whether a chunk
+    /// fits. [`status_sent_at`](Self::status_sent_at) is the matching lower
+    /// bound.
+    pub fn status_received_at(&self) -> time::Instant {
+        self.status_received_at
+    }
+
+    /// Ask the firmware for its build string with the `'v'` command.
+    ///
+    /// Send this only when no other command is in flight. Firmware that does
+    /// not implement `'v'` may reset the connection, which surfaces as an I/O
+    /// error; the stream is unusable afterwards and must be reconnected.
+    ///
+    /// Returns `Ok(None)` if the firmware answered with a normal NAK frame
+    /// instead of a build string.
+    pub fn query_version(&mut self) -> Result<Option<String>, CommunicationError> {
+        const V: u8 = protocol::command::Version::START_BYTE;
+        let sent_at = time::Instant::now();
+        self.send_command(protocol::command::Version)?;
+        let mut raw = [0u8; protocol::command::Version::RESPONSE_SIZE_BYTES];
+        let head = protocol::DacResponse::SIZE_BYTES;
+        read_exact_with_budget(&mut self.tcp_reader, &mut raw[..head], VERSION_BUDGET)?;
+        // A NAK frame for 'v' starts with a response code then 'v'. No real
+        // build string starts that way.
+        if Nak::from_protocol(raw[0]).is_some() && raw[1] == V {
+            let response = (&raw[..head]).read_bytes::<protocol::DacResponse>()?;
+            self.dac.update_status(&response.dac_status)?;
+            self.status_sent_at = sent_at;
+            self.status_received_at = time::Instant::now();
+            return Ok(None);
+        }
+        read_exact_with_budget(&mut self.tcp_reader, &mut raw[head..], VERSION_BUDGET)?;
+        Ok(Some(protocol::command::Version::decode_response(&raw)))
+    }
+
+    /// Address of the connected DAC.
+    pub fn peer_addr(&self) -> io::Result<net::SocketAddr> {
+        self.tcp_writer.peer_addr()
+    }
+
     pub fn queue_commands(&mut self) -> CommandQueue<'_> {
         self.command_buffer.clear();
         self.point_buffer.clear();
@@ -116,29 +188,6 @@ impl Stream {
     pub fn set_timeout(&self, duration: Option<time::Duration>) -> io::Result<()> {
         self.set_read_timeout(duration)?;
         self.set_write_timeout(duration)
-    }
-
-    /// Build a `Stream` around an already-connected TCP stream and a known DAC
-    /// state, bypassing the discovery handshake. Test-only: lets the backend
-    /// tests drive a mock DAC over a loopback socket.
-    #[cfg(test)]
-    pub(crate) fn from_tcp_stream_for_test(
-        dac: Addressed,
-        tcp: net::TcpStream,
-    ) -> io::Result<Self> {
-        tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(READ_TIMEOUT))?;
-        tcp.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let tcp_writer = tcp.try_clone()?;
-        let tcp_reader = BufReader::new(tcp);
-        Ok(Stream {
-            dac,
-            tcp_reader,
-            tcp_writer,
-            command_buffer: vec![],
-            point_buffer: vec![],
-            bytes: vec![],
-        })
     }
 }
 
@@ -227,13 +276,43 @@ impl<'a> CommandQueue<'a> {
         self
     }
 
+    /// Send every queued command, then read one response per command.
+    ///
+    /// Every response is read even after a NAK, and the first NAK is
+    /// returned, so the stream stays in sync for the next submit.
+    ///
+    /// A `'b'`, `'u'` or `'q'` whose rate is 0, or above the DAC's advertised
+    /// `max_point_rate` (when it advertises one), is rejected with an
+    /// [`io::ErrorKind::InvalidInput`] error before anything is sent. Rate 0
+    /// hangs Ether Dream firmware until a power cycle. An over-max rate is
+    /// NAKed after only the opcode byte is consumed, and the firmware then
+    /// parses the argument bytes as further commands (a low-water mark of 0
+    /// becomes two emergency stops).
     pub fn submit(self) -> Result<(), CommunicationError> {
         let CommandQueue { stream } = self;
+
+        let max_rate = stream.dac().max_point_rate;
+        let unsafe_rate = |rate: u32| rate == 0 || (max_rate > 0 && rate > max_rate);
+        if let Some(rate) = stream
+            .command_buffer
+            .iter()
+            .filter_map(QueuedCommand::point_rate)
+            .find(|&rate| unsafe_rate(rate))
+        {
+            stream.command_buffer.clear();
+            stream.point_buffer.clear();
+            return Err(CommunicationError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("point rate {rate} is outside 1..={max_rate} pps"),
+            )));
+        }
 
         let mut command_bytes = vec![];
         let mut command_buffer = mem::take(&mut stream.command_buffer);
 
+        let mut sent_at = Vec::with_capacity(command_buffer.len());
         for command in command_buffer.drain(..) {
+            sent_at.push(time::Instant::now());
             let start_byte = match command {
                 QueuedCommand::PrepareStream => {
                     stream.send_command(protocol::command::PrepareStream)?;
@@ -279,11 +358,33 @@ impl<'a> CommandQueue<'a> {
 
         mem::swap(&mut stream.command_buffer, &mut command_buffer);
 
-        for command_byte in command_bytes {
-            stream.recv_response(command_byte)?;
+        // Read every response even after a NAK. Returning at the first NAK
+        // would leave the remaining responses queued in the socket, and the
+        // next submit would read them as its own.
+        let mut first_nak = None;
+        for (command_byte, sent_at) in command_bytes.into_iter().zip(sent_at) {
+            let result = stream.recv_response(command_byte);
+            let received_at = time::Instant::now();
+            match result {
+                Ok(()) => {
+                    stream.status_sent_at = sent_at;
+                    stream.status_received_at = received_at;
+                }
+                Err(CommunicationError::Response(e))
+                    if matches!(e.kind, ResponseErrorKind::Nak(_)) =>
+                {
+                    stream.status_sent_at = sent_at;
+                    stream.status_received_at = received_at;
+                    first_nak.get_or_insert(CommunicationError::Response(e));
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        Ok(())
+        match first_nak {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -390,6 +491,10 @@ const READ_TIMEOUT: time::Duration = time::Duration::from_millis(500);
 /// rather than restarting the whole stream.
 const READ_BUDGET: time::Duration = time::Duration::from_secs(2);
 
+/// Budget for the `'v'` reply. Kept short: firmware that ignores `'v'`
+/// should not stall a connect for the full [`READ_BUDGET`].
+const VERSION_BUDGET: time::Duration = time::Duration::from_millis(500);
+
 /// Write timeout — bounds how long a hung DAC can wedge `write_all`.
 const WRITE_TIMEOUT: time::Duration = time::Duration::from_secs(2);
 
@@ -398,8 +503,66 @@ pub fn connect(
     broadcast: &protocol::DacBroadcast,
     dac_ip: net::IpAddr,
 ) -> Result<Stream, CommunicationError> {
-    connect_inner(broadcast, dac_ip, &net::TcpStream::connect)
+    let addr = net::SocketAddr::new(dac_ip, protocol::COMMUNICATION_PORT);
+    connect_inner(broadcast, addr, &net::TcpStream::connect)
 }
+
+/// Connect to a DAC by socket address, without needing its UDP broadcast.
+///
+/// Use this when broadcasts cannot reach the host (different subnet, a
+/// firewall, or link-local setups where they are simply not seen) or to reach
+/// a DAC on a non-standard port, such as a simulator.
+///
+/// When `broadcast` is `None` the DAC's identity is synthesised: the MAC
+/// address and revisions are reported as zero, and the buffer capacity and
+/// maximum point rate fall back to 1799 points, the smallest known ring
+/// (ED1), and 100 000 pps, which every known Ether Dream advertises. The
+/// live status comes from the hello
+/// frame the DAC sends on connect either way.
+pub fn connect_to(
+    addr: net::SocketAddr,
+    broadcast: Option<&protocol::DacBroadcast>,
+    timeout: time::Duration,
+) -> Result<Stream, CommunicationError> {
+    let fallback;
+    let broadcast = match broadcast {
+        Some(b) => b,
+        None => {
+            fallback = synthetic_broadcast();
+            &fallback
+        }
+    };
+    let connect = |addr| net::TcpStream::connect_timeout(&addr, timeout);
+    connect_inner(broadcast, addr, &connect)
+}
+
+/// Broadcast used by [`connect_to`] when none was received.
+pub(crate) fn synthetic_broadcast() -> protocol::DacBroadcast {
+    protocol::DacBroadcast {
+        mac_address: [0; 6],
+        hw_revision: 0,
+        sw_revision: 0,
+        buffer_capacity: SYNTHETIC_BUFFER_CAPACITY,
+        max_point_rate: SYNTHETIC_MAX_POINT_RATE,
+        dac_status: protocol::DacStatus {
+            protocol: 0,
+            light_engine_state: protocol::DacStatus::LIGHT_ENGINE_READY,
+            playback_state: protocol::DacStatus::PLAYBACK_IDLE,
+            source: protocol::DacStatus::SOURCE_NETWORK_STREAMING,
+            light_engine_flags: 0,
+            playback_flags: 0,
+            source_flags: 0,
+            buffer_fullness: 0,
+            point_rate: 0,
+            point_count: 0,
+        },
+    }
+}
+
+/// Capacity assumed when connecting without a broadcast.
+pub(crate) const SYNTHETIC_BUFFER_CAPACITY: u16 = 1799;
+/// Max point rate assumed when connecting without a broadcast.
+pub(crate) const SYNTHETIC_MAX_POINT_RATE: u32 = 100_000;
 
 /// Establishes a TCP stream connection with a timeout.
 pub fn connect_timeout(
@@ -408,17 +571,18 @@ pub fn connect_timeout(
     timeout: time::Duration,
 ) -> Result<Stream, CommunicationError> {
     let connect = |addr| net::TcpStream::connect_timeout(&addr, timeout);
-    connect_inner(broadcast, dac_ip, &connect)
+    let addr = net::SocketAddr::new(dac_ip, protocol::COMMUNICATION_PORT);
+    connect_inner(broadcast, addr, &connect)
 }
 
 fn connect_inner(
     broadcast: &protocol::DacBroadcast,
-    dac_ip: net::IpAddr,
+    dac_addr: net::SocketAddr,
     connect: &dyn Fn(net::SocketAddr) -> io::Result<net::TcpStream>,
 ) -> Result<Stream, CommunicationError> {
     let mut dac = Addressed::from_broadcast(broadcast)?;
 
-    let dac_addr = net::SocketAddr::new(dac_ip, protocol::COMMUNICATION_PORT);
+    let opened_at = time::Instant::now();
     let tcp_stream = connect(dac_addr)?;
 
     tcp_stream.set_nodelay(true)?;
@@ -442,6 +606,7 @@ fn connect_inner(
         &mut dac,
         protocol::command::Ping::START_BYTE,
     )?;
+    let hello_received_at = time::Instant::now();
 
     Ok(Stream {
         dac,
@@ -450,6 +615,8 @@ fn connect_inner(
         command_buffer: vec![],
         point_buffer: vec![],
         bytes,
+        status_sent_at: opened_at,
+        status_received_at: hello_received_at,
     })
 }
 

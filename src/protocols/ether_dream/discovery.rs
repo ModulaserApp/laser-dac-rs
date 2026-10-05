@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{BackendKind, EtherDreamBackend, Result};
 use crate::device::DacType;
 use crate::discovery::{downcast_connect_data, DiscoveredDevice, DiscoveredDeviceInfo, Discoverer};
+use crate::protocols::ether_dream::backend::caps_for;
 use crate::protocols::ether_dream::protocol::DacBroadcast;
 use crate::protocols::ether_dream::recv_dac_broadcasts;
 
@@ -42,6 +43,18 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// A scan result for one broadcast. Caps come from what the DAC advertises,
+/// exactly as the backend computes them after connecting.
+fn discovered_device(broadcast: DacBroadcast, ip: IpAddr) -> DiscoveredDevice {
+    let device_mac = broadcast.mac_address;
+    let stable_id = format!("{}:{}", PREFIX, format_mac(device_mac));
+    let info = DiscoveredDeviceInfo::new(DacType::EtherDream, stable_id, ip.to_string())
+        .with_ip(ip)
+        .with_mac(device_mac);
+    let caps = caps_for(broadcast.buffer_capacity, broadcast.max_point_rate);
+    DiscoveredDevice::new(info, Box::new(ConnectData { broadcast, ip })).with_caps(caps)
 }
 
 impl Discoverer for EtherDreamDiscoverer {
@@ -93,20 +106,10 @@ impl Discoverer for EtherDreamDiscoverer {
                 }
             };
 
-            let ip = source_addr.ip();
-            let device_mac = broadcast.mac_address;
-            if !seen_macs.insert(device_mac) {
+            if !seen_macs.insert(broadcast.mac_address) {
                 continue;
             }
-
-            let stable_id = format!("{}:{}", PREFIX, format_mac(device_mac));
-            let info = DiscoveredDeviceInfo::new(DacType::EtherDream, stable_id, ip.to_string())
-                .with_ip(ip)
-                .with_mac(device_mac);
-            discovered.push(DiscoveredDevice::new(
-                info,
-                Box::new(ConnectData { broadcast, ip }),
-            ));
+            discovered.push(discovered_device(broadcast, source_addr.ip()));
         }
         discovered
     }
@@ -133,5 +136,36 @@ mod tests {
         .with_ip("192.168.1.100".parse().unwrap())
         .with_mac(mac);
         assert_eq!(info.stable_id(), "etherdream:01:23:45:67:89:ab");
+    }
+
+    /// Regression: scan results reported the 1799-point default instead of
+    /// the capacity and rate the DAC advertised.
+    #[test]
+    fn scan_caps_come_from_the_broadcast() {
+        let broadcast = DacBroadcast {
+            mac_address: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab],
+            hw_revision: 2,
+            sw_revision: 2,
+            buffer_capacity: 3899,
+            max_point_rate: 50_000,
+            dac_status: crate::protocols::ether_dream::protocol::DacStatus {
+                protocol: 0,
+                light_engine_state: 0,
+                playback_state: 0,
+                source: 0,
+                light_engine_flags: 0,
+                playback_flags: 0,
+                source_flags: 0,
+                buffer_fullness: 0,
+                point_rate: 0,
+                point_count: 0,
+            },
+        };
+        let ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let device = discovered_device(broadcast, ip);
+        assert_eq!(device.caps().max_points_per_chunk, 3899);
+        assert_eq!(device.caps().pps_max, 50_000);
+        assert_eq!(device.dac_info().caps.max_points_per_chunk, 3899);
+        assert_eq!(device.info().stable_id(), "etherdream:01:23:45:67:89:ab");
     }
 }
