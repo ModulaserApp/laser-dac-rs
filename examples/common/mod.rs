@@ -17,7 +17,7 @@ pub struct Args {
     pub shape: Shape,
 
     /// Number of points per frame (detail level for static shapes; ignored by
-    /// orientation and test-pattern, which have a fixed point count)
+    /// orientation and the test patterns, which have a fixed point count)
     #[arg(short, long, default_value_t = 200)]
     pub points: usize,
 
@@ -60,6 +60,9 @@ pub enum Shape {
     OrbitingCircle,
     Orientation,
     TestPattern,
+    /// The ILDA standard scanner test pattern, meant to be shown at 12K or
+    /// 30K points per second for tuning galvo scanners.
+    IldaTestPattern,
 }
 
 impl Shape {
@@ -71,14 +74,21 @@ impl Shape {
             Shape::OrbitingCircle => "orbiting-circle",
             Shape::Orientation => "orientation",
             Shape::TestPattern => "test-pattern",
+            Shape::IldaTestPattern => "ilda-test-pattern",
         }
+    }
+
+    /// Test patterns must play exactly as authored: no animation and no
+    /// transition blanking injected at the loop seam.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, Shape::TestPattern | Shape::IldaTestPattern)
     }
 }
 
 /// Generate a complete frame of points for a shape.
 ///
 /// The frame contains `n_points` points representing one full cycle of the
-/// shape (Orientation and TestPattern have a fixed point count instead). This
+/// shape (Orientation and the test patterns have a fixed point count instead). This
 /// frame is then streamed continuously by wrapping around — the DAC never
 /// waits for frame boundaries.
 ///
@@ -91,6 +101,7 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
         Shape::Circle | Shape::OrbitingCircle => fill_circle_points(&mut frame, n_points),
         Shape::Orientation => return fill_orientation_points(n_points, scale),
         Shape::TestPattern => frame = test_pattern_points(),
+        Shape::IldaTestPattern => frame = ilda_test_pattern_points(),
     }
     if (scale - 1.0).abs() > f32::EPSILON {
         scale_points(&mut frame, scale);
@@ -486,6 +497,30 @@ fn test_pattern_points() -> Vec<LaserPoint> {
         .collect()
 }
 
+/// The ILDA test pattern (rev. 1995), stored as `[x, y, r, g, b]` with ILDA's
+/// signed 16-bit coordinates and 8-bit colors. Converted from the original
+/// format 0 `.ild` file, with color indices resolved through the default
+/// palette from the ILDA IDTF spec (Appendix A).
+fn ilda_test_pattern_points() -> Vec<LaserPoint> {
+    let json_str = include_str!("ilda-test-pattern.json");
+    let pattern_points: Vec<(i16, i16, u8, u8, u8)> = serde_json::from_str(json_str).unwrap();
+
+    pattern_points
+        .into_iter()
+        .map(|(x, y, r, g, b)| {
+            let color = |c: u8| c as u16 * 257;
+            LaserPoint::new(
+                x as f32 / 32767.0,
+                y as f32 / 32767.0,
+                color(r),
+                color(g),
+                color(b),
+                u16::MAX,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +552,19 @@ mod tests {
         let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
         let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
         assert!(min_x < -0.99 && max_x > 0.99);
+        let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
+        assert_eq!(max_channel, Some(u16::MAX));
+    }
+
+    #[test]
+    fn ilda_test_pattern_uses_full_frame_and_range() {
+        let points = ilda_test_pattern_points();
+        assert_eq!(points.len(), 1191);
+        assert_eq!(generate_frame(Shape::IldaTestPattern, 200, 1.0).len(), 1191);
+        let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(min_x < -0.99 && max_x > 0.99);
+        assert!(points.iter().all(|p| p.x.abs() <= 1.0 && p.y.abs() <= 1.0));
         let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
         assert_eq!(max_channel, Some(u16::MAX));
     }
