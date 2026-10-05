@@ -5,7 +5,7 @@
 //!
 //! Run with: `cargo run --example scope_xy --features oscilloscope -- [shape] [--device <name>]`
 //!
-//! Shapes: triangle, circle, orbiting-circle, orientation, test-pattern
+//! Shapes: triangle, circle, orbiting-circle, orientation, test-pattern, ilda-test-pattern
 //!
 //! **Note:** A DC-coupled audio interface is required for accurate DC
 //! representation. AC-coupled interfaces will high-pass filter the signal,

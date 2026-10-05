@@ -17,7 +17,7 @@ rust-version = "1.87"
 bench = false
 
 [workspace]
-members = [".", "tools/idn-simulator"]
+members = [".", "tools/idn-simulator", "tools/etherdream-simulator"]
 
 [features]
 default = ["all-dacs", "asio"]
@@ -133,6 +133,16 @@ required-features = ["oscilloscope"]
 [[example]]
 name = "transitions"
 path = "examples/transitions.rs"
+
+[[example]]
+name = "ether_dream_capture"
+path = "examples/ether_dream_capture.rs"
+required-features = ["testutils", "ether-dream"]
+
+[[example]]
+name = "ether_dream_hwcheck"
+path = "examples/ether_dream_hwcheck.rs"
+required-features = ["testutils", "ether-dream"]
 
 [[bench]]
 name = "presentation"

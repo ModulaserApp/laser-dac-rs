@@ -1,0 +1,36 @@
+{"seq":1,"phase":"connect","op":"hello","req":"","resp":"613f000000000000315f0000b2050000000000000000","status":"ok","n":0,"dt_us":700,"dur_us":null,"t_us":700,"note":"stale fullness from an earlier session"}
+{"seq":2,"phase":"stream","op":"prepare","req":"70","resp":"6170000001000000315f000000000000000000000000","status":"ok","n":1,"dt_us":400,"dur_us":null,"t_us":1100,"note":""}
+{"seq":3,"phase":"stream","op":"data","req":"64f401","resp":"6164000001000000315f0000f4010000000000000000","status":"ok","n":9003,"dt_us":1400,"dur_us":null,"t_us":2500,"note":"payload elided: 500 blanked points, 18 zero bytes each"}
+{"seq":4,"phase":"stream","op":"begin","req":"62000030750000","resp":"6162000002000000315f0000f4013075000000000000","status":"ok","n":7,"dt_us":500,"dur_us":null,"t_us":3000,"note":""}
+{"seq":5,"phase":"stream","op":"ping","req":"3f","resp":"613f000002000000315f00004e0130750000a6000000","status":"ok","n":1,"dt_us":5500,"dur_us":null,"t_us":8500,"note":""}
+{"seq":6,"phase":"stream","op":"ping","req":"3f","resp":"613f000002000000315f0000a700307500004d010000","status":"ok","n":1,"dt_us":5500,"dur_us":null,"t_us":14000,"note":""}
+{"seq":7,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":5700,"dur_us":null,"t_us":19700,"note":""}
+{"seq":8,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":5400,"dur_us":null,"t_us":25100,"note":""}
+{"seq":9,"phase":"stream","op":"data","req":"64e803","resp":"4964000000000000335f000000000000000000000000","status":"ok","n":18003,"dt_us":5100,"dur_us":null,"t_us":30200,"note":"DAC already underflowed; payload elided: 1000 blanked points, 18 zero bytes each"}
+{"seq":10,"phase":"stream","op":"data","req":"640707","resp":"4964000000000000335f000000000000000000000000","status":"ok","n":32385,"dt_us":6200,"dur_us":null,"t_us":36400,"note":"DAC idle; payload elided: 1799 blanked points, 18 zero bytes each"}
+{"seq":11,"phase":"stream","op":"data","req":"640707","resp":"4964000000000000335f000000000000000000000000","status":"ok","n":32385,"dt_us":6300,"dur_us":null,"t_us":42700,"note":"DAC idle; payload elided: 1799 blanked points, 18 zero bytes each"}
+{"seq":12,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":12700,"dur_us":null,"t_us":55400,"note":""}
+{"seq":13,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":11500,"dur_us":null,"t_us":66900,"note":""}
+{"seq":14,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":11300,"dur_us":null,"t_us":78200,"note":""}
+{"seq":15,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":13200,"dur_us":null,"t_us":91400,"note":""}
+{"seq":16,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":13000,"dur_us":null,"t_us":104400,"note":""}
+{"seq":17,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":13200,"dur_us":null,"t_us":117600,"note":""}
+{"seq":18,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000335f000000000000000000000000","status":"ok","n":1,"dt_us":152900,"dur_us":null,"t_us":270500,"note":"after a 150 ms pause"}
+{"seq":19,"phase":"stream","op":"data","req":"646400","resp":"4964000000000000335f000000000000000000000000","status":"ok","n":1803,"dt_us":3300,"dur_us":null,"t_us":273800,"note":"data while idle; payload elided: 100 blanked points, 18 zero bytes each"}
+{"seq":20,"phase":"stream","op":"begin","req":"62000030750000","resp":"6162000000000000335f000000000000000000000000","status":"ok","n":7,"dt_us":500,"dur_us":null,"t_us":274300,"note":"begin while idle is ACKed and ignored"}
+{"seq":21,"phase":"stream","op":"prepare","req":"70","resp":"6170000001000000315f000000000000000000000000","status":"ok","n":1,"dt_us":500,"dur_us":null,"t_us":274800,"note":""}
+{"seq":22,"phase":"stream","op":"data","req":"642c01","resp":"6164000001000000315f00002c010000000000000000","status":"ok","n":5403,"dt_us":1100,"dur_us":null,"t_us":275900,"note":"payload elided: 300 blanked points, 18 zero bytes each"}
+{"seq":23,"phase":"stream","op":"begin","req":"62000030750000","resp":"6162000002000000315f00002c013075000000000000","status":"ok","n":7,"dt_us":500,"dur_us":null,"t_us":276400,"note":""}
+{"seq":24,"phase":"stream","op":"update","req":"750000204e0000","resp":"6175000002000000315f00001e01204e00000e000000","status":"ok","n":7,"dt_us":300,"dur_us":null,"t_us":276700,"note":""}
+{"seq":25,"phase":"stream","op":"point_rate","req":"71a8610000","resp":"6171000002000000315f00001801204e000014000000","status":"ok","n":5,"dt_us":400,"dur_us":null,"t_us":277100,"note":"queued; no control bit follows"}
+{"seq":26,"phase":"stream","op":"stop","req":"73","resp":"6173000000000000315f000011010000000000000000","status":"ok","n":1,"dt_us":400,"dur_us":null,"t_us":277500,"note":"fullness is kept after stop"}
+{"seq":27,"phase":"stream","op":"stop","req":"73","resp":"4973000000000000315f000011010000000000000000","status":"ok","n":1,"dt_us":500,"dur_us":null,"t_us":278000,"note":"stop while idle is NAK-Invalid"}
+{"seq":28,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000315f000011010000000000000000","status":"ok","n":1,"dt_us":300,"dur_us":null,"t_us":278300,"note":""}
+{"seq":29,"phase":"stream","op":"begin","req":"62000030750000","resp":"6162000000000000315f000011010000000000000000","status":"ok","n":7,"dt_us":400,"dur_us":null,"t_us":278700,"note":"ACKed, playback stays idle"}
+{"seq":30,"phase":"stream","op":"data","req":"640a00","resp":"4964000000000000315f000011010000000000000000","status":"ok","n":183,"dt_us":8400,"dur_us":null,"t_us":287100,"note":"data while idle; payload elided: 10 blanked points, 18 zero bytes each"}
+{"seq":31,"phase":"stream","op":"estop","req":"00","resp":"6100000300000300355f000011010000000000000000","status":"ok","n":1,"dt_us":2000,"dur_us":null,"t_us":289100,"note":""}
+{"seq":32,"phase":"stream","op":"ping","req":"3f","resp":"613f000300000300355f000011010000000000000000","status":"ok","n":1,"dt_us":600,"dur_us":null,"t_us":289700,"note":""}
+{"seq":33,"phase":"stream","op":"data","req":"640a00","resp":"4964000300000300355f000011010000000000000000","status":"ok","n":183,"dt_us":2900,"dur_us":null,"t_us":292600,"note":"payload elided: 10 blanked points, 18 zero bytes each"}
+{"seq":34,"phase":"stream","op":"clear_estop","req":"63","resp":"6163000000000000355f000011010000000000000000","status":"ok","n":1,"dt_us":500,"dur_us":null,"t_us":293100,"note":"ready immediately; e-stop playback flag stays until prepare"}
+{"seq":35,"phase":"stream","op":"ping","req":"3f","resp":"613f000000000000355f000011010000000000000000","status":"ok","n":1,"dt_us":300,"dur_us":null,"t_us":293400,"note":""}
+{"seq":36,"phase":"stream","op":"unknown","req":"7a","resp":"","status":"reset","n":1,"dt_us":600,"dur_us":null,"t_us":294000,"note":"unknown command 'z': the DAC resets the TCP connection; time approximate"}

@@ -941,6 +941,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "etherdream-simulator"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "eframe",
+ "env_logger",
+ "laser-dac",
+ "log",
+]
+
+[[package]]
 name = "fdeflate"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

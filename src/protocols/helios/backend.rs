@@ -312,7 +312,13 @@ impl DacBackend for HeliosBackend {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        self.close_handle();
+        // After a physical unplug, closing the dead handle can segfault in
+        // `libusb_close()` on macOS (see `Drop`), so leak it instead.
+        if self.fatal_disconnect {
+            self.leak_handle();
+        } else {
+            self.close_handle();
+        }
         Ok(())
     }
 
@@ -670,6 +676,26 @@ mod tests {
     /// keep a handle to inspect recorded writes after `from_dac` takes the DAC.
     fn backend_over(fake: &FakeUsb) -> HeliosBackend {
         HeliosBackend::from_dac(HeliosDac::from_endpoints(fake.clone(), Some(1)))
+    }
+
+    #[test]
+    fn disconnect_after_fatal_error_leaks_the_handle() {
+        let fake = FakeUsb::default();
+        let mut backend = backend_over(&fake);
+        backend.map_err_ctx("ctx", HeliosDacError::UsbError(rusb::Error::NoDevice));
+        backend.disconnect().unwrap();
+        assert!(!backend.is_connected());
+        // A leaked handle never drops its clone of the fake.
+        assert_eq!(std::sync::Arc::strong_count(&fake.inner), 2);
+    }
+
+    #[test]
+    fn disconnect_without_fatal_error_closes_the_handle() {
+        let fake = FakeUsb::default();
+        let mut backend = backend_over(&fake);
+        backend.disconnect().unwrap();
+        assert!(!backend.is_connected());
+        assert_eq!(std::sync::Arc::strong_count(&fake.inner), 1);
     }
 
     // (1) is_ready_for_frame happy path: Ready -> true, NotReady -> false.

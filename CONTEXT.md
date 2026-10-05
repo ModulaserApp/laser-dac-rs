@@ -68,6 +68,14 @@ A canonical, namespaced string identifier for a [DiscoveredDevice](#discoveredde
 
 `stable_id` is the canonical key for tracking, deduplication, and `open_device(id)` lookup. Each protocol prefixes its ids with its own protocol slug (`etherdream:`, `idn:`, `helios:`, …) by convention.
 
+### Firmware profile
+A record of what one Ether Dream firmware advertises (buffer capacity, max point rate, revisions, flag bits, `'v'` build string) and how it reacts to edge cases (NAK-Full, `begin` while idle, `'v'` support). `FirmwareProfile` presets cover ED1 through ED4. Each carries a `Provenance` that says whether its facts were probed on hardware, read from firmware source, or guessed.
+
+Profiles drive the [Ether Dream simulator](#ether-dream-simulator) and test parametrisation. The backend never branches on a profile. It reacts only to what the DAC reports, and treats unknown firmware like ED2.
+
+### Ether Dream simulator
+The `sim` module, available with the `testutils` feature. `EtherDreamModel` is a pure, time-driven state machine that answers Ether Dream commands as a given [Firmware profile](#firmware-profile) would. `SimServer` serves that model over real TCP and UDP sockets, with fault knobs such as dropped connections, short replies and delays. Replay tests check the model against wire captures from real hardware in `tests/fixtures/ether_dream/`.
+
 ## Architectural terms
 
 These come from the `improve-codebase-architecture` workflow. Use them when discussing structural changes:

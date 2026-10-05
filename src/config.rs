@@ -139,6 +139,17 @@ impl StreamConfig {
     /// Safer default target buffer for network DACs when caller leaves defaults untouched.
     pub const NETWORK_DEFAULT_TARGET_BUFFER: std::time::Duration =
         std::time::Duration::from_millis(50);
+    /// Default target buffer for Ether Dream DACs.
+    ///
+    /// Measured on an ED2 at 30 kpps: host-side stalls of 20–22 ms about once a
+    /// minute plus a ~12 ms steady-state dip left the 50 ms network default
+    /// only ~38 ms of margin. 80 ms covers stalls up to ~68 ms at ~5 frames of
+    /// latency at 60 Hz. That cover only holds below about 39 kpps on ED2 and
+    /// about 18 kpps on ED1: above that the backend's ring ceiling (80 % of
+    /// the ring) bounds the target, e.g. 3119 points = 31 ms at 100 kpps on
+    /// ED2 and 1439 points = 48 ms at 30 kpps on ED1.
+    pub const ETHER_DREAM_DEFAULT_TARGET_BUFFER: std::time::Duration =
+        std::time::Duration::from_millis(80);
     /// Default target buffer for LaserCube network devices.
     ///
     /// LaserCube Ethernet/client profiles use a device-side cutoff around
@@ -154,9 +165,10 @@ impl StreamConfig {
     /// (`presentation::session::target_buffer_for_backend`) and the stream path
     /// (`Dac::apply_backend_buffer_defaults`) so the two never drift.
     ///
-    /// LaserCube network devices want a deep cushion. Other real network/FIFO
+    /// LaserCube network devices want a deep cushion, and Ether Dream gets its
+    /// own measured default. Other real network/FIFO
     /// DACs (`NetworkFifo`/`UdpTimed`/`BlockingFifo` — AVB, oscilloscope,
-    /// Ether Dream, IDN, LaserCube USB, …) get the 50ms network default rather
+    /// IDN, LaserCube USB, …) get the 50ms network default rather
     /// than the blanket 20ms; combined with the runtime-authority estimator's
     /// pps-point conversion this gives audio-clocked backends a genuine
     /// multi-callback-quantum cushion. `Custom` backends are intentionally
@@ -168,6 +180,8 @@ impl StreamConfig {
     ) -> std::time::Duration {
         if matches!(dac_type, DacType::LaserCubeNetwork) {
             Self::LASERCUBE_NETWORK_DEFAULT_TARGET_BUFFER
+        } else if matches!(dac_type, DacType::EtherDream) {
+            Self::ETHER_DREAM_DEFAULT_TARGET_BUFFER
         } else if !matches!(dac_type, DacType::Custom(_))
             && matches!(
                 output_model,

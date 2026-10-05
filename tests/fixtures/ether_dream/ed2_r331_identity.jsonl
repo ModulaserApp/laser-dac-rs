@@ -1,0 +1,3 @@
+{"seq":1,"phase":"connect","op":"hello","req":"","resp":"613f000000000000315f000029050000000000000000","status":"ok","n":0,"dt_us":700,"dur_us":null,"t_us":700,"note":"raw bytes; idle DAC reporting a stale fullness of 1321"}
+{"seq":2,"phase":"identity","op":"ping","req":"3f","resp":"613f000000000000315f000029050000000000000000","status":"ok","n":1,"dt_us":500,"dur_us":null,"t_us":1200,"note":"raw bytes"}
+{"seq":3,"phase":"identity","op":"version","req":"76","resp":"723333312d656434626566350000000000000000000000000000000000000000","status":"ok","n":1,"dt_us":500,"dur_us":null,"t_us":1700,"note":"raw bytes; 32-byte NUL-padded build string, no 'a' prefix"}

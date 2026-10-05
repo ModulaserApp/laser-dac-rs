@@ -3,17 +3,21 @@
 //! Demonstrates the recommended frame-first workflow: discover a device,
 //! start a frame session, and submit frames. The shape orbits around the
 //! center, showing how `send_frame()` updates the output in real time.
+//! Test patterns are the exception: they play raw (no orbit, no transition
+//! blanking) so the scanner sees exactly the authored points.
 //!
 //! The library handles looping (each frame repeats until replaced),
 //! transition blanking, and transport-appropriate delivery.
 //!
-//! Run with: `cargo run --example frame -- [triangle|circle|orientation|test-pattern]`
+//! Run with: `cargo run --example frame -- [triangle|circle|orientation|test-pattern|ilda-test-pattern]`
 
 mod common;
 
 use clap::Parser;
-use common::{generate_frame, Args};
-use laser_dac::{list_devices, open_device, Frame, FrameSessionConfig, Result};
+use common::{generate_frame, select_device, Args};
+use laser_dac::{
+    list_devices, open_device, Frame, FrameSessionConfig, LaserPoint, Result, TransitionPlan,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,12 +33,20 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let device_info = &devices[0];
+    let Some(device_info) = select_device(&devices, args.device.as_deref()) else {
+        println!("No DAC matching {:?}.", args.device.unwrap_or_default());
+        return Ok(());
+    };
     println!("  Found: {} ({})", device_info.name, device_info.kind);
 
     let device = open_device(&device_info.id)?;
 
-    let config = FrameSessionConfig::new(30_000);
+    let mut config = FrameSessionConfig::new(30_000);
+    if args.shape.is_raw() {
+        config = config.with_transition_fn(Box::new(|_: &LaserPoint, _: &LaserPoint, _| {
+            TransitionPlan::Transition(vec![])
+        }));
+    }
     let (session, info) = device.start_frame_session(config)?;
 
     println!(
@@ -55,6 +67,18 @@ fn main() -> Result<()> {
     // Generate the base shape once
     let base_frame = generate_frame(args.shape, args.points, args.scale);
 
+    // Raw patterns are sent once; the library loops the frame until stopped.
+    if args.shape.is_raw() {
+        session.send_frame(Frame::new(base_frame));
+        // Also exit if the session ends on its own (device error, disconnect).
+        while !session.control().is_stop_requested() && !session.is_finished() {
+            thread::sleep(Duration::from_millis(16));
+        }
+        let exit = session.join()?;
+        println!("\nSession ended: {:?}", exit);
+        return Ok(());
+    }
+
     // Submit frames at ~60fps — the shape orbits around the center.
     // Each send_frame() replaces the current output; the library loops
     // the latest frame until a new one arrives.
@@ -73,7 +97,7 @@ fn main() -> Result<()> {
         session.send_frame(Frame::new(points));
 
         thread::sleep(Duration::from_millis(16));
-        if session.control().is_stop_requested() {
+        if session.control().is_stop_requested() || session.is_finished() {
             break;
         }
     }

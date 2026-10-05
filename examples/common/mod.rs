@@ -5,7 +5,7 @@
 pub mod audio;
 
 use clap::{Parser, ValueEnum};
-use laser_dac::{ChunkRequest, ChunkResult, LaserPoint};
+use laser_dac::{ChunkRequest, ChunkResult, DacInfo, LaserPoint};
 use serde::Deserialize;
 use std::f32::consts::{PI, TAU};
 
@@ -16,13 +16,41 @@ pub struct Args {
     #[arg(value_enum, default_value_t = Shape::Triangle)]
     pub shape: Shape,
 
-    /// Number of points per frame (detail level for static shapes)
+    /// Number of points per frame (detail level for static shapes; ignored by
+    /// orientation and the test patterns, which have a fixed point count)
     #[arg(short, long, default_value_t = 200)]
     pub points: usize,
 
     /// Geometry scale around center (0,0); range: (0, 10]
     #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
     pub scale: f32,
+
+    /// Only use a DAC whose name, type or id contains this (case-insensitive,
+    /// e.g. "etherdream", "helios"); defaults to the first DAC found
+    #[arg(short, long)]
+    pub device: Option<String>,
+}
+
+/// Pick the first device matching `filter`, or the first device if no filter.
+///
+/// Matching ignores case, spaces and punctuation, so "etherdream" matches the
+/// "Ether Dream" type.
+pub fn select_device<'a>(devices: &'a [DacInfo], filter: Option<&str>) -> Option<&'a DacInfo> {
+    let Some(filter) = filter else {
+        return devices.first();
+    };
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let filter = normalize(filter);
+    devices.iter().find(|d| {
+        [d.name.as_str(), d.kind.display_name(), d.id.as_str()]
+            .iter()
+            .any(|field| normalize(field).contains(&filter))
+    })
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -32,6 +60,9 @@ pub enum Shape {
     OrbitingCircle,
     Orientation,
     TestPattern,
+    /// The ILDA standard scanner test pattern, meant to be shown at 12K or
+    /// 30K points per second for tuning galvo scanners.
+    IldaTestPattern,
 }
 
 impl Shape {
@@ -43,15 +74,23 @@ impl Shape {
             Shape::OrbitingCircle => "orbiting-circle",
             Shape::Orientation => "orientation",
             Shape::TestPattern => "test-pattern",
+            Shape::IldaTestPattern => "ilda-test-pattern",
         }
+    }
+
+    /// Test patterns must play exactly as authored: no animation and no
+    /// transition blanking injected at the loop seam.
+    pub fn is_raw(&self) -> bool {
+        matches!(self, Shape::TestPattern | Shape::IldaTestPattern)
     }
 }
 
 /// Generate a complete frame of points for a shape.
 ///
-/// The frame contains exactly `n_points` points representing one full cycle
-/// of the shape. This frame is then streamed continuously by wrapping around
-/// — the DAC never waits for frame boundaries.
+/// The frame contains `n_points` points representing one full cycle of the
+/// shape (Orientation and the test patterns have a fixed point count instead). This
+/// frame is then streamed continuously by wrapping around — the DAC never
+/// waits for frame boundaries.
 ///
 /// For time-based shapes (OrbitingCircle), this produces a static circle.
 /// Use `make_producer` for timestamp-driven animation in the stream API.
@@ -61,10 +100,11 @@ pub fn generate_frame(shape: Shape, n_points: usize, scale: f32) -> Vec<LaserPoi
         Shape::Triangle => fill_triangle_points(&mut frame, n_points),
         Shape::Circle | Shape::OrbitingCircle => fill_circle_points(&mut frame, n_points),
         Shape::Orientation => return fill_orientation_points(n_points, scale),
-        Shape::TestPattern => fill_test_pattern_points(&mut frame, n_points),
+        Shape::TestPattern => frame = test_pattern_points(),
+        Shape::IldaTestPattern => frame = ilda_test_pattern_points(),
     }
     if (scale - 1.0).abs() > f32::EPSILON {
-        scale_points(&mut frame[..n_points], scale);
+        scale_points(&mut frame, scale);
     }
     frame
 }
@@ -437,27 +477,48 @@ struct PatternPoint {
     b: u8,
 }
 
-fn fill_test_pattern_points(buffer: &mut [LaserPoint], n_points: usize) {
+fn test_pattern_points() -> Vec<LaserPoint> {
     let json_str = include_str!("test-pattern.json");
     let pattern_points: Vec<PatternPoint> = serde_json::from_str(json_str).unwrap();
 
-    let points: Vec<LaserPoint> = pattern_points
+    pattern_points
         .into_iter()
         .map(|p| {
+            // The pattern file stores coordinates in 0..1 and colors as 0/1
             LaserPoint::new(
-                p.x,
-                p.y,
-                p.r as u16 * 257,
-                p.g as u16 * 257,
-                p.b as u16 * 257,
-                65535,
+                p.x * 2.0 - 1.0,
+                p.y * 2.0 - 1.0,
+                p.r as u16 * u16::MAX,
+                p.g as u16 * u16::MAX,
+                p.b as u16 * u16::MAX,
+                u16::MAX,
             )
         })
-        .collect();
+        .collect()
+}
 
-    for (i, point) in points.iter().cycle().take(n_points).enumerate() {
-        buffer[i] = *point;
-    }
+/// The ILDA test pattern (rev. 1995), stored as `[x, y, r, g, b]` with ILDA's
+/// signed 16-bit coordinates and 8-bit colors. Converted from the original
+/// format 0 `.ild` file, with color indices resolved through the default
+/// palette from the ILDA IDTF spec (Appendix A).
+fn ilda_test_pattern_points() -> Vec<LaserPoint> {
+    let json_str = include_str!("ilda-test-pattern.json");
+    let pattern_points: Vec<(i16, i16, u8, u8, u8)> = serde_json::from_str(json_str).unwrap();
+
+    pattern_points
+        .into_iter()
+        .map(|(x, y, r, g, b)| {
+            let color = |c: u8| c as u16 * 257;
+            LaserPoint::new(
+                x as f32 / 32767.0,
+                y as f32 / 32767.0,
+                color(r),
+                color(g),
+                color(b),
+                u16::MAX,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -470,6 +531,42 @@ mod tests {
         assert_eq!(frame.len(), 200);
         // All points have color (no leading blanks)
         assert!(frame.iter().all(|p| p.intensity != 0));
+    }
+
+    #[test]
+    fn test_pattern_ignores_point_count() {
+        let full = test_pattern_points();
+        assert_eq!(
+            generate_frame(Shape::TestPattern, 200, 1.0).len(),
+            full.len()
+        );
+        assert_eq!(
+            generate_frame(Shape::TestPattern, 5000, 1.0).len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn test_pattern_fills_full_range_at_full_brightness() {
+        let points = test_pattern_points();
+        let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(min_x < -0.99 && max_x > 0.99);
+        let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
+        assert_eq!(max_channel, Some(u16::MAX));
+    }
+
+    #[test]
+    fn ilda_test_pattern_uses_full_frame_and_range() {
+        let points = ilda_test_pattern_points();
+        assert_eq!(points.len(), 1191);
+        assert_eq!(generate_frame(Shape::IldaTestPattern, 200, 1.0).len(), 1191);
+        let max_x = points.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        let min_x = points.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        assert!(min_x < -0.99 && max_x > 0.99);
+        assert!(points.iter().all(|p| p.x.abs() <= 1.0 && p.y.abs() <= 1.0));
+        let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
+        assert_eq!(max_channel, Some(u16::MAX));
     }
 
     #[test]

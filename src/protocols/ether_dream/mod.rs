@@ -29,17 +29,52 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Connecting without a broadcast
+//!
+//! A DAC on a known address can be reached without waiting for its UDP
+//! broadcast: use [`dac::stream::connect_to`] for the low-level stream, or
+//! [`EtherDreamBackend::with_address`] for the backend. Without a broadcast,
+//! the buffer capacity and maximum point rate fall back to 1799 points, the
+//! smallest known ring (ED1), and 100 000 pps, which every known Ether Dream
+//! advertises.
+//!
+//! # Buffering
+//!
+//! Streams default to an 80 ms target buffer
+//! ([`StreamConfig::ETHER_DREAM_DEFAULT_TARGET_BUFFER`](crate::StreamConfig::ETHER_DREAM_DEFAULT_TARGET_BUFFER)),
+//! measured to cover the host stalls seen on an ED2. The backend caps the
+//! target at 80 % of the DAC's ring
+//! ([`FifoBackend::target_buffer_ceiling`](crate::FifoBackend::target_buffer_ceiling)),
+//! so at high rates the target stays reachable and steady writes always fit.
+//! Writes are admitted against the reported fullness decayed from when the
+//! reply arrived, an upper bound, so an oversized chunk is never sent into a
+//! full ring.
+//!
+//! # Firmware profiles and the simulator
+//!
+//! [`FirmwareProfile`] records what each known firmware advertises and how it
+//! reacts to edge cases. With the `testutils` feature, the `sim` module
+//! provides `EtherDreamModel`, a pure state machine, and `SimServer`, which
+//! serves the model over real TCP and UDP sockets. Tests use them to run the
+//! production code against every profile in [`FirmwareProfile::all`].
 
 pub mod backend;
 pub mod dac;
 mod discovery;
+pub mod profile;
 pub mod protocol;
+#[cfg(test)]
+mod replay;
+#[cfg(any(test, feature = "testutils"))]
+pub mod sim;
 
 pub use self::protocol::{
     DacBroadcast, DacPoint, DacResponse, DacStatus, ReadBytes, SizeBytes, WriteBytes,
 };
 pub use backend::EtherDreamBackend;
 pub use discovery::EtherDreamDiscoverer;
+pub use profile::{FirmwareProfile, Provenance};
 
 use crate::device::{DacCapabilities, OutputModel};
 use std::{io, net};

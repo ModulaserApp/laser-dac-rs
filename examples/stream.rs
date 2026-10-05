@@ -7,11 +7,12 @@
 //! smooth continuous animation, which is the streaming API's strength.
 //!
 //! Run with: `cargo run --example stream -- [orbiting-circle|triangle|circle]`
+//! Add `--device etherdream` (or any name/type/id substring) to pick a DAC.
 
 mod common;
 
 use clap::Parser;
-use common::{make_producer, Args};
+use common::{make_producer, select_device, Args};
 use laser_dac::{list_devices, open_device, Result, StreamConfig};
 
 fn main() -> Result<()> {
@@ -26,8 +27,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Open first device
-    let device_info = &devices[0];
+    let Some(device_info) = select_device(&devices, args.device.as_deref()) else {
+        println!("No DAC matching {:?}.", args.device.unwrap_or_default());
+        return Ok(());
+    };
     println!("  Found: {} ({})", device_info.name, device_info.kind);
 
     let device = open_device(&device_info.id)?;

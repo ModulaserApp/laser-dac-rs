@@ -1,0 +1,9 @@
+{"dt_us":62405,"dur_us":640,"n":0,"note":"","op":"hello","phase":"partial_room","req":"","resp":"613f0000000000003177000058050000000000000000","seq":1,"status":"ok","t_us":63045}
+{"dt_us":415,"dur_us":307,"n":1,"note":"","op":"prepare","phase":"partial_room","req":"70","resp":"61700000010000003177000000000000000000000000","seq":2,"status":"ok","t_us":63768}
+{"dt_us":1810,"dur_us":6351,"n":69285,"note":"payload elided: 3849 blanked points, 18 zero bytes each","op":"data","phase":"partial_room","req":"64090f","resp":"616400000100000031770000090f0000000000000000","seq":3,"status":"ok","t_us":71930}
+{"dt_us":121,"dur_us":306,"n":1,"note":"","op":"ping","phase":"partial_room","req":"3f","resp":"613f00000100000031770000090f0000000000000000","seq":4,"status":"ok","t_us":72358}
+{"dt_us":163,"dur_us":2839,"n":1803,"note":"payload elided: 100 blanked points, 18 zero bytes each","op":"data","phase":"partial_room","req":"646400","resp":"4964000001000000317700003b0f0000000000000000","seq":5,"status":"ok","t_us":75361}
+{"dt_us":99,"dur_us":340,"n":1,"note":"","op":"ping","phase":"partial_room","req":"3f","resp":"613f000001000000317700003b0f0000000000000000","seq":6,"status":"ok","t_us":75801}
+{"dt_us":98,"dur_us":351,"n":7,"note":"","op":"begin","phase":"partial_room","req":"620000e8030000","resp":"6162000002000000317700003b0fe803000000000000","seq":7,"status":"ok","t_us":76251}
+{"dt_us":93,"dur_us":335,"n":1,"note":"","op":"stop","phase":"partial_room","req":"73","resp":"6173000000000000317700003b0f0000000000000000","seq":8,"status":"ok","t_us":76681}
+{"dt_us":395024,"dur_us":732,"n":0,"note":"","op":"hello","phase":"partial_room","req":"","resp":"613f000000000000317700003b0f0000000000000000","seq":9,"status":"ok","t_us":472438}
