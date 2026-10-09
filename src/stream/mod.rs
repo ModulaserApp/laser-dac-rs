@@ -162,6 +162,9 @@ pub struct ChunkRequest {
     /// Calculated as: `ceil((target_buffer - buffered) * pps)`, clamped to buffer length.
     /// On network FIFO backends the target is first capped to the backend's
     /// [`FifoBackend::target_buffer_ceiling`](crate::FifoBackend::target_buffer_ceiling).
+    /// Right after a point-rate change those backends ask for at least one
+    /// minimum write (about 5 ms of points) even when the buffer is already
+    /// at the target, so the device learns the new rate promptly.
     pub target_points: usize,
 }
 

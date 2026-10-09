@@ -491,7 +491,7 @@ fn test_pattern_points() -> Vec<LaserPoint> {
                 p.r as u16 * u16::MAX,
                 p.g as u16 * u16::MAX,
                 p.b as u16 * u16::MAX,
-                u16::MAX,
+                pattern_intensity(p.r, p.g, p.b),
             )
         })
         .collect()
@@ -515,10 +515,20 @@ fn ilda_test_pattern_points() -> Vec<LaserPoint> {
                 color(r),
                 color(g),
                 color(b),
-                u16::MAX,
+                pattern_intensity(r, g, b),
             )
         })
         .collect()
+}
+
+/// Full intensity on lit points, zero on blank travel moves, so projectors
+/// that use the intensity channel do not draw the blanked moves.
+fn pattern_intensity(r: u8, g: u8, b: u8) -> u16 {
+    if r == 0 && g == 0 && b == 0 {
+        0
+    } else {
+        u16::MAX
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +577,20 @@ mod tests {
         assert!(points.iter().all(|p| p.x.abs() <= 1.0 && p.y.abs() <= 1.0));
         let max_channel = points.iter().map(|p| p.r.max(p.g).max(p.b)).max();
         assert_eq!(max_channel, Some(u16::MAX));
+        assert_blank_moves_are_dark(&points);
+    }
+
+    #[test]
+    fn test_pattern_blank_moves_are_dark() {
+        assert_blank_moves_are_dark(&test_pattern_points());
+    }
+
+    fn assert_blank_moves_are_dark(points: &[LaserPoint]) {
+        assert!(points.iter().any(|p| p.r == 0 && p.g == 0 && p.b == 0));
+        for p in points {
+            let lit = p.r != 0 || p.g != 0 || p.b != 0;
+            assert_eq!(p.intensity, if lit { u16::MAX } else { 0 }, "{p:?}");
+        }
     }
 
     #[test]

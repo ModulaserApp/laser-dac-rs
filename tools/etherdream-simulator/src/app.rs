@@ -26,7 +26,6 @@ const SWALLOWABLE: &[(u8, &str)] = &[
 struct FaultKnobs {
     reply_delay_ms: u32,
     duplicate_replies: bool,
-    rst_on_unknown: bool,
     drop_enabled: bool,
     drop_after: usize,
     truncate_enabled: bool,
@@ -39,7 +38,6 @@ impl FaultKnobs {
         let mut f = Faults::default();
         f.reply_delay = Duration::from_millis(self.reply_delay_ms.into());
         f.duplicate_replies = self.duplicate_replies;
-        f.rst_on_unknown = self.rst_on_unknown;
         f.drop_after_replies = self.drop_enabled.then_some(self.drop_after);
         f.truncate_reply = self.truncate_enabled.then_some(self.truncate_at);
         f.swallow_opcodes = self.swallow.clone();
@@ -130,7 +128,6 @@ impl SimulatorApp {
         let k = &mut self.knobs;
         ui.add(egui::Slider::new(&mut k.reply_delay_ms, 0..=500).text("reply delay ms"));
         ui.checkbox(&mut k.duplicate_replies, "duplicate every reply");
-        ui.checkbox(&mut k.rst_on_unknown, "reset on unknown command");
         ui.horizontal(|ui| {
             ui.checkbox(&mut k.drop_enabled, "drop connection at reply");
             ui.add_enabled(k.drop_enabled, egui::DragValue::new(&mut k.drop_after));
@@ -342,7 +339,6 @@ mod tests {
             truncate_enabled: true,
             truncate_at: 3,
             swallow: vec![b'b'],
-            ..FaultKnobs::default()
         };
         let f = knobs.to_faults();
         assert_eq!(f.reply_delay, Duration::from_millis(20));

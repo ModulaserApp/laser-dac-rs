@@ -200,9 +200,9 @@ impl DacBackend for EtherDreamBackend {
     fn stop(&mut self) -> Result<()> {
         if let Some(stream) = &mut self.stream {
             match stream.queue_commands().stop().submit() {
-                Ok(()) => {}
                 // Stopping while already idle draws a NAK-Invalid from the
                 // firmware; that's benign — we're already in the target state.
+                Ok(()) => {}
                 Err(e) if matches!(nak_of(&e), Some(Nak::Invalid)) => {}
                 Err(e) => {
                     // The link is broken or out of sync. Drop it so
@@ -211,6 +211,12 @@ impl DacBackend for EtherDreamBackend {
                     return Err(Error::backend(e));
                 }
             }
+            // The reply's idle status empties the estimate, so a stream
+            // restarted on this connection is not held back by the points
+            // the stop discarded.
+            self.last_status_received = Some(stream.status_received_at());
+            self.estimator
+                .record_status(stream.status_sent_at(), &stream.dac().status);
         }
         Ok(())
     }
@@ -222,6 +228,33 @@ impl DacBackend for EtherDreamBackend {
 
 impl FifoBackend for EtherDreamBackend {
     fn try_write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
+        let result = self.write_points(pps, points);
+        if result.is_err() {
+            // Every error is fatal for this link (IO, timeout or a desynced
+            // stream). Drop it like `stop()` does, so the caller's
+            // `disconnect()` does not wait out a stop on a dead socket.
+            self.stream = None;
+        }
+        result
+    }
+
+    fn estimator(&self) -> &dyn BufferEstimator {
+        &self.estimator
+    }
+
+    /// 80 % of the ring the DAC advertises (3119 of 3899 points on ED2, 1439
+    /// of 1799 on ED1).
+    fn target_buffer_ceiling(&self) -> Option<usize> {
+        let capacity = match &self.stream {
+            Some(stream) => effective_capacity(stream.dac().buffer_capacity) as usize,
+            None => self.caps.max_points_per_chunk,
+        };
+        Some(capacity * TARGET_CEILING_PERCENT / 100)
+    }
+}
+
+impl EtherDreamBackend {
+    fn write_points(&mut self, pps: u32, points: &[LaserPoint]) -> Result<WriteOutcome> {
         let stream = self
             .stream
             .as_mut()
@@ -504,20 +537,6 @@ impl FifoBackend for EtherDreamBackend {
         // record_send would double-count one chunk.
         self.estimator.record_status(now, &stream.dac().status);
         Ok(WriteOutcome::Written)
-    }
-
-    fn estimator(&self) -> &dyn BufferEstimator {
-        &self.estimator
-    }
-
-    /// 80 % of the ring the DAC advertises (3119 of 3899 points on ED2, 1439
-    /// of 1799 on ED1).
-    fn target_buffer_ceiling(&self) -> Option<usize> {
-        let capacity = match &self.stream {
-            Some(stream) => effective_capacity(stream.dac().buffer_capacity) as usize,
-            None => self.caps.max_points_per_chunk,
-        };
-        Some(capacity * TARGET_CEILING_PERCENT / 100)
     }
 }
 
@@ -1566,11 +1585,11 @@ mod tests {
         );
         assert_eq!(srv.status().playback_state, DacStatus::PLAYBACK_PLAYING);
 
-        // One slow data reply: the DAC handles the 'd' 20 ms after it was
-        // sent, so the status it reports is 600 points fresher than the send
+        // One slow data reply: the DAC handles the 'd' 40 ms after it was
+        // sent, so the status it reports is 1200 points fresher than the send
         // time suggests.
         srv.set_faults(Faults {
-            data_delay: Duration::from_millis(20),
+            data_delay: Duration::from_millis(40),
             ..Faults::default()
         });
         assert_eq!(
@@ -1579,10 +1598,12 @@ mod tests {
         );
         srv.set_faults(Faults::default());
 
-        // A chunk 300 points (10 ms) larger than the true room. The send-time
-        // anchor reads ~600 points of extra room and would admit it.
+        // A chunk 600 points (20 ms) larger than the true room. The send-time
+        // anchor reads ~1200 points of extra room and would admit it; the
+        // 20 ms margin keeps a scheduling stall between reading `room` and
+        // the write from making the chunk fit legitimately.
         let room = p.buffer_capacity as usize - srv.status().buffer_fullness as usize;
-        let chunk = room + 300;
+        let chunk = room + 600;
         let (d_before, naks_before) = (
             count(&srv.commands(), b'd'),
             srv.with_model(|m| m.nak_replies()),
@@ -1690,6 +1711,12 @@ mod tests {
         let mut b = connect(&srv);
         assert!(b.try_write_points(30_000, &points(10)).is_err());
         assert_eq!(count(&srv.commands(), b'd'), 1, "no retry on IO error");
+        // The dead link is dropped, so the caller's disconnect() does not
+        // send a stop into it and wait out the read timeout.
+        assert!(!b.is_connected());
+        let stops = count(&srv.commands(), b's');
+        b.disconnect().unwrap();
+        assert_eq!(count(&srv.commands(), b's'), stops);
     }
 
     #[test]
@@ -1736,6 +1763,31 @@ mod tests {
         let mut b = EtherDreamBackend::with_address("127.0.0.1:1".parse().unwrap(), None);
         let err = b.try_write_points(30_000, &points(1)).unwrap_err();
         assert!(err.is_disconnected());
+    }
+
+    /// Regression: the stop reply's idle status was never recorded, so a
+    /// stream restarted on the same connection saw the discarded points as
+    /// still buffered and stayed dark until they "drained".
+    #[test]
+    fn stop_empties_the_estimate() {
+        each_profile(|p| {
+            let srv = start(p.clone());
+            let mut b = connect(&srv);
+            assert_eq!(
+                b.try_write_points(1_000, &points(1_000)).unwrap(),
+                WriteOutcome::Written,
+                "{}",
+                p.name
+            );
+            assert!(b.estimator().estimated_fullness(Instant::now(), 1_000) > 0);
+            b.stop().unwrap();
+            assert_eq!(
+                b.estimator().estimated_fullness(Instant::now(), 1_000),
+                0,
+                "{}",
+                p.name
+            );
+        });
     }
 
     #[test]

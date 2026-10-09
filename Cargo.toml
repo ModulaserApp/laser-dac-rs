@@ -116,6 +116,8 @@ path = "examples/stream.rs"
 [[example]]
 name = "frame"
 path = "examples/frame.rs"
+# Runs the shared `examples/common` unit tests under `cargo test`.
+test = true
 
 [[example]]
 name = "audio"

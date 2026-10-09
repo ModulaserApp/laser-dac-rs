@@ -1240,10 +1240,15 @@ fn stats(v: &[i64]) -> Value {
     json!({"count": v.len(), "min": min, "max": max, "mean": (mean * 10.0).round() / 10.0})
 }
 
-fn max_abs(v: &Value) -> i64 {
+/// The largest absolute value in `stats`, or `None` when there were no
+/// samples, so a check over an empty set fails instead of passing.
+fn max_abs(v: &Value) -> Option<i64> {
+    if v["count"].as_u64().unwrap_or(0) == 0 {
+        return None;
+    }
     let a = v["min"].as_i64().unwrap_or(0).abs();
     let b = v["max"].as_i64().unwrap_or(0).abs();
-    a.max(b)
+    Some(a.max(b))
 }
 
 /// Where the host was slow: the longest backend call, the longest pause
@@ -1523,7 +1528,10 @@ fn rate_change(cx: &Ctx) -> Result<Verdict, String> {
     let changes = changes.lock().unwrap().clone();
     let evs = cx.events();
     let first_play = evs.iter().position(|e| e.playing()).ok_or("never played")?;
-    let last_stop = evs.iter().rposition(|e| e.op == b's').unwrap_or(evs.len());
+    let last_stop = evs[first_play..]
+        .iter()
+        .rposition(|e| e.op == b's')
+        .map_or(evs.len(), |i| first_play + i);
     let window = &evs[first_play..last_stop];
     let underflows = window
         .iter()
@@ -1582,7 +1590,7 @@ fn rate_change(cx: &Ctx) -> Result<Verdict, String> {
         let s = est_error_stats(&run.log, Some(pps));
         v.set(&format!("estimate_error_at_{pps}"), s.clone());
         v.check(
-            max_abs(&s) <= 300,
+            max_abs(&s).is_some_and(|m| m <= 300),
             format!("estimate within 300 points of the DAC at {pps} pps"),
         );
     }
@@ -1884,7 +1892,10 @@ fn steady_stream(cx: &Ctx) -> Result<Verdict, String> {
     v.set("seconds", json!(secs.as_secs()));
     let evs = cx.events();
     let first_play = evs.iter().position(|e| e.playing()).ok_or("never played")?;
-    let last_stop = evs.iter().rposition(|e| e.op == b's').unwrap_or(evs.len());
+    let last_stop = evs[first_play..]
+        .iter()
+        .rposition(|e| e.op == b's')
+        .map_or(evs.len(), |i| first_play + i);
     let window = &evs[first_play..last_stop];
     let underflows = window
         .iter()
@@ -1937,7 +1948,7 @@ fn steady_stream(cx: &Ctx) -> Result<Verdict, String> {
         calm_err.clone(),
     );
     v.check(
-        max_abs(&calm_err) <= 300,
+        max_abs(&calm_err).is_some_and(|m| m <= 300),
         "estimate within 300 points of the DAC, excluding slow round trips",
     );
     let slow_calls: Vec<Value> = run
@@ -2087,9 +2098,10 @@ fn broadcast_discovery(cx: &Ctx) -> Result<Verdict, String> {
         "backend_caps",
         json!({"max_points_per_chunk": caps.max_points_per_chunk, "pps_max": caps.pps_max}),
     );
+    let (want_points, want_pps) = (cx.bc.buffer_capacity as usize, cx.bc.max_point_rate);
     v.check(
-        caps.max_points_per_chunk == 3899 && caps.pps_max == 100_000,
-        "backend capabilities are 3899 points and 100000 pps",
+        caps.max_points_per_chunk == want_points && caps.pps_max == want_pps,
+        format!("backend capabilities are the advertised {want_points} points and {want_pps} pps"),
     );
     if scan_caps.max_points_per_chunk != caps.max_points_per_chunk {
         v.notes.push(format!(

@@ -74,7 +74,7 @@ A record of what one Ether Dream firmware advertises (buffer capacity, max point
 Profiles drive the [Ether Dream simulator](#ether-dream-simulator) and test parametrisation. The backend never branches on a profile. It reacts only to what the DAC reports, and treats unknown firmware like ED2.
 
 ### Ether Dream simulator
-The `sim` module, available with the `testutils` feature. `EtherDreamModel` is a pure, time-driven state machine that answers Ether Dream commands as a given [Firmware profile](#firmware-profile) would. `SimServer` serves that model over real TCP and UDP sockets, with fault knobs such as dropped connections, short replies and delays. Replay tests check the model against wire captures from real hardware in `tests/fixtures/ether_dream/`.
+The `sim` module, available with the `ether-dream` and `testutils` features. `EtherDreamModel` is a pure, time-driven state machine that answers Ether Dream commands as a given [Firmware profile](#firmware-profile) would. `SimServer` serves that model over real TCP and UDP sockets, with fault knobs such as dropped connections, short replies and delays. Replay tests check the model against wire captures from real hardware in `tests/fixtures/ether_dream/`.
 
 ## Architectural terms
 
