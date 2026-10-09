@@ -141,8 +141,12 @@ impl EtherDreamModel {
         self.hung
     }
 
-    /// When false, `'c'` cannot clear an e-stop and answers `'!'`.
+    /// Opening the interlock (`false`) e-stops the DAC like the hardware
+    /// does, and `'c'` cannot clear the e-stop until it closes again.
     pub fn set_interlock(&mut self, ok: bool) {
+        if self.interlock_ok && !ok {
+            self.estop();
+        }
         self.interlock_ok = ok;
     }
 
@@ -424,7 +428,9 @@ impl EtherDreamModel {
             }
             handled += 1;
             if let (Some(&op), Some((want, _))) = (input.first(), &self.inject) {
-                if op == *want {
+                // Only once the whole command has arrived: a large 'd' comes
+                // in over several reads, and the race is with handling it.
+                if op == *want && command_complete(input) {
                     let (_, mut other) = self.inject.take().expect("checked above");
                     while let Some((n, _)) = self.step(&other) {
                         other.drain(..n);
@@ -474,7 +480,7 @@ impl EtherDreamModel {
     }
 
     /// Handle one command at the front of `input`. Returns `None` if the
-    /// command is not complete yet.
+    /// command is not complete yet (see [`command_complete`]).
     fn step(&mut self, input: &[u8]) -> Option<(usize, Reply)> {
         let &cmd = input.first()?;
         let p = self.profile.clone();
@@ -659,6 +665,21 @@ impl EtherDreamModel {
     }
 }
 
+/// Whether `input` starts with a complete command, using the same lengths
+/// as the model's command handling.
+pub(crate) fn command_complete(input: &[u8]) -> bool {
+    match input.first() {
+        None => false,
+        Some(b'b' | b'u') => input.len() >= 7,
+        Some(b'q') => input.len() >= 5,
+        Some(b'd') => {
+            input.len() >= 3
+                && input.len() >= 3 + LE::read_u16(&input[1..3]) as usize * DacPoint::SIZE_BYTES
+        }
+        Some(_) => true,
+    }
+}
+
 /// Wire encoders for building command byte streams in tests and tools.
 pub mod cmd {
     use crate::protocols::ether_dream::protocol::{DacPoint, WriteBytes};
@@ -683,8 +704,9 @@ pub mod cmd {
     }
     /// `'d'` carrying `points`.
     pub fn data(points: &[DacPoint]) -> Vec<u8> {
+        let n = u16::try_from(points.len()).expect("a 'd' carries at most 65535 points");
         let mut v = vec![b'd'];
-        v.extend_from_slice(&(points.len() as u16).to_le_bytes());
+        v.extend_from_slice(&n.to_le_bytes());
         for p in points {
             v.write_bytes(p).expect("Vec write cannot fail");
         }
@@ -1099,6 +1121,41 @@ mod tests {
         );
         m.advance_to(ms(100));
         assert_eq!(m.status().light_engine_state, DacStatus::LIGHT_ENGINE_READY);
+    }
+
+    #[test]
+    fn opening_the_interlock_estops() {
+        let mut m = ed2();
+        one(&mut m, ms(0), &prepare());
+        one(&mut m, ms(0), &blank_data(1000));
+        one(&mut m, ms(0), &begin(30_000));
+        assert_eq!(m.status().playback_state, DacStatus::PLAYBACK_PLAYING);
+        m.set_interlock(false);
+        let st = m.status();
+        assert_eq!(st.playback_state, DacStatus::PLAYBACK_IDLE);
+        assert_eq!(
+            st.light_engine_state,
+            DacStatus::LIGHT_ENGINE_EMERGENCY_STOP
+        );
+    }
+
+    /// Regression: the injection fired as soon as the opcode byte arrived, so
+    /// a `'d'` split across reads raced against its first few bytes.
+    #[test]
+    fn inject_before_waits_for_the_whole_command() {
+        let mut m = ed2();
+        one(&mut m, ms(0), &prepare());
+        m.inject_before(b'd', vec![0x00]);
+        let data = blank_data(100);
+        let (head, tail) = data.split_at(5);
+        assert!(m.feed(ms(0), head).is_empty());
+        assert_eq!(m.status().light_engine_state, DacStatus::LIGHT_ENGINE_READY);
+        let r = m.feed(ms(0), tail);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(
+            m.status().light_engine_state,
+            DacStatus::LIGHT_ENGINE_EMERGENCY_STOP
+        );
     }
 
     #[test]

@@ -11,11 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::model::{EtherDreamModel, Reply};
+use super::model::{command_complete, EtherDreamModel, Reply};
 use crate::protocols::ether_dream::profile::FirmwareProfile;
-use crate::protocols::ether_dream::protocol::{
-    DacBroadcast, DacPoint, DacStatus, SizeBytes, WriteBytes,
-};
+use crate::protocols::ether_dream::protocol::{DacBroadcast, DacStatus, WriteBytes};
 
 /// Network faults the server can inject. All default to off.
 ///
@@ -32,9 +30,6 @@ pub struct Faults {
     pub reply_delay: Duration,
     /// Send every normal response twice.
     pub duplicate_replies: bool,
-    /// Reset the TCP connection on an unknown command even if the profile
-    /// would NAK it.
-    pub rst_on_unknown: bool,
     /// Process commands with these opcodes but never answer them.
     pub swallow_opcodes: Vec<u8>,
     /// Replace the status in the connection hello, for example with an
@@ -163,31 +158,41 @@ impl SimServer {
             enforce_single_client: config.enforce_single_client,
         });
         let threads = Arc::new(Mutex::new(Vec::new()));
-
+        // Set up the broadcast socket first: an error after the accept thread
+        // is running would leave it holding the TCP port forever.
+        let broadcast = match config.broadcast {
+            Some(bc) => {
+                let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+                socket.set_broadcast(true)?;
+                Some((socket, bc))
+            }
+            None => None,
+        };
+        let server = SimServer {
+            shared,
+            addr,
+            threads,
+        };
+        // From here on, dropping `server` on an error stops and joins
+        // whatever was already spawned.
         let accept = {
-            let shared = Arc::clone(&shared);
-            let threads = Arc::clone(&threads);
+            let shared = Arc::clone(&server.shared);
+            let threads = Arc::clone(&server.threads);
             thread::Builder::new()
                 .name("ether-dream-sim-accept".into())
                 .spawn(move || accept_loop(listener, shared, threads))?
         };
-        threads.lock().unwrap().push(accept);
+        server.threads.lock().unwrap().push(accept);
 
-        if let Some(bc) = config.broadcast {
-            let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-            socket.set_broadcast(true)?;
-            let shared = Arc::clone(&shared);
+        if let Some((socket, bc)) = broadcast {
+            let shared = Arc::clone(&server.shared);
             let handle = thread::Builder::new()
                 .name("ether-dream-sim-broadcast".into())
                 .spawn(move || broadcast_loop(socket, bc, shared))?;
-            threads.lock().unwrap().push(handle);
+            server.threads.lock().unwrap().push(handle);
         }
 
-        Ok(SimServer {
-            shared,
-            addr,
-            threads,
-        })
+        Ok(server)
     }
 
     /// Start a loopback server for `profile` with default settings.
@@ -276,22 +281,34 @@ fn accept_loop(
                     continue;
                 }
                 shared.active.fetch_add(1, Ordering::SeqCst);
-                shared.accepted.fetch_add(1, Ordering::SeqCst);
-                let shared = Arc::clone(&shared);
+                let conn_shared = Arc::clone(&shared);
                 let spawned = thread::Builder::new()
                     .name("ether-dream-sim-conn".into())
                     .spawn(move || {
-                        let _ = handle_connection(sock, &shared);
+                        let _ = handle_connection(sock, &conn_shared);
                         // All clients share one playback state, so only the
                         // last connection closing counts as a disconnect.
-                        if shared.active.fetch_sub(1, Ordering::SeqCst) == 1 {
-                            let now = shared.now();
-                            shared.lock_model().connection_closed(now);
+                        if conn_shared.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+                            let now = conn_shared.now();
+                            conn_shared.lock_model().connection_closed(now);
                         }
                     });
                 match spawned {
-                    Ok(h) => threads.lock().unwrap().push(h),
-                    Err(e) => log::warn!("ether dream sim: spawn failed: {e}"),
+                    Ok(h) => {
+                        shared.accepted.fetch_add(1, Ordering::SeqCst);
+                        let mut threads = threads.lock().unwrap();
+                        // Reap finished connections so a long run with many
+                        // reconnects does not pile up unjoined threads.
+                        for t in extract_finished(&mut threads) {
+                            let _ = t.join();
+                        }
+                        threads.push(h);
+                    }
+                    Err(e) => {
+                        // The socket was dropped with the closure; undo the count.
+                        shared.active.fetch_sub(1, Ordering::SeqCst);
+                        log::warn!("ether dream sim: spawn failed: {e}");
+                    }
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -305,15 +322,34 @@ fn accept_loop(
     }
 }
 
+/// Remove and return the handles of threads that have exited.
+fn extract_finished(threads: &mut Vec<JoinHandle<()>>) -> Vec<JoinHandle<()>> {
+    let (done, running) = std::mem::take(threads)
+        .into_iter()
+        .partition(|t| t.is_finished());
+    *threads = running;
+    done
+}
+
 fn broadcast_loop(socket: UdpSocket, config: BroadcastConfig, shared: Arc<Shared>) {
     let mut next = Instant::now();
+    let mut warned = false;
     while !shared.stop.load(Ordering::SeqCst) {
         if Instant::now() >= next {
             let frame = shared.lock_model().broadcast();
             let mut bytes = Vec::new();
             bytes.write_bytes(frame).expect("Vec write cannot fail");
             if let Err(e) = socket.send_to(&bytes, config.target) {
-                log::debug!("ether dream sim: broadcast send failed: {e}");
+                // Warn once: discovery silently never works otherwise.
+                if !warned {
+                    warned = true;
+                    log::warn!(
+                        "ether dream sim: broadcast to {} failed: {e}",
+                        config.target
+                    );
+                } else {
+                    log::debug!("ether dream sim: broadcast send failed: {e}");
+                }
             }
             // Skip missed slots after a stall instead of bursting to catch up.
             next = (next + config.interval).max(Instant::now());
@@ -389,21 +425,15 @@ fn handle_connection(mut sock: TcpStream, shared: &Shared) -> io::Result<()> {
         loop {
             let (replies, data_ready) = {
                 let mut model = shared.lock_model();
-                if faults.rst_on_unknown && !model.profile().unknown_command_resets_tcp {
-                    if let Some(&op) = input.first() {
-                        if !is_known_opcode(op) {
-                            drop(model);
-                            reset(&sock);
-                            return Ok(());
-                        }
-                    }
-                }
                 let now = shared.now();
                 if faults.data_delay.is_zero() {
                     (model.process(now, &mut input), false)
                 } else {
                     let replies = model.process_before(now, &mut input, b'd');
-                    (replies, data_command_complete(&input))
+                    (
+                        replies,
+                        input.first() == Some(&b'd') && command_complete(&input),
+                    )
                 }
             };
             if !send_replies(&sock, shared, replies, &faults, &mut sent, &mut hung)? {
@@ -430,15 +460,6 @@ fn handle_connection(mut sock: TcpStream, shared: &Shared) -> io::Result<()> {
             }
         }
     }
-}
-
-/// Whether `input` starts with a complete `'d'` command.
-fn data_command_complete(input: &[u8]) -> bool {
-    if input.first() != Some(&b'd') || input.len() < 3 {
-        return false;
-    }
-    let n = u16::from_le_bytes([input[1], input[2]]) as usize;
-    input.len() >= 3 + n * DacPoint::SIZE_BYTES
 }
 
 /// Send `replies`, applying the reply faults. Returns `Ok(false)` when the
@@ -482,13 +503,6 @@ fn send_replies(
         *sent += 1;
     }
     Ok(true)
-}
-
-fn is_known_opcode(op: u8) -> bool {
-    matches!(
-        op,
-        b'p' | b'b' | b'u' | b'q' | b'd' | b's' | b'c' | b'?' | b'v' | 0x00 | 0xff
-    )
 }
 
 #[cfg(test)]

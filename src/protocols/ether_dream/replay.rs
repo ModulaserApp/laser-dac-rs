@@ -271,11 +271,15 @@ fn replay(name: &str, events: &[TraceEvent], flags: u16) -> usize {
     for e in events {
         prepared |= e.op == "prepare";
         // `blocked` and `synthesized` events (hwcheck traces) never reached
-        // the DAC: the capture proxy refused or answered them itself.
+        // the DAC: the capture proxy refused or answered them itself. A
+        // `closed` event carries no reply to compare.
         if !prepared
             || e.op == "hello"
             || e.phase == "pre"
-            || matches!(e.status.as_str(), "timeout" | "blocked" | "synthesized")
+            || matches!(
+                e.status.as_str(),
+                "timeout" | "closed" | "blocked" | "synthesized"
+            )
         {
             continue;
         }
